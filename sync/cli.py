@@ -5,14 +5,37 @@ from .config import Config
 from .daemon import SyncDaemon
 from .discovery import discover_sources
 from .store import Store
-from .launchd import install, uninstall, plist_path
+from .launchd import StateMigrationBlocked, install, plist_path, plist_paths, restart as restart_agents, start as start_agents, status as launchd_status, stop as stop_agents, uninstall
 
 def main(argv=None):
     ap=argparse.ArgumentParser(prog="funes-sync")
     sub=ap.add_subparsers(dest="cmd",required=True)
     for n in ("backfill","run","drain","status","sources","doctor","install","uninstall","start","stop","restart","logs","mcp"): sub.add_parser(n)
     ap.add_argument("--root", type=str, help="override the home directory for a dry-run")
-    a=ap.parse_args(argv); cfg=Config.load(Path(a.root).expanduser() if a.root else None); store=Store(config=cfg)
+    a=ap.parse_args(argv); cfg=Config.load(Path(a.root).expanduser() if a.root else None)
+    if a.cmd=="install":
+        try:
+            installed=install(config=cfg)
+        except StateMigrationBlocked as exc:
+            print(json.dumps(exc.as_dict(), ensure_ascii=False, indent=2), file=sys.stderr)
+            return 2
+        for path in installed: print(path)
+        from .integrations import install_all
+        print(json.dumps(install_all(cfg.home), ensure_ascii=False, indent=2))
+        return 0
+    if a.cmd=="uninstall":
+        for path in uninstall(config=cfg): print(path)
+        return 0
+    if a.cmd in ("start","stop","restart"):
+        action={"start":start_agents,"stop":stop_agents,"restart":restart_agents}[a.cmd]
+        try:
+            managed=action(config=cfg)
+        except StateMigrationBlocked as exc:
+            print(json.dumps(exc.as_dict(), ensure_ascii=False, indent=2), file=sys.stderr)
+            return 2
+        for path in managed: print(path)
+        return 0
+    store=Store(config=cfg)
     try:
         if a.cmd in ("backfill","run"):
             d=SyncDaemon(cfg,store)
@@ -22,26 +45,13 @@ def main(argv=None):
             print(json.dumps({"flushed": d.drain(), "remaining": store.pending_count()}, ensure_ascii=False))
         elif a.cmd=="status":
             from .client import SyncClient
-            status=store.stats(); status.update({"remote_url":cfg.remote_url,"native_memory":cfg.native_memory,"native_primary":cfg.native_primary,"remote_ready":SyncClient(cfg).health(),"device_id":cfg.device_id,"interval":cfg.interval})
+            status=store.stats(); status.update({"remote_url":cfg.remote_url,"native_memory":cfg.native_memory,"native_primary":cfg.native_primary,"remote_ready":SyncClient(cfg).health(),"device_id":cfg.device_id,"interval":cfg.interval,"launch_agents":launchd_status(config=cfg)})
             print(json.dumps(status,ensure_ascii=False,indent=2))
         elif a.cmd=="sources": print(json.dumps([s.as_dict() for s in discover_sources(cfg)],ensure_ascii=False,indent=2))
         elif a.cmd=="doctor":
             from .client import SyncClient
-            checks={"state_dir":str(cfg.state_dir),"db":str(store.path),"remote_url":cfg.remote_url,"native_memory":cfg.native_memory,"native_primary":cfg.native_primary,"token_configured":bool(os.environ.get("FUNES_API_TOKEN")),"sources":store.stats()["sources"],"remote_ready":SyncClient(cfg).health(),"launch_agent":str(plist_path(cfg.home))}
+            checks={"state_dir":str(cfg.state_dir),"db":str(store.path),"remote_url":cfg.remote_url,"native_memory":cfg.native_memory,"native_primary":cfg.native_primary,"token_configured":bool(os.environ.get("FUNES_API_TOKEN")),"sources":store.stats()["sources"],"remote_ready":SyncClient(cfg).health(),"launch_agent":str(plist_path(cfg.home)),"launch_agents":[str(path) for path in plist_paths(cfg.home)]}
             print(json.dumps(checks,ensure_ascii=False,indent=2))
-        elif a.cmd=="install":
-            print(install(cfg.home))
-            from .integrations import install_all
-            print(json.dumps(install_all(cfg.home), ensure_ascii=False, indent=2))
-        elif a.cmd=="uninstall": print(uninstall(cfg.home))
-        elif a.cmd in ("start","stop","restart"):
-            path=plist_path(cfg.home); uid=str(os.getuid())
-            if a.cmd in ("stop","restart"):
-                subprocess.run(["launchctl","bootout",f"gui/{uid}",str(path)],check=False,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
-            if a.cmd in ("start","restart"):
-                if not path.exists(): install(cfg.home)
-                subprocess.run(["launchctl","bootstrap",f"gui/{uid}",str(path)],check=False,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
-            print(path)
         elif a.cmd=="logs":
             p=cfg.home/"Library/Logs/funes-sync.log"; print(p.read_text(errors="replace")[-10000:] if p.exists() else "")
         elif a.cmd=="mcp":

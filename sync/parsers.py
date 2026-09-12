@@ -36,11 +36,30 @@ class Chunk:
         # database retains the compact record_id too.
         value.pop("text", None)
         value["source_identity"] = value["record_id"]
-        value["source_version"] = value["content_hash"] = hashlib.sha256(self.raw_text.encode()).hexdigest()
+        value["content_hash"] = hashlib.sha256(self.raw_text.encode()).hexdigest()
         value["source_path"] = value["path"]
         value["source_agent"] = self.source_agent or self.kind
         value["source_type"] = self.source_type or self.kind
         value["agent_id"] = self.subagent_id
+        revision = {
+            key: value.get(key)
+            for key in (
+                "source_agent",
+                "source_type",
+                "role",
+                "timestamp",
+                "content_type",
+                "project",
+                "repo",
+                "worktree",
+                "agent_type",
+                "parent_session_id",
+                "agent_id",
+            )
+        }
+        value["source_version"] = hashlib.sha256(
+            (value["content_hash"] + json.dumps(revision, ensure_ascii=False, sort_keys=True)).encode()
+        ).hexdigest()
         return value
 
 def _text(v: Any) -> str:
@@ -424,7 +443,21 @@ def _stable_identity(source: Source, session: str, message: str = "", *, timesta
     # semantic fields rather than a byte offset or line ordinal.
     agent = source.source_agent or source.kind
     kind = source.source_type or source.kind
-    if message:
+    memory_source = source.kind in {"codex_memory", "pi_memory", "claude_memory", "agents_md", "persistent"}
+    if message and memory_source:
+        # A memory section's semantic message id already contains its stable
+        # repo/path/heading identity.  Reproduce the v1 classifier tuple from
+        # immutable source.kind values so correcting agent/type metadata neither
+        # forks existing records nor changes cross-device identity.
+        legacy_agent = {
+            "codex_memory": "codex",
+            "pi_memory": "pi",
+            "claude_memory": "claude_code",
+        }.get(source.kind, "unknown")
+        legacy_type = "memory" if source.kind.endswith("memory") else source.kind
+        legacy_record_type = "agents_md" if source.kind == "agents_md" else "memory"
+        locator = ("native", legacy_agent, legacy_type, session, legacy_record_type, message)
+    elif message:
         locator = ("native", agent, kind, session, record_type, message)
     else:
         locator = ("fallback", agent, kind, session, timestamp, role,
@@ -644,6 +677,7 @@ def _parse_memory_native(source: Source) -> list[Chunk]:
         if len(piece) > 6000:
             pieces[i:i + 1] = [piece[j:j + 6000] for j in range(0, len(piece), 6000)]
     repo_identity, relative_path = _memory_identity_context(source)
+    source_content_type = source.source_type if source.source_type in {"agents_md", "project_instruction"} else "memory"
     for i, piece in enumerate(pieces):
         # Memory identity is semantic rather than path/index based so copies of
         # the same repository memory converge across devices and mount points.
@@ -654,8 +688,8 @@ def _parse_memory_native(source: Source) -> list[Chunk]:
         section = heading or "__preamble__"
         semantic_id = f"memory:{source.kind}:{repo_identity}:{relative_path}:{section}"
         c = _chunk(source, ordinal=i, session="", message=semantic_id, role="system",
-                   text=piece, raw=piece, content_type="agents_md" if source.kind == "agents_md" else "memory",
-                   metadata={"source_file": str(source.path)}, record_type="agents_md" if source.kind == "agents_md" else "memory",
+                   text=piece, raw=piece, content_type=source_content_type,
+                   metadata={"source_file": str(source.path)}, record_type=source_content_type,
                    fallback_key=heading)
         if c:
             out.append(c)

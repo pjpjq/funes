@@ -2,7 +2,7 @@ from __future__ import annotations
 import logging, os, signal, threading, time
 from pathlib import Path
 from .config import Config
-from .discovery import discover_sources
+from .discovery import _project_roots, discover_sources
 from .parsers import parse_file
 from .store import Store
 from .client import SyncClient
@@ -17,10 +17,18 @@ class SyncDaemon:
         self.native=NativeFunes(self.config) if self.config.native_primary and not self.config.memory_only else None
         self.running=False; self._wake=threading.Event(); self._observer=None
         self._backfill_marker = self.config.state_dir / "initial-backfill.complete"
+        self._source_schema_marker = self.config.state_dir / "source-schema-v2.complete"
     def scan_once(self):
         if not self.config.enabled or not self.config.auto_discover:
             return 0
-        if not self.config.initial_backfill and not self._backfill_marker.exists():
+        source_schema_missing=not self._source_schema_marker.exists()
+        legacy_state=bool(self.store.db.execute(
+            "SELECT EXISTS(SELECT 1 FROM records) OR EXISTS(SELECT 1 FROM sources)"
+        ).fetchone()[0])
+        refresh_source_schema=source_schema_missing and (
+            self._backfill_marker.exists() or legacy_state
+        )
+        if not refresh_source_schema and not self.config.initial_backfill and not self._backfill_marker.exists():
             # Seed cursors at EOF once so existing history is left untouched,
             # while files created or appended after installation still flow
             # through the normal incremental path.
@@ -36,6 +44,7 @@ class SyncDaemon:
                 self.store.set_cursor(source.source_key, stat.st_size, stat.st_ino, stat.st_size)
             self._backfill_marker.parent.mkdir(parents=True, exist_ok=True)
             self._backfill_marker.write_text(str(time.time()), encoding="utf-8")
+            self._source_schema_marker.write_text(str(time.time()), encoding="utf-8")
             return 0
         sources=discover_sources(self.config); present={s.source_key for s in sources}
         self.store.mark_missing(present)
@@ -47,19 +56,22 @@ class SyncDaemon:
             self.store.register_source(s,st)
             cur=self.store.cursor(s.source_key); start=0
             # No full reparse for unchanged files; append-only growth resumes at the byte cursor.
-            if old and old[0] == st.st_size and old[1] == st.st_mtime and old[2] == st.st_ino:
+            if not refresh_source_schema and old and old[0] == st.st_size and old[1] == st.st_mtime and old[2] == st.st_ino:
                 continue
             appendable = s.kind in {"codex", "pi", "claude", "codex_session", "pi_session", "claude_session"} or s.kind.endswith("session")
-            if appendable and cur and cur.get("inode")==st.st_ino and st.st_size>=cur.get("size",0):
+            if not refresh_source_schema and appendable and cur and cur.get("inode")==st.st_ino and st.st_size>=cur.get("size",0):
                 start=cur.get("offset",0)
             chunks=parse_file(s,start)
             total += self.store.upsert_chunks(chunks)
             if start == 0:
                 self.store.reconcile_source(s.source_key, {c.record_id for c in chunks})
             self.store.set_cursor(s.source_key,st.st_size,st.st_ino,st.st_size)
-        if self.config.initial_backfill and not self._backfill_marker.exists():
+        if (self.config.initial_backfill or refresh_source_schema) and not self._backfill_marker.exists():
             self._backfill_marker.parent.mkdir(parents=True, exist_ok=True)
             self._backfill_marker.write_text(str(time.time()), encoding="utf-8")
+        if source_schema_missing:
+            self._source_schema_marker.parent.mkdir(parents=True, exist_ok=True)
+            self._source_schema_marker.write_text(str(time.time()), encoding="utf-8")
         return total
 
     def _start_watcher(self) -> None:
@@ -79,9 +91,7 @@ class SyncDaemon:
                     daemon._wake.set()
         observer = Observer()
         roots = {self.config.home / ".codex", self.config.home / ".pi", self.config.home / ".claude"}
-        project = Path(os.environ.get("FUNES_PROJECT_ROOT", Path.cwd())).expanduser()
-        if project.exists():
-            roots.add(project)
+        roots.update(_project_roots(self.config))
         for root in roots:
             if root.exists():
                 try:
@@ -138,7 +148,6 @@ class SyncDaemon:
             self._start_watcher()
         try:
           while self.running:
-            self.scan_once()
             if self.native:
                 result = self.native.sync()
                 if not result.ok:
@@ -147,6 +156,7 @@ class SyncDaemon:
                     break
                 self._wake.wait(max(1,self.config.interval)); self._wake.clear()
                 continue
+            self.scan_once()
             # A one-shot backfill must drain the durable queue completely when
             # the remote is available; otherwise the first startup would leave
             # most history pending until the next 5-minute pass.  The continuous

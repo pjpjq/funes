@@ -622,7 +622,7 @@ class ServiceTests(unittest.TestCase):
         store.close()
 
         restored = Store(directory.name)
-        restored.record_reindex_control(control, replay_applied=True)
+        restored.record_reindex_control(control)
         resumed = restored.conn.execute(
             "SELECT row_cursor FROM reindex_controls WHERE generation=1"
         ).fetchone()
@@ -682,6 +682,71 @@ class ServiceTests(unittest.TestCase):
         self.assertTrue(result["durable"])
         self.assertEqual(item["translation_status"], "skipped_raw_mode")
         self.assertNotEqual(item["translation_hash"], "old-model-hash")
+        store.close()
+
+    def test_full_hub_restore_rewinds_partial_cursor_before_drain(self):
+        from service.server import SnapshotSync
+
+        store = Store(self.tmp.name)
+        store.ingest(
+            [
+                {
+                    "source_identity": f"hub-row-{index}",
+                    "source_version": "v1",
+                    "raw_text": f"old raw {index}",
+                    "retrieval_text": f"old shadow {index}",
+                    "translation_status": "ok",
+                }
+                for index in range(4)
+            ]
+        )
+        control = {
+            "generation": 1,
+            "scope": "retrieval_text",
+            "created_at": "2026-09-13T00:00:01Z",
+        }
+        store.record_reindex_control(control)
+        first = store.apply_pending_reindex_controls(2)
+        self.assertEqual(first["scanned"], 2)
+        self.assertEqual(first["applied"], 0)
+
+        syncer = SnapshotSync(store)
+        syncer.repo = "owner/private"
+        syncer.token = "test-token"
+        syncer.restore_batch = 2
+
+        def restore_cursor_prefix_revision(_filename):
+            result = store.ingest(
+                [
+                    {
+                        "source_identity": "hub-row-0",
+                        "source_version": "v2",
+                        "raw_text": "new raw revision before cursor",
+                        "retrieval_text": "stale generation-zero shadow",
+                        "translation_status": "skipped_non_cjk",
+                        "retrieval_generation": 0,
+                        "native_generation": 0,
+                        "updated_at": "9999-01-01T00:00:00Z",
+                    }
+                ]
+            )
+            return result["updated"]
+
+        with mock.patch.object(syncer, "_repo_files", return_value=["delta.enc"]), mock.patch.object(
+            syncer, "_restore_file", side_effect=restore_cursor_prefix_revision
+        ):
+            self.assertEqual(syncer.restore(), 1)
+
+        restored = store.get("hub-row-0")
+        state = store.conn.execute(
+            "SELECT row_cursor, applied_at FROM reindex_controls WHERE generation=1"
+        ).fetchone()
+        self.assertEqual(restored["raw_text"], "new raw revision before cursor")
+        self.assertEqual(restored["retrieval_text"], "new raw revision before cursor")
+        self.assertEqual(restored["translation_status"], "pending_provider")
+        self.assertEqual(restored["retrieval_generation"], 1)
+        self.assertEqual(state["row_cursor"], 4)
+        self.assertIsNotNone(state["applied_at"])
         store.close()
 
     def test_reindex_http_returns_202_only_after_durable_queue(self):

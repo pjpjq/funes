@@ -128,6 +128,10 @@ class SyncClient:
         with open_no_redirect(req, timeout=timeout) as response:
             raw = response.read()
             result = json.loads(raw) if raw else {}
+            if response.status != 202:
+                raise RuntimeError(
+                    f"remote reindex returned HTTP {response.status}, expected 202"
+                )
             if result.get("durable") is not True or result.get("queued") is not True:
                 raise RuntimeError("remote reindex did not confirm a durable queue record")
             return result

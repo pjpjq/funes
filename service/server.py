@@ -566,9 +566,7 @@ class Store:
             "created_at": utc_now(),
         }
 
-    def record_reindex_control(
-        self, control: dict[str, Any], *, replay_applied: bool = False
-    ) -> bool:
+    def record_reindex_control(self, control: dict[str, Any]) -> bool:
         scope = str(control.get("scope", ""))
         generation = int(control.get("generation", 0))
         created_at = str(control.get("created_at") or utc_now())
@@ -581,15 +579,6 @@ class Store:
                 ) VALUES(?,?,?,0,NULL)""",
                 (generation, scope, created_at),
             )
-            if not cursor.rowcount and replay_applied:
-                # Remote restore may add legacy deltas after a control that was
-                # already completed locally. Replay only completed controls;
-                # an interrupted control keeps its durable row cursor.
-                self.conn.execute(
-                    """UPDATE reindex_controls SET row_cursor=0, applied_at=NULL
-                    WHERE generation=? AND applied_at IS NOT NULL""",
-                    (generation,),
-                )
             return cursor.rowcount == 1
 
     @staticmethod
@@ -709,6 +698,13 @@ class Store:
                 totals[name] += result[name]
             if not result["scanned"] and not result["applied"]:
                 return totals
+
+    def reset_reindex_control_cursors(self) -> None:
+        """Restart every control after a complete unordered Hub restore."""
+        with self.lock, self.conn:
+            self.conn.execute(
+                "UPDATE reindex_controls SET row_cursor=0, applied_at=NULL"
+            )
 
     def canonical_index_candidates(self, limit: int) -> list[dict[str, Any]]:
         """Return final non-session retrieval shadows for native reconciliation."""
@@ -903,7 +899,7 @@ class Store:
                     result = self.ingest(batch)
                     total += result["created"] + result["updated"]
                     batch = []
-                self.record_reindex_control(item, replay_applied=not apply_controls)
+                self.record_reindex_control(item)
                 continue
             if record_type == "translation_cache":
                 query = str(item.get("query", ""))
@@ -1202,6 +1198,10 @@ class SnapshotSync:
                 restored = 0
                 for filename in files:
                     restored += self._restore_file(filename)
+                # A complete Hub restore can replay an old generation-zero
+                # revision into an id below a partially persisted row cursor.
+                # Rewind only here; ordinary local restarts keep their cursor.
+                self.store.reset_reindex_control_cursors()
                 self.store.drain_reindex_controls(self.restore_batch)
                 self.restored = True
                 return restored

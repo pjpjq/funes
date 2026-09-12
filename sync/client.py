@@ -52,7 +52,21 @@ class SyncClient:
 
     def health(self) -> bool:
         try:
-            with request.urlopen(self.config.remote_url.rstrip("/") + "/ready", timeout=8) as r:
+            headers = {"User-Agent": "funes-sync/1"}
+            token = os.environ.get("FUNES_API_TOKEN")
+            if token:
+                hub_token = os.environ.get("FUNES_HF_TOKEN") or os.environ.get("HF_TOKEN")
+                if hub_token:
+                    headers["Authorization"] = "Bearer " + hub_token
+                    headers["X-Funes-Authorization"] = "Bearer " + token
+                else:
+                    headers["Authorization"] = "Bearer " + token
+            req = request.Request(
+                self.config.remote_url.rstrip("/") + "/ready",
+                headers=headers,
+                method="GET",
+            )
+            with request.urlopen(req, timeout=8) as r:
                 return 200 <= r.status < 300
         except (OSError, error.URLError):
             return False

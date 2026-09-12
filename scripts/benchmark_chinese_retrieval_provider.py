@@ -7,8 +7,8 @@ build English retrieval shadows, and compares two isolated native Funes indexes:
 
 * before: canonical documents whose retrieval text is raw Chinese, queried with
   raw Chinese queries;
-* after: canonical documents whose retrieval text is only the provider-generated
-  English shadow, queried with provider-generated shadows.
+* after: canonical documents use document-prompt English shadows; queries use
+  query-prompt rewrites that pass service validation, otherwise raw queries.
 
 Both arms use the same checked-in 60-memory/20-query fixture and the same native
 Lance hybrid retrieval settings.  No remote memory or long-lived service is
@@ -29,6 +29,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -41,7 +42,14 @@ for path in (ROOT, SCRIPTS):
         sys.path.insert(0, str(path))
 
 from benchmark_chinese_retrieval import Memory, Query, _memories, _queries
-from service.server import PROMPT_VERSION, RETRIEVAL_PROMPT, normalize_text
+from service.server import (
+    PROMPT_VERSION,
+    QUERY_PROMPT_VERSION,
+    QUERY_RETRIEVAL_PROMPT,
+    RETRIEVAL_PROMPT,
+    Translator,
+    normalize_text,
+)
 from space.server import NativeMcpWorker
 
 
@@ -49,6 +57,9 @@ DEFAULT_ENDPOINT = "https://router.huggingface.co/v1/chat/completions"
 DEFAULT_MODEL = "Qwen/Qwen3-4B-Instruct-2507"
 DEFAULT_OUTPUT = ROOT / "docs" / "chinese-retrieval-provider-results.json"
 DEFAULT_BINARY = ROOT / "target" / "release" / "funes"
+BENCHMARK_KIND = "provider_backed_native_funes_chinese_retrieval_v2"
+DOCUMENT_MAX_TOKENS: int | None = None
+QUERY_MAX_TOKENS = 128
 TOKEN_ENV_NAMES = (
     "HF_TOKEN",
     "FUNES_HF_TOKEN",
@@ -67,6 +78,13 @@ class ProviderError(RuntimeError):
 class ProviderStats:
     calls: int
     seconds: float
+
+
+@dataclass(frozen=True)
+class ProviderOutput:
+    provider_output: str
+    effective_output: str
+    validation_status: str
 
 
 class ProviderNormalizer:
@@ -95,19 +113,41 @@ class ProviderNormalizer:
         with self._lock:
             return ProviderStats(calls=self._calls, seconds=round(self._seconds, 3))
 
-    def normalize(self, raw: str) -> str:
-        payload = json.dumps(
-            {
-                "model": self.model,
-                "temperature": 0,
-                "max_tokens": 256,
-                "messages": [
-                    {"role": "system", "content": RETRIEVAL_PROMPT},
-                    {"role": "user", "content": raw},
-                ],
-            },
-            ensure_ascii=False,
-        ).encode("utf-8")
+    def normalize_document(self, raw: str) -> ProviderOutput:
+        return self._normalize(
+            raw,
+            prompt=RETRIEVAL_PROMPT,
+            max_tokens=DOCUMENT_MAX_TOKENS,
+        )
+
+    def normalize_query(self, raw: str) -> ProviderOutput:
+        return self._normalize(
+            raw,
+            prompt=QUERY_RETRIEVAL_PROMPT,
+            max_tokens=QUERY_MAX_TOKENS,
+            validate=Translator._valid_query_rewrite,
+        )
+
+    def _normalize(
+        self,
+        raw: str,
+        *,
+        prompt: str,
+        max_tokens: int | None,
+        validate: Callable[[str, str], bool] | None = None,
+    ) -> ProviderOutput:
+        normalized_raw = normalize_text(raw)
+        request_body = {
+            "model": self.model,
+            "temperature": 0,
+            "messages": [
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": raw},
+            ],
+        }
+        if max_tokens is not None:
+            request_body["max_tokens"] = max_tokens
+        payload = json.dumps(request_body, ensure_ascii=False).encode("utf-8")
         last_error = "provider request failed"
         for attempt in range(self.retries):
             request = urllib.request.Request(
@@ -124,9 +164,24 @@ class ProviderNormalizer:
                 with urllib.request.urlopen(request, timeout=self.timeout) as response:
                     data = json.load(response)
                 content = data["choices"][0]["message"]["content"]
-                if not isinstance(content, str) or not normalize_text(content):
+                if not isinstance(content, str):
+                    raise ProviderError("provider returned non-string completion content")
+                rewritten = normalize_text(content)
+                if validate is not None and (
+                    not rewritten or not validate(normalized_raw, rewritten)
+                ):
+                    return ProviderOutput(
+                        provider_output=rewritten,
+                        effective_output=normalized_raw,
+                        validation_status="fallback_invalid_query",
+                    )
+                if not rewritten:
                     raise ProviderError("provider returned empty completion content")
-                return normalize_text(content)
+                return ProviderOutput(
+                    provider_output=rewritten,
+                    effective_output=rewritten,
+                    validation_status="accepted",
+                )
             except urllib.error.HTTPError as exc:
                 last_error = f"provider HTTP {exc.code} ({exc.reason})"
                 retryable = exc.code in (408, 425, 429) or exc.code >= 500
@@ -158,21 +213,26 @@ def _token_from_environment(requested: str | None) -> tuple[str, str]:
 
 
 def _normalize_unique(
-    provider: ProviderNormalizer,
+    normalize: Callable[[str], ProviderOutput],
     texts: list[str],
     concurrency: int,
-) -> dict[str, str]:
+    input_type: str,
+) -> dict[str, ProviderOutput]:
     unique = list(dict.fromkeys(texts))
     completed = 0
-    results: dict[str, str] = {}
+    results: dict[str, ProviderOutput] = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
-        futures = {pool.submit(provider.normalize, text): text for text in unique}
+        futures = {pool.submit(normalize, text): text for text in unique}
         for future in concurrent.futures.as_completed(futures):
             text = futures[future]
             results[text] = future.result()
             completed += 1
             if completed == len(unique) or completed % 10 == 0:
-                print(f"provider normalization: {completed}/{len(unique)}", file=sys.stderr, flush=True)
+                print(
+                    f"provider {input_type} normalization: {completed}/{len(unique)}",
+                    file=sys.stderr,
+                    flush=True,
+                )
     return results
 
 
@@ -201,15 +261,37 @@ def _atomic_write_json(path: Path, value: dict[str, object]) -> None:
             temporary.unlink()
 
 
-def _provider_outputs(inputs: list[str], translations: dict[str, str]) -> list[dict[str, str]]:
+def _provider_outputs(
+    inputs: list[str],
+    outputs: dict[str, ProviderOutput],
+    input_type: str,
+) -> list[dict[str, str]]:
     return [
         {
+            "input_type": input_type,
             "input_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
             "input": text,
-            "output": translations[text],
+            "output": outputs[text].provider_output,
+            "effective_output": outputs[text].effective_output,
+            "validation_status": outputs[text].validation_status,
         }
         for text in inputs
     ]
+
+
+def _prompt_metadata() -> dict[str, object]:
+    return {
+        "document_prompt_version": PROMPT_VERSION,
+        "document_prompt_sha256": hashlib.sha256(RETRIEVAL_PROMPT.encode("utf-8")).hexdigest(),
+        "document_max_tokens": DOCUMENT_MAX_TOKENS,
+        "query_prompt_version": QUERY_PROMPT_VERSION,
+        "query_prompt_sha256": hashlib.sha256(QUERY_RETRIEVAL_PROMPT.encode("utf-8")).hexdigest(),
+        "query_max_tokens": QUERY_MAX_TOKENS,
+    }
+
+
+def _effective_outputs(outputs: dict[str, ProviderOutput]) -> dict[str, str]:
+    return {raw: output.effective_output for raw, output in outputs.items()}
 
 
 def _load_provider_checkpoint(
@@ -217,8 +299,9 @@ def _load_provider_checkpoint(
     *,
     endpoint: str,
     model: str,
-    inputs: list[str],
-) -> tuple[dict[str, str], dict[str, object]] | None:
+    document_inputs: list[str],
+    query_inputs: list[str],
+) -> tuple[dict[str, ProviderOutput], dict[str, ProviderOutput], dict[str, object]] | None:
     if not path.is_file():
         return None
     try:
@@ -227,26 +310,73 @@ def _load_provider_checkpoint(
         rows = checkpoint["provider_outputs"]
     except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
         return None
-    prompt_sha256 = hashlib.sha256(RETRIEVAL_PROMPT.encode("utf-8")).hexdigest()
     if (
-        not isinstance(provider, dict)
+        checkpoint.get("benchmark_kind") != BENCHMARK_KIND
+        or not isinstance(provider, dict)
         or provider.get("endpoint") != endpoint
         or provider.get("model") != model
-        or provider.get("prompt_sha256") != prompt_sha256
+        or any(provider.get(key) != value for key, value in _prompt_metadata().items())
         or not isinstance(rows, list)
     ):
         return None
-    translations = {
-        row["input"]: row["output"]
-        for row in rows
-        if isinstance(row, dict)
-        and isinstance(row.get("input"), str)
-        and isinstance(row.get("output"), str)
-        and normalize_text(row["output"])
+    document_outputs: dict[str, ProviderOutput] = {}
+    query_outputs: dict[str, ProviderOutput] = {}
+    expected_keys = {
+        *(("document", text) for text in document_inputs),
+        *(("query", text) for text in query_inputs),
     }
-    if any(text not in translations for text in inputs):
+    seen_keys: set[tuple[str, str]] = set()
+    for row in rows:
+        if (
+            not isinstance(row, dict)
+            or not isinstance(row.get("input"), str)
+            or not isinstance(row.get("output"), str)
+            or not isinstance(row.get("effective_output"), str)
+            or row.get("input_sha256")
+            != hashlib.sha256(row.get("input", "").encode("utf-8")).hexdigest()
+        ):
+            return None
+        raw = row["input"]
+        input_type = str(row.get("input_type", ""))
+        key = (input_type, raw)
+        if key not in expected_keys or key in seen_keys:
+            return None
+        seen_keys.add(key)
+        provider_output = normalize_text(row["output"])
+        effective_output = normalize_text(row["effective_output"])
+        if input_type == "document":
+            if (
+                provider_output
+                and effective_output == provider_output
+                and row.get("validation_status") == "accepted"
+            ):
+                document_outputs[raw] = ProviderOutput(
+                    provider_output=provider_output,
+                    effective_output=effective_output,
+                    validation_status="accepted",
+                )
+            else:
+                return None
+        elif input_type == "query":
+            accepted = bool(provider_output) and Translator._valid_query_rewrite(
+                normalize_text(raw), provider_output
+            )
+            expected_effective = provider_output if accepted else normalize_text(raw)
+            expected_status = "accepted" if accepted else "fallback_invalid_query"
+            if (
+                effective_output == expected_effective
+                and row.get("validation_status") == expected_status
+            ):
+                query_outputs[raw] = ProviderOutput(
+                    provider_output=provider_output,
+                    effective_output=effective_output,
+                    validation_status=expected_status,
+                )
+            else:
+                return None
+    if seen_keys != expected_keys:
         return None
-    return translations, dict(provider)
+    return document_outputs, query_outputs, dict(provider)
 
 
 def _write_canonical_source(
@@ -382,6 +512,8 @@ def _run_arm(
 def _self_check() -> dict[str, object]:
     memories = _memories()
     queries = _queries(memories)
+    document_inputs = list(dict.fromkeys(memory.raw for memory in memories))
+    query_inputs = list(dict.fromkeys(query.text for query in queries))
     assert len(memories) >= 50
     assert len(queries) == 20
     assert len({memory.ident for memory in memories}) == len(memories)
@@ -396,12 +528,22 @@ def _self_check() -> dict[str, object]:
         "recall@3": 0.5,
         "recall@5": 0.75,
     }
-    assert len(set([m.raw for m in memories] + [q.text for q in queries])) == 44
+    assert len(set(document_inputs + query_inputs)) == 44
+    assert set(_prompt_metadata()) == {
+        "document_prompt_version",
+        "document_prompt_sha256",
+        "document_max_tokens",
+        "query_prompt_version",
+        "query_prompt_sha256",
+        "query_max_tokens",
+    }
     return {
         "status": "ok",
         "memories": len(memories),
         "queries": len(queries),
-        "unique_provider_inputs": len(set([m.raw for m in memories] + [q.text for q in queries])),
+        "unique_provider_inputs": len(set(document_inputs + query_inputs)),
+        "document_provider_inputs": len(document_inputs),
+        "query_provider_inputs": len(query_inputs),
     }
 
 
@@ -412,18 +554,24 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         raise RuntimeError("fixture must contain at least 50 memories and 20 queries")
     if not args.binary.is_file():
         raise RuntimeError(f"native Funes binary not found: {args.binary}")
-    inputs = list(dict.fromkeys([memory.raw for memory in memories] + [query.text for query in queries]))
+    document_inputs = list(dict.fromkeys(memory.raw for memory in memories))
+    query_inputs = list(dict.fromkeys(query.text for query in queries))
     cached = _load_provider_checkpoint(
         args.output,
         endpoint=args.endpoint,
         model=args.model,
-        inputs=inputs,
+        document_inputs=document_inputs,
+        query_inputs=query_inputs,
     )
     token = ""
     checkpoint_reused = cached is not None
     if cached is not None:
-        translations, provider_metadata = cached
-        print(f"provider normalization: reused {len(inputs)} outputs from {args.output}", file=sys.stderr)
+        document_outputs, query_outputs, provider_metadata = cached
+        print(
+            "provider normalization: reused "
+            f"{len(document_outputs) + len(query_outputs)} outputs from {args.output}",
+            file=sys.stderr,
+        )
     else:
         token, token_env = _token_from_environment(args.token_env)
         provider = ProviderNormalizer(
@@ -433,7 +581,18 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             timeout=args.request_timeout,
             retries=args.retries,
         )
-        translations = _normalize_unique(provider, inputs, args.concurrency)
+        document_outputs = _normalize_unique(
+            provider.normalize_document,
+            document_inputs,
+            args.concurrency,
+            "document",
+        )
+        query_outputs = _normalize_unique(
+            provider.normalize_query,
+            query_inputs,
+            args.concurrency,
+            "query",
+        )
         stats = provider.stats
         provider_metadata = {
             "protocol": "OpenAI-compatible chat completions",
@@ -441,23 +600,29 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             "model": args.model,
             "credential_source": f"environment variable {token_env}",
             "credential_value_recorded": False,
-            "prompt_version": PROMPT_VERSION,
-            "prompt_sha256": hashlib.sha256(RETRIEVAL_PROMPT.encode("utf-8")).hexdigest(),
+            **_prompt_metadata(),
             "request_attempts": stats.calls,
             "request_seconds": stats.seconds,
         }
         checkpoint = {
             "status": "provider_normalization_completed",
             "recorded_at": datetime.now(timezone.utc).isoformat(),
-            "benchmark_kind": "provider_backed_native_funes_chinese_retrieval_v1",
+            "benchmark_kind": BENCHMARK_KIND,
             "provider": provider_metadata,
             "dataset": {
                 "fixture": "scripts/benchmark_chinese_retrieval.py",
                 "memories": len(memories),
                 "queries": len(queries),
-                "unique_provider_inputs": len(translations),
+                "unique_provider_inputs": len(set(document_inputs + query_inputs)),
+                "document_provider_inputs": len(document_inputs),
+                "query_provider_inputs": len(query_inputs),
             },
-            "provider_outputs": _provider_outputs(inputs, translations),
+            "provider_outputs": _provider_outputs(
+                document_inputs,
+                document_outputs,
+                "document",
+            )
+            + _provider_outputs(query_inputs, query_outputs, "query"),
         }
         _atomic_write_json(args.output, checkpoint)
         print(f"provider normalization: checkpoint written to {args.output}", file=sys.stderr)
@@ -465,9 +630,12 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         return {
             "status": "provider_normalization_completed",
             "output": str(args.output),
-            "provider_outputs": len(translations),
+            "provider_outputs": len(document_outputs) + len(query_outputs),
             "checkpoint_reused": checkpoint_reused,
         }
+
+    document_translations = _effective_outputs(document_outputs)
+    query_translations = _effective_outputs(query_outputs)
 
     with tempfile.TemporaryDirectory(prefix="funes-provider-bench.") as temp:
         root = Path(temp)
@@ -476,7 +644,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         before_source = before_root / "canonical.jsonl"
         after_source = after_root / "canonical.jsonl"
         _write_canonical_source(before_source, memories, None)
-        _write_canonical_source(after_source, memories, translations)
+        _write_canonical_source(after_source, memories, document_translations)
         before, before_rows = _run_arm(
             name="before",
             binary=args.binary,
@@ -497,7 +665,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             memory=after_root / "memory",
             source=after_source,
             queries=queries,
-            query_shadows=translations,
+            query_shadows=query_translations,
             candidates=args.candidates,
             index_timeout=args.index_timeout,
             recall_timeout=args.recall_timeout,
@@ -506,10 +674,14 @@ def run(args: argparse.Namespace) -> dict[str, object]:
 
     combined_rows = []
     for before_row, after_row in zip(before_rows, after_rows):
+        query_output = query_outputs[str(before_row["query"])]
         combined_rows.append(
             {
                 "query": before_row["query"],
                 "provider_query_shadow": after_row["retrieval_query"],
+                "provider_query_output": query_output.provider_output,
+                "effective_retrieval_query": after_row["retrieval_query"],
+                "query_validation_status": query_output.validation_status,
                 "expected": before_row["expected"],
                 "before_rank": before_row["rank"],
                 "after_rank": after_row["rank"],
@@ -520,13 +692,19 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     result: dict[str, object] = {
         "status": "completed",
         "recorded_at": datetime.now(timezone.utc).isoformat(),
-        "benchmark_kind": "provider_backed_native_funes_chinese_retrieval_v1",
+        "benchmark_kind": BENCHMARK_KIND,
         "provider": {**provider_metadata, "checkpoint_reused_for_retrieval": checkpoint_reused},
         "dataset": {
             "fixture": "scripts/benchmark_chinese_retrieval.py",
             "memories": len(memories),
             "queries": len(queries),
-            "unique_provider_inputs": len(translations),
+            "unique_provider_inputs": len(set(document_inputs + query_inputs)),
+            "document_provider_inputs": len(document_inputs),
+            "query_provider_inputs": len(query_inputs),
+            "query_fallbacks": sum(
+                output.validation_status == "fallback_invalid_query"
+                for output in query_outputs.values()
+            ),
         },
         "retrieval": {
             "backend": "native Funes Lance vector + BM25 + cross-encoder rerank",
@@ -538,7 +716,11 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         },
         "method": {
             "before": "canonical retrieval_text contains raw Chinese and queries use raw Chinese",
-            "after": "canonical retrieval_text contains only the provider-generated English shadow and queries use provider-generated shadows",
+            "after": (
+                "canonical retrieval_text contains only document-prompt provider shadows; "
+                "queries use query-prompt rewrites or raw-query fallback after "
+                "service-equivalent validation"
+            ),
             "ingestion": "both arms use funes ingest-docs with explicit local --memory paths; no transcript or raw_text sidecar is indexed",
             "isolation": "each arm has a separate temporary FUNES_HOME and local memory path; temporary files are removed after the run",
         },
@@ -550,9 +732,15 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         },
         "rows": combined_rows,
         "document_shadows": [
-            {"id": memory.ident, "provider_shadow": translations[memory.raw]} for memory in memories
+            {"id": memory.ident, "provider_shadow": document_translations[memory.raw]}
+            for memory in memories
         ],
-        "provider_outputs": _provider_outputs(inputs, translations),
+        "provider_outputs": _provider_outputs(
+            document_inputs,
+            document_outputs,
+            "document",
+        )
+        + _provider_outputs(query_inputs, query_outputs, "query"),
     }
     _atomic_write_json(args.output, result)
     return result

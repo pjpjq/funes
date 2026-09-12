@@ -85,7 +85,7 @@ pub(crate) async fn compact_remote(w: &remote::Writable, message: &str) -> Resul
 pub(crate) async fn compact_local(ds: &mut Dataset) -> Result<()> {
     eprintln!("compacting the memory…");
     dataset::compact_fragments(ds, ui::index_progress).await?;
-    dataset::build_indexes_checked(ds, ui::index_progress).await?;
+    dataset::build_indexes(ds, ui::index_progress).await?;
 
     // Best-effort: a failed cleanup waits for the next compaction.
     match dataset::delete_versions_before(ds, chrono::Duration::minutes(10)).await {

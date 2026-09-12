@@ -685,45 +685,23 @@ fn fts_params(model: EmbeddingModel) -> InvertedIndexParams {
 
 /// Build or refresh the required text index and optional vector index.
 /// Fewer than 256 non-null vectors cannot train IVF_PQ and use brute-force search.
+/// Checked variant for callers, such as local indexing, that can return an index failure to the
+/// invoking user instead of only reporting it on stderr.
 pub async fn build_indexes(ds: &mut Dataset, on_event: impl Fn(IndexBuildEvent)) -> Result<()> {
     sweep_shuffle_leftovers(&std::env::temp_dir());
     let existing = sub_index_counts(ds).await?;
     let fts = fts_params(embedding_model(ds)?);
     refresh_or_build(ds, &FTS, &existing, &fts, &on_event).await?;
     if let Some(ivf_pq) = ivf_pq_params(ds) {
-        let result: Result<()> = async {
-            let embedded = ds
-                .count_rows(Some("vector IS NOT NULL".into()))
-                .await
-                .context("counting embedded rows for the vector index")?;
-            if embedded < 256 {
-                return Ok(());
-            }
-            refresh_or_build(ds, &VECTOR, &existing, &ivf_pq, &on_event).await
-        }
-        .await;
-        if let Err(error) = result {
-            on_event(IndexBuildEvent::VectorIndexFailed(error));
+        let embedded = ds
+            .count_rows(Some(EMBEDDED.into()))
+            .await
+            .context("counting embedded rows for the vector index")?;
+        if embedded >= 256 {
+            refresh_or_build(ds, &VECTOR, &existing, &ivf_pq, &on_event).await?;
         }
     }
     Ok(())
-}
-
-/// Checked variant for callers, such as local indexing, that can return an index failure to the
-/// invoking user instead of only reporting it on stderr.
-pub(crate) async fn build_indexes_checked(ds: &mut Dataset, on_event: impl Fn(IndexBuildEvent)) -> Result<()> {
-    let failure = std::sync::Mutex::new(None);
-    build_indexes(ds, |event| match event {
-        IndexBuildEvent::VectorIndexFailed(error) => {
-            *failure.lock().expect("index failure lock") = Some(error);
-        }
-        event => on_event(event),
-    })
-    .await?;
-    match failure.into_inner().expect("index failure lock") {
-        Some(error) => Err(error),
-        None => Ok(()),
-    }
 }
 
 /// Whether a no-new-chunk indexing pass must rebuild its indexes. This closes the crash window
@@ -2050,7 +2028,7 @@ mod tests {
         let mut ds = Dataset::write(reader(embedded(&turns(0, TRAINABLE))), &table_uri(dir.path()), None)
             .await
             .unwrap();
-        build_indexes_checked(&mut ds, |_| {}).await.unwrap();
+        build_indexes(&mut ds, |_| {}).await.unwrap();
         let pending = chunk::chunks_from_turns(&turns(TRAINABLE, 2), true);
         append(&mut ds, build_batch(model::ENGLISH, &pending, None).unwrap())
             .await
@@ -2080,7 +2058,7 @@ mod tests {
         // This is the state after append + persisted source state, then a crash before finalize:
         // the retry will find no new source chunks, but FTS is still absent.
         assert!(indexes_need_rebuild(&ds).await.unwrap());
-        build_indexes_checked(&mut ds, |_| {}).await.unwrap();
+        build_indexes(&mut ds, |_| {}).await.unwrap();
         assert!(!indexes_need_rebuild(&ds).await.unwrap());
 
         // An append after an existing FTS leaves an index delta. A no-new-source retry must also
@@ -2093,7 +2071,28 @@ mod tests {
         .await
         .unwrap();
         assert!(indexes_need_rebuild(&ds).await.unwrap());
-        build_indexes_checked(&mut ds, |_| {}).await.unwrap();
+        build_indexes(&mut ds, |_| {}).await.unwrap();
         assert!(!indexes_need_rebuild(&ds).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn build_indexes_returns_text_index_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().join("chunks.lance");
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(StringArray::from(vec!["row"]))]).unwrap();
+        let mut ds = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema),
+            uri.to_str().unwrap(),
+            Some(WriteParams::default()),
+        )
+        .await
+        .unwrap();
+
+        let error = build_indexes(&mut ds, |_| {}).await.unwrap_err();
+        assert!(
+            error.to_string().contains("building the text search index"),
+            "missing text column should propagate the FTS creation error: {error:#}"
+        );
     }
 }

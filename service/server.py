@@ -23,6 +23,7 @@ import time
 import uuid
 import urllib.error
 import urllib.request
+from collections import Counter
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -41,6 +42,7 @@ FIELDS = (
 )
 CJK_RE = re.compile(r"[\u3400-\u9fff\uf900-\ufaff]")
 PROMPT_VERSION = "funes-retrieval-v2"
+QUERY_PROMPT_VERSION = "funes-query-retrieval-v1"
 ENCRYPTED_MAGIC = b"FUNES-SOURCE-V1\0"
 ENCRYPTED_AAD = b"funes-source-snapshot-v1"
 RETRIEVAL_PROMPT = """You are a retrieval normalization engine.
@@ -54,6 +56,21 @@ Rules:
 6. Add concise retrieval keywords/entities when useful.
 7. Never invent facts.
 8. Output retrieval text only."""
+QUERY_RETRIEVAL_PROMPT = """You are a retrieval query normalization engine.
+Rewrite the user's retrieval query into short English text optimized for semantic retrieval.
+Apply the same preservation rules used for document normalization:
+1. Preserve all technical entities verbatim.
+2. Preserve code, commands, URLs, file paths, API names, environment variables, model names, product names, repository names, IDs, error messages, quoted strings and version numbers exactly.
+3. Never translate identifiers such as previous_response_id, Codex, Northflank, Funes, MCP, CPA, Gemini, Claude, OpenAI.
+4. Preserve the user's intent, constraints and factual details.
+5. This is a retrieval query: only rewrite its intent. Do not answer the question.
+6. Do not add configuration values, solutions, recommendations, facts, numbers or versions that are not present in the query.
+7. Keep the output concise and never invent facts.
+8. Output retrieval text only."""
+TECHNICAL_ENTITY_RE = re.compile(
+    r"https?://\S+|(?:[~/]|\.{1,2}/)[^\s]+|[A-Za-z][A-Za-z0-9_.*:/-]*"
+)
+ARABIC_NUMBER_RE = re.compile(r"\d+(?:\.\d+)*")
 
 
 def utc_now() -> str:
@@ -69,6 +86,47 @@ def cjk_ratio(value: str) -> float:
         return 0.0
     chars = [c for c in value if not c.isspace()]
     return sum(bool(CJK_RE.match(c)) for c in chars) / max(1, len(chars))
+
+
+def expanded_candidate_limit(limit: int) -> int:
+    """Bound per-route recall while leaving room for cross-route consensus."""
+    limit = max(1, int(limit))
+    return min(100, limit * 3)
+
+
+def result_identity(item: dict[str, Any]) -> str:
+    for name in ("source_identity", "session_id", "id"):
+        value = str(item.get(name, "")).strip()
+        if value:
+            return value
+    return ""
+
+
+def stable_rrf(
+    rankings: list[list[dict[str, Any]]],
+    limit: int,
+    rank_constant: int = 60,
+) -> list[dict[str, Any]]:
+    """Fuse rankings with stable tie-breaking and cross-route identity dedupe."""
+    scores: dict[str, float] = {}
+    first_seen: dict[str, tuple[int, int, int]] = {}
+    items: dict[str, dict[str, Any]] = {}
+    sequence = 0
+    for list_index, ranking in enumerate(rankings):
+        seen_in_ranking = set()
+        for rank, item in enumerate(ranking, start=1):
+            identity = result_identity(item)
+            key = identity or f"anonymous:{list_index}:{rank}"
+            if key in seen_in_ranking:
+                continue
+            seen_in_ranking.add(key)
+            scores[key] = scores.get(key, 0.0) + 1.0 / (rank_constant + rank)
+            if key not in items:
+                items[key] = item
+                first_seen[key] = (list_index, rank, sequence)
+                sequence += 1
+    ordered = sorted(items, key=lambda key: (-scores[key], *first_seen[key]))
+    return [items[key] for key in ordered[:limit]]
 
 
 class Store:
@@ -533,9 +591,9 @@ class Store:
             row = self.conn.execute("SELECT rewritten FROM translation_cache WHERE query=?", (query,)).fetchone()
             return row[0] if row else None
 
-    def translation_put(self, query: str, rewritten: str, status: str = "ok", translation_hash: str = "") -> None:
+    def translation_put(self, query: str, rewritten: str, status: str = "ok", translation_hash: str = "", translation_version: str = PROMPT_VERSION) -> None:
         with self.lock, self.conn:
-            self.conn.execute("INSERT OR REPLACE INTO translation_cache(query,rewritten,created_at,translation_hash,translation_version,translation_status) VALUES(?,?,?,?,?,?)", (query, rewritten, utc_now(), translation_hash, PROMPT_VERSION, status))
+            self.conn.execute("INSERT OR REPLACE INTO translation_cache(query,rewritten,created_at,translation_hash,translation_version,translation_status) VALUES(?,?,?,?,?,?)", (query, rewritten, utc_now(), translation_hash, translation_version, status))
 
     def set_sync(self, **kwargs: Any) -> None:
         fields = ", ".join(f"{k}=?" for k in kwargs)
@@ -597,6 +655,7 @@ class Store:
                         rewritten,
                         status=str(item.get("translation_status") or "ok"),
                         translation_hash=str(item.get("translation_hash") or ""),
+                        translation_version=str(item.get("translation_version") or PROMPT_VERSION),
                     )
                 continue
             if record_type != "memory":
@@ -638,31 +697,66 @@ class Translator:
         self.max_per_ingest = max(0, int(os.getenv("TRANSLATION_MAX_PER_INGEST", "0")))
         self.retries = max(1, int(os.getenv("TRANSLATION_RETRIES", "2")))
         self.timeout = max(1.0, float(os.getenv("TRANSLATION_TIMEOUT", "12")))
+        self.query_max_tokens = max(1, int(os.getenv("TRANSLATION_QUERY_MAX_TOKENS", "128")))
         self.mode = os.getenv("FUNES_RETRIEVAL_LANGUAGE_MODE", "auto").lower()
         self._provider_lock = threading.Lock()
         self._provider_disabled_until = 0.0
 
-    def _cache_key(self, query: str) -> str:
+    def _cache_key(self, query: str, prompt_version: str = PROMPT_VERSION) -> str:
         return hashlib.sha256(
-            (query + self.model + PROMPT_VERSION).encode("utf-8")
+            (query + self.model + prompt_version).encode("utf-8")
         ).hexdigest()
 
     def rewrite(self, query: str) -> str:
+        return self._rewrite(query, RETRIEVAL_PROMPT, PROMPT_VERSION)
+
+    def rewrite_query(self, query: str) -> str:
+        return self._rewrite(
+            query,
+            QUERY_RETRIEVAL_PROMPT,
+            QUERY_PROMPT_VERSION,
+            max_tokens=self.query_max_tokens,
+            validate=self._valid_query_rewrite,
+        )
+
+    @staticmethod
+    def _valid_query_rewrite(raw_query: str, rewritten: str) -> bool:
+        max_length = max(256, len(re.sub(r"\s+", "", raw_query)) * 6)
+        if len(rewritten) > max_length:
+            return False
+        entities = set(TECHNICAL_ENTITY_RE.findall(raw_query))
+        if any(entity not in rewritten for entity in entities):
+            return False
+        source_numbers = Counter(ARABIC_NUMBER_RE.findall(raw_query))
+        return Counter(ARABIC_NUMBER_RE.findall(rewritten)) == source_numbers
+
+    def _rewrite(
+        self,
+        query: str,
+        prompt: str,
+        prompt_version: str,
+        *,
+        max_tokens: int | None = None,
+        validate: Any = None,
+    ) -> str:
         raw_query = query
         query = normalize_text(query)
         if self.mode == "raw" or not self.base or not self.key or not self.model or (self.mode == "auto" and cjk_ratio(query) < self.threshold):
             return query
-        cache_key = self._cache_key(raw_query)
+        cache_key = self._cache_key(raw_query, prompt_version)
         cached = self.store.translation_get(cache_key)
         if cached:
             return cached
         with self._provider_lock:
             if time.monotonic() < self._provider_disabled_until:
                 return query
-        payload = json.dumps({"model": self.model, "temperature": 0, "messages": [
-            {"role": "system", "content": RETRIEVAL_PROMPT},
+        request_body = {"model": self.model, "temperature": 0, "messages": [
+            {"role": "system", "content": prompt},
             {"role": "user", "content": query},
-        ]}).encode()
+        ]}
+        if max_tokens is not None:
+            request_body["max_tokens"] = max_tokens
+        payload = json.dumps(request_body).encode()
         endpoint = self.base + ("/chat/completions" if self.base.endswith("/v1") else "/v1/chat/completions")
         req = urllib.request.Request(endpoint, data=payload, headers={"Content-Type": "application/json", "Authorization": "Bearer " + self.key})
         for attempt in range(self.retries):
@@ -670,8 +764,12 @@ class Translator:
                 with urllib.request.urlopen(req, timeout=self.timeout) as response:
                     data = json.loads(response.read())
                 rewritten = normalize_text(data["choices"][0]["message"]["content"])
-                if rewritten:
-                    self.store.translation_put(cache_key, rewritten)
+                if rewritten and (validate is None or validate(query, rewritten)):
+                    self.store.translation_put(
+                        cache_key,
+                        rewritten,
+                        translation_version=prompt_version,
+                    )
                     return rewritten
                 break
             except urllib.error.HTTPError as exc:
@@ -709,7 +807,7 @@ class Translator:
         rewritten = self.rewrite(normalized)
         if rewritten == normalized:
             return normalized, translation_hash, translation_version, "pending_provider"
-        return " ".join(dict.fromkeys((normalized, rewritten))), translation_hash, translation_version, "ok"
+        return rewritten, translation_hash, translation_version, "ok"
 
     def pending_document(self, raw: str) -> tuple[str, str, str, str]:
         """Describe the durable pre-provider state for a source revision."""
@@ -1367,7 +1465,7 @@ def make_handler(app: App):
                     query = normalize_text(str(body.get("query", body.get("q", ""))))
                     if not query:
                         raise ValueError("query is required")
-                    rewritten = app.translator.rewrite(query)
+                    rewritten = app.translator.rewrite_query(query)
                     facet_values = body.get("facets") or {}
                     if not isinstance(facet_values, dict):
                         raise ValueError("facets must be an object")
@@ -1387,9 +1485,15 @@ def make_handler(app: App):
                         )
                         if body.get(key, facet_values.get(key)) is not None
                     }
-                    hits = app.store.search(rewritten, int(body.get("limit", 20)), filters=filters)
-                    if rewritten != query and not hits:
-                        hits = app.store.search(query, int(body.get("limit", 20)), filters=filters)
+                    limit = max(1, min(int(body.get("limit", 20)), 100))
+                    candidate_limit = expanded_candidate_limit(limit)
+                    raw_hits = app.store.search(query, candidate_limit, filters=filters)
+                    rewritten_hits = (
+                        app.store.search(rewritten, candidate_limit, filters=filters)
+                        if rewritten != query
+                        else []
+                    )
+                    hits = stable_rrf([raw_hits, rewritten_hits], limit)
                     return self._json(200, {"query": query, "rewritten_query": rewritten, "results": [self._public(x) for x in hits]})
                 if self.path == "/get":
                     item = app.store.get(body.get("source_identity", body.get("id", "")))

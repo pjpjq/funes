@@ -9,16 +9,16 @@ from http.client import HTTPConnection
 from pathlib import Path
 from http.server import ThreadingHTTPServer
 
-from service.server import App, Store, Translator, make_handler
+from service.server import QUERY_PROMPT_VERSION, QUERY_RETRIEVAL_PROMPT, RETRIEVAL_PROMPT, App, Store, Translator, make_handler
 
 
 class ServiceTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.old = {k: os.environ.get(k) for k in ("FUNES_DATA_DIR", "FUNES_AUTH_TOKEN", "FUNES_API_TOKEN", "FUNES_STORAGE_KEY", "FUNES_STORAGE_REPO", "FUNES_SNAPSHOT_FILE", "HF_TOKEN", "FUNES_REQUIRE_DURABLE_ACK", "FUNES_ALLOW_EMPTY_REMOTE", "TRANSLATION_BASE_URL", "TRANSLATION_API_KEY", "TRANSLATION_MODEL", "TRANSLATION_MAX_PER_INGEST", "TRANSLATION_RECONCILE_INTERVAL", "RETURN_RETRIEVAL_TEXT")}
+        self.old = {k: os.environ.get(k) for k in ("FUNES_DATA_DIR", "FUNES_AUTH_TOKEN", "FUNES_API_TOKEN", "FUNES_STORAGE_KEY", "FUNES_STORAGE_REPO", "FUNES_SNAPSHOT_FILE", "HF_TOKEN", "FUNES_REQUIRE_DURABLE_ACK", "FUNES_ALLOW_EMPTY_REMOTE", "TRANSLATION_BASE_URL", "TRANSLATION_API_KEY", "TRANSLATION_MODEL", "TRANSLATION_MAX_PER_INGEST", "TRANSLATION_QUERY_MAX_TOKENS", "TRANSLATION_RECONCILE_INTERVAL", "RETURN_RETRIEVAL_TEXT")}
         os.environ["FUNES_DATA_DIR"] = self.tmp.name
         os.environ["FUNES_AUTH_TOKEN"] = "test-token"
-        for k in ("FUNES_API_TOKEN", "FUNES_STORAGE_KEY", "FUNES_STORAGE_REPO", "FUNES_SNAPSHOT_FILE", "HF_TOKEN", "FUNES_REQUIRE_DURABLE_ACK", "FUNES_ALLOW_EMPTY_REMOTE", "TRANSLATION_BASE_URL", "TRANSLATION_API_KEY", "TRANSLATION_MODEL", "TRANSLATION_MAX_PER_INGEST", "TRANSLATION_RECONCILE_INTERVAL", "RETURN_RETRIEVAL_TEXT"):
+        for k in ("FUNES_API_TOKEN", "FUNES_STORAGE_KEY", "FUNES_STORAGE_REPO", "FUNES_SNAPSHOT_FILE", "HF_TOKEN", "FUNES_REQUIRE_DURABLE_ACK", "FUNES_ALLOW_EMPTY_REMOTE", "TRANSLATION_BASE_URL", "TRANSLATION_API_KEY", "TRANSLATION_MODEL", "TRANSLATION_MAX_PER_INGEST", "TRANSLATION_QUERY_MAX_TOKENS", "TRANSLATION_RECONCILE_INTERVAL", "RETURN_RETRIEVAL_TEXT"):
             os.environ.pop(k, None)
 
     def tearDown(self):
@@ -221,6 +221,60 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(item["source_path"], "x")
 
+    def test_compatibility_search_fuses_expanded_raw_and_rewrite_rankings(self):
+        calls = []
+
+        class Translator:
+            def rewrite_query(self, query):
+                calls.append(("rewrite", query))
+                return "provider query"
+
+        class Store:
+            def search(self, query, limit, filters):
+                calls.append(("search", query, limit, filters))
+                if query == "raw query":
+                    return [
+                        {"source_identity": "raw-only", "raw_text": "raw BM25", "retrieval_text": "raw shadow"},
+                        {"source_identity": "both", "raw_text": "both raw", "retrieval_text": "both shadow"},
+                    ]
+                return [
+                    {"source_identity": "provider-only", "raw_text": "provider raw", "retrieval_text": "provider shadow"},
+                    {"source_identity": "both", "raw_text": "both raw", "retrieval_text": "both shadow"},
+                ]
+
+        app = type("CompatibilityApp", (), {})()
+        app.translator = Translator()
+        app.store = Store()
+        app.syncer = type("Syncer", (), {"restoring": False})()
+        server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(app))
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            status, body = self._request(
+                server,
+                "POST",
+                "/search",
+                {"query": "raw query", "limit": 3, "project": "demo"},
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            [item["source_identity"] for item in body["results"]],
+            ["both", "raw-only", "provider-only"],
+        )
+        self.assertTrue(all("retrieval_text" not in item for item in body["results"]))
+        self.assertEqual(
+            calls,
+            [
+                ("rewrite", "raw query"),
+                ("search", "raw query", 9, {"project": "demo"}),
+                ("search", "provider query", 9, {"project": "demo"}),
+            ],
+        )
+
     def test_chinese_fallback_and_normalization_cache(self):
         store = Store(self.tmp.name)
         tr = Translator(store)
@@ -254,6 +308,127 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(tr.rewrite("另一个中文查询"), "另一个中文查询")
         self.assertEqual(request.call_count, 1)
         store.close()
+
+    def test_query_rewrite_rejects_hallucinations_and_does_not_cache_them(self):
+        store = Store(self.tmp.name)
+        os.environ.update(
+            TRANSLATION_BASE_URL="https://provider.example/v1",
+            TRANSLATION_API_KEY="test-key",
+            TRANSLATION_MODEL="test-model",
+        )
+        tr = Translator(store)
+
+        class Response:
+            def __init__(self, content):
+                self.content = content
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return json.dumps({"choices": [{"message": {"content": self.content}}]}).encode()
+
+        invalid = (
+            ("Funes MCP 怎么配置？", "Funes MCP use 1.0 with 1024 tokens and temperature 0.9"),
+            ("Funes MCP 怎么检索？", "Funes MCP " + "detailed answer " * 40),
+            ("请检索最近 30 天的 CPA 记录", "recent CPA records"),
+            (
+                "CPA previous_response_id 为什么丢上下文？",
+                "CPA context loss",
+            ),
+        )
+        try:
+            for raw, hallucination in invalid:
+                with self.subTest(raw=raw), mock.patch(
+                    "service.server.urllib.request.urlopen",
+                    return_value=Response(hallucination),
+                ) as request:
+                    self.assertEqual(tr.rewrite_query(raw), raw)
+                    self.assertIsNone(
+                        store.translation_get(tr._cache_key(raw, QUERY_PROMPT_VERSION))
+                    )
+                    self.assertEqual(request.call_count, 1)
+        finally:
+            store.close()
+
+    def test_query_rewrite_uses_query_prompt_token_limit_and_versioned_cache(self):
+        store = Store(self.tmp.name)
+        os.environ.update(
+            TRANSLATION_BASE_URL="https://provider.example/v1",
+            TRANSLATION_API_KEY="test-key",
+            TRANSLATION_MODEL="test-model",
+            TRANSLATION_QUERY_MAX_TOKENS="96",
+        )
+        tr = Translator(store)
+        raw_query = "Funes MCP CPA previous_response_id 请问之前为什么会丢上下文，应该如何检索？"
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return b'{"choices":[{"message":{"content":"Funes MCP CPA previous_response_id retrieval configuration"}}]}'
+
+        try:
+            with mock.patch(
+                "service.server.urllib.request.urlopen", return_value=Response()
+            ) as request:
+                self.assertEqual(
+                    tr.rewrite_query(raw_query),
+                    "Funes MCP CPA previous_response_id retrieval configuration",
+                )
+                self.assertEqual(
+                    tr.rewrite_query(raw_query),
+                    "Funes MCP CPA previous_response_id retrieval configuration",
+                )
+            self.assertEqual(request.call_count, 1)
+            payload = json.loads(request.call_args.args[0].data)
+            self.assertEqual(payload["max_tokens"], 96)
+            self.assertEqual(payload["messages"][0]["content"], QUERY_RETRIEVAL_PROMPT)
+            self.assertNotEqual(
+                tr._cache_key(raw_query),
+                tr._cache_key(raw_query, QUERY_PROMPT_VERSION),
+            )
+        finally:
+            store.close()
+
+    def test_document_normalization_keeps_original_prompt_and_english_only_shadow(self):
+        store = Store(self.tmp.name)
+        os.environ.update(
+            TRANSLATION_BASE_URL="https://provider.example/v1",
+            TRANSLATION_API_KEY="test-key",
+            TRANSLATION_MODEL="test-model",
+        )
+        tr = Translator(store)
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return b'{"choices":[{"message":{"content":"English CPA retrieval text"}}]}'
+
+        try:
+            with mock.patch(
+                "service.server.urllib.request.urlopen", return_value=Response()
+            ) as request:
+                normalized = tr.normalize_document("中文 CPA 正文")
+            self.assertEqual(normalized[0], "English CPA retrieval text")
+            self.assertEqual(normalized[3], "ok")
+            payload = json.loads(request.call_args.args[0].data)
+            self.assertEqual(payload["messages"][0]["content"], RETRIEVAL_PROMPT)
+            self.assertNotIn("max_tokens", payload)
+        finally:
+            store.close()
 
     def test_records_and_api_token_alias(self):
         os.environ.pop("FUNES_AUTH_TOKEN")

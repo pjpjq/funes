@@ -22,8 +22,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from service.server import App as SourceApp
+from service.server import expanded_candidate_limit
 from service.server import ingest_documents as persist_source_ingest
 from service.server import prepare_ingest_documents as prepare_source_ingest_documents
+from service.server import stable_rrf
 
 
 FUNES_BIN = os.getenv("FUNES_BIN", "/usr/local/bin/funes")
@@ -129,25 +131,41 @@ def ingest_source_documents(docs: list[dict]) -> tuple[int, dict, list[dict]] | 
     return (200 if result["durable"] else 503), result, canonical
 
 
-def search_source_documents(query: str, limit: int, filters: dict[str, object]) -> tuple[str, list[dict]]:
+def search_source_rankings(query: str, limit: int, filters: dict[str, object]) -> tuple[str, list[list[dict]]]:
     app = source_app()
     if app is None or app.syncer.restoring or app.syncer.restore_failed:
         return query, []
-    rewritten = app.translator.rewrite(query)
-    hits = app.store.search(rewritten, limit, filters=filters)
-    if rewritten != query and not hits:
-        hits = app.store.search(query, limit, filters=filters)
+    rewritten = app.translator.rewrite_query(query)
+    candidate_limit = expanded_candidate_limit(limit)
+    raw_hits = app.store.search(query, candidate_limit, filters=filters)
+    rewritten_hits = (
+        app.store.search(rewritten, candidate_limit, filters=filters)
+        if rewritten != query
+        else []
+    )
     native_filterable = set(filters).issubset({"source_agent", "repo"})
-    if native_filterable:
-        hits = [
-            item
-            for item in hits
-            if str(item.get("source_type", "")).lower()
-            not in {"session", "codex", "codex_session", "pi", "pi_session", "claude", "claude_session"}
-        ]
-    for item in hits:
-        item.pop("retrieval_text", None)
-    return rewritten, hits
+    excluded_types = {
+        "session", "codex", "codex_session", "pi", "pi_session",
+        "claude", "claude_session",
+    }
+    rankings = []
+    for hits in (raw_hits, rewritten_hits):
+        public_hits = []
+        for item in hits:
+            if native_filterable and str(item.get("source_type", "")).lower() in excluded_types:
+                continue
+            public_item = dict(item)
+            public_item.pop("retrieval_text", None)
+            public_hits.append(public_item)
+        if public_hits:
+            rankings.append(public_hits)
+    return rewritten, rankings
+
+
+def search_source_documents(query: str, limit: int, filters: dict[str, object]) -> tuple[str, list[dict]]:
+    """Compatibility helper for callers that consume a fused sidecar ranking."""
+    rewritten, rankings = search_source_rankings(query, limit, filters)
+    return rewritten, stable_rrf(rankings, limit)
 
 # A remote Lance memory can take longer than the Space ingress timeout to open
 # on the first recall (model + snapshot + ANN/FTS handles).  Warm it in the
@@ -316,38 +334,17 @@ def query_text(raw: str) -> str:
         return raw
     # Keep technical entities verbatim even when the optional provider is absent.
     entities = re.findall(r"[A-Za-z][A-Za-z0-9_.*:/-]{1,}", raw)
-    prompt = (
-        "You are a retrieval normalization engine. Convert the natural-language Chinese "
-        "portions into concise English retrieval text. Preserve technical entities exactly. "
-        "Output retrieval text only.\n\nInput:\n" + raw
-    )
-    base = os.getenv("TRANSLATION_BASE_URL")
-    key = os.getenv("TRANSLATION_API_KEY")
-    model = os.getenv("TRANSLATION_MODEL", "")
-    translated = ""
-    if base and key and model:
-        payload = json.dumps({"model": model, "messages": [{"role": "user", "content": prompt}], "temperature": 0}).encode()
-        base_url = base.rstrip("/")
-        endpoint = base_url + ("/chat/completions" if base_url.endswith("/v1") else "/v1/chat/completions")
-        req = urllib.request.Request(endpoint, data=payload, headers={"Authorization": "Bearer " + key, "Content-Type": "application/json"})
-        try:
-            with urllib.request.urlopen(req, timeout=12) as response:
-                obj = json.load(response)
-            translated = obj.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
-        except (OSError, ValueError, KeyError, IndexError):
-            translated = ""
-    # A configured provider is preferred.  If it is unavailable, use the
-    # deterministic phrase map above; sending raw CJK to the English embedding
-    # backend can take longer than the Space request deadline.
+    # Provider rewriting belongs exclusively to Translator.rewrite_query.
+    # This deterministic map is used only after that single provider path falls
+    # back to raw CJK.
     fallback = []
     for phrase, english in CHINESE_RETRIEVAL_TERMS:
         if phrase in raw:
             fallback.append(english)
     # Do not put a CJK-only shadow back into the native CLI.  The raw query is
     # still returned to clients and the original source text remains untouched.
-    translated_ascii = re.sub(r"[^\x00-\x7F]+", " ", translated).strip()
     pieces = []
-    for piece in (translated_ascii, " ".join(fallback), " ".join(entities)):
+    for piece in (" ".join(fallback), " ".join(entities)):
         if piece and piece not in pieces:
             pieces.append(piece)
     shadow = " ".join(pieces).strip()
@@ -1164,10 +1161,10 @@ class Handler(BaseHTTPRequestHandler):
                     error = "restore_in_progress" if app.syncer.restoring else "restore_failed"
                     self.send_json(503, {"ok": False, "results": [], "results_text": "", "error": error})
                     return
-                source_query, source_hits = search_source_documents(raw_query, limit, filters)
-                # The source-side translator is cached and uses the full
-                # normalization prompt. Reuse its rewrite for native semantic
-                # retrieval instead of paying for a second provider call.
+                source_query, source_rankings = search_source_rankings(raw_query, limit, filters)
+                # Reuse the source-side query rewrite for native semantic
+                # retrieval. query_text is deterministic fallback only, so a
+                # search can make at most one provider request.
                 query = source_query if source_query != raw_query else query_text(raw_query)
                 # CJK queries use the ASCII shadow above.  Keep the native
                 # search bounded so the CPU Space does not spend its entire
@@ -1202,31 +1199,19 @@ class Handler(BaseHTTPRequestHandler):
                     # deadline after a large remote snapshot is opened. Keep
                     # the HTTP surface bounded while allowing operators to
                     # raise the cap with FUNES_HTTP_MAX_CANDIDATES.
-                    tuning.setdefault("candidates", min(HTTP_MAX_CANDIDATES, max(2, limit * 2)))
+                    requested_candidates = int(tuning.get("candidates", max(2, limit * 2)))
+                    tuning["candidates"] = min(HTTP_MAX_CANDIDATES, requested_candidates)
                     tuning.setdefault("neighbors", 0)
                     tuning.setdefault("half_life", 0)
                     out = recall(query, k=limit, **tuning) if native_allowed else ""
                     results = materialize_native_results(out, app, limit) if out else []
                 except NativeMcpBusyError:
-                    self.send_json(429, {"ok": False, "query": raw_query, "retrieval_query": query, "results": [], "results_text": "", "error": "native_mcp_busy", "retry_after": 3}, {"Retry-After": "3"})
+                    self.send_json(429, {"ok": False, "results": [], "results_text": "", "error": "native_mcp_busy", "retry_after": 3}, {"Retry-After": "3"})
                     return
                 except NativeMcpError:
-                    self.send_json(503, {"ok": False, "query": raw_query, "retrieval_query": query, "results": [], "results_text": "", "error": "native_mcp_unavailable"})
+                    self.send_json(503, {"ok": False, "results": [], "results_text": "", "error": "native_mcp_unavailable"})
                     return
-                seen = {
-                    str(item.get("source_identity"))
-                    for item in results
-                    if item.get("source_identity") is not None
-                }
-                for item in source_hits:
-                    if len(results) >= limit:
-                        break
-                    identity = str(item.get("source_identity", ""))
-                    if identity and identity in seen:
-                        continue
-                    results.append(item)
-                    if identity:
-                        seen.add(identity)
+                results = stable_rrf([*source_rankings, results], limit)
                 results_text = "\n\n".join(
                     str(item.get("raw_text", ""))
                     for item in results

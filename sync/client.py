@@ -1,7 +1,37 @@
 from __future__ import annotations
-import json, os, time
+import json, os, subprocess, sys, time
 from urllib import request, error
 from .config import Config
+
+
+def _keychain_token(service: str) -> str:
+    """Read a token from the macOS Keychain without putting it in argv."""
+    if sys.platform != "darwin":
+        return ""
+    account = os.environ.get("USER") or str(os.getuid())
+    try:
+        result = subprocess.run(
+            [
+                "/usr/bin/security",
+                "find-generic-password",
+                "-a",
+                account,
+                "-s",
+                service,
+                "-w",
+            ],
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    if result.returncode != 0:
+        return ""
+    return (result.stdout or "").rstrip("\r\n")
+
 
 class SyncClient:
     def __init__(self, config: Config|None=None): self.config=config or Config.load()
@@ -13,10 +43,10 @@ class SyncClient:
         # implementation.
         body=json.dumps({"device_id":self.config.device_id,"documents":records}, ensure_ascii=False).encode()
         headers={"Content-Type":"application/json","User-Agent":"funes-sync/1"}
-        token=os.environ.get("FUNES_API_TOKEN")
+        token=os.environ.get("FUNES_API_TOKEN") or _keychain_token("funes-api-token")
         if not token:
             raise RuntimeError("FUNES_API_TOKEN is not configured")
-        hub_token = os.environ.get("FUNES_HF_TOKEN") or os.environ.get("HF_TOKEN")
+        hub_token = os.environ.get("FUNES_HF_TOKEN") or os.environ.get("HF_TOKEN") or _keychain_token("funes-hf-token")
         if hub_token:
             headers["Authorization"] = "Bearer " + hub_token
             headers["X-Funes-Authorization"] = "Bearer " + token
@@ -57,10 +87,10 @@ class SyncClient:
     def health(self) -> bool:
         try:
             headers = {"User-Agent": "funes-sync/1"}
-            token = os.environ.get("FUNES_API_TOKEN")
+            token = os.environ.get("FUNES_API_TOKEN") or _keychain_token("funes-api-token")
             if not token:
                 return False
-            hub_token = os.environ.get("FUNES_HF_TOKEN") or os.environ.get("HF_TOKEN")
+            hub_token = os.environ.get("FUNES_HF_TOKEN") or os.environ.get("HF_TOKEN") or _keychain_token("funes-hf-token")
             if hub_token:
                 headers["Authorization"] = "Bearer " + hub_token
                 headers["X-Funes-Authorization"] = "Bearer " + token
@@ -77,11 +107,11 @@ class SyncClient:
             return False
 
     def sync_snapshot(self) -> dict:
-        token = os.environ.get("FUNES_API_TOKEN")
+        token = os.environ.get("FUNES_API_TOKEN") or _keychain_token("funes-api-token")
         if not token:
             raise RuntimeError("FUNES_API_TOKEN is not configured")
         headers={"Content-Type":"application/json"}
-        hub_token=os.environ.get("FUNES_HF_TOKEN") or os.environ.get("HF_TOKEN")
+        hub_token=os.environ.get("FUNES_HF_TOKEN") or os.environ.get("HF_TOKEN") or _keychain_token("funes-hf-token")
         if hub_token:
             headers["Authorization"]="Bearer "+hub_token
             headers["X-Funes-Authorization"]="Bearer "+token

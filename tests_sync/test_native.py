@@ -34,6 +34,22 @@ def test_same_session_converges_across_devices(tmp_path):
     assert a.record_id == b.record_id
 
 
+def test_native_id_wins_when_session_envelope_is_missing(tmp_path):
+    path = tmp_path / "pi-native-no-session.jsonl"
+    path.write_text(
+        json.dumps({"type": "message", "id": "native-1", "message": {"role": "user", "content": "before"}}) + "\n",
+        encoding="utf-8",
+    )
+    source = Source("pi:~/sessions/native.jsonl", "pi", path, "dev-a")
+    before = parse_file(source)[0]
+    path.write_text(
+        json.dumps({"type": "message", "id": "native-1", "message": {"role": "user", "content": "after"}}) + "\n",
+        encoding="utf-8",
+    )
+    after = parse_file(source)[0]
+    assert before.record_id == after.record_id
+
+
 def test_pi_append_keeps_native_session_identity(tmp_path):
     path = tmp_path / "pi-session.jsonl"
     path.write_text(
@@ -52,6 +68,55 @@ def test_pi_append_keeps_native_session_identity(tmp_path):
     assert first[0].session_id == "pi-real-session"
     assert appended[0].session_id == "pi-real-session"
     assert first[0].record_id != appended[0].record_id
+
+
+def test_codex_fallback_append_matches_full_rescan_without_native_id(tmp_path):
+    path = tmp_path / "codex-fallback.jsonl"
+    path.write_text(
+        json.dumps({"type": "session_meta", "payload": {"id": "fallback-session"}}) + "\n"
+        + json.dumps({"type": "response_item", "timestamp": "2026-01-01T00:00:00Z", "payload": {"type": "message", "role": "user", "content": "first"}}) + "\n",
+        encoding="utf-8",
+    )
+    source = Source("codex:~/sessions/fallback.jsonl", "codex", path, "dev-a")
+    offset = path.stat().st_size
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"type": "response_item", "timestamp": "2026-01-01T00:00:01Z", "payload": {"type": "message", "role": "assistant", "content": "second"}}) + "\n")
+    appended = parse_file(source, offset)
+    full = parse_file(source)
+    assert len(appended) == 1
+    assert appended[0].record_id == full[1].record_id
+    assert len({chunk.record_id for chunk in full}) == len(full)
+
+
+def test_pi_fallback_append_matches_full_rescan_without_native_id(tmp_path):
+    path = tmp_path / "pi-fallback.jsonl"
+    path.write_text(
+        json.dumps({"type": "session", "id": "pi-fallback-session"}) + "\n"
+        + json.dumps({"type": "message", "timestamp": "2026-01-01T00:00:00Z", "message": {"role": "user", "content": "first"}}) + "\n",
+        encoding="utf-8",
+    )
+    source = Source("pi:~/sessions/fallback.jsonl", "pi", path, "dev-a")
+    offset = path.stat().st_size
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"type": "message", "timestamp": "2026-01-01T00:00:01Z", "message": {"role": "assistant", "content": "second"}}) + "\n")
+    appended = parse_file(source, offset)
+    full = parse_file(source)
+    assert len(appended) == 1
+    assert appended[0].record_id == full[1].record_id
+    assert len({chunk.record_id for chunk in full}) == len(full)
+
+
+def test_memory_converges_across_absolute_repo_paths(tmp_path):
+    first_path = tmp_path / "checkout-a" / "MEMORY.md"
+    second_path = tmp_path / "checkout-b" / "MEMORY.md"
+    first_path.parent.mkdir()
+    second_path.parent.mkdir()
+    content = "# shared decision\n保留跨设备稳定 ID\n"
+    first_path.write_text(content, encoding="utf-8")
+    second_path.write_text(content, encoding="utf-8")
+    a = parse_file(Source("codex_memory:/Users/a/repo/MEMORY.md", "codex_memory", first_path, "dev-a", "/Users/a/repo"))[0]
+    b = parse_file(Source("codex_memory:/Volumes/work/repo/MEMORY.md", "codex_memory", second_path, "dev-b", "/Volumes/work/repo"))[0]
+    assert a.record_id == b.record_id
 
 
 def test_memory_update_is_one_record_and_queue_is_idempotent(tmp_path):

@@ -284,6 +284,19 @@ enum Cmd {
     Doctor,
     /// List discovered Codex/Pi/Claude sessions and memory files.
     Sources,
+    /// Rebuild derived retrieval state from the authoritative encrypted source store.
+    Reindex {
+        /// Regenerate retrieval shadows from raw source text.
+        #[arg(long, required_unless_present = "all", conflicts_with = "all")]
+        retrieval_text: bool,
+        /// Regenerate retrieval shadows and force all eligible canonical rows through indexing.
+        #[arg(
+            long,
+            required_unless_present = "retrieval_text",
+            conflicts_with = "retrieval_text"
+        )]
+        all: bool,
+    },
 }
 
 // Flattened into every agent so they share one optional `[MEMORY]` positional; the user-facing help
@@ -668,6 +681,13 @@ async fn main() -> Result<()> {
         Cmd::Sync { command } => run_sync_command(command),
         Cmd::Doctor => run_sync_command(SyncCommand::Doctor),
         Cmd::Sources => run_sync_command(SyncCommand::Sources),
+        Cmd::Reindex {
+            retrieval_text: _,
+            all,
+        } => run_sync_args(&[
+            "reindex",
+            if all { "--all" } else { "--retrieval-text" },
+        ]),
     }
 }
 
@@ -689,9 +709,13 @@ fn run_sync_command(command: SyncCommand) -> Result<()> {
         SyncCommand::Logs => "logs",
         SyncCommand::Mcp => "mcp",
     };
+    run_sync_args(&[name])
+}
+
+fn run_sync_args(args: &[&str]) -> Result<()> {
     let mut child = std::process::Command::new(std::env::var("FUNES_SYNC_BIN").unwrap_or_else(|_| "funes-sync".into()));
     let status = child
-        .arg(name)
+        .args(args)
         .status()
         .context("running funes-sync (set FUNES_SYNC_BIN to its absolute path)")?;
     if status.success() {

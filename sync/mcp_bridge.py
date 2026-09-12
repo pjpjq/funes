@@ -28,7 +28,12 @@ def _remote_call(path, payload):
     else:
         headers["Authorization"]="Bearer "+token
     req=request.Request(base+path, data=json.dumps(payload,ensure_ascii=False).encode(), headers=headers, method="POST")
-    with request.urlopen(req, timeout=30) as resp:
+    try:
+        timeout = float(os.environ.get("FUNES_REMOTE_TIMEOUT", "90"))
+    except ValueError:
+        timeout = 90.0
+    timeout = min(180.0, max(5.0, timeout))
+    with request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read() or b"{}")
 
 def serve(store=None):

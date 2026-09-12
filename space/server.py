@@ -32,6 +32,10 @@ INGEST_PUSH_TIMEOUT = int(os.getenv("FUNES_INGEST_PUSH_TIMEOUT", "1800"))
 MCP_PROTOCOL_VERSION = "2024-11-05"
 MCP_TIMEOUT = float(os.getenv("FUNES_MCP_TIMEOUT", "180"))
 MCP_HANDSHAKE_TIMEOUT = float(os.getenv("FUNES_MCP_HANDSHAKE_TIMEOUT", "10"))
+try:
+    HTTP_MAX_CANDIDATES = max(1, int(os.getenv("FUNES_HTTP_MAX_CANDIDATES", "12")))
+except ValueError:
+    HTTP_MAX_CANDIDATES = 12
 PROMPT_VERSION = "funes-retrieval-v1"
 LANGUAGE_MODE = os.getenv("FUNES_RETRIEVAL_LANGUAGE_MODE", "auto").lower()
 INDEX_LOCK = threading.Lock()
@@ -615,6 +619,15 @@ class Handler(BaseHTTPRequestHandler):
                 # clients; the service backend can later provide structured
                 # per-chunk metadata without changing this contract.
                 try:
+                    # The native CLI defaults to 30 fused candidates, recency
+                    # weighting, and neighbor expansion. Those defaults are
+                    # useful interactively but can exceed a CPU Space ingress
+                    # deadline after a large remote snapshot is opened. Keep
+                    # the HTTP surface bounded while allowing operators to
+                    # raise the cap with FUNES_HTTP_MAX_CANDIDATES.
+                    tuning.setdefault("candidates", min(HTTP_MAX_CANDIDATES, max(2, limit * 2)))
+                    tuning.setdefault("neighbors", 0)
+                    tuning.setdefault("half_life", 0)
                     out = recall(query, k=limit, **tuning)
                 except NativeMcpError:
                     self.send_json(503, {"ok": False, "query": raw_query, "retrieval_query": query, "results": [], "results_text": "", "error": "native_mcp_unavailable"})

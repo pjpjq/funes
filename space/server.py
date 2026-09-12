@@ -20,6 +20,8 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from service.server import App as SourceApp
+
 
 FUNES_BIN = os.getenv("FUNES_BIN", "/usr/local/bin/funes")
 REMOTE = os.getenv("FUNES_MEMORY", "")
@@ -47,6 +49,123 @@ INDEX_LOCK = threading.Lock()
 # Python-level serialization separate from reads so a background ingest/push
 # cannot make an HTTP recall wait for the full upload duration.
 WRITE_LOCK = threading.Lock()
+SOURCE_APP = None
+SOURCE_APP_LOCK = threading.Lock()
+
+
+def source_app():
+    """Return the encrypted raw/source store, or None when not configured."""
+    global SOURCE_APP
+    if SOURCE_APP is not None:
+        return SOURCE_APP
+    if not os.getenv("FUNES_STORAGE_REPO"):
+        return None
+    with SOURCE_APP_LOCK:
+        if SOURCE_APP is None:
+            os.environ.setdefault("FUNES_DATA_DIR", str(HOME / "source-store"))
+            os.environ.setdefault("FUNES_LAZY_RESTORE", "true")
+            SOURCE_APP = SourceApp()
+    return SOURCE_APP
+
+
+def source_state() -> dict[str, object]:
+    app = source_app()
+    if app is None:
+        return {"configured": False, "ready": False, "documents": 0}
+    if app.syncer.restoring:
+        return {"configured": True, "ready": False, "restoring": True, "documents": app.store.count()}
+    if app.syncer.restore_failed:
+        return {"configured": True, "ready": False, "error": "restore_failed", "documents": app.store.count()}
+    return {
+        "configured": True,
+        "ready": True,
+        "documents": app.store.count(),
+        "restored": app.restore_result,
+        "sync": app.store.sync_status(),
+    }
+
+
+def close_source_app() -> None:
+    global SOURCE_APP
+    with SOURCE_APP_LOCK:
+        app = SOURCE_APP
+        SOURCE_APP = None
+    if app is not None:
+        try:
+            app.close()
+        except Exception:
+            pass
+
+
+def prepare_source_documents(app, docs: list[dict]) -> list[dict]:
+    """Add retrieval shadows without translating an already-cached good revision again."""
+    prepared = []
+    pending_indexes = []
+    pending_raws = []
+    for index, doc in enumerate(docs):
+        item = dict(doc)
+        raw = str(item.get("raw_text", item.get("text", "")))
+        identity = str(item.get("source_identity", ""))
+        existing = app.store.get(identity) if identity else None
+        same_content = bool(
+            existing
+            and existing.get("content_hash") == hashlib.sha256(raw.encode("utf-8")).hexdigest()
+            and existing.get("translation_status") in {"ok", "skipped_non_cjk", "skipped_raw_mode"}
+        )
+        if same_content and not item.get("retrieval_text"):
+            item["retrieval_text"] = existing.get("retrieval_text") or raw
+            for name in ("translation_hash", "translation_version", "translation_status"):
+                if existing.get(name) is not None:
+                    item.setdefault(name, existing[name])
+        elif not item.get("retrieval_text"):
+            pending_indexes.append(index)
+            pending_raws.append(raw)
+        prepared.append(item)
+    if pending_raws:
+        for index, derived in zip(pending_indexes, app.translator.normalize_many(pending_raws)):
+            shadow, translation_hash, translation_version, translation_status = derived
+            prepared[index]["retrieval_text"] = shadow
+            prepared[index].setdefault("translation_hash", translation_hash)
+            prepared[index].setdefault("translation_version", translation_version)
+            prepared[index].setdefault("translation_status", translation_status)
+    return prepared
+
+
+def ingest_source_documents(docs: list[dict]) -> tuple[int, dict, list[dict]] | None:
+    app = source_app()
+    if app is None:
+        return None
+    if app.syncer.restoring or app.syncer.restore_failed:
+        error = "restore_in_progress" if app.syncer.restoring else "restore_failed"
+        return 503, {"ok": False, "durable": False, "error": error}, []
+    prepared = prepare_source_documents(app, docs)
+    result = app.store.ingest(prepared)
+    identities = [str(item.get("source_identity", "")) for item in result["items"]]
+    canonical = app.store.get_many(identities)
+    durable = app.syncer.upload(canonical)
+    result.update(
+        ok=bool(durable.get("durable")),
+        durable=bool(durable.get("durable")),
+        accepted=result["created"] + result["updated"] + result["deduped"],
+        sync=durable,
+    )
+    if not result["durable"]:
+        result["error"] = "durability_pending"
+    return (200 if result["durable"] else 503), result, canonical
+
+
+def search_source_documents(query: str, limit: int, filters: dict[str, object]) -> tuple[str, list[dict]]:
+    app = source_app()
+    if app is None or app.syncer.restoring or app.syncer.restore_failed:
+        return query, []
+    rewritten = app.translator.rewrite(query)
+    hits = app.store.search(rewritten, limit, filters=filters)
+    if rewritten != query and not hits:
+        hits = app.store.search(query, limit, filters=filters)
+    for item in hits:
+        if os.getenv("RETURN_RETRIEVAL_TEXT", "false").lower() not in {"1", "true", "yes", "on"}:
+            item.pop("retrieval_text", None)
+    return rewritten, hits
 
 # A remote Lance memory can take longer than the Space ingress timeout to open
 # on the first recall (model + snapshot + ANN/FTS handles).  Warm it in the
@@ -592,6 +711,7 @@ def _refresh_native_worker() -> None:
 
 
 atexit.register(close_native_worker)
+atexit.register(close_source_app)
 
 
 def recall(query: str, **kwargs) -> str:
@@ -627,14 +747,17 @@ def ready_payload() -> tuple[int, dict[str, object]]:
     if not REMOTE:
         return 503, {"ok": False, "error": "FUNES_MEMORY is not configured", "native_warm": warm_state()}
     code, out, err = run("status", REMOTE, timeout=30)
+    sources = source_state()
+    source_ok = not sources.get("configured") or bool(sources.get("ready"))
     return (
-        200 if code == 0 else 503,
+        200 if code == 0 and source_ok else 503,
         {
-            "ok": code == 0,
+            "ok": code == 0 and source_ok,
             "remote": REMOTE,
             "status": out[-2000:],
             "error": err[-500:],
             "native_warm": warm_state(),
+            "source_store": sources,
         },
     )
 
@@ -686,6 +809,25 @@ class Handler(BaseHTTPRequestHandler):
                 code, payload = ready_payload()
                 self.send_json(code, payload)
                 return
+            if self.path == "/sync":
+                app = source_app()
+                if app is not None:
+                    if app.syncer.restoring or app.syncer.restore_failed:
+                        error = "restore_in_progress" if app.syncer.restoring else "restore_failed"
+                        self.send_json(503, {"ok": False, "durable": False, "error": error})
+                        return
+                    result = app.syncer.upload()
+                    result["ok"] = bool(result.get("durable"))
+                    self.send_json(200 if result["ok"] else 503, result)
+                    return
+                if not REMOTE:
+                    self.send_json(503, {"ok": False, "durable": False, "error": "FUNES_MEMORY is not configured"})
+                    return
+                # Every successful /ingest already completes a native push.
+                # This compatibility checkpoint therefore acknowledges that
+                # durable state without rebuilding or pushing the index again.
+                self.send_json(200, {"ok": True, "durable": True, "remote": REMOTE})
+                return
             if self.path == "/warm":
                 if not REMOTE:
                     self.send_json(503, {"ok": False, "error": "FUNES_MEMORY is not configured"})
@@ -694,11 +836,27 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if self.path in ("/search", "/recall"):
                 raw_query = str(obj.get("query", "")).strip()
-                query = query_text(raw_query)
-                if not query:
+                if not raw_query:
                     self.send_json(400, {"error": "query is required"})
                     return
                 limit = min(int(obj.get("limit", obj.get("k", 8))), 50)
+                filters = {
+                    key: obj.get(key)
+                    for key in (
+                        "source_agent",
+                        "source_type",
+                        "project",
+                        "repo",
+                        "device_id",
+                        "role",
+                        "content_type",
+                        "since",
+                        "until",
+                    )
+                    if obj.get(key) is not None
+                }
+                source_query, source_hits = search_source_documents(raw_query, limit, filters)
+                query = query_text(raw_query)
                 # CJK queries use the ASCII shadow above.  Keep the native
                 # search bounded so the CPU Space does not spend its entire
                 # request window reranking broad generic terms.
@@ -712,10 +870,22 @@ class Handler(BaseHTTPRequestHandler):
                 for name in ("harness", "repo"):
                     if obj.get(name):
                         tuning[name] = str(obj[name])
+                if obj.get("source_agent") and not obj.get("harness"):
+                    tuning["harness"] = {
+                        "claude_code": "claude",
+                    }.get(str(obj["source_agent"]), str(obj["source_agent"]))
                 # Native CLI output is intentionally human-readable.  Keep it
                 # lossless while also exposing the list shape expected by MCP
                 # clients; the service backend can later provide structured
                 # per-chunk metadata without changing this contract.
+                # Native Funes presently filters only harness/repo. For a
+                # stricter metadata/date filter, returning an unfiltered native
+                # block would violate the caller's contract; the authoritative
+                # source store handles those filters instead.
+                native_allowed = not any(
+                    key in filters
+                    for key in ("source_type", "project", "device_id", "role", "content_type", "since", "until")
+                )
                 try:
                     # The native CLI defaults to 30 fused candidates, recency
                     # weighting, and neighbor expansion. Those defaults are
@@ -726,20 +896,31 @@ class Handler(BaseHTTPRequestHandler):
                     tuning.setdefault("candidates", min(HTTP_MAX_CANDIDATES, max(2, limit * 2)))
                     tuning.setdefault("neighbors", 0)
                     tuning.setdefault("half_life", 0)
-                    out = recall(query, k=limit, **tuning)
+                    out = recall(query, k=limit, **tuning) if native_allowed else ""
                 except NativeMcpBusyError:
                     self.send_json(429, {"ok": False, "query": raw_query, "retrieval_query": query, "results": [], "results_text": "", "error": "native_mcp_busy", "retry_after": 3}, {"Retry-After": "3"})
                     return
                 except NativeMcpError:
                     self.send_json(503, {"ok": False, "query": raw_query, "retrieval_query": query, "results": [], "results_text": "", "error": "native_mcp_unavailable"})
                     return
-                results = ([{"raw_text": out}] if out.strip() else [])
-                self.send_json(200, {"ok": True, "query": raw_query, "retrieval_query": query, "results": results, "results_text": out, "error": ""})
+                results = list(source_hits)
+                if out.strip():
+                    results.append({"raw_text": out, "source_type": "session", "retrieval_backend": "native_funes"})
+                source_text = "\n\n".join(str(item.get("raw_text", "")) for item in source_hits if item.get("raw_text"))
+                results_text = "\n\n".join(part for part in (source_text, out) if part.strip())
+                self.send_json(200, {"ok": True, "query": raw_query, "retrieval_query": source_query if source_query != raw_query else query, "results": results, "results_text": results_text, "error": ""})
                 return
             if self.path == "/get":
                 sid = str(obj.get("session_id", obj.get("id", ""))).strip()
                 if not sid:
                     self.send_json(400, {"error": "session_id is required"})
+                    return
+                app = source_app()
+                item = app.store.get(sid) if app is not None and not app.syncer.restoring and not app.syncer.restore_failed else None
+                if item is not None:
+                    if os.getenv("RETURN_RETRIEVAL_TEXT", "false").lower() not in {"1", "true", "yes", "on"}:
+                        item.pop("retrieval_text", None)
+                    self.send_json(200, {"ok": True, "result": item, "error": ""})
                     return
                 try:
                     out = get(sid, from_=obj.get("from"), to=obj.get("to"))
@@ -757,6 +938,14 @@ class Handler(BaseHTTPRequestHandler):
                     docs = [obj]
                 if not isinstance(docs, list) or not docs:
                     self.send_json(400, {"error": "documents must be a non-empty list"})
+                    return
+                if not all(isinstance(doc, dict) for doc in docs):
+                    self.send_json(400, {"error": "each document must be an object"})
+                    return
+                source_result = ingest_source_documents(docs)
+                if source_result is not None:
+                    status, result, _canonical = source_result
+                    self.send_json(status, result)
                     return
                 if not REMOTE:
                     self.send_json(503, {"error": "FUNES_MEMORY is not configured", "durable": False})
@@ -782,18 +971,49 @@ class Handler(BaseHTTPRequestHandler):
                         harness = {"claude_code": "claude"}.get(agent, agent if agent in {"codex", "pi", "claude", "hermes"} else "codex")
                         harnesses.add(harness)
                         session_ids.append(sid)
-                        metadata = {k: doc[k] for k in ("source_identity", "source_type", "project", "repo", "worktree", "message_id", "content_type") if doc.get(k) is not None}
+                        metadata = {
+                            k: doc[k]
+                            for k in (
+                                "source_identity",
+                                "source_agent",
+                                "source_type",
+                                "device_id",
+                                "project",
+                                "repo",
+                                "worktree",
+                                "session_id",
+                                "message_id",
+                                "role",
+                                "timestamp",
+                                "source_path",
+                                "content_hash",
+                                "ingested_at",
+                                "updated_at",
+                                "source_missing",
+                                "content_type",
+                                "agent_type",
+                                "parent_session_id",
+                                "agent_id",
+                                "translation_hash",
+                                "translation_version",
+                                "translation_status",
+                            )
+                            if doc.get(k) is not None
+                        }
+                        metadata.setdefault("source_agent", agent)
+                        metadata.setdefault("ingested_at", now)
                         cwd = str(doc.get("worktree", doc.get("project", "remote")))
                         role = str(doc.get("role", "user"))
+                        source_timestamp = str(doc.get("timestamp") or now)
                         if harness == "pi":
-                            line = {"type": "session", "id": sid, "cwd": cwd, "timestamp": now, "metadata": metadata}
-                            msg = {"type": "message", "id": str(doc.get("message_id") or hashlib.sha256((sid + raw).encode()).hexdigest()[:24]), "timestamp": now, "message": {"role": role, "content": [{"type": "text", "text": raw}]}}
+                            line = {"type": "session", "id": sid, "cwd": cwd, "timestamp": source_timestamp, "metadata": metadata}
+                            msg = {"type": "message", "id": str(doc.get("message_id") or hashlib.sha256((sid + raw).encode()).hexdigest()[:24]), "timestamp": source_timestamp, "message": {"role": role, "content": [{"type": "text", "text": raw}]}}
                         elif harness == "claude":
-                            line = {"type": role if role in {"user", "assistant"} else "user", "uuid": str(doc.get("message_id") or hashlib.sha256((sid + raw).encode()).hexdigest()[:24]), "timestamp": now, "cwd": cwd, "metadata": metadata}
-                            msg = {"type": line["type"], "uuid": line["uuid"], "timestamp": now, "cwd": cwd, "message": {"role": role, "content": [{"type": "text", "text": raw}]}}
+                            line = {"type": role if role in {"user", "assistant"} else "user", "uuid": str(doc.get("message_id") or hashlib.sha256((sid + raw).encode()).hexdigest()[:24]), "timestamp": source_timestamp, "cwd": cwd, "metadata": metadata}
+                            msg = {"type": line["type"], "uuid": line["uuid"], "timestamp": source_timestamp, "cwd": cwd, "message": {"role": role, "content": [{"type": "text", "text": raw}]}}
                         else:
-                            line = {"type": "session_meta", "timestamp": now, "payload": {"id": sid, "cwd": cwd, "metadata": metadata}}
-                            msg = {"type": "response_item", "timestamp": now, "payload": {"type": "message", "role": role, "content": [{"type": "input_text", "text": raw}]}}
+                            line = {"type": "session_meta", "timestamp": source_timestamp, "payload": {"id": sid, "cwd": cwd, "metadata": metadata}}
+                            msg = {"type": "response_item", "timestamp": source_timestamp, "payload": {"type": "message", "role": role, "content": [{"type": "input_text", "text": raw}]}}
                         # Keep each harness in its own directory.  A Pi/Claude
                         # parser must never rescan a Codex envelope from the
                         # same batch.
@@ -833,6 +1053,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def serve(host: str = "0.0.0.0", port: int = PORT) -> None:
     (HOME / "sources").mkdir(parents=True, exist_ok=True)
+    source_app()
     request_warm()
     ThreadingHTTPServer((host, port), Handler).serve_forever()
 

@@ -3,6 +3,7 @@ import os
 import tempfile
 import threading
 import unittest
+import urllib.error
 from unittest import mock
 from http.client import HTTPConnection
 from pathlib import Path
@@ -14,10 +15,10 @@ from service.server import App, Store, Translator, make_handler
 class ServiceTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.old = {k: os.environ.get(k) for k in ("FUNES_DATA_DIR", "FUNES_AUTH_TOKEN", "FUNES_API_TOKEN", "FUNES_STORAGE_REPO", "HF_TOKEN", "FUNES_REQUIRE_DURABLE_ACK", "FUNES_ALLOW_EMPTY_REMOTE", "TRANSLATION_BASE_URL", "TRANSLATION_API_KEY", "TRANSLATION_MODEL")}
+        self.old = {k: os.environ.get(k) for k in ("FUNES_DATA_DIR", "FUNES_AUTH_TOKEN", "FUNES_API_TOKEN", "FUNES_STORAGE_KEY", "FUNES_STORAGE_REPO", "FUNES_SNAPSHOT_FILE", "HF_TOKEN", "FUNES_REQUIRE_DURABLE_ACK", "FUNES_ALLOW_EMPTY_REMOTE", "TRANSLATION_BASE_URL", "TRANSLATION_API_KEY", "TRANSLATION_MODEL")}
         os.environ["FUNES_DATA_DIR"] = self.tmp.name
         os.environ["FUNES_AUTH_TOKEN"] = "test-token"
-        for k in ("FUNES_STORAGE_REPO", "HF_TOKEN", "FUNES_REQUIRE_DURABLE_ACK", "FUNES_ALLOW_EMPTY_REMOTE", "TRANSLATION_BASE_URL", "TRANSLATION_API_KEY", "TRANSLATION_MODEL"):
+        for k in ("FUNES_API_TOKEN", "FUNES_STORAGE_KEY", "FUNES_STORAGE_REPO", "FUNES_SNAPSHOT_FILE", "HF_TOKEN", "FUNES_REQUIRE_DURABLE_ACK", "FUNES_ALLOW_EMPTY_REMOTE", "TRANSLATION_BASE_URL", "TRANSLATION_API_KEY", "TRANSLATION_MODEL"):
             os.environ.pop(k, None)
 
     def tearDown(self):
@@ -95,6 +96,26 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(store.search("中文")[0]["raw_text"], "中文检索内容")
         store.close()
 
+    def test_translation_cache_key_is_hashed_and_permanent_error_opens_circuit(self):
+        store = Store(self.tmp.name)
+        os.environ.update(
+            TRANSLATION_BASE_URL="https://provider.example/v1",
+            TRANSLATION_API_KEY="test-key",
+            TRANSLATION_MODEL="test-model",
+        )
+        tr = Translator(store)
+        cache_key = tr._cache_key("中文 查询")
+        self.assertEqual(len(cache_key), 64)
+        self.assertNotIn("中文", cache_key)
+        failure = urllib.error.HTTPError(
+            "https://provider.example/v1/chat/completions", 402, "payment", {}, None
+        )
+        with mock.patch("service.server.urllib.request.urlopen", side_effect=failure) as request:
+            self.assertEqual(tr.rewrite("中文 查询"), "中文 查询")
+            self.assertEqual(tr.rewrite("另一个中文查询"), "另一个中文查询")
+        self.assertEqual(request.call_count, 1)
+        store.close()
+
     def test_records_and_api_token_alias(self):
         os.environ.pop("FUNES_AUTH_TOKEN")
         os.environ["FUNES_API_TOKEN"] = "api-token"
@@ -106,7 +127,8 @@ class ServiceTests(unittest.TestCase):
     def test_snapshot_roundtrip(self):
         source = Store(self.tmp.name)
         source.ingest([{"source_path": "s", "raw_text": "durable text", "role": "user", "metadata": {"project": "demo"}}])
-        snap = Path(self.tmp.name) / "snapshot.jsonl"
+        source.translation_put("cache-key", "cached retrieval text")
+        snap = Path(self.tmp.name) / "snapshot.jsonl.gz"
         source.snapshot(snap)
         second_dir = tempfile.TemporaryDirectory()
         target = Store(second_dir.name)
@@ -114,6 +136,7 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(target.restore(snap), 0)
         target.reindex()
         self.assertEqual(target.search("durable")[0]["raw_text"], "durable text")
+        self.assertEqual(target.translation_get("cache-key"), "cached retrieval text")
         source.close(); target.close(); second_dir.cleanup()
 
     def test_ingest_does_not_ack_before_durable_snapshot(self):
@@ -124,16 +147,38 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(result["error"], "durability_pending")
         self.assertFalse(result["sync"]["durable"])
 
-    def test_secret_gate_blocks_remote_snapshot(self):
+    def test_encrypted_source_snapshot_roundtrip_hides_plaintext(self):
         from service.server import SnapshotSync
         store = Store(self.tmp.name)
-        store.ingest([{"source_path": "secret", "raw_text": "bearer token"}])
-        os.environ.update(FUNES_STORAGE_REPO="owner/private", HF_TOKEN="hf-test")
+        marker = "sensitive bearer material must remain encrypted"
+        store.ingest([{"source_path": "secret", "raw_text": marker}])
+        os.environ["FUNES_STORAGE_KEY"] = "test-storage-key"
         syncer = SnapshotSync(store)
-        with mock.patch.object(syncer, "_secret_gate", return_value=(False, "secret_detected")):
-            result = syncer.upload()
+        plain = Path(self.tmp.name) / "source.jsonl.gz"
+        encrypted = Path(self.tmp.name) / "source.jsonl.gz.enc"
+        decrypted = Path(self.tmp.name) / "restored.jsonl.gz"
+        store.snapshot(plain)
+        syncer._encrypt_file(plain, encrypted)
+        self.assertNotIn(marker.encode(), encrypted.read_bytes())
+        syncer._decrypt_file(encrypted, decrypted)
+        second_dir = tempfile.TemporaryDirectory()
+        restored = Store(second_dir.name)
+        self.assertEqual(restored.restore(decrypted), 1)
+        self.assertEqual(restored.get("secret")["raw_text"], marker)
+        restored.close(); second_dir.cleanup()
+        store.close()
+
+    def test_remote_source_upload_fails_closed_without_encryption_key(self):
+        from service.server import SnapshotSync
+        store = Store(self.tmp.name)
+        store.ingest([{"source_path": "secret", "raw_text": "private source"}])
+        os.environ.update(FUNES_STORAGE_REPO="owner/private", HF_TOKEN="hf-test")
+        os.environ.pop("FUNES_AUTH_TOKEN", None)
+        os.environ.pop("FUNES_API_TOKEN", None)
+        os.environ.pop("FUNES_STORAGE_KEY", None)
+        result = SnapshotSync(store).upload()
         self.assertFalse(result["durable"])
-        self.assertEqual(result["reason"], "secret_detected")
+        self.assertEqual(result["reason"], "RuntimeError")
         store.close()
 
     def test_restore_failure_is_fail_closed(self):

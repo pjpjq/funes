@@ -15,6 +15,7 @@ import os
 import re
 import sqlite3
 import shutil
+import struct
 import subprocess
 import threading
 import time
@@ -36,6 +37,8 @@ FIELDS = (
 )
 CJK_RE = re.compile(r"[\u3400-\u9fff\uf900-\ufaff]")
 PROMPT_VERSION = "funes-retrieval-v2"
+ENCRYPTED_MAGIC = b"FUNES-SOURCE-V1\0"
+ENCRYPTED_AAD = b"funes-source-snapshot-v1"
 RETRIEVAL_PROMPT = """You are a retrieval normalization engine.
 Convert the natural-language Chinese portions of the input into concise English optimized for semantic retrieval.
 Rules:
@@ -242,6 +245,23 @@ class Store:
             row = self.conn.execute("SELECT * FROM memories WHERE id=? OR source_identity=?", (str(ident), str(ident))).fetchone()
             return self._row(row) if row else None
 
+    def get_many(self, identities: list[str]) -> list[dict[str, Any]]:
+        """Return canonical stored rows without exceeding SQLite's bind limit."""
+        unique = list(dict.fromkeys(str(value) for value in identities if value))
+        found: dict[str, dict[str, Any]] = {}
+        with self.lock:
+            for begin in range(0, len(unique), 500):
+                current = unique[begin : begin + 500]
+                placeholders = ",".join("?" for _ in current)
+                rows = self.conn.execute(
+                    f"SELECT * FROM memories WHERE source_identity IN ({placeholders})",
+                    current,
+                ).fetchall()
+                for row in rows:
+                    item = self._row(row)
+                    found[item["source_identity"]] = item
+        return [found[value] for value in unique if value in found]
+
     def search(self, query: str, limit: int = 20, rerank: Any = None, filters: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         limit = max(1, min(int(limit), 100))
         filters = filters or {}
@@ -319,10 +339,20 @@ class Store:
     def snapshot(self, path: Path) -> None:
         with self.lock:
             rows = self.conn.execute("SELECT * FROM memories ORDER BY id").fetchall()
+            cache = self.conn.execute(
+                "SELECT query,rewritten,created_at,translation_hash,translation_version,translation_status "
+                "FROM translation_cache ORDER BY query"
+            ).fetchall()
             path.parent.mkdir(parents=True, exist_ok=True)
-            with path.open("w", encoding="utf-8") as f:
+            opener = gzip.open if path.name.endswith(".gz") else open
+            with opener(path, "wt", encoding="utf-8") as f:
                 for row in rows:
                     d = self._row(row)
+                    d["_funes_record"] = "memory"
+                    f.write(json.dumps(d, ensure_ascii=False) + "\n")
+                for row in cache:
+                    d = dict(row)
+                    d["_funes_record"] = "translation_cache"
                     f.write(json.dumps(d, ensure_ascii=False) + "\n")
 
     def iter_documents(self, batch_size: int = 500):
@@ -346,6 +376,20 @@ class Store:
             if not isinstance(item, dict):
                 continue
             item = dict(item)
+            record_type = item.pop("_funes_record", "memory")
+            if record_type == "translation_cache":
+                query = str(item.get("query", ""))
+                rewritten = str(item.get("rewritten", ""))
+                if query and rewritten:
+                    self.translation_put(
+                        query,
+                        rewritten,
+                        status=str(item.get("translation_status") or "ok"),
+                        translation_hash=str(item.get("translation_hash") or ""),
+                    )
+                continue
+            if record_type != "memory":
+                continue
             item["metadata"] = item.pop("metadata", item.pop("metadata_json", {}))
             batch.append(item)
             if len(batch) >= batch_size:
@@ -360,7 +404,7 @@ class Store:
     def restore(self, path: Path) -> int:
         if not path.exists():
             return 0
-        opener = gzip.open if path.suffix == ".gz" else open
+        opener = gzip.open if path.name.endswith(".gz") else open
         def rows():
             with opener(path, "rt", encoding="utf-8") as f:
                 for line in f:
@@ -379,10 +423,15 @@ class Translator:
         self.batch_size = max(1, int(os.getenv("TRANSLATION_BATCH_SIZE", "16")))
         self.concurrency = max(1, int(os.getenv("TRANSLATION_CONCURRENCY", "4")))
         self.retries = max(1, int(os.getenv("TRANSLATION_RETRIES", "2")))
+        self.timeout = max(1.0, float(os.getenv("TRANSLATION_TIMEOUT", "12")))
         self.mode = os.getenv("FUNES_RETRIEVAL_LANGUAGE_MODE", "auto").lower()
+        self._provider_lock = threading.Lock()
+        self._provider_disabled_until = 0.0
 
     def _cache_key(self, query: str) -> str:
-        return json.dumps({"raw": query, "model": self.model, "prompt_version": PROMPT_VERSION}, ensure_ascii=False, sort_keys=True)
+        return hashlib.sha256(
+            (query + self.model + PROMPT_VERSION).encode("utf-8")
+        ).hexdigest()
 
     def rewrite(self, query: str) -> str:
         raw_query = query
@@ -393,21 +442,45 @@ class Translator:
         cached = self.store.translation_get(cache_key)
         if cached:
             return cached
+        with self._provider_lock:
+            if time.monotonic() < self._provider_disabled_until:
+                return query
         payload = json.dumps({"model": self.model, "temperature": 0, "messages": [
             {"role": "system", "content": RETRIEVAL_PROMPT},
             {"role": "user", "content": query},
         ]}).encode()
-        req = urllib.request.Request(self.base + "/v1/chat/completions", data=payload, headers={"Content-Type": "application/json", "Authorization": "Bearer " + self.key})
+        endpoint = self.base + ("/chat/completions" if self.base.endswith("/v1") else "/v1/chat/completions")
+        req = urllib.request.Request(endpoint, data=payload, headers={"Content-Type": "application/json", "Authorization": "Bearer " + self.key})
         for attempt in range(self.retries):
             try:
-                with urllib.request.urlopen(req, timeout=8) as response:
+                with urllib.request.urlopen(req, timeout=self.timeout) as response:
                     data = json.loads(response.read())
                 rewritten = normalize_text(data["choices"][0]["message"]["content"])
                 if rewritten:
                     self.store.translation_put(cache_key, rewritten)
                     return rewritten
                 break
-            except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, KeyError, json.JSONDecodeError):
+            except urllib.error.HTTPError as exc:
+                if exc.code not in (408, 425, 429) and exc.code < 500:
+                    with self._provider_lock:
+                        self._provider_disabled_until = time.monotonic() + 300
+                    break
+                if exc.code == 429:
+                    retry_after = exc.headers.get("Retry-After") if exc.headers else None
+                    try:
+                        disabled_for = float(retry_after) if retry_after else 30.0
+                    except ValueError:
+                        disabled_for = 30.0
+                    with self._provider_lock:
+                        self._provider_disabled_until = time.monotonic() + min(300.0, max(1.0, disabled_for))
+                if attempt + 1 < self.retries:
+                    retry_after = exc.headers.get("Retry-After") if exc.headers else None
+                    try:
+                        delay = float(retry_after) if retry_after else 0.2 * (2**attempt)
+                    except ValueError:
+                        delay = 0.2 * (2**attempt)
+                    time.sleep(min(30.0, max(0.0, delay)))
+            except (urllib.error.URLError, TimeoutError, KeyError, json.JSONDecodeError):
                 if attempt + 1 < self.retries:
                     time.sleep(0.2 * (2**attempt))
         return query
@@ -456,7 +529,7 @@ class SnapshotSync:
         self.upload_lock = threading.Lock()
         self.repo = os.getenv("FUNES_STORAGE_REPO") or os.getenv("FUNES_MEMORY", "")
         self.token = os.getenv("HF_TOKEN", "")
-        self.filename = os.getenv("FUNES_SNAPSHOT_FILE", "funes-snapshot.jsonl")
+        self.filename = os.getenv("FUNES_SNAPSHOT_FILE", "funes-snapshot.jsonl.gz")
         self.prefix = os.getenv("FUNES_SNAPSHOT_PREFIX", "funes-snapshot-")
         self.delta_prefix = os.getenv("FUNES_DELTA_PREFIX", "funes-delta-")
         self.restore_batch = max(50, int(os.getenv("FUNES_RESTORE_BATCH", "500")))
@@ -464,6 +537,11 @@ class SnapshotSync:
         self.restore_error = None
         self.restored = False
         self.restoring = False
+        self.storage_key = (
+            os.getenv("FUNES_STORAGE_KEY")
+            or os.getenv("FUNES_API_TOKEN")
+            or os.getenv("FUNES_AUTH_TOKEN", "")
+        )
 
     @staticmethod
     def _truth(name: str, default: bool = False) -> bool:
@@ -487,10 +565,10 @@ class SnapshotSync:
         files = []
         for item in api.list_repo_tree(self.repo, repo_type="dataset", recursive=True, token=self.token):
             name = getattr(item, "path", "")
-            if name == self.filename or name.startswith(self.prefix) or name.startswith(self.delta_prefix):
-                if name.endswith((".jsonl", ".jsonl.gz")):
+            if name == self.filename + ".enc" or name.startswith(self.prefix) or name.startswith(self.delta_prefix):
+                if name.endswith((".jsonl.enc", ".jsonl.gz.enc")):
                     files.append(name)
-        snapshots = sorted(name for name in files if name == self.filename or name.startswith(self.prefix))
+        snapshots = sorted(name for name in files if name == self.filename + ".enc" or name.startswith(self.prefix))
         deltas = sorted(name for name in files if name.startswith(self.delta_prefix))
         return snapshots + deltas
 
@@ -503,7 +581,15 @@ class SnapshotSync:
             token=self.token,
             local_dir=str(self.store.data_dir / "remote"),
         )
-        return self.store.restore_documents(self._iter_file(Path(downloaded)), self.restore_batch)
+        encrypted = Path(downloaded)
+        if not filename.endswith(".enc"):
+            if not self._truth("FUNES_ALLOW_PLAINTEXT_SOURCE_RESTORE"):
+                raise RuntimeError("plaintext source snapshot restore is disabled")
+            return self.store.restore_documents(self._iter_file(encrypted), self.restore_batch)
+        with tempfile.TemporaryDirectory(prefix="funes-source-restore-") as directory:
+            plaintext = Path(directory) / Path(filename).name.removesuffix(".enc")
+            self._decrypt_file(encrypted, plaintext)
+            return self.store.restore_documents(self._iter_file(plaintext), self.restore_batch)
 
     @staticmethod
     def _iter_file(path: Path):
@@ -519,7 +605,7 @@ class SnapshotSync:
                 files = self._repo_files()
                 if not files:
                     # Backwards-compatible single-file snapshot lookup.
-                    files = [self.filename]
+                    files = [self.filename + ".enc"]
                 restored = 0
                 for filename in files:
                     restored += self._restore_file(filename)
@@ -572,6 +658,69 @@ class SnapshotSync:
                 stream.write(json.dumps(doc, ensure_ascii=False, separators=(",", ":")))
                 stream.write("\n")
 
+    def _encryption_key(self) -> bytes:
+        if not self.storage_key:
+            raise RuntimeError("FUNES_STORAGE_KEY is not configured")
+        return hashlib.sha256(
+            b"funes-source-storage-v1\0" + self.storage_key.encode("utf-8")
+        ).digest()
+
+    def _encrypt_file(self, source: Path, target: Path) -> None:
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
+        nonce = os.urandom(12)
+        encryptor = Cipher(algorithms.AES(self._encryption_key()), modes.GCM(nonce)).encryptor()
+        encryptor.authenticate_additional_data(ENCRYPTED_AAD)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with source.open("rb") as incoming, target.open("wb") as outgoing:
+            outgoing.write(ENCRYPTED_MAGIC)
+            outgoing.write(struct.pack(">B", len(nonce)))
+            outgoing.write(nonce)
+            while chunk := incoming.read(1024 * 1024):
+                outgoing.write(encryptor.update(chunk))
+            outgoing.write(encryptor.finalize())
+            outgoing.write(encryptor.tag)
+
+    def _decrypt_file(self, source: Path, target: Path) -> None:
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
+        size = source.stat().st_size
+        with source.open("rb") as incoming:
+            magic = incoming.read(len(ENCRYPTED_MAGIC))
+            if magic != ENCRYPTED_MAGIC:
+                raise RuntimeError("invalid encrypted source snapshot header")
+            nonce_size_raw = incoming.read(1)
+            if len(nonce_size_raw) != 1:
+                raise RuntimeError("truncated encrypted source snapshot")
+            nonce_size = struct.unpack(">B", nonce_size_raw)[0]
+            nonce = incoming.read(nonce_size)
+            header_size = len(ENCRYPTED_MAGIC) + 1 + nonce_size
+            if len(nonce) != nonce_size or size < header_size + 16:
+                raise RuntimeError("truncated encrypted source snapshot")
+            incoming.seek(-16, os.SEEK_END)
+            tag = incoming.read(16)
+            ciphertext_size = size - header_size - len(tag)
+            incoming.seek(header_size)
+            decryptor = Cipher(
+                algorithms.AES(self._encryption_key()), modes.GCM(nonce, tag)
+            ).decryptor()
+            decryptor.authenticate_additional_data(ENCRYPTED_AAD)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            temporary = target.with_name(target.name + ".partial")
+            try:
+                with temporary.open("wb") as outgoing:
+                    remaining = ciphertext_size
+                    while remaining:
+                        chunk = incoming.read(min(1024 * 1024, remaining))
+                        if not chunk:
+                            raise RuntimeError("truncated encrypted source snapshot")
+                        remaining -= len(chunk)
+                        outgoing.write(decryptor.update(chunk))
+                    outgoing.write(decryptor.finalize())
+                os.replace(temporary, target)
+            finally:
+                temporary.unlink(missing_ok=True)
+
     def upload(self, docs: list[dict[str, Any]] | None = None) -> dict[str, Any]:
         with self.upload_lock:
             if self.restore_failed:
@@ -582,9 +731,10 @@ class SnapshotSync:
             # compact full snapshot for operators.
             if docs is not None:
                 digest = hashlib.sha256(json.dumps(docs, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:24]
-                # Timestamp gives restart restore a deterministic causal order;
-                # the digest suffix keeps retries identifiable in diagnostics.
-                path = self.store.data_dir / f"{self.delta_prefix}{time.time_ns()}-{digest}.jsonl.gz"
+                # Content addressing makes a retry upload the same immutable
+                # object. Restore is order-independent because Store.ingest
+                # applies updated_at LWW rather than trusting filename order.
+                path = self.store.data_dir / f"{self.delta_prefix}{digest}.jsonl.gz"
                 self._write_jsonl_gzip(docs, path)
             else:
                 path = self.snapshot_path()
@@ -594,16 +744,20 @@ class SnapshotSync:
                 if self._truth("FUNES_REQUIRE_DURABLE_ACK"):
                     return {"uploaded": False, "durable": False, "path": str(path), "reason": "HF storage not configured"}
                 return {"uploaded": False, "durable": True, "path": str(path), "reason": "local durable store"}
-            clean, gate_reason = self._secret_gate(path)
-            if not clean:
-                self.store.set_sync(last_error=gate_reason, snapshot_path=str(path))
-                return {"uploaded": False, "durable": False, "path": str(path), "reason": gate_reason}
+            try:
+                encrypted = path.with_name(path.name + ".enc")
+                self._encrypt_file(path, encrypted)
+            except Exception as exc:
+                reason = type(exc).__name__
+                self.store.set_sync(last_error=reason, snapshot_path=str(path))
+                return {"uploaded": False, "durable": False, "path": str(path), "reason": reason}
             try:
                 from huggingface_hub import HfApi
-                target = path.name if docs is not None else self.filename
-                HfApi(token=self.token).upload_file(path_or_fileobj=str(path), path_in_repo=target, repo_id=self.repo, repo_type="dataset", commit_message="funes durable memory delta" if docs is not None else "funes snapshot")
+                target = (path.name if docs is not None else self.filename) + ".enc"
+                HfApi(token=self.token).upload_file(path_or_fileobj=str(encrypted), path_in_repo=target, repo_id=self.repo, repo_type="dataset", commit_message="funes encrypted source delta" if docs is not None else "funes encrypted source snapshot")
                 if docs is not None:
                     path.unlink(missing_ok=True)
+                encrypted.unlink(missing_ok=True)
                 self.store.set_sync(last_sync=utc_now(), snapshot_path=str(path), last_error=None)
                 return {"uploaded": True, "durable": True, "path": str(path)}
             except Exception as exc:
@@ -751,7 +905,10 @@ def make_handler(app: App):
                     # A remote caller must not receive an ACK that can be lost
                     # between SQLite commit and HF persistence.  The upload is
                     # idempotent; retrying the same source identities is safe.
-                    result["sync"] = app.syncer.upload(prepared)
+                    canonical = app.store.get_many(
+                        [str(item.get("source_identity", "")) for item in result["items"]]
+                    )
+                    result["sync"] = app.syncer.upload(canonical)
                     if not result["sync"].get("durable"):
                         return self._json(503, {"error": "durability_pending", **result})
                     return self._json(200, result)

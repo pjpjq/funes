@@ -646,11 +646,13 @@ class Handler(BaseHTTPRequestHandler):
         # Never log request bodies, Authorization, or raw memory text.
         return
 
-    def send_json(self, code: int, obj: object) -> None:
+    def send_json(self, code: int, obj: object, headers: dict[str, str] | None = None) -> None:
         data = json.dumps(obj, ensure_ascii=False).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(data)
 
@@ -726,7 +728,7 @@ class Handler(BaseHTTPRequestHandler):
                     tuning.setdefault("half_life", 0)
                     out = recall(query, k=limit, **tuning)
                 except NativeMcpBusyError:
-                    self.send_json(429, {"ok": False, "query": raw_query, "retrieval_query": query, "results": [], "results_text": "", "error": "native_mcp_busy", "retry_after": 3})
+                    self.send_json(429, {"ok": False, "query": raw_query, "retrieval_query": query, "results": [], "results_text": "", "error": "native_mcp_busy", "retry_after": 3}, {"Retry-After": "3"})
                     return
                 except NativeMcpError:
                     self.send_json(503, {"ok": False, "query": raw_query, "retrieval_query": query, "results": [], "results_text": "", "error": "native_mcp_unavailable"})
@@ -742,7 +744,7 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     out = get(sid, from_=obj.get("from"), to=obj.get("to"))
                 except NativeMcpBusyError:
-                    self.send_json(429, {"ok": False, "result": "", "error": "native_mcp_busy", "retry_after": 3})
+                    self.send_json(429, {"ok": False, "result": "", "error": "native_mcp_busy", "retry_after": 3}, {"Retry-After": "3"})
                     return
                 except NativeMcpError:
                     self.send_json(503, {"ok": False, "result": "", "error": "native_mcp_unavailable"})

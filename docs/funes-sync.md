@@ -10,6 +10,8 @@ active/archived）、Claude Code、pi 的会话，以及 Codex/Claude/pi 和仓�
 `deploy/funes-sync/native-backfill.sh` 调用官方原生 parser/index/push。它完成首次回填后不会退出，
 而是按 `FUNES_NATIVE_BACKFILL_RECONCILE_INTERVAL`（默认 300 秒）继续扫描 Codex、Pi、Claude
 的新建/追加 session；这样 memory-only daemon 不会留下未来 session 的接管空档。
+每次原生 push 成功后，LaunchAgent 还会通过受保护的 `/warm` 通知让 HF Space 在后台
+刷新读取 worker；通知失败不影响本地已完成的 durable push。
 
 ## 快速使用
 

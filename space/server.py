@@ -21,6 +21,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from service.server import App as SourceApp
+from service.server import PROMPT_VERSION as SOURCE_PROMPT_VERSION
+from service.server import normalize_text as normalize_source_text
 
 
 FUNES_BIN = os.getenv("FUNES_BIN", "/usr/local/bin/funes")
@@ -105,12 +107,46 @@ def prepare_source_documents(app, docs: list[dict]) -> list[dict]:
     for index, doc in enumerate(docs):
         item = dict(doc)
         raw = str(item.get("raw_text", item.get("text", "")))
+        source_type = str(item.get("source_type", item.get("kind", ""))).lower()
+        content_type = str(item.get("content_type", "")).lower()
+        native_session = source_type in {
+            "session",
+            "codex",
+            "codex_session",
+            "pi",
+            "pi_session",
+            "claude",
+            "claude_session",
+        }
+        low_value = content_type in {
+            "tool_call",
+            "tool_result",
+            "shell_output",
+            "progress",
+        }
+        if (native_session or low_value) and not item.get("retrieval_text"):
+            item["retrieval_text"] = normalize_source_text(raw)
+            item.setdefault(
+                "translation_hash",
+                hashlib.sha256((raw + app.translator.model + SOURCE_PROMPT_VERSION).encode("utf-8")).hexdigest(),
+            )
+            item.setdefault("translation_version", SOURCE_PROMPT_VERSION)
+            item.setdefault(
+                "translation_status",
+                "skipped_native_session" if native_session else "skipped_low_value",
+            )
         identity = str(item.get("source_identity", ""))
         existing = app.store.get(identity) if identity else None
         same_content = bool(
             existing
             and existing.get("content_hash") == hashlib.sha256(raw.encode("utf-8")).hexdigest()
-            and existing.get("translation_status") in {"ok", "skipped_non_cjk", "skipped_raw_mode"}
+            and existing.get("translation_status") in {
+                "ok",
+                "skipped_non_cjk",
+                "skipped_raw_mode",
+                "skipped_native_session",
+                "skipped_low_value",
+            }
         )
         if same_content and not item.get("retrieval_text"):
             item["retrieval_text"] = existing.get("retrieval_text") or raw
@@ -162,6 +198,14 @@ def search_source_documents(query: str, limit: int, filters: dict[str, object]) 
     hits = app.store.search(rewritten, limit, filters=filters)
     if rewritten != query and not hits:
         hits = app.store.search(query, limit, filters=filters)
+    native_filterable = set(filters).issubset({"source_agent", "repo"})
+    if native_filterable:
+        hits = [
+            item
+            for item in hits
+            if str(item.get("source_type", "")).lower()
+            not in {"session", "codex", "codex_session", "pi", "pi_session", "claude", "claude_session"}
+        ]
     for item in hits:
         if os.getenv("RETURN_RETRIEVAL_TEXT", "false").lower() not in {"1", "true", "yes", "on"}:
             item.pop("retrieval_text", None)

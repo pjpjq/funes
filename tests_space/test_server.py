@@ -513,6 +513,8 @@ def test_ingest_preserves_source_metadata_and_timestamp(monkeypatch, tmp_path):
 
 
 class _SourceTranslator:
+    model = "test-model"
+
     def normalize_many(self, raws):
         return [
             (
@@ -563,6 +565,31 @@ def _post(server, path, payload):
     body = json.loads(response.read())
     conn.close()
     return response.status, body
+
+
+def test_native_session_and_low_value_records_skip_provider_translation(tmp_path):
+    class Translator:
+        model = "test-model"
+
+        def normalize_many(self, _raws):
+            raise AssertionError("session/tool records must not call the provider")
+
+    store = SourceStore(str(tmp_path / "skip-store"))
+    app = SimpleNamespace(store=store, translator=Translator())
+    try:
+        prepared = bridge.prepare_source_documents(
+            app,
+            [
+                {"source_identity": "session", "source_type": "session", "raw_text": "中文 session"},
+                {"source_identity": "tool", "content_type": "tool_result", "raw_text": "中文 tool"},
+            ],
+        )
+    finally:
+        store.close()
+    assert [item["translation_status"] for item in prepared] == [
+        "skipped_native_session",
+        "skipped_low_value",
+    ]
 
 
 def test_source_sidecar_updates_in_place_and_returns_only_raw_text(monkeypatch, tmp_path):

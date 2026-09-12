@@ -1,10 +1,21 @@
 // Funes remote recall for pi. The URL/token stay in the process environment;
 // this file contains no credential or machine-specific value.
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { execFileSync } from "node:child_process";
 
 const base = (process.env.FUNES_REMOTE_URL || "").replace(/\/+$/, "");
-const token = process.env.FUNES_API_TOKEN || "";
-const hubToken = process.env.FUNES_HF_TOKEN || process.env.HF_TOKEN || "";
+
+function keychain(service: string): string {
+  if (process.platform !== "darwin") return "";
+  try {
+    return execFileSync("/usr/bin/security", [
+      "find-generic-password", "-a", process.env.USER || "", "-s", service, "-w",
+    ], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+  } catch { return ""; }
+}
+
+const token = process.env.FUNES_API_TOKEN || keychain("funes-api-token");
+const hubToken = process.env.FUNES_HF_TOKEN || process.env.HF_TOKEN || keychain("funes-hf-token");
 
 // Keep automatic recall useful without adding latency to every self-contained
 // prompt.  Explicit memory language and historical/project-decision cues opt in;

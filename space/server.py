@@ -11,6 +11,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -24,8 +25,11 @@ TOKEN = os.getenv("FUNES_API_TOKEN", "")
 HOME = Path(os.getenv("FUNES_HOME", "/data/.funes"))
 PORT = int(os.getenv("PORT", "7860"))
 TRANSLATION_THRESHOLD = float(os.getenv("TRANSLATE_CHINESE_THRESHOLD", "0.15"))
+INGEST_INDEX_TIMEOUT = int(os.getenv("FUNES_INGEST_INDEX_TIMEOUT", "900"))
+INGEST_PUSH_TIMEOUT = int(os.getenv("FUNES_INGEST_PUSH_TIMEOUT", "1800"))
 PROMPT_VERSION = "funes-retrieval-v1"
 LANGUAGE_MODE = os.getenv("FUNES_RETRIEVAL_LANGUAGE_MODE", "auto").lower()
+INDEX_LOCK = threading.Lock()
 
 
 def cjk_ratio(text: str) -> float:
@@ -107,6 +111,9 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(200, {"ok": True, "service": "funes"})
             return
         if self.path == "/ready":
+            if not auth_ok(self):
+                self.send_json(401, {"error": "unauthorized"})
+                return
             if not REMOTE:
                 self.send_json(503, {"ok": False, "error": "FUNES_MEMORY is not configured"})
                 return
@@ -133,10 +140,15 @@ class Handler(BaseHTTPRequestHandler):
                     if obj.get(name):
                         args += ["--" + name, str(obj[name])]
                 code, out, err = run(*args)
-                self.send_json(200 if code == 0 else 503, {"ok": code == 0, "query": query, "results": out, "error": err[-1000:]})
+                # Native CLI output is intentionally human-readable.  Keep it
+                # lossless while also exposing the list shape expected by MCP
+                # clients; the service backend can later provide structured
+                # per-chunk metadata without changing this contract.
+                results = ([{"raw_text": out}] if code == 0 and out.strip() else [])
+                self.send_json(200 if code == 0 else 503, {"ok": code == 0, "query": query, "results": results, "results_text": out, "error": err[-1000:]})
                 return
             if self.path == "/get":
-                sid = str(obj.get("session_id", "")).strip()
+                sid = str(obj.get("session_id", obj.get("id", ""))).strip()
                 if not sid:
                     self.send_json(400, {"error": "session_id is required"})
                     return
@@ -178,23 +190,29 @@ class Handler(BaseHTTPRequestHandler):
                         # TruffleHog push gate.  Keep one synthetic transcript per
                         # source identity so retries remain idempotent.
                         agent = str(doc.get("source_agent", "codex")).lower()
-                        harness = agent if agent in {"codex", "pi", "claude", "hermes"} else "codex"
+                        harness = {"claude_code": "claude"}.get(agent, agent if agent in {"codex", "pi", "claude", "hermes"} else "codex")
                         harnesses.add(harness)
                         session_ids.append(sid)
                         metadata = {k: doc[k] for k in ("source_identity", "source_type", "project", "repo", "worktree", "message_id", "content_type") if doc.get(k) is not None}
                         line = {"type": "session_meta", "timestamp": now, "payload": {"id": sid, "cwd": str(doc.get("worktree", doc.get("project", "remote"))), "metadata": metadata}}
                         msg = {"type": "response_item", "timestamp": now, "payload": {"type": "message", "role": str(doc.get("role", "user")), "content": [{"type": "input_text", "text": raw}]}}
-                        (source / f"{index:08d}-{hashlib.sha256(sid.encode()).hexdigest()[:16]}.jsonl").write_text(json.dumps(line, ensure_ascii=False) + "\n" + json.dumps(msg, ensure_ascii=False) + "\n", encoding="utf-8")
+                        # Keep each harness in its own directory.  A Pi/Claude
+                        # parser must never rescan a Codex envelope from the
+                        # same batch.
+                        harness_dir = source / harness
+                        harness_dir.mkdir(exist_ok=True)
+                        (harness_dir / f"{index:08d}-{hashlib.sha256(sid.encode()).hexdigest()[:16]}.jsonl").write_text(json.dumps(line, ensure_ascii=False) + "\n" + json.dumps(msg, ensure_ascii=False) + "\n", encoding="utf-8")
                     outputs = []
                     errors = []
-                    for harness in sorted(harnesses):
-                        code, out, err = run("index", str(source), "--harness", harness, "--yes", timeout=300)
-                        outputs.append(out)
-                        errors.append(err)
-                        if code != 0:
-                            self.send_json(503, {"ok": False, "durable": False, "session_ids": session_ids, "error": "native_index_failed"})
-                            return
-                    code, pout, perr = run("push", REMOTE, "--yes", "--force-reindex", timeout=600)
+                    with INDEX_LOCK:
+                        for harness in sorted(harnesses):
+                            code, out, err = run("index", str(source / harness), "--harness", harness, "--yes", timeout=INGEST_INDEX_TIMEOUT)
+                            outputs.append(out)
+                            errors.append(err)
+                            if code != 0:
+                                self.send_json(503, {"ok": False, "durable": False, "session_ids": session_ids, "error": "native_index_failed"})
+                                return
+                        code, pout, perr = run("push", REMOTE, "--yes", "--force-reindex", timeout=INGEST_PUSH_TIMEOUT)
                     outputs.append(pout)
                     errors.append(perr)
                     durable = code == 0

@@ -1,0 +1,85 @@
+from __future__ import annotations
+import json, sqlite3, time
+from pathlib import Path
+from typing import Any
+from .config import Config
+from .discovery import Source
+from .parsers import Chunk
+
+class Store:
+    def __init__(self, path: Path|str|None=None, config: Config|None=None):
+        self.config=config or Config.load(); self.config.ensure()
+        self.path=Path(path or self.config.state_dir/"sync.db"); self.path.parent.mkdir(parents=True,exist_ok=True)
+        self.db=sqlite3.connect(self.path, timeout=30, check_same_thread=False)
+        self.db.row_factory=sqlite3.Row; self.db.execute("PRAGMA journal_mode=WAL"); self._schema()
+    def _schema(self):
+        self.db.executescript('''
+        CREATE TABLE IF NOT EXISTS sources(source_key TEXT PRIMARY KEY,kind TEXT NOT NULL,path TEXT NOT NULL,device_id TEXT,project TEXT,active INTEGER DEFAULT 1,size INTEGER,mtime REAL,inode INTEGER,updated_at REAL);
+        CREATE TABLE IF NOT EXISTS records(record_id TEXT PRIMARY KEY,source_key TEXT NOT NULL,content_hash TEXT NOT NULL,version INTEGER DEFAULT 1,payload TEXT NOT NULL,updated_at REAL);
+        CREATE INDEX IF NOT EXISTS records_source ON records(source_key);
+        CREATE TABLE IF NOT EXISTS queue(record_id TEXT PRIMARY KEY,attempts INTEGER DEFAULT 0,next_at REAL DEFAULT 0,last_error TEXT,queued_at REAL);
+        CREATE TABLE IF NOT EXISTS cursors(source_key TEXT PRIMARY KEY,offset INTEGER DEFAULT 0,inode INTEGER,size INTEGER,updated_at REAL);
+        '''); self.db.commit()
+    def close(self): self.db.close()
+    def register_source(self,s:Source,stat=None):
+        now=time.time(); st=stat
+        self.db.execute("INSERT INTO sources(source_key,kind,path,device_id,project,active,size,mtime,inode,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(source_key) DO UPDATE SET kind=excluded.kind,path=excluded.path,device_id=excluded.device_id,project=excluded.project,active=1,size=excluded.size,mtime=excluded.mtime,inode=excluded.inode,updated_at=excluded.updated_at",(s.source_key,s.kind,str(s.path),s.device_id,s.project,1,st.st_size if st else None,st.st_mtime if st else None,st.st_ino if st else None,now)); self.db.commit()
+    def mark_missing(self, present:set[str]):
+        # Keep records and source rows; only mark source inactive.
+        self.db.execute("UPDATE sources SET active=0,updated_at=? WHERE source_key NOT IN (%s)" % (','.join('?'*len(present)) if present else "''"), (time.time(),*present) if present else (time.time(),)); self.db.commit()
+    def cursor(self,key):
+        r=self.db.execute("SELECT * FROM cursors WHERE source_key=?",(key,)).fetchone(); return dict(r) if r else None
+    def set_cursor(self,key,offset,inode,size):
+        self.db.execute("INSERT INTO cursors(source_key,offset,inode,size,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(source_key) DO UPDATE SET offset=excluded.offset,inode=excluded.inode,size=excluded.size,updated_at=excluded.updated_at",(key,offset,inode,size,time.time())); self.db.commit()
+    def upsert_chunks(self,chunks:list[Chunk]):
+        now=time.time(); count=0
+        with self.db:
+            for c in chunks:
+                payload=json.dumps(c.as_dict(),ensure_ascii=False,sort_keys=True)
+                import hashlib; h=hashlib.sha256(c.raw_text.encode("utf-8")).hexdigest()
+                old=self.db.execute("SELECT content_hash,version FROM records WHERE record_id=?",(c.record_id,)).fetchone()
+                if old and old[0] == h:
+                    count += 1
+                    continue
+                version=(old[1]+1 if old and old[0]!=h else (old[1] if old else 1))
+                self.db.execute("INSERT INTO records(record_id,source_key,content_hash,version,payload,updated_at) VALUES(?,?,?,?,?,?) ON CONFLICT(record_id) DO UPDATE SET content_hash=excluded.content_hash,version=excluded.version,payload=excluded.payload,updated_at=excluded.updated_at",(c.record_id,c.source_key,h,version,payload,now))
+                self.db.execute("INSERT INTO queue(record_id,attempts,next_at,last_error,queued_at) VALUES(?,?,?,?,?) ON CONFLICT(record_id) DO UPDATE SET next_at=MIN(queue.next_at,excluded.next_at),last_error=NULL",(c.record_id,0,0,None,now)); count+=1
+        return count
+    def reconcile_source(self, source_key: str, current_ids: set[str]):
+        """Remove local records deleted from a fully reparsed source.
+
+        Append scans never call this; a full rewrite therefore cannot leave stale
+        remote queue entries behind while normal append-only logs remain cheap.
+        """
+        rows=self.db.execute("SELECT record_id FROM records WHERE source_key=?",(source_key,)).fetchall()
+        stale=[r[0] for r in rows if r[0] not in current_ids]
+        if stale:
+            # Keep the local source-of-truth row and send a soft-missing update;
+            # the remote service defaults to the same keep policy.  Physical
+            # deletion is intentionally never implied by a local rewrite.
+            with self.db:
+                for record_id in stale:
+                    row=self.db.execute("SELECT payload FROM records WHERE record_id=?",(record_id,)).fetchone()
+                    if not row:
+                        continue
+                    payload=json.loads(row[0]); payload["source_missing"]=True
+                    payload["updated_at"]=str(time.time())
+                    self.db.execute("UPDATE records SET payload=?,updated_at=? WHERE record_id=?",(json.dumps(payload,ensure_ascii=False,sort_keys=True),time.time(),record_id))
+                    self.db.execute("INSERT INTO queue(record_id,attempts,next_at,last_error,queued_at) VALUES(?,?,?,?,?) ON CONFLICT(record_id) DO UPDATE SET next_at=MIN(queue.next_at,excluded.next_at),last_error=NULL",(record_id,0,0,None,time.time()))
+        return len(stale)
+    def pending(self,limit=50,now=None):
+        now=now or time.time(); rows=self.db.execute("SELECT q.*,r.payload FROM queue q JOIN records r ON r.record_id=q.record_id WHERE q.next_at<=? ORDER BY q.queued_at LIMIT ?",(now,limit)).fetchall(); return [dict(r) for r in rows]
+    def ack(self,ids:list[str]):
+        if ids:
+            self.db.executemany("DELETE FROM queue WHERE record_id=?",((i,) for i in ids)); self.db.commit()
+    def fail(self,record_id,error,delay=30):
+        self.db.execute("UPDATE queue SET attempts=attempts+1,next_at=?,last_error=? WHERE record_id=?",(time.time()+delay,error[:1000],record_id)); self.db.commit()
+    def stats(self):
+        by_agent={}
+        for row in self.db.execute("SELECT json_extract(payload,'$.source_agent') AS agent,count(*) AS n FROM records GROUP BY agent"):
+            by_agent[row[0] or "unknown"]=row[1]
+        return {"sources":self.db.execute("SELECT count(*) FROM sources").fetchone()[0],"active_sources":self.db.execute("SELECT count(*) FROM sources WHERE active=1").fetchone()[0],"records":self.db.execute("SELECT count(*) FROM records").fetchone()[0],"pending":self.db.execute("SELECT count(*) FROM queue").fetchone()[0],"by_agent":by_agent}
+    def search(self,query,limit=20):
+        q=f"%{query}%"; rows=self.db.execute("SELECT payload FROM records WHERE payload LIKE ? ORDER BY updated_at DESC LIMIT ?",(q,limit)).fetchall(); return [json.loads(r[0]) for r in rows]
+    def get(self,record_id):
+        r=self.db.execute("SELECT payload FROM records WHERE record_id=?",(record_id,)).fetchone(); return json.loads(r[0]) if r else None

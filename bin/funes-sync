@@ -1,0 +1,6 @@
+#!/bin/sh
+# Stable launcher for the unified sync package when the repository is not installed as a wheel.
+set -eu
+ROOT=${FUNES_SYNC_ROOT:-$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)}
+export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"
+exec "${PYTHON:-python3}" -m sync "$@"

@@ -1,0 +1,2 @@
+# Optional: enables private Hugging Face dataset snapshot restore/upload.
+huggingface_hub>=0.24,<1

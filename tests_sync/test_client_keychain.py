@@ -53,10 +53,9 @@ def test_sync_methods_use_keychain_credentials_when_environment_is_empty(tmp_pat
     requests = []
 
     class Response:
-        status = 200
-
-        def __init__(self, payload):
+        def __init__(self, payload, status=200):
             self.payload = payload
+            self.status = status
 
         def __enter__(self):
             return self
@@ -74,7 +73,9 @@ def test_sync_methods_use_keychain_credentials_when_environment_is_empty(tmp_pat
         if req.full_url.endswith("/sync"):
             return Response({"durable": True})
         if req.full_url.endswith("/reindex"):
-            return Response({"durable": True, "queued": True, "scope": "all"})
+            return Response(
+                {"durable": True, "queued": True, "scope": "all"}, status=202
+            )
         return Response({})
 
     monkeypatch.setattr(client_module, "open_no_redirect", urlopen)
@@ -91,6 +92,30 @@ def test_sync_methods_use_keychain_credentials_when_environment_is_empty(tmp_pat
         assert headers["authorization"] == "Bearer hf-keychain-value"
         assert headers["x-funes-authorization"] == "Bearer api-keychain-value"
     assert json.loads(requests[-1].data) == {"scope": "all"}
+
+
+@pytest.mark.parametrize("status", [200, 201])
+def test_reindex_rejects_non_202_success_status(tmp_path, monkeypatch, status):
+    monkeypatch.setenv("FUNES_API_TOKEN", "api-environment-value")
+    monkeypatch.delenv("FUNES_HF_TOKEN", raising=False)
+    monkeypatch.delenv("HF_TOKEN", raising=False)
+    monkeypatch.setattr(client_module, "_keychain_token", lambda _service: "")
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+        def read(self):
+            return b'{"durable":true,"queued":true,"scope":"all"}'
+
+    response = Response()
+    response.status = status
+    monkeypatch.setattr(client_module, "open_no_redirect", lambda *_args, **_kwargs: response)
+    with pytest.raises(RuntimeError, match=f"HTTP {status}, expected 202"):
+        SyncClient(cfg(tmp_path)).reindex("all")
 
 
 def test_environment_credentials_take_precedence_over_keychain(tmp_path, monkeypatch):

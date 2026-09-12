@@ -16,6 +16,10 @@ function keychain(service: string): string {
 
 const token = process.env.FUNES_API_TOKEN || keychain("funes-api-token");
 const hubToken = process.env.FUNES_HF_TOKEN || process.env.HF_TOKEN || keychain("funes-hf-token");
+const remoteTimeoutMs = (() => {
+  const value = Number(process.env.FUNES_REMOTE_TIMEOUT_MS || "90000");
+  return Number.isFinite(value) && value >= 5000 && value <= 180000 ? value : 90000;
+})();
 
 // Keep automatic recall useful without adding latency to every self-contained
 // prompt.  Explicit memory language and historical/project-decision cues opt in;
@@ -39,7 +43,7 @@ async function call(path: string, body: Record<string, unknown>) {
       method: "POST",
       headers,
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(20_000),
+      signal: AbortSignal.timeout(remoteTimeoutMs),
     });
     return response.ok ? await response.json() : null;
   } catch { return null; }

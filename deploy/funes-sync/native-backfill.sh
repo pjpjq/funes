@@ -7,7 +7,7 @@ set -eu
 PATH="/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:$HOME/.local/bin:$PATH"
 export PATH
 STATE_DIR="${FUNES_SYNC_STATE_DIR:-$HOME/.local/share/funes-sync}"
-LOCK="$STATE_DIR/native-backfill.lock"
+LOCK="$STATE_DIR/native-backfill.lockfile"
 LOG="${FUNES_NATIVE_BACKFILL_LOG:-$HOME/Library/Logs/funes-native-backfill.log}"
 BIN="${FUNES_BIN:-$HOME/.local/bin/funes}"
 REMOTE="${FUNES_NATIVE_MEMORY:?FUNES_NATIVE_MEMORY is required}"
@@ -19,9 +19,15 @@ RECONCILE_INTERVAL="${FUNES_NATIVE_BACKFILL_RECONCILE_INTERVAL:-300}"
 case "$PUSH_EVERY" in ''|*[!0-9]*|0) PUSH_EVERY=4 ;; esac
 case "$RECONCILE_INTERVAL" in ''|*[!0-9]*|0) RECONCILE_INTERVAL=300 ;; esac
 mkdir -p "$STATE_DIR" "$(dirname "$LOG")"
-if ! mkdir "$LOCK" 2>/dev/null; then exit 0; fi
-cleanup() { rmdir "$LOCK" 2>/dev/null || true; }
-trap cleanup EXIT INT TERM
+if [ ! -x /usr/bin/lockf ]; then
+  printf '%s lockf unavailable\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" >>"$LOG"
+  exit 1
+fi
+# Hold a kernel advisory lock on fd 9 for the whole script.  The file may
+# survive a crash, but the lock cannot: the kernel releases it with the last
+# inherited descriptor, so PID reuse and stale-directory ABA races are absent.
+exec 9>"$LOCK"
+/usr/bin/lockf -s -t 0 9 || exit 0
 
 if [ ! -x "$BIN" ]; then
   printf '%s missing funes binary\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" >>"$LOG"
@@ -31,15 +37,21 @@ fi
 # Prefer the macOS Keychain; the zshrc fallback is for the explicit local
 # setup requested by the operator and is never echoed or persisted by this
 # script.
-if command -v security >/dev/null 2>&1; then
+if [ -z "${HF_TOKEN:-}" ] && command -v security >/dev/null 2>&1; then
   HF_TOKEN="$(security find-generic-password -a "${USER:-$(id -un)}" -s funes-hf-token -w 2>/dev/null || true)"
   [ -n "$HF_TOKEN" ] && export HF_TOKEN
+fi
+if [ -z "${FUNES_API_TOKEN:-}" ] && command -v security >/dev/null 2>&1; then
   FUNES_API_TOKEN="$(security find-generic-password -a "${USER:-$(id -un)}" -s funes-api-token -w 2>/dev/null || true)"
   [ -n "$FUNES_API_TOKEN" ] && export FUNES_API_TOKEN
 fi
 if [ -z "${HF_TOKEN:-}" ] && [ -r "$HOME/.zshrc" ] && command -v zsh >/dev/null 2>&1; then
   HF_TOKEN="$(zsh -c 'source "$HOME/.zshrc" >/dev/null 2>&1; printf %s "${FUNES_HF_TOKEN:-${HF_TOKEN:-}}"' 2>/dev/null || true)"
   [ -n "$HF_TOKEN" ] && export HF_TOKEN
+fi
+if [ -z "${FUNES_API_TOKEN:-}" ] && [ -r "$HOME/.zshrc" ] && command -v zsh >/dev/null 2>&1; then
+  FUNES_API_TOKEN="$(zsh -c 'source "$HOME/.zshrc" >/dev/null 2>&1; printf %s "${FUNES_API_TOKEN:-}"' 2>/dev/null || true)"
+  [ -n "$FUNES_API_TOKEN" ] && export FUNES_API_TOKEN
 fi
 [ -n "${HF_TOKEN:-}" ] || { printf '%s HF token unavailable\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" >>"$LOG"; exit 1; }
 export FUNES_TRUFFLEHOG="${FUNES_TRUFFLEHOG:-$HOME/.local/bin/trufflehog}"
@@ -50,9 +62,9 @@ while :; do
   case "$iteration" in ''|*[!0-9]*) iteration=0 ;; esac
   iteration=$((iteration + 1)); printf '%s\n' "$iteration" >"$ITER_FILE"
   changed=0
-  for harness in codex pi claude; do
+  for harness in codex pi claude hermes; do
     tmp="$STATE_DIR/native-backfill.$$.out"
-    if "$BIN" index --harness "$harness" >"$tmp" 2>&1; then
+    if "$BIN" index --harness "$harness" --yes >"$tmp" 2>&1; then
       cat "$tmp" >>"$LOG"
       grep -Eq 'chunks=[1-9][0-9]*' "$tmp" && changed=1 || true
     else

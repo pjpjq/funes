@@ -9,9 +9,13 @@ active/archived）、Claude Code、pi 的会话，以及 Codex/Claude/pi 和仓�
 当 `FUNES_MEMORY_ONLY=1` 用于让轻量 HTTP 队列只处理持久记忆文件时，历史 session 由
 `deploy/funes-sync/native-backfill.sh` 调用官方原生 parser/index/push。它完成首次回填后不会退出，
 而是按 `FUNES_NATIVE_BACKFILL_RECONCILE_INTERVAL`（默认 300 秒）继续扫描 Codex、Pi、Claude
-的新建/追加 session；这样 memory-only daemon 不会留下未来 session 的接管空档。
-每次原生 push 成功后，LaunchAgent 还会通过受保护的 `/warm` 通知让 HF Space 在后台
-刷新读取 worker；通知失败不影响本地已完成的 durable push。
+和 Hermes 的新建/追加 session；`--yes` 会一次 drain 完整 tier backlog，避免每 60 秒重建
+text/vector index；这样 memory-only daemon 不会留下未来 session 的接管空档。macOS `lockf`
+内核锁会在最后一个进程描述符关闭时自动释放，不依赖 PID 或删除 lock 文件，Mac/进程重启不会
+因 stale lock 永久停摆。
+原生 push 成功后，LaunchAgent 会通过受保护的 `/warm` 通知让 HF Space 在后台刷新读取
+worker；通知默认按 `FUNES_NATIVE_WARM_MIN_INTERVAL=300` 节流，避免历史回填期间重复加载
+embedding/index。通知失败不影响本地已完成的 durable push。
 
 ## 快速使用
 

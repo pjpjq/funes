@@ -1,0 +1,15 @@
+{
+  "memories": 60,
+  "queries": 20,
+  "method": "ASCII-token overlap proxy for the deployed FTS path; not a fabricated BGE score",
+  "before_raw_chinese_to_bge_en_proxy": {
+    "recall@1": 0.45,
+    "recall@3": 0.65,
+    "recall@5": 0.75
+  },
+  "after_english_retrieval_shadow_proxy": {
+    "recall@1": 0.75,
+    "recall@3": 0.75,
+    "recall@5": 1.0
+  }
+}

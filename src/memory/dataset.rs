@@ -709,6 +709,55 @@ pub async fn build_indexes(ds: &mut Dataset, on_event: impl Fn(IndexBuildEvent))
     Ok(())
 }
 
+/// Checked variant for callers, such as local indexing, that can return an index failure to the
+/// invoking user instead of only reporting it on stderr.
+pub(crate) async fn build_indexes_checked(ds: &mut Dataset, on_event: impl Fn(IndexBuildEvent)) -> Result<()> {
+    let failure = std::sync::Mutex::new(None);
+    build_indexes(ds, |event| match event {
+        IndexBuildEvent::VectorIndexFailed(error) => {
+            *failure.lock().expect("index failure lock") = Some(error);
+        }
+        event => on_event(event),
+    })
+    .await?;
+    match failure.into_inner().expect("index failure lock") {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+/// Whether a no-new-chunk indexing pass must rebuild its indexes. This closes the crash window
+/// after an append: the source state may already say every chunk is stored, while the interrupted
+/// finalization left an absent FTS/IVF index or a delta with unindexed rows behind.
+pub(crate) async fn indexes_need_rebuild(ds: &Dataset) -> Result<bool> {
+    if fts_needs_refresh(ds).await? {
+        return Ok(true);
+    }
+    if ivf_pq_params(ds).is_none()
+        || ds
+            .count_rows(Some(EMBEDDED.into()))
+            .await
+            .context("counting embedded rows for index health")?
+            < 256
+    {
+        return Ok(false);
+    }
+    let fragments = ds
+        .unindexed_fragments(VECTOR_INDEX)
+        .await
+        .context("checking vector index coverage")?;
+    if fragments.is_empty() {
+        return Ok(false);
+    }
+    // Rows-first fragments with only null vectors owe embedding, not index maintenance.
+    let mut scan = ds.scan();
+    scan.with_fragments(fragments);
+    scan.empty_project()?;
+    scan.filter(EMBEDDED)?;
+    scan.limit(Some(1), None)?;
+    Ok(collect(scan).await?.iter().any(|batch| batch.num_rows() > 0))
+}
+
 /// One of the two indexes a memory carries.
 struct IndexSpec {
     name: &'static str,
@@ -1946,6 +1995,14 @@ mod tests {
         assert_eq!(by_session["other"], [chunks[1].id.clone()]);
     }
 
+    fn text_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![Field::new("text", DataType::Utf8, false)]))
+    }
+
+    fn text_batch(texts: &[&str]) -> RecordBatch {
+        RecordBatch::try_new(text_schema(), vec![Arc::new(StringArray::from(texts.to_vec()))]).unwrap()
+    }
+
     #[test]
     fn schema_column_order_is_load_bearing() {
         // Column order must match build_batch's array order exactly, or Lance writes the
@@ -1985,5 +2042,58 @@ mod tests {
                 "metadata_json",
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn null_vector_fragments_are_not_vector_index_debt() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ds = Dataset::write(reader(embedded(&turns(0, TRAINABLE))), &table_uri(dir.path()), None)
+            .await
+            .unwrap();
+        build_indexes_checked(&mut ds, |_| {}).await.unwrap();
+        let pending = chunk::chunks_from_turns(&turns(TRAINABLE, 2), true);
+        append(&mut ds, build_batch(model::ENGLISH, &pending, None).unwrap())
+            .await
+            .unwrap();
+        optimize_index(&mut ds, FTS_INDEX, 1, |_| {}).await.unwrap();
+        assert!(!ds.unindexed_fragments(VECTOR_INDEX).await.unwrap().is_empty());
+        assert!(!indexes_need_rebuild(&ds).await.unwrap());
+        let vector = vectors(1).pop().unwrap();
+        ds = fill_vectors(&ds, &[pending[0].id.as_str()], &[vector]).await.unwrap();
+        assert!(indexes_need_rebuild(&ds).await.unwrap());
+        assert_eq!(ds.count_rows(None).await.unwrap(), TRAINABLE + 2);
+    }
+
+    #[tokio::test]
+    async fn interrupted_index_finalization_is_repaired_without_new_source_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().join("chunks.lance");
+        let first = text_batch(&["already stored source row"]);
+        let mut ds = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(first)].into_iter(), text_schema()),
+            uri.to_str().unwrap(),
+            Some(WriteParams::default()),
+        )
+        .await
+        .unwrap();
+
+        // This is the state after append + persisted source state, then a crash before finalize:
+        // the retry will find no new source chunks, but FTS is still absent.
+        assert!(indexes_need_rebuild(&ds).await.unwrap());
+        build_indexes_checked(&mut ds, |_| {}).await.unwrap();
+        assert!(!indexes_need_rebuild(&ds).await.unwrap());
+
+        // An append after an existing FTS leaves an index delta. A no-new-source retry must also
+        // detect that debt and fold the stored row into a rebuilt index.
+        let appended = text_batch(&["stored while finalization was interrupted"]);
+        ds.append(
+            RecordBatchIterator::new(vec![Ok(appended)].into_iter(), text_schema()),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(indexes_need_rebuild(&ds).await.unwrap());
+        build_indexes_checked(&mut ds, |_| {}).await.unwrap();
+        assert!(!indexes_need_rebuild(&ds).await.unwrap());
     }
 }

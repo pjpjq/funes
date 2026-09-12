@@ -832,15 +832,18 @@ impl Indexer {
         Ok(embedded)
     }
 
+    /// Build or repair the FTS + IVF_PQ indexes, reap superseded versions, and print the run summary.
     /// Consumes the indexer, releasing the memory lock.
     async fn finalize(mut self) -> Result<()> {
         if let Some(d) = &mut self.ds {
             record_languages(d, self.languages.as_ref()).await?;
+            // A crash after append can leave state.json current even though FTS/IVF creation never
+            // completed. Check stored index health even on a no-new-chunk retry.
             // Retry incomplete FTS coverage, and compact a fragmented memory, even when no rows or
             // vectors were written.
             if self.n_chunks > 0
                 || self.n_embedded > 0
-                || dataset::fts_needs_refresh(d).await?
+                || dataset::indexes_need_rebuild(d).await?
                 || dataset::fragments_to_compact(d).await? > 0
             {
                 compact::compact_local(d).await?;

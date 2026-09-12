@@ -35,6 +35,7 @@ FIELDS = (
     "session_id", "message_id", "role", "timestamp", "source_path", "content_hash",
     "ingested_at", "updated_at", "content_type", "source_missing", "agent_type",
     "parent_session_id", "agent_id",
+    "translation_hash", "translation_version", "translation_status",
 )
 CJK_RE = re.compile(r"[\u3400-\u9fff\uf900-\ufaff]")
 PROMPT_VERSION = "funes-retrieval-v2"
@@ -155,14 +156,60 @@ class Store:
                 now = utc_now()
                 incoming_updated = doc.get("updated_at", metadata.get("updated_at")) or now
                 row = self.conn.execute(
-                    "SELECT id, content_hash, source_version, updated_at FROM memories WHERE source_identity=?",
+                    """SELECT id, content_hash, source_version, updated_at, retrieval_text,
+                    translation_hash, translation_version, translation_status
+                    FROM memories WHERE source_identity=?""",
                     (source_identity,),
                 ).fetchone()
                 values = {k: doc.get(k, metadata.get(k)) for k in FIELDS if k not in ("content_hash", "ingested_at", "updated_at")}
                 values["source_missing"] = int(bool(values.get("source_missing", False)))
                 if row and row["content_hash"] == content_hash and row["source_version"] == source_version:
-                    deduped += 1
-                    results.append({"id": row["id"], "status": "deduped", "source_identity": source_identity})
+                    derived_supplied = any(
+                        name in doc
+                        for name in (
+                            "retrieval_text",
+                            "translation_hash",
+                            "translation_version",
+                            "translation_status",
+                        )
+                    )
+                    incoming_status = values.get("translation_status")
+                    current_status = row["translation_status"]
+                    retryable = {"pending_provider", "fallback_provider_error", "fallback_no_provider"}
+                    final = {
+                        "ok",
+                        "skipped_raw_mode",
+                        "skipped_non_cjk",
+                        "skipped_native_session",
+                        "skipped_low_value",
+                    }
+                    would_regress = current_status in final and incoming_status in retryable
+                    incoming_derived = (
+                        retrieval,
+                        values.get("translation_hash"),
+                        values.get("translation_version"),
+                        incoming_status,
+                    )
+                    current_derived = (
+                        row["retrieval_text"],
+                        row["translation_hash"],
+                        row["translation_version"],
+                        current_status,
+                    )
+                    if derived_supplied and not would_regress and incoming_derived != current_derived:
+                        # Raw revisions and derived retrieval shadows have separate
+                        # lifecycles.  A reconciled shadow must update in place even
+                        # when the source bytes/version are unchanged.
+                        self.conn.execute(
+                            """UPDATE memories SET retrieval_text=?, translation_hash=?,
+                            translation_version=?, translation_status=? WHERE id=?""",
+                            (*incoming_derived, row["id"]),
+                        )
+                        updated += 1
+                        results.append({"id": row["id"], "status": "derived_updated", "source_identity": source_identity})
+                    else:
+                        deduped += 1
+                        results.append({"id": row["id"], "status": "deduped", "source_identity": source_identity})
                     continue
                 if row and self._older(incoming_updated, row["updated_at"]):
                     # Delta files can arrive out of order after a retry.  Never
@@ -262,6 +309,33 @@ class Store:
                     item = self._row(row)
                     found[item["source_identity"]] = item
         return [found[value] for value in unique if value in found]
+
+    def pending_translations(self, limit: int) -> list[dict[str, Any]]:
+        """Return a bounded restart-safe reconciliation batch."""
+        with self.lock:
+            rows = self.conn.execute(
+                """SELECT * FROM memories WHERE translation_status='pending_provider'
+                ORDER BY updated_at, id LIMIT ?""",
+                (max(1, int(limit)),),
+            ).fetchall()
+            return [self._row(row) for row in rows]
+
+    def mark_translations_pending(self, documents: list[dict[str, Any]]) -> None:
+        """Requeue derived writes whose encrypted delta did not become durable."""
+        with self.lock, self.conn:
+            for item in documents:
+                self.conn.execute(
+                    """UPDATE memories SET retrieval_text=raw_text, translation_status='pending_provider'
+                    WHERE source_identity=? AND content_hash=? AND source_version=?
+                    AND retrieval_text=? AND translation_status=?""",
+                    (
+                        item.get("source_identity"),
+                        item.get("content_hash"),
+                        str(item.get("source_version", "")),
+                        item.get("retrieval_text"),
+                        item.get("translation_status"),
+                    ),
+                )
 
     def search(self, query: str, limit: int = 20, rerank: Any = None, filters: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         limit = max(1, min(int(limit), 100))
@@ -423,6 +497,10 @@ class Translator:
         self.threshold = float(os.getenv("TRANSLATE_CHINESE_THRESHOLD", os.getenv("TRANSLATION_CJK_THRESHOLD", "0.15")))
         self.batch_size = max(1, int(os.getenv("TRANSLATION_BATCH_SIZE", "16")))
         self.concurrency = max(1, int(os.getenv("TRANSLATION_CONCURRENCY", "4")))
+        # Raw durability must not wait on an external provider. Operators may
+        # opt into a small synchronous budget, while the default leaves all
+        # provider work to the restart-safe background reconciler.
+        self.max_per_ingest = max(0, int(os.getenv("TRANSLATION_MAX_PER_INGEST", "0")))
         self.retries = max(1, int(os.getenv("TRANSLATION_RETRIES", "2")))
         self.timeout = max(1.0, float(os.getenv("TRANSLATION_TIMEOUT", "12")))
         self.mode = os.getenv("FUNES_RETRIEVAL_LANGUAGE_MODE", "auto").lower()
@@ -488,18 +566,25 @@ class Translator:
 
     def normalize_document(self, raw: str) -> tuple[str, str, str, str]:
         """Return derived retrieval text plus hash/version/status metadata."""
+        normalized, translation_hash, translation_version, translation_status = self.pending_document(raw)
+        if translation_status != "pending_provider":
+            return normalized, translation_hash, translation_version, translation_status
+        if not self.base or not self.key or not self.model:
+            return normalized, translation_hash, translation_version, "pending_provider"
+        rewritten = self.rewrite(normalized)
+        if rewritten == normalized:
+            return normalized, translation_hash, translation_version, "pending_provider"
+        return " ".join(dict.fromkeys((normalized, rewritten))), translation_hash, translation_version, "ok"
+
+    def pending_document(self, raw: str) -> tuple[str, str, str, str]:
+        """Describe the durable pre-provider state for a source revision."""
         normalized = normalize_text(raw)
         translation_hash = hashlib.sha256((raw + self.model + PROMPT_VERSION).encode("utf-8")).hexdigest()
         if self.mode == "raw":
             return normalized, translation_hash, PROMPT_VERSION, "skipped_raw_mode"
         if self.mode == "auto" and cjk_ratio(normalized) < self.threshold:
             return normalized, translation_hash, PROMPT_VERSION, "skipped_non_cjk"
-        if not self.base or not self.key or not self.model:
-            return normalized, translation_hash, PROMPT_VERSION, "fallback_no_provider"
-        rewritten = self.rewrite(normalized)
-        if rewritten == normalized:
-            return normalized, translation_hash, PROMPT_VERSION, "fallback_provider_error"
-        return " ".join(dict.fromkeys((normalized, rewritten))), translation_hash, PROMPT_VERSION, "ok"
+        return normalized, translation_hash, PROMPT_VERSION, "pending_provider"
 
     def normalize_many(self, raws: list[str]) -> list[tuple[str, str, str, str]]:
         """Normalize a batch with bounded concurrency; one failure never blocks ingest."""
@@ -742,7 +827,7 @@ class SnapshotSync:
                 self.store.snapshot(path)
             if not self.repo or not self.token:
                 self.store.set_sync(last_sync=utc_now(), snapshot_path=str(path), last_error=None)
-                if self._truth("FUNES_REQUIRE_DURABLE_ACK"):
+                if self.repo or self._truth("FUNES_REQUIRE_DURABLE_ACK"):
                     return {"uploaded": False, "durable": False, "path": str(path), "reason": "HF storage not configured"}
                 return {"uploaded": False, "durable": True, "path": str(path), "reason": "local durable store"}
             try:
@@ -766,6 +851,195 @@ class SnapshotSync:
                 return {"uploaded": False, "durable": False, "path": str(path), "reason": type(exc).__name__}
 
 
+FINAL_TRANSLATION_STATUSES = {
+    "ok",
+    "skipped_raw_mode",
+    "skipped_non_cjk",
+    "skipped_native_session",
+    "skipped_low_value",
+}
+
+
+def prepare_ingest_documents(app: Any, docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Build the raw-first durable representation without calling a provider."""
+    prepared = []
+    for doc in docs:
+        if not isinstance(doc, dict):
+            raise ValueError("each document must be an object")
+        item = dict(doc)
+        raw = str(item.get("raw_text", item.get("text", "")))
+        if not raw:
+            raise ValueError("raw_text/text is required")
+        metadata = item.get("metadata") or {}
+        if not isinstance(metadata, dict):
+            raise ValueError("metadata must be an object")
+        identity = str(item.get("source_identity") or app.store._identity(item, metadata, raw))
+        item["source_identity"] = identity
+        source_version = str(item.get("source_version", metadata.get("source_version", "")))
+        content_hash = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+        existing = app.store.get(identity)
+        same_final_revision = bool(
+            existing
+            and existing.get("content_hash") == content_hash
+            and str(existing.get("source_version", "")) == source_version
+            and existing.get("translation_status") in FINAL_TRANSLATION_STATUSES
+        )
+        if same_final_revision and not item.get("retrieval_text"):
+            item["retrieval_text"] = existing.get("retrieval_text") or normalize_text(raw)
+            for name in ("translation_hash", "translation_version", "translation_status"):
+                if existing.get(name) is not None:
+                    item.setdefault(name, existing[name])
+            prepared.append(item)
+            continue
+        if item.get("retrieval_text"):
+            prepared.append(item)
+            continue
+        source_type = str(item.get("source_type", item.get("kind", ""))).lower()
+        content_type = str(item.get("content_type", "")).lower()
+        native_session = source_type in {
+            "session",
+            "codex",
+            "codex_session",
+            "pi",
+            "pi_session",
+            "claude",
+            "claude_session",
+        }
+        low_value = content_type in {"tool_call", "tool_result", "shell_output", "progress"}
+        if native_session or low_value:
+            shadow = normalize_text(raw)
+            translation_hash = hashlib.sha256(
+                (raw + app.translator.model + PROMPT_VERSION).encode("utf-8")
+            ).hexdigest()
+            derived = (
+                shadow,
+                translation_hash,
+                PROMPT_VERSION,
+                "skipped_native_session" if native_session else "skipped_low_value",
+            )
+        else:
+            pending_document = getattr(app.translator, "pending_document", None)
+            if callable(pending_document):
+                derived = pending_document(raw)
+            else:
+                translation_hash = hashlib.sha256(
+                    (raw + app.translator.model + PROMPT_VERSION).encode("utf-8")
+                ).hexdigest()
+                derived = normalize_text(raw), translation_hash, PROMPT_VERSION, "pending_provider"
+        shadow, translation_hash, translation_version, translation_status = derived
+        item["retrieval_text"] = shadow
+        item.setdefault("translation_hash", translation_hash)
+        item.setdefault("translation_version", translation_version)
+        item.setdefault("translation_status", translation_status)
+        prepared.append(item)
+    return prepared
+
+
+def _persist_translation_documents(app: Any, documents: list[dict[str, Any]]) -> dict[str, Any]:
+    """Translate and durably write derived fields without ever replacing raw text."""
+    if not documents:
+        return {"attempted": 0, "updated": 0, "durable": True}
+    active = []
+    for selected in documents:
+        current = app.store.get(str(selected["source_identity"]))
+        if not current or current.get("translation_status") != "pending_provider":
+            continue
+        if (
+            current.get("content_hash") == selected.get("content_hash")
+            and str(current.get("source_version", "")) == str(selected.get("source_version", ""))
+        ):
+            active.append(current)
+    if not active:
+        return {"attempted": 0, "updated": 0, "durable": True}
+    derived_values = app.translator.normalize_many([str(item["raw_text"]) for item in active])
+    updates = []
+    for selected, derived in zip(active, derived_values):
+        current = app.store.get(str(selected["source_identity"]))
+        if not current:
+            continue
+        if (
+            current.get("content_hash") != selected.get("content_hash")
+            or str(current.get("source_version", "")) != str(selected.get("source_version", ""))
+        ):
+            # A newer source revision won the race while the provider was in
+            # flight.  Never attach an old shadow to new raw content.
+            continue
+        shadow, translation_hash, translation_version, translation_status = derived
+        if translation_status == "pending_provider":
+            continue
+        updated = dict(current)
+        updated["retrieval_text"] = shadow
+        updated["translation_hash"] = translation_hash
+        updated["translation_version"] = translation_version
+        updated["translation_status"] = translation_status
+        updates.append(updated)
+    if not updates:
+        return {"attempted": len(active), "updated": 0, "durable": True}
+    result = app.store.ingest(updates)
+    changed = [
+        item["source_identity"]
+        for item in result["items"]
+        if item["status"] in {"updated", "derived_updated"}
+    ]
+    canonical = app.store.get_many(changed)
+    if not canonical:
+        return {"attempted": len(active), "updated": 0, "durable": True}
+    sync = app.syncer.upload(canonical)
+    if not sync.get("durable"):
+        app.store.mark_translations_pending(canonical)
+    return {
+        "attempted": len(active),
+        "updated": len(canonical) if sync.get("durable") else 0,
+        "durable": bool(sync.get("durable")),
+        "sync": sync,
+    }
+
+
+def persist_translation_documents(app: Any, documents: list[dict[str, Any]]) -> dict[str, Any]:
+    """Serialize provider work and leave every failed item restart-safe."""
+    lock = getattr(app, "translation_lock", None)
+    try:
+        if lock is None:
+            return _persist_translation_documents(app, documents)
+        with lock:
+            return _persist_translation_documents(app, documents)
+    except Exception:
+        current = app.store.get_many(
+            [str(item.get("source_identity", "")) for item in documents]
+        )
+        app.store.mark_translations_pending(current)
+        return {
+            "attempted": len(documents),
+            "updated": 0,
+            "durable": True,
+            "retry_pending": True,
+        }
+
+
+def ingest_documents(app: Any, docs: list[dict[str, Any]]) -> dict[str, Any]:
+    """Persist every raw source first, then perform a bounded derived pass."""
+    prepared = prepare_ingest_documents(app, docs)
+    result = app.store.ingest(prepared)
+    identities = [str(item["source_identity"]) for item in result["items"]]
+    canonical = app.store.get_many(identities)
+    raw_sync = app.syncer.upload(canonical)
+    result.update(
+        accepted=result["created"] + result["updated"] + result["deduped"],
+        durable=bool(raw_sync.get("durable")),
+        sync=raw_sync,
+    )
+    result["translation"] = {"attempted": 0, "updated": 0, "durable": True}
+    if not result["durable"]:
+        result["error"] = "durability_pending"
+        return result
+    pending = [item for item in canonical if item.get("translation_status") == "pending_provider"]
+    result["translation"] = persist_translation_documents(
+        app,
+        pending[: max(0, int(getattr(app.translator, "max_per_ingest", 0)))],
+    )
+    return result
+
+
 class App:
     def __init__(self):
         # Free Gradio Spaces do not expose /data.  The Hub snapshot remains the
@@ -776,11 +1050,22 @@ class App:
         self.syncer = SnapshotSync(self.store)
         self.restore_result = 0
         self.restore_done = threading.Event()
+        self.reconcile_stop = threading.Event()
+        self.translation_lock = threading.Lock()
+        self.reconcile_interval = max(0.01, float(os.getenv("TRANSLATION_RECONCILE_INTERVAL", "300")))
+        self.restore_thread = None
         if os.getenv("FUNES_LAZY_RESTORE", "false").lower() in {"1", "true", "yes", "on"}:
             self.syncer.restoring = True
-            threading.Thread(target=self._restore_background, name="funes-restore", daemon=True).start()
+            self.restore_thread = threading.Thread(target=self._restore_background, name="funes-restore", daemon=True)
+            self.restore_thread.start()
         else:
             self._restore_background()
+        self.reconcile_thread = threading.Thread(
+            target=self._reconcile_background,
+            name="funes-translation-reconcile",
+            daemon=True,
+        )
+        self.reconcile_thread.start()
 
     def _restore_background(self) -> None:
         try:
@@ -793,7 +1078,33 @@ class App:
             self.syncer.restoring = False
             self.restore_done.set()
 
+    def ingest_documents(self, docs: list[dict[str, Any]]) -> dict[str, Any]:
+        return ingest_documents(self, docs)
+
+    def reconcile_pending(self) -> dict[str, Any]:
+        if self.syncer.restoring or self.syncer.restore_failed:
+            return {"attempted": 0, "updated": 0, "durable": False}
+        limit = self.translator.batch_size * self.translator.concurrency
+        return persist_translation_documents(self, self.store.pending_translations(limit))
+
+    def _reconcile_background(self) -> None:
+        self.restore_done.wait()
+        while not self.reconcile_stop.is_set():
+            try:
+                self.reconcile_pending()
+            except Exception:
+                # Pending state is already durable.  A later interval retries;
+                # never log raw text, provider payloads, or credentials here.
+                pass
+            if self.reconcile_stop.wait(self.reconcile_interval):
+                break
+
     def close(self):
+        self.reconcile_stop.set()
+        if self.reconcile_thread is not threading.current_thread():
+            self.reconcile_thread.join()
+        if self.restore_thread is not None and self.restore_thread is not threading.current_thread():
+            self.restore_thread.join()
         self.store.close()
 
 
@@ -886,31 +1197,8 @@ def make_handler(app: App):
                         docs = [body]
                     if not isinstance(docs, list):
                         raise ValueError("documents must be a list")
-                    # Keep raw_text untouched; retrieval_text is a normalized,
-                    # optional translation shadow used solely by FTS.
-                    prepared = []
-                    normalized = app.translator.normalize_many([
-                        str(doc.get("raw_text", doc.get("text", ""))) for doc in docs
-                    ])
-                    for doc, derived in zip(docs, normalized):
-                        item = dict(doc)
-                        shadow, translation_hash, translation_version, translation_status = derived
-                        if not item.get("retrieval_text"):
-                            item["retrieval_text"] = shadow
-                        item.setdefault("translation_hash", translation_hash)
-                        item.setdefault("translation_version", translation_version)
-                        item.setdefault("translation_status", translation_status)
-                        prepared.append(item)
-                    result = app.store.ingest(prepared)
-                    result["accepted"] = result["created"] + result["updated"] + result["deduped"]
-                    # A remote caller must not receive an ACK that can be lost
-                    # between SQLite commit and HF persistence.  The upload is
-                    # idempotent; retrying the same source identities is safe.
-                    canonical = app.store.get_many(
-                        [str(item.get("source_identity", "")) for item in result["items"]]
-                    )
-                    result["sync"] = app.syncer.upload(canonical)
-                    if not result["sync"].get("durable"):
+                    result = app.ingest_documents(docs)
+                    if not result["durable"]:
                         return self._json(503, {"error": "durability_pending", **result})
                     return self._json(200, result)
                 if self.path in ("/search", "/recall"):

@@ -15,10 +15,10 @@ from service.server import App, Store, Translator, make_handler
 class ServiceTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.old = {k: os.environ.get(k) for k in ("FUNES_DATA_DIR", "FUNES_AUTH_TOKEN", "FUNES_API_TOKEN", "FUNES_STORAGE_KEY", "FUNES_STORAGE_REPO", "FUNES_SNAPSHOT_FILE", "HF_TOKEN", "FUNES_REQUIRE_DURABLE_ACK", "FUNES_ALLOW_EMPTY_REMOTE", "TRANSLATION_BASE_URL", "TRANSLATION_API_KEY", "TRANSLATION_MODEL")}
+        self.old = {k: os.environ.get(k) for k in ("FUNES_DATA_DIR", "FUNES_AUTH_TOKEN", "FUNES_API_TOKEN", "FUNES_STORAGE_KEY", "FUNES_STORAGE_REPO", "FUNES_SNAPSHOT_FILE", "HF_TOKEN", "FUNES_REQUIRE_DURABLE_ACK", "FUNES_ALLOW_EMPTY_REMOTE", "TRANSLATION_BASE_URL", "TRANSLATION_API_KEY", "TRANSLATION_MODEL", "TRANSLATION_MAX_PER_INGEST", "TRANSLATION_RECONCILE_INTERVAL")}
         os.environ["FUNES_DATA_DIR"] = self.tmp.name
         os.environ["FUNES_AUTH_TOKEN"] = "test-token"
-        for k in ("FUNES_API_TOKEN", "FUNES_STORAGE_KEY", "FUNES_STORAGE_REPO", "FUNES_SNAPSHOT_FILE", "HF_TOKEN", "FUNES_REQUIRE_DURABLE_ACK", "FUNES_ALLOW_EMPTY_REMOTE", "TRANSLATION_BASE_URL", "TRANSLATION_API_KEY", "TRANSLATION_MODEL"):
+        for k in ("FUNES_API_TOKEN", "FUNES_STORAGE_KEY", "FUNES_STORAGE_REPO", "FUNES_SNAPSHOT_FILE", "HF_TOKEN", "FUNES_REQUIRE_DURABLE_ACK", "FUNES_ALLOW_EMPTY_REMOTE", "TRANSLATION_BASE_URL", "TRANSLATION_API_KEY", "TRANSLATION_MODEL", "TRANSLATION_MAX_PER_INGEST", "TRANSLATION_RECONCILE_INTERVAL"):
             os.environ.pop(k, None)
 
     def tearDown(self):
@@ -38,6 +38,45 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(store.ingest([changed])["updated"], 1)
         self.assertEqual(store.count(), 1)
         self.assertEqual(store.get("a.md")["raw_text"], "hello revised")
+        store.close()
+
+    def test_translation_defaults_to_background_only(self):
+        store = Store(self.tmp.name)
+        try:
+            self.assertEqual(Translator(store).max_per_ingest, 0)
+        finally:
+            store.close()
+
+    def test_same_revision_updates_only_derived_fields_in_place(self):
+        store = Store(self.tmp.name)
+        raw = "原始正文"
+        original = {
+            "source_identity": "derived-only",
+            "source_version": "v1",
+            "raw_text": raw,
+            "retrieval_text": raw,
+            "translation_hash": "same-hash",
+            "translation_version": "v1",
+            "translation_status": "pending_provider",
+        }
+        self.assertEqual(store.ingest([original])["created"], 1)
+        reconciled = dict(
+            original,
+            retrieval_text=raw + " english retrieval",
+            translation_status="ok",
+        )
+        result = store.ingest([reconciled])
+        item = store.get("derived-only")
+        self.assertEqual(result["updated"], 1)
+        self.assertEqual(result["items"][0]["status"], "derived_updated")
+        self.assertEqual(store.count(), 1)
+        self.assertEqual(item["raw_text"], raw)
+        self.assertEqual(item["retrieval_text"], raw + " english retrieval")
+        self.assertEqual(item["translation_status"], "ok")
+        # An older/raw pending delta can restore later without regressing the
+        # successfully reconciled shadow.
+        self.assertEqual(store.ingest([original])["deduped"], 1)
+        self.assertEqual(store.get("derived-only")["translation_status"], "ok")
         store.close()
 
     def test_multiple_chunks_same_source_path(self):
@@ -146,6 +185,16 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(status, 503)
         self.assertEqual(result["error"], "durability_pending")
         self.assertFalse(result["sync"]["durable"])
+
+    def test_configured_remote_without_hf_token_is_not_durable(self):
+        from service.server import SnapshotSync
+        store = Store(self.tmp.name)
+        store.ingest([{"source_identity": "remote", "raw_text": "must reach hub"}])
+        os.environ["FUNES_STORAGE_REPO"] = "owner/private"
+        result = SnapshotSync(store).upload(store.get_many(["remote"]))
+        self.assertFalse(result["durable"])
+        self.assertEqual(result["reason"], "HF storage not configured")
+        store.close()
 
     def test_encrypted_source_snapshot_roundtrip_hides_plaintext(self):
         from service.server import SnapshotSync

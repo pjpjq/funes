@@ -51,12 +51,20 @@ class SyncDaemon:
         signal.signal(signal.SIGTERM,stop); signal.signal(signal.SIGINT,stop)
         while self.running:
             self.scan_once()
-            # Drain a bounded number of batches on each pass.  If the remote is
-            # offline, flush_once leaves the durable queue untouched and the next
-            # reconciliation retries with exponential backoff.
-            for _ in range(8):
-                if not self.flush_once():
-                    break
+            # A one-shot backfill must drain the durable queue completely when
+            # the remote is available; otherwise the first startup would leave
+            # most history pending until the next 5-minute pass.  The continuous
+            # daemon keeps a bounded batch count so it remains lightweight.  If
+            # the remote is offline, flush_once leaves the queue intact and this
+            # exits promptly for a later retry.
+            if once:
+                while self.store.stats()["pending"]:
+                    if not self.flush_once():
+                        break
+            else:
+                for _ in range(8):
+                    if not self.flush_once():
+                        break
             if self.store.stats()["pending"] == 0 and self.client.health():
                 try:
                     self.client.sync_snapshot()

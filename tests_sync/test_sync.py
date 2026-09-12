@@ -27,3 +27,27 @@ def test_launchagent(monkeypatch):
     monkeypatch.setenv("FUNES_API_TOKEN", "redacted-test-token")
     d=render_plist('/usr/bin/python3'); assert d['Label']=='com.funes.sync'; assert d['RunAtLoad']
     assert "FUNES_API_TOKEN" not in d["EnvironmentVariables"]
+
+
+def test_one_shot_backfill_drains_all_pending(tmp_path):
+    class Client:
+        def ingest(self, records):
+            return {"accepted": len(records)}
+
+        def health(self):
+            return False
+
+    c=cfg(tmp_path)
+    c.auto_discover=False
+    s=Store(config=c)
+    p=tmp_path/'x.jsonl'; p.write_text('{"role":"user","text":"one"}\n')
+    from sync.discovery import Source
+    chunks=parse_file(Source('pi:~/x','pi',p,'d'))
+    s.upsert_chunks(chunks)
+    # Add a second record so one flush pass cannot accidentally prove the loop.
+    p.write_text('{"role":"user","text":"one"}\n{"role":"assistant","text":"two"}\n')
+    s.upsert_chunks(parse_file(Source('pi:~/x','pi',p,'d')))
+    assert s.stats()['pending'] == 2
+    SyncDaemon(c, s, Client()).run(once=True)
+    assert s.stats()['pending'] == 0
+    s.close()

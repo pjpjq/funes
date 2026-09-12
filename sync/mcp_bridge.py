@@ -1,20 +1,39 @@
 from __future__ import annotations
 import json,sys,os
+import subprocess
 from urllib import request
 from .store import Store
 
+def _keychain(service):
+    if sys.platform != "darwin":
+        return ""
+    try:
+        return subprocess.run(
+            ["/usr/bin/security", "find-generic-password", "-a", os.environ.get("USER", ""), "-s", service, "-w"],
+            check=False, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+        ).stdout.rstrip("\n")
+    except OSError:
+        return ""
+
 def _remote_call(path, payload):
     base=os.environ.get("FUNES_REMOTE_URL", "").rstrip("/")
-    token=os.environ.get("FUNES_API_TOKEN", "")
+    token=os.environ.get("FUNES_API_TOKEN", "") or _keychain("funes-api-token")
+    hub_token=os.environ.get("FUNES_HF_TOKEN", "") or os.environ.get("HF_TOKEN", "") or _keychain("funes-hf-token")
     if not base or not token:
         return None
-    req=request.Request(base+path, data=json.dumps(payload,ensure_ascii=False).encode(), headers={"Content-Type":"application/json","Authorization":"Bearer "+token,"User-Agent":"funes-sync-mcp/1"}, method="POST")
+    headers={"Content-Type":"application/json","User-Agent":"funes-sync-mcp/1"}
+    if hub_token:
+        headers["Authorization"]="Bearer "+hub_token
+        headers["X-Funes-Authorization"]="Bearer "+token
+    else:
+        headers["Authorization"]="Bearer "+token
+    req=request.Request(base+path, data=json.dumps(payload,ensure_ascii=False).encode(), headers=headers, method="POST")
     with request.urlopen(req, timeout=30) as resp:
         return json.loads(resp.read() or b"{}")
 
 def serve(store=None):
     store=store or Store()
-    remote=bool(os.environ.get("FUNES_REMOTE_URL") and os.environ.get("FUNES_API_TOKEN"))
+    remote=bool(os.environ.get("FUNES_REMOTE_URL") and (os.environ.get("FUNES_API_TOKEN") or _keychain("funes-api-token")))
     for line in sys.stdin:
         try:
             msg=json.loads(line); method=msg.get("method"); ident=msg.get("id"); p=msg.get("params") or {}
@@ -25,7 +44,7 @@ def serve(store=None):
                 name=p.get("name"); args=p.get("arguments") or {}
                 if remote:
                     if name=="recall": val=_remote_call("/search", args)
-                    elif name=="get": val=_remote_call("/get", {"id":args.get("record_id","")})
+                    elif name=="get": val=_remote_call("/get", {"session_id":args.get("record_id","")})
                     elif name=="status": val=_remote_call("/sync/status", {})
                     else: val={"error":"unknown_tool"}
                 else:

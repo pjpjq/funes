@@ -31,6 +31,43 @@ PROMPT_VERSION = "funes-retrieval-v1"
 LANGUAGE_MODE = os.getenv("FUNES_RETRIEVAL_LANGUAGE_MODE", "auto").lower()
 INDEX_LOCK = threading.Lock()
 
+# The default Funes embedding model is English-oriented.  Keep this small,
+# deterministic fallback for installations without a translation provider so
+# Chinese queries do not enter the slow CJK tokenizer path.  Technical names
+# and identifiers are always collected separately and remain verbatim.
+CHINESE_RETRIEVAL_TERMS = (
+    ("previous_response_id", "previous_response_id"),
+    ("第二轮", "second turn"),
+    ("第二次", "second turn"),
+    ("上下文丢失", "context loss"),
+    ("上下文丢了", "context loss"),
+    ("丢上下文", "context loss"),
+    ("上下文", "context"),
+    ("高延迟", "high latency"),
+    ("延迟", "latency"),
+    ("连接", "connection"),
+    ("配置", "configuration settings"),
+    ("设置", "configuration settings"),
+    ("默认", "default"),
+    ("推理", "reasoning inference"),
+    ("记忆", "memory"),
+    ("会话", "conversation session"),
+    ("历史", "history previous"),
+    ("之前", "previous prior"),
+    ("上次", "previous last time"),
+    ("以前", "previous earlier"),
+    ("为什么", "why cause"),
+    ("为何", "why cause"),
+    ("是什么", "what is"),
+    ("讨论", "discussion"),
+    ("决定", "decision"),
+    ("测试", "test result"),
+    ("偏好", "preference"),
+    ("部署", "deployment deployed"),
+    ("丢", "loss lost"),
+    ("办公室", "office"),
+)
+
 
 def cjk_ratio(text: str) -> float:
     if not text:
@@ -39,7 +76,7 @@ def cjk_ratio(text: str) -> float:
 
 
 def query_text(raw: str) -> str:
-    """Expand Chinese queries; original text is always retained for BM25."""
+    """Build an ASCII retrieval shadow while leaving the caller's raw query intact."""
     if LANGUAGE_MODE == "raw":
         return raw
     if LANGUAGE_MODE == "auto" and cjk_ratio(raw) < TRANSLATION_THRESHOLD:
@@ -64,7 +101,18 @@ def query_text(raw: str) -> str:
             translated = obj.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
         except (OSError, ValueError, KeyError, IndexError):
             translated = ""
-    return " ".join(x for x in (raw, translated, " ".join(entities)) if x)
+    # A configured provider is preferred.  If it is unavailable, use the
+    # deterministic phrase map above; sending raw CJK to the English embedding
+    # backend can take longer than the Space request deadline.
+    fallback = []
+    for phrase, english in CHINESE_RETRIEVAL_TERMS:
+        if phrase in raw:
+            fallback.append(english)
+    # Do not put a CJK-only shadow back into the native CLI.  The raw query is
+    # still returned to clients and the original source text remains untouched.
+    translated_ascii = re.sub(r"[^\x00-\x7F]+", " ", translated).strip()
+    shadow = " ".join(x for x in (translated_ascii, " ".join(fallback), " ".join(entities)) if x).strip()
+    return shadow or "memory context retrieval"
 
 
 def run(*args: str, timeout: int = 180) -> tuple[int, str, str]:

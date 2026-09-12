@@ -6,6 +6,21 @@ from http.server import ThreadingHTTPServer
 import space.server as bridge
 
 
+def test_chinese_query_uses_ascii_retrieval_shadow(monkeypatch):
+    monkeypatch.setattr(bridge, "LANGUAGE_MODE", "auto")
+    query = bridge.query_text("CPA 第二轮为什么丢上下文？")
+    assert "CPA" in query
+    assert "second turn" in query
+    assert "context loss" in query
+    assert not any("\u4e00" <= char <= "\u9fff" for char in query)
+
+
+def test_mixed_english_query_is_left_unchanged(monkeypatch):
+    monkeypatch.setattr(bridge, "LANGUAGE_MODE", "auto")
+    query = "Codex previous_response_id context loss"
+    assert bridge.query_text(query) == query
+
+
 def _request(server, payload, token="test-token"):
     conn = HTTPConnection(*server.server_address)
     conn.request(

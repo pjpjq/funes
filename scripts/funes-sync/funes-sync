@@ -1,0 +1,6 @@
+#!/bin/sh
+# Compatibility entry point; the unified package lives in sync/.
+set -eu
+ROOT=${FUNES_SYNC_ROOT:-$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)}
+export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"
+exec "${PYTHON:-python3}" -m sync "$@"

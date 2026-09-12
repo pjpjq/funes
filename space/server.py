@@ -99,7 +99,9 @@ def query_text(raw: str) -> str:
     translated = ""
     if base and key and model:
         payload = json.dumps({"model": model, "messages": [{"role": "user", "content": prompt}], "temperature": 0}).encode()
-        req = urllib.request.Request(base.rstrip("/") + "/v1/chat/completions", data=payload, headers={"Authorization": "Bearer " + key, "Content-Type": "application/json"})
+        base_url = base.rstrip("/")
+        endpoint = base_url + ("/chat/completions" if base_url.endswith("/v1") else "/v1/chat/completions")
+        req = urllib.request.Request(endpoint, data=payload, headers={"Authorization": "Bearer " + key, "Content-Type": "application/json"})
         try:
             with urllib.request.urlopen(req, timeout=12) as response:
                 obj = json.load(response)
@@ -116,7 +118,11 @@ def query_text(raw: str) -> str:
     # Do not put a CJK-only shadow back into the native CLI.  The raw query is
     # still returned to clients and the original source text remains untouched.
     translated_ascii = re.sub(r"[^\x00-\x7F]+", " ", translated).strip()
-    shadow = " ".join(x for x in (translated_ascii, " ".join(fallback), " ".join(entities)) if x).strip()
+    pieces = []
+    for piece in (translated_ascii, " ".join(fallback), " ".join(entities)):
+        if piece and piece not in pieces:
+            pieces.append(piece)
+    shadow = " ".join(pieces).strip()
     return shadow or "memory context retrieval"
 
 

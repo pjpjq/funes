@@ -1,0 +1,381 @@
+{
+  "status": "completed",
+  "corpus_memories": 60,
+  "queries": 20,
+  "index_seconds": 56.78,
+  "backend": "native Funes Lance hybrid via local MCP; BAAI/bge-small-en-v1.5 default model",
+  "shadow": {
+    "recall@1": 0.65,
+    "recall@3": 0.9,
+    "recall@5": 0.95,
+    "mean_seconds": 0.226
+  },
+  "rows": [
+    {
+      "mode": "raw",
+      "query": "CPA 第二轮为什么丢上下文？",
+      "retrieval_query": "CPA 第二轮为什么丢上下文？",
+      "expected": "codex-cpa",
+      "rank": 1,
+      "seconds": 0.911,
+      "preview": "[2026-09-12T00:00:01Z] codex <bench>/bench-co text  score=0.999\n  → get bench-codex-cpa --from 0 --to 3 --memory /var/folders/n5/tj4x3v8x7kj8fp6dx6yq5rww0000gn/T/funes-e2e-bench.q0qjki2w/home/memory\n我把 CPA 部署在 Northflank 上，第二轮 "
+    },
+    {
+      "mode": "raw",
+      "query": "之前 Pi 里讨论过的 Tailscale 延迟",
+      "retrieval_query": "之前 Pi 里讨论过的 Tailscale 延迟",
+      "expected": "pi-tailscale",
+      "rank": 3,
+      "seconds": 0.226,
+      "preview": "[2026-09-12T00:00:01Z] codex <bench>/bench-pi text  score=0.813\n  → get bench-pi-surge --from 0 --to 3 --memory /var/folders/n5/tj4x3v8x7kj8fp6dx6yq5rww0000gn/T/funes-e2e-bench.q0qjki2w/home/memory\nPi 里记录过 Surge 与 Tailscale use"
+    },
+    {
+      "mode": "raw",
+      "query": "Gemini 默认 reasoning 配置是什么？",
+      "retrieval_query": "Gemini 默认 reasoning 配置是什么？",
+      "expected": "codex-gemini",
+      "rank": 1,
+      "seconds": 0.254,
+      "preview": "[2026-09-12T00:00:01Z] codex <bench>/bench-co text  score=0.983\n  → get bench-codex-gemini --from 0 --to 3 --memory /var/folders/n5/tj4x3v8x7kj8fp6dx6yq5rww0000gn/T/funes-e2e-bench.q0qjki2w/home/memory\n默认 Gemini 使用 High reasoni"
+    },
+    {
+      "mode": "raw",
+      "query": "chatcmpl-* 和 previous_response_id 的关系",
+      "retrieval_query": "chatcmpl-* 和 previous_response_id 的关系",
+      "expected": "codex-chatcmpl",
+      "rank": 1,
+      "seconds": 0.273,
+      "preview": "[2026-09-12T00:00:01Z] codex <bench>/bench-co text  score=0.994\n  → get bench-codex-chatcmpl --from 0 --to 3 --memory /var/folders/n5/tj4x3v8x7kj8fp6dx6yq5rww0000gn/T/funes-e2e-bench.q0qjki2w/home/memory\nCodex 调用 CPA 时 previous"
+    },
+    {
+      "mode": "raw",
+      "query": "Claude 的后台任务如何保持运行？",
+      "retrieval_query": "Claude 的后台任务如何保持运行？",
+      "expected": "claude-launchd",
+      "rank": 1,
+      "seconds": 0.239,
+      "preview": "[2026-09-12T00:00:01Z] codex <bench>/bench-cl text  score=0.940\n  → get bench-claude-launchd --from 0 --to 3 --memory /var/folders/n5/tj4x3v8x7kj8fp6dx6yq5rww0000gn/T/funes-e2e-bench.q0qjki2w/home/memory\nClaude Code 的 LaunchAge"
+    },
+    {
+      "mode": "raw",
+      "query": "HF Space 重启后如何恢复记忆？",
+      "retrieval_query": "HF Space 重启后如何恢复记忆？",
+      "expected": "codex-hf",
+      "rank": 1,
+      "seconds": 0.25,
+      "preview": "[2026-09-12T00:00:01Z] codex <bench>/bench-co text  score=0.968\n  → get bench-codex-hf --from 0 --to 3 --memory /var/folders/n5/tj4x3v8x7kj8fp6dx6yq5rww0000gn/T/funes-e2e-bench.q0qjki2w/home/memory\nHugging Face Space 重启后用私有 dat"
+    },
+    {
+      "mode": "raw",
+      "query": "Pi 和 Surge 共存要注意什么？",
+      "retrieval_query": "Pi 和 Surge 共存要注意什么？",
+      "expected": "pi-surge",
+      "rank": 1,
+      "seconds": 0.215,
+      "preview": "[2026-09-12T00:00:01Z] codex <bench>/bench-pi text  score=0.983\n  → get bench-pi-surge --from 0 --to 3 --memory /var/folders/n5/tj4x3v8x7kj8fp6dx6yq5rww0000gn/T/funes-e2e-bench.q0qjki2w/home/memory\nPi 里记录过 Surge 与 Tailscale use"
+    },
+    {
+      "mode": "raw",
+      "query": "social_signal 查询前为什么要看字段？",
+      "retrieval_query": "social_signal 查询前为什么要看字段？",
+      "expected": "codex-d1",
+      "rank": 1,
+      "seconds": 0.253,
+      "preview": "[2026-09-12T00:00:01Z] codex <bench>/bench-co text  score=0.970\n  → get bench-codex-d1 --from 0 --to 3 --memory /var/folders/n5/tj4x3v8x7kj8fp6dx6yq5rww0000gn/T/funes-e2e-bench.q0qjki2w/home/memory\nD1 social_signal 查询必须先 SHOW C"
+    },
+    {
+      "mode": "raw",
+      "query": "tool_result 在检索中应该怎样处理？",
+      "retrieval_query": "tool_result 在检索中应该怎样处理？",
+      "expected": "claude-bm25",
+      "rank": 1,
+      "seconds": 0.254,
+      "preview": "[2026-09-12T00:00:01Z] codex <bench>/bench-cl text  score=0.970\n  → get bench-claude-bm25 --from 0 --to 3 --memory /var/folders/n5/tj4x3v8x7kj8fp6dx6yq5rww0000gn/T/funes-e2e-bench.q0qjki2w/home/memory\nClaude 记忆检索默认保留 BM25，并把 to"
+    },
+    {
+      "mode": "raw",
+      "query": "断网时 Pi 的记忆会丢吗？",
+      "retrieval_query": "断网时 Pi 的记忆会丢吗？",
+      "expected": "pi-offline",
+      "rank": 1,
+      "seconds": 0.254,
+      "preview": "[2026-09-12T00:00:01Z] codex <bench>/bench-pi text  score=0.815\n  → get bench-pi-offline --from 0 --to 3 --memory /var/folders/n5/tj4x3v8x7kj8fp6dx6yq5rww0000gn/T/funes-e2e-bench.q0qjki2w/home/memory\nPi 离线时把上传放入 pending queue，恢"
+    },
+    {
+      "mode": "raw",
+      "query": "部署失败怎样自动恢复？",
+      "retrieval_query": "部署失败怎样自动恢复？",
+      "expected": "codex-rollback",
+      "rank": 1,
+      "seconds": 0.235,
+      "preview": "[2026-09-12T00:00:01Z] codex <bench>/bench-co text  score=0.755\n  → get bench-codex-rollback --from 0 --to 3 --memory /var/folders/n5/tj4x3v8x7kj8fp6dx6yq5rww0000gn/T/funes-e2e-bench.q0qjki2w/home/memory\n部署必须带 health probe 和 au"
+    },
+    {
+      "mode": "raw",
+      "query": "raw_text 和 retrieval_text 谁是真源？",
+      "retrieval_query": "raw_text 和 retrieval_text 谁是真源？",
+      "expected": "claude-raw",
+      "rank": 1,
+      "seconds": 0.268,
+      "preview": "[2026-09-12T00:00:01Z] codex <bench>/bench-cl text  score=0.997\n  → get bench-claude-raw --from 0 --to 3 --memory /var/folders/n5/tj4x3v8x7kj8fp6dx6yq5rww0000gn/T/funes-e2e-bench.q0qjki2w/home/memory\n原始 session 永远是 source of tr"
+    },
+    {
+      "mode": "raw",
+      "query": "Pi 能不能搜 Codex？",
+      "retrieval_query": "Pi 能不能搜 Codex？",
+      "expected": "pi-cross",
+      "rank": 1,
+      "seconds": 0.24,
+      "preview": "[2026-09-12T00:00:01Z] codex <bench>/bench-pi text  score=0.991\n  → get bench-pi-cross --from 0 --to 3 --memory /var/folders/n5/tj4x3v8x7kj8fp6dx6yq5rww0000gn/T/funes-e2e-bench.q0qjki2w/home/memory\nPi 查询 Codex 历史时保留 source_agen"
+    },
+    {
+      "mode": "raw",
+      "query": "多台 Mac 如何避免泄露硬件标识？",
+      "retrieval_query": "多台 Mac 如何避免泄露硬件标识？",
+      "expected": "codex-device",
+      "rank": 1,
+      "seconds": 0.255,
+      "preview": "[2026-09-12T00:00:01Z] codex <bench>/bench-co text  score=0.407\n  → get bench-codex-device --from 0 --to 3 --memory /var/folders/n5/tj4x3v8x7kj8fp6dx6yq5rww0000gn/T/funes-e2e-bench.q0qjki2w/home/memory\n多台 Mac 使用 privacy-safe de"
+    },
+    {
+      "mode": "raw",
+      "query": "Claude 扫描时哪些文件不能上传？",
+      "retrieval_query": "Claude 扫描时哪些文件不能上传？",
+      "expected": "claude-secret",
+      "rank": 1,
+      "seconds": 0.244,
+      "preview": "[2026-09-12T00:00:01Z] codex <bench>/bench-cl text  score=0.988\n  → get bench-claude-secret --from 0 --to 3 --memory /var/folders/n5/tj4x3v8x7kj8fp6dx6yq5rww0000gn/T/funes-e2e-bench.q0qjki2w/home/memory\nClaude 项目扫描要排除 auth.json"
+    },
+    {
+      "mode": "raw",
+      "query": "watcher 监听哪些变化？",
+      "retrieval_query": "watcher 监听哪些变化？",
+      "expected": "distractor-watcher-0",
+      "rank": 1,
+      "seconds": 0.21,
+      "preview": "[2026-09-12T00:00:01Z] codex <bench>/bench-di text  score=0.065\n  → get bench-distractor-watcher-0 --from 0 --to 3 --memory /var/folders/n5/tj4x3v8x7kj8fp6dx6yq5rww0000gn/T/funes-e2e-bench.q0qjki2w/home/memory\n文件 watcher 只处理 cr"
+    },
+    {
+      "mode": "raw",
+      "query": "重复扫描如何去重？",
+      "retrieval_query": "重复扫描如何去重？",
+      "expected": "distractor-dedupe-0",
+      "rank": null,
+      "seconds": 0.238,
+      "preview": "[2026-09-12T00:00:01Z] codex <bench>/bench-cl text  score=0.122\n  → get bench-claude-raw --from 0 --to 3 --memory /var/folders/n5/tj4x3v8x7kj8fp6dx6yq5rww0000gn/T/funes-e2e-bench.q0qjki2w/home/memory\n原始 session 永远是 source of tr"
+    },
+    {
+      "mode": "raw",
+      "query": "换 embedding 模型如何重建？",
+      "retrieval_query": "换 embedding 模型如何重建？",
+      "expected": "distractor-reindex-0",
+      "rank": null,
+      "seconds": 0.234,
+      "preview": "[2026-09-12T00:00:01Z] codex <bench>/bench-co text  score=0.974\n  → get bench-codex-hf --from 0 --to 3 --memory /var/folders/n5/tj4x3v8x7kj8fp6dx6yq5rww0000gn/T/funes-e2e-bench.q0qjki2w/home/memory\nHugging Face Space 重启后用私有 dat"
+    },
+    {
+      "mode": "raw",
+      "query": "远程 MCP 挂了怎么办？",
+      "retrieval_query": "远程 MCP 挂了怎么办？",
+      "expected": "distractor-mcp-0",
+      "rank": 1,
+      "seconds": 0.255,
+      "preview": "[2026-09-12T00:00:01Z] codex <bench>/bench-di text  score=0.809\n  → get bench-distractor-mcp-0 --from 0 --to 3 --memory /var/folders/n5/tj4x3v8x7kj8fp6dx6yq5rww0000gn/T/funes-e2e-bench.q0qjki2w/home/memory\n远程 MCP 不可用时使用本地 stdio"
+    },
+    {
+      "mode": "raw",
+      "query": "日志时区怎么对齐？",
+      "retrieval_query": "日志时区怎么对齐？",
+      "expected": "distractor-logs-0",
+      "rank": 1,
+      "seconds": 0.243,
+      "preview": "[2026-09-12T00:00:01Z] codex <bench>/bench-di text  score=0.985\n  → get bench-distractor-logs-0 --from 0 --to 3 --memory /var/folders/n5/tj4x3v8x7kj8fp6dx6yq5rww0000gn/T/funes-e2e-bench.q0qjki2w/home/memory\nGrafana Loki 查询按 UTC"
+    },
+    {
+      "mode": "shadow",
+      "query": "CPA 第二轮为什么丢上下文？",
+      "retrieval_query": "second turn context loss context why cause loss lost CPA",
+      "expected": "codex-cpa",
+      "rank": 2,
+      "seconds": 0.249,
+      "preview": "[2026-09-12T00:00:01Z] codex <bench>/bench-co text  score=0.996\n  → get bench-codex-chatcmpl --from 0 --to 3 --memory /var/folders/n5/tj4x3v8x7kj8fp6dx6yq5rww0000gn/T/funes-e2e-bench.q0qjki2w/home/memory\nCodex 调用 CPA 时 previous"
+    },
+    {
+      "mode": "shadow",
+      "query": "之前 Pi 里讨论过的 Tailscale 延迟",
+      "retrieval_query": "latency previous prior discussion Pi Tailscale",
+      "expected": "pi-tailscale",
+      "rank": 3,
+      "seconds": 0.246,
+      "preview": "[2026-09-12T00:00:01Z] codex <bench>/bench-pi text  score=0.099\n  → get bench-pi-surge --from 0 --to 3 --memory /var/folders/n5/tj4x3v8x7kj8fp6dx6yq5rww0000gn/T/funes-e2e-bench.q0qjki2w/home/memory\nPi 里记录过 Surge 与 Tailscale use"
+    },
+    {
+      "mode": "shadow",
+      "query": "Gemini 默认 reasoning 配置是什么？",
+      "retrieval_query": "configuration settings default what is Gemini reasoning",
+      "expected": "codex-gemini",
+      "rank": 1,
+      "seconds": 0.244,
+      "preview": "[2026-09-12T00:00:01Z] codex <bench>/bench-co text  score=0.702\n  → get bench-codex-gemini --from 0 --to 3 --memory /var/folders/n5/tj4x3v8x7kj8fp6dx6yq5rww0000gn/T/funes-e2e-bench.q0qjki2w/home/memory\n默认 Gemini 使用 High reasoni"
+    },
+    {
+      "mode": "shadow",
+      "query": "chatcmpl-* 和 previous_response_id 的关系",
+      "retrieval_query": "chatcmpl-* 和 previous_response_id 的关系",
+      "expected": "codex-chatcmpl",
+      "rank": 1,
+      "seconds": 0.27,
+      "preview": "[2026-09-12T00:00:01Z] codex <bench>/bench-co text  score=0.994\n  → get bench-codex-chatcmpl --from 0 --to 3 --memory /var/folders/n5/tj4x3v8x7kj8fp6dx6yq5rww0000gn/T/funes-e2e-bench.q0qjki2w/home/memory\nCodex 调用 CPA 时 previous"
+    },
+    {
+      "mode": "shadow",
+      "query": "Claude 的后台任务如何保持运行？",
+      "retrieval_query": "background task keep running how to keep Claude",
+      "expected": "claude-launchd",
+      "rank": 2,
+      "seconds": 0.227,
+      "preview": "[2026-09-12T00:00:01Z] codex <bench>/bench-cl text  score=0.534\n  → get bench-claude-bm25 --from 0 --to 3 --memory /var/folders/n5/tj4x3v8x7kj8fp6dx6yq5rww0000gn/T/funes-e2e-bench.q0qjki2w/home/memory\nClaude 记忆检索默认保留 BM25，并把 to"
+    },
+    {
+      "mode": "shadow",
+      "query": "HF Space 重启后如何恢复记忆？",
+      "retrieval_query": "after restart memory HF Space",
+      "expected": "codex-hf",
+      "rank": 1,
+      "seconds": 0.212,
+      "preview": "[2026-09-12T00:00:01Z] codex <bench>/bench-co text  score=0.883\n  → get bench-codex-hf --from 0 --to 3 --memory /var/folders/n5/tj4x3v8x7kj8fp6dx6yq5rww0000gn/T/funes-e2e-bench.q0qjki2w/home/memory\nHugging Face Space 重启后用私有 dat"
+    },
+    {
+      "mode": "shadow",
+      "query": "Pi 和 Surge 共存要注意什么？",
+      "retrieval_query": "coexistence considerations Pi Surge",
+      "expected": "pi-surge",
+      "rank": 1,
+      "seconds": 0.214,
+      "preview": "[2026-09-12T00:00:01Z] codex <bench>/bench-pi text  score=0.393\n  → get bench-pi-surge --from 0 --to 3 --memory /var/folders/n5/tj4x3v8x7kj8fp6dx6yq5rww0000gn/T/funes-e2e-bench.q0qjki2w/home/memory\nPi 里记录过 Surge 与 Tailscale use"
+    },
+    {
+      "mode": "shadow",
+      "query": "social_signal 查询前为什么要看字段？",
+      "retrieval_query": "query fields schema why cause social_signal",
+      "expected": "codex-d1",
+      "rank": 1,
+      "seconds": 0.245,
+      "preview": "[2026-09-12T00:00:01Z] codex <bench>/bench-co text  score=0.803\n  → get bench-codex-d1 --from 0 --to 3 --memory /var/folders/n5/tj4x3v8x7kj8fp6dx6yq5rww0000gn/T/funes-e2e-bench.q0qjki2w/home/memory\nD1 social_signal 查询必须先 SHOW C"
+    },
+    {
+      "mode": "shadow",
+      "query": "tool_result 在检索中应该怎样处理？",
+      "retrieval_query": "retrieval handle tool_result",
+      "expected": "claude-bm25",
+      "rank": 1,
+      "seconds": 0.21,
+      "preview": "[2026-09-12T00:00:01Z] codex <bench>/bench-cl text  score=0.763\n  → get bench-claude-bm25 --from 0 --to 3 --memory /var/folders/n5/tj4x3v8x7kj8fp6dx6yq5rww0000gn/T/funes-e2e-bench.q0qjki2w/home/memory\nClaude 记忆检索默认保留 BM25，并把 to"
+    },
+    {
+      "mode": "shadow",
+      "query": "断网时 Pi 的记忆会丢吗？",
+      "retrieval_query": "when offline lost memory loss lost Pi",
+      "expected": "pi-offline",
+      "rank": 1,
+      "seconds": 0.207,
+      "preview": "[2026-09-12T00:00:01Z] codex <bench>/bench-pi text  score=0.991\n  → get bench-pi-offline --from 0 --to 3 --memory /var/folders/n5/tj4x3v8x7kj8fp6dx6yq5rww0000gn/T/funes-e2e-bench.q0qjki2w/home/memory\nPi 离线时把上传放入 pending queue，恢"
+    },
+    {
+      "mode": "shadow",
+      "query": "部署失败怎样自动恢复？",
+      "retrieval_query": "automatic recovery deployment deployed",
+      "expected": "codex-rollback",
+      "rank": null,
+      "seconds": 0.213,
+      "preview": "[2026-09-12T00:00:01Z] codex <bench>/bench-di text  score=0.025\n  → get bench-distractor-config-1 --from 0 --to 3 --memory /var/folders/n5/tj4x3v8x7kj8fp6dx6yq5rww0000gn/T/funes-e2e-bench.q0qjki2w/home/memory\n配置文件不保存 API key，只保"
+    },
+    {
+      "mode": "shadow",
+      "query": "raw_text 和 retrieval_text 谁是真源？",
+      "retrieval_query": "raw_text retrieval_text",
+      "expected": "claude-raw",
+      "rank": 1,
+      "seconds": 0.238,
+      "preview": "[2026-09-12T00:00:01Z] codex <bench>/bench-cl text  score=0.996\n  → get bench-claude-raw --from 0 --to 3 --memory /var/folders/n5/tj4x3v8x7kj8fp6dx6yq5rww0000gn/T/funes-e2e-bench.q0qjki2w/home/memory\n原始 session 永远是 source of tr"
+    },
+    {
+      "mode": "shadow",
+      "query": "Pi 能不能搜 Codex？",
+      "retrieval_query": "can search Pi Codex",
+      "expected": "pi-cross",
+      "rank": 1,
+      "seconds": 0.228,
+      "preview": "[2026-09-12T00:00:01Z] codex <bench>/bench-pi text  score=0.978\n  → get bench-pi-cross --from 0 --to 3 --memory /var/folders/n5/tj4x3v8x7kj8fp6dx6yq5rww0000gn/T/funes-e2e-bench.q0qjki2w/home/memory\nPi 查询 Codex 历史时保留 source_agen"
+    },
+    {
+      "mode": "shadow",
+      "query": "多台 Mac 如何避免泄露硬件标识？",
+      "retrieval_query": "hardware identifier multiple avoid leak Mac",
+      "expected": "codex-device",
+      "rank": 1,
+      "seconds": 0.243,
+      "preview": "[2026-09-12T00:00:01Z] codex <bench>/bench-co text  score=0.013\n  → get bench-codex-device --from 0 --to 3 --memory /var/folders/n5/tj4x3v8x7kj8fp6dx6yq5rww0000gn/T/funes-e2e-bench.q0qjki2w/home/memory\n多台 Mac 使用 privacy-safe de"
+    },
+    {
+      "mode": "shadow",
+      "query": "Claude 扫描时哪些文件不能上传？",
+      "retrieval_query": "must not upload scan file upload Claude",
+      "expected": "claude-secret",
+      "rank": 1,
+      "seconds": 0.221,
+      "preview": "[2026-09-12T00:00:01Z] codex <bench>/bench-cl text  score=0.765\n  → get bench-claude-secret --from 0 --to 3 --memory /var/folders/n5/tj4x3v8x7kj8fp6dx6yq5rww0000gn/T/funes-e2e-bench.q0qjki2w/home/memory\nClaude 项目扫描要排除 auth.json"
+    },
+    {
+      "mode": "shadow",
+      "query": "watcher 监听哪些变化？",
+      "retrieval_query": "watcher",
+      "expected": "distractor-watcher-0",
+      "rank": 1,
+      "seconds": 0.188,
+      "preview": "[2026-09-12T00:00:01Z] codex <bench>/bench-di text  score=0.806\n  → get bench-distractor-watcher-0 --from 0 --to 3 --memory /var/folders/n5/tj4x3v8x7kj8fp6dx6yq5rww0000gn/T/funes-e2e-bench.q0qjki2w/home/memory\n文件 watcher 只处理 cr"
+    },
+    {
+      "mode": "shadow",
+      "query": "重复扫描如何去重？",
+      "retrieval_query": "repeated scan how to deduplicate scan duplicate",
+      "expected": "distractor-dedupe-0",
+      "rank": 3,
+      "seconds": 0.212,
+      "preview": "[2026-09-12T00:00:01Z] codex <bench>/bench-di text  score=0.708\n  → get bench-distractor-dedupe-2 --from 0 --to 3 --memory /var/folders/n5/tj4x3v8x7kj8fp6dx6yq5rww0000gn/T/funes-e2e-bench.q0qjki2w/home/memory\n稳定 source_identity"
+    },
+    {
+      "mode": "shadow",
+      "query": "换 embedding 模型如何重建？",
+      "retrieval_query": "switch embedding model rebuild embedding",
+      "expected": "distractor-reindex-0",
+      "rank": 4,
+      "seconds": 0.214,
+      "preview": "[2026-09-12T00:00:01Z] codex <bench>/bench-co text  score=0.789\n  → get bench-codex-hf --from 0 --to 3 --memory /var/folders/n5/tj4x3v8x7kj8fp6dx6yq5rww0000gn/T/funes-e2e-bench.q0qjki2w/home/memory\nHugging Face Space 重启后用私有 dat"
+    },
+    {
+      "mode": "shadow",
+      "query": "远程 MCP 挂了怎么办？",
+      "retrieval_query": "remote MCP remote unavailable failed what to do MCP",
+      "expected": "distractor-mcp-0",
+      "rank": 2,
+      "seconds": 0.221,
+      "preview": "[2026-09-12T00:00:01Z] codex <bench>/bench-di text  score=0.965\n  → get bench-distractor-mcp-1 --from 0 --to 3 --memory /var/folders/n5/tj4x3v8x7kj8fp6dx6yq5rww0000gn/T/funes-e2e-bench.q0qjki2w/home/memory\n远程 MCP 不可用时使用本地 stdio"
+    },
+    {
+      "mode": "shadow",
+      "query": "日志时区怎么对齐？",
+      "retrieval_query": "logs timezone align",
+      "expected": "distractor-logs-0",
+      "rank": 1,
+      "seconds": 0.225,
+      "preview": "[2026-09-12T00:00:01Z] codex <bench>/bench-di text  score=0.368\n  → get bench-distractor-logs-0 --from 0 --to 3 --memory /var/folders/n5/tj4x3v8x7kj8fp6dx6yq5rww0000gn/T/funes-e2e-bench.q0qjki2w/home/memory\nGrafana Loki 查询按 UTC"
+    }
+  ],
+  "raw": {
+    "recall@1": 0.85,
+    "recall@3": 0.9,
+    "recall@5": 0.9,
+    "mean_seconds": 0.278
+  }
+}

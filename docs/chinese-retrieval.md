@@ -48,3 +48,21 @@ own ranked results and report the backend/model, corpus, query set, and latency 
 The HTTP API always returns `raw_text`; set `RETURN_RETRIEVAL_TEXT=true` only when inspecting derived
 text. Provider-dependent Recall@k values must be recorded only after a real translation provider
 and embedding backend are configured; the synthetic proxy values above are not substitutes.
+
+## Real native Funes E2E (recorded 2026-09-12)
+
+The same 60-memory/20-query fixture was indexed into an isolated temporary `FUNES_HOME` and
+queried through one long-lived `funes mcp local` process. This exercises the native Lance vector +
+BM25 + reranker path (default `BAAI/bge-small-en-v1.5`), not the SQLite compatibility service.
+The shadow arm uses the deployed bridge's deterministic `auto` fallback because no external
+translation provider secret was configured; it is therefore a real backend shadow test, not a
+provider-quality claim. Full rows are in `docs/chinese-retrieval-e2e-results.json`.
+
+| mode | Recall@1 | Recall@3 | Recall@5 | mean query seconds |
+| --- | ---: | ---: | ---: | ---: |
+| native Funes, raw Chinese query | 0.85 | 0.90 | 0.90 | 0.278 |
+| native Funes, deterministic English shadow query | 0.65 | 0.90 | 0.95 | 0.226 |
+
+The result is intentionally not presented as “shadow always wins”: it improves Recall@5 on this
+fixture but lowers Recall@1. A provider-backed Chinese translation comparison remains a follow-up
+when `TRANSLATION_BASE_URL`, `TRANSLATION_API_KEY`, and `TRANSLATION_MODEL` are configured.

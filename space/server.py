@@ -78,6 +78,18 @@ def _warm_native_memory() -> None:
     with _WARM_STATE_LOCK:
         _WARM_STATE.update(state=state, finished_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
 
+
+def request_warm(*, force: bool = False) -> dict[str, object]:
+    """Start one background refresh, optionally replacing an old remote worker."""
+    if force:
+        close_native_worker()
+    with _WARM_STATE_LOCK:
+        if _WARM_STATE.get("state") == "warming":
+            return dict(_WARM_STATE)
+        _WARM_STATE.update(state="not_started", started_at=None, finished_at=None)
+    threading.Thread(target=_warm_native_memory, name="funes-native-warm", daemon=True).start()
+    return warm_state()
+
 # The default Funes embedding model is English-oriented.  Keep this small,
 # deterministic fallback for installations without a translation provider so
 # Chinese queries do not enter the slow CJK tokenizer path.  Technical names
@@ -594,6 +606,12 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             obj = self.body()
+            if self.path == "/warm":
+                if not REMOTE:
+                    self.send_json(503, {"ok": False, "error": "FUNES_MEMORY is not configured"})
+                    return
+                self.send_json(202, {"ok": True, "native_warm": request_warm(force=True)})
+                return
             if self.path in ("/search", "/recall"):
                 raw_query = str(obj.get("query", "")).strip()
                 query = query_text(raw_query)
@@ -725,7 +743,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def serve(host: str = "0.0.0.0", port: int = PORT) -> None:
     (HOME / "sources").mkdir(parents=True, exist_ok=True)
-    threading.Thread(target=_warm_native_memory, name="funes-native-warm", daemon=True).start()
+    request_warm()
     ThreadingHTTPServer((host, port), Handler).serve_forever()
 
 

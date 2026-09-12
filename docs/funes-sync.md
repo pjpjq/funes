@@ -13,6 +13,8 @@ active/archived）、Claude Code、pi 的会话，以及 Codex/Claude/pi 和仓�
 text/vector index；这样 memory-only daemon 不会留下未来 session 的接管空档。macOS `lockf`
 内核锁会在最后一个进程描述符关闭时自动释放，不依赖 PID 或删除 lock 文件，Mac/进程重启不会
 因 stale lock 永久停摆。
+原生 auto-discovery 之外还显式复用官方 parser 扫描 Codex `archived_sessions`/`subagents`、
+Pi legacy/custom session roots 和 Claude `history`，不会把这些目录改用兼容 parser。
 原生 push 成功后，LaunchAgent 会通过受保护的 `/warm` 通知让 HF Space 在后台刷新读取
 worker；通知默认按 `FUNES_NATIVE_WARM_MIN_INTERVAL=300` 节流，避免历史回填期间重复加载
 embedding/index。通知失败不影响本地已完成的 durable push。

@@ -56,6 +56,19 @@ fi
 [ -n "${HF_TOKEN:-}" ] || { printf '%s HF token unavailable\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" >>"$LOG"; exit 1; }
 export FUNES_TRUFFLEHOG="${FUNES_TRUFFLEHOG:-$HOME/.local/bin/trufflehog}"
 
+index_source() {
+  index_harness="$1"
+  shift
+  tmp="$STATE_DIR/native-backfill.$$.out"
+  if "$BIN" index "$@" --harness "$index_harness" --yes >"$tmp" 2>&1; then
+    cat "$tmp" >>"$LOG"
+    grep -Eq 'chunks=[1-9][0-9]*' "$tmp" && changed=1 || true
+  else
+    printf '%s harness=%s index_failed\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$index_harness" >>"$LOG"
+  fi
+  "$PYTHON" -c 'import os,sys; os.unlink(sys.argv[1])' "$tmp" 2>/dev/null || true
+}
+
 ITER_FILE="$STATE_DIR/native-backfill.iteration"
 while :; do
   iteration="$(cat "$ITER_FILE" 2>/dev/null || printf '0')"
@@ -63,14 +76,22 @@ while :; do
   iteration=$((iteration + 1)); printf '%s\n' "$iteration" >"$ITER_FILE"
   changed=0
   for harness in codex pi claude hermes; do
-    tmp="$STATE_DIR/native-backfill.$$.out"
-    if "$BIN" index --harness "$harness" --yes >"$tmp" 2>&1; then
-      cat "$tmp" >>"$LOG"
-      grep -Eq 'chunks=[1-9][0-9]*' "$tmp" && changed=1 || true
-    else
-      printf '%s harness=%s index_failed\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$harness" >>"$LOG"
-    fi
-    python3 -c 'import os,sys; os.unlink(sys.argv[1])' "$tmp" 2>/dev/null || true
+    index_source "$harness"
+  done
+  # Native Funes intentionally keeps one canonical auto-discovery root per
+  # harness.  Index the additional locations used by older/current clients
+  # with the same official parser so archived and subagent sessions are not
+  # silently omitted.
+  CODEX_ROOT="${CODEX_HOME:-$HOME/.codex}"
+  for source_path in "$CODEX_ROOT/archived_sessions" "$CODEX_ROOT/subagents"; do
+    [ -d "$source_path" ] && index_source codex "$source_path"
+  done
+  for source_path in "$HOME/.pi/sessions" "${PI_CODING_AGENT_SESSION_DIR:-}" "${PI_CODING_AGENT_DIR:-}" "${PI_SESSION_DIR:-}"; do
+    [ -d "$source_path" ] && index_source pi "$source_path"
+  done
+  CLAUDE_ROOT="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+  for source_path in "$CLAUDE_ROOT/history"; do
+    [ -d "$source_path" ] && index_source claude "$source_path"
   done
   push_now=0
   [ "$changed" -eq 1 ] && [ $((iteration % PUSH_EVERY)) -eq 0 ] && push_now=1

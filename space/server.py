@@ -177,11 +177,18 @@ class Handler(BaseHTTPRequestHandler):
         try:
             obj = self.body()
             if self.path in ("/search", "/recall"):
-                query = query_text(str(obj.get("query", "")).strip())
+                raw_query = str(obj.get("query", "")).strip()
+                query = query_text(raw_query)
                 if not query:
                     self.send_json(400, {"error": "query is required"})
                     return
-                args = ["recall", query, "--k", str(min(int(obj.get("limit", obj.get("k", 8))), 50))]
+                limit = min(int(obj.get("limit", obj.get("k", 8))), 50)
+                args = ["recall", query, "--k", str(limit)]
+                # CJK queries use the ASCII shadow above.  Keep the native
+                # search bounded so the CPU Space does not spend its entire
+                # request window reranking broad generic terms.
+                if LANGUAGE_MODE == "auto" and cjk_ratio(raw_query) >= TRANSLATION_THRESHOLD:
+                    args += ["--candidates", str(max(6, min(20, limit * 3))), "--neighbors", "0", "--half-life", "0"]
                 if REMOTE:
                     args += ["--memory", REMOTE]
                 for name in ("harness", "repo"):
@@ -193,7 +200,7 @@ class Handler(BaseHTTPRequestHandler):
                 # clients; the service backend can later provide structured
                 # per-chunk metadata without changing this contract.
                 results = ([{"raw_text": out}] if code == 0 and out.strip() else [])
-                self.send_json(200 if code == 0 else 503, {"ok": code == 0, "query": query, "results": results, "results_text": out, "error": err[-1000:]})
+                self.send_json(200 if code == 0 else 503, {"ok": code == 0, "query": raw_query, "retrieval_query": query, "results": results, "results_text": out, "error": err[-1000:]})
                 return
             if self.path == "/get":
                 sid = str(obj.get("session_id", obj.get("id", ""))).strip()

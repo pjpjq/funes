@@ -20,6 +20,7 @@ class NativeBackfillLockTest(unittest.TestCase):
     def test_second_process_cannot_enter_and_signal_releases_lock(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
+            (root / ".codex/sessions").mkdir(parents=True)
             invocations = root / "invocations"
             fake = root / "funes"
             fake.write_text(
@@ -91,6 +92,7 @@ class NativeBackfillLockTest(unittest.TestCase):
         with TemporaryDirectory() as directory:
             root = Path(directory)
             for path in (
+                root / ".codex/sessions",
                 root / ".codex/archived_sessions",
                 root / ".codex/subagents",
                 root / ".pi/sessions",
@@ -139,10 +141,12 @@ class NativeBackfillLockTest(unittest.TestCase):
                         if invocations.exists()
                         else []
                     )
-                    if len(lines) >= 9:
+                    if len(lines) >= 6:
                         break
                     time.sleep(0.05)
-                self.assertIn("index --harness codex --yes", lines)
+                self.assertIn(
+                    f"index {root}/.codex/sessions --harness codex --yes", lines
+                )
                 self.assertIn(
                     f"index {root}/.codex/archived_sessions --harness codex --yes",
                     lines,

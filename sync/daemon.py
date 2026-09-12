@@ -11,7 +11,11 @@ log=logging.getLogger("funes.sync")
 
 class SyncDaemon:
     def __init__(self, config=None, store=None, client=None):
-        self.config=config or Config.load(); self.store=store or Store(config=self.config); self.client=client or SyncClient(self.config); self.native=NativeFunes(self.config) if self.config.native_primary else None; self.running=False; self._wake=threading.Event(); self._observer=None
+        self.config=config or Config.load(); self.store=store or Store(config=self.config); self.client=client or SyncClient(self.config)
+        # Memory-only companion mode must drain the HTTP queue even when the
+        # shared config enables the native primary path for interactive hooks.
+        self.native=NativeFunes(self.config) if self.config.native_primary and not self.config.memory_only else None
+        self.running=False; self._wake=threading.Event(); self._observer=None
         self._backfill_marker = self.config.state_dir / "initial-backfill.complete"
     def scan_once(self):
         if not self.config.enabled or not self.config.auto_discover:

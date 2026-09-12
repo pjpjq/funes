@@ -7,7 +7,12 @@ def render_plist(python=None):
     python=python or os.environ.get("PYTHON", sys.executable)
     root=Path(__file__).resolve().parents[1]
     launcher=root / "bin" / "funes-sync"
-    return {"Label":LABEL,"ProgramArguments":[str(launcher),"run"],"EnvironmentVariables":{"PYTHONPATH":str(root)},"WorkingDirectory":str(root),"RunAtLoad":True,"KeepAlive":True,"StandardOutPath":str(Path.home()/"Library/Logs/funes-sync.log"),"StandardErrorPath":str(Path.home()/"Library/Logs/funes-sync.err.log")}
+    env={"PYTHONPATH":str(root)}
+    for key in ("FUNES_REMOTE_URL", "FUNES_API_TOKEN"):
+        value=os.environ.get(key)
+        if value:
+            env[key]=value
+    return {"Label":LABEL,"ProgramArguments":[str(launcher),"run"],"EnvironmentVariables":env,"WorkingDirectory":str(root),"RunAtLoad":True,"KeepAlive":True,"StandardOutPath":str(Path.home()/"Library/Logs/funes-sync.log"),"StandardErrorPath":str(Path.home()/"Library/Logs/funes-sync.err.log")}
 def install(home=None):
     p=plist_path(home); p.parent.mkdir(parents=True,exist_ok=True)
     if p.exists():

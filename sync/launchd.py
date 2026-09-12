@@ -50,7 +50,7 @@ def render_plist(python=None):
     env={"PYTHONPATH":str(root)}
     # The launcher loads FUNES_API_TOKEN from macOS Keychain at runtime; never
     # persist the bearer token in a world-readable plist.
-    for key in ("FUNES_REMOTE_URL",):
+    for key in ("FUNES_REMOTE_URL", "FUNES_MEMORY_ONLY", "FUNES_STATE_DIR"):
         value=os.environ.get(key)
         if value:
             env[key]=value

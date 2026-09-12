@@ -26,6 +26,7 @@ class Config:
     native_memory: str = ""
     native_primary: bool = False
     native_bin: str = ""
+    memory_only: bool = False
     def __post_init__(self):
         raw = self.device_id or os.environ.get("FUNES_DEVICE_ID") or socket.gethostname()
         self.device_id = "dev-" + hashlib.sha256(("funes:" + raw).encode()).hexdigest()[:20]
@@ -63,6 +64,7 @@ class Config:
                    os.environ.get("FUNES_RETRIEVAL_LANGUAGE_MODE", retrieval.get("language_mode", section.get("retrieval_language_mode", "auto"))),
                    os.environ.get("FUNES_MEMORY", remote.get("memory", "")),
                    truth(os.environ.get("FUNES_NATIVE_PRIMARY", section.get("native_primary", False))),
-                   os.environ.get("FUNES_BIN", ""))
+                   os.environ.get("FUNES_BIN", ""),
+                   truth(os.environ.get("FUNES_MEMORY_ONLY", section.get("memory_only", False))))
     def ensure(self):
         self.state_dir.mkdir(parents=True, exist_ok=True)

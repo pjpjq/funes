@@ -73,13 +73,14 @@ def _wait_until_ready(base, headers, deadline):
 
 
 def _retry_after(exc, attempt):
+    exponential = min(30.0, float(2 ** (attempt + 1)))
     if isinstance(exc, error.HTTPError):
         try:
             value = float(exc.headers.get("Retry-After", ""))
-            return min(10.0, max(0.0, value))
+            return max(exponential, min(30.0, max(0.0, value)))
         except (AttributeError, TypeError, ValueError):
             pass
-    return min(8.0, float(2**attempt))
+    return exponential
 
 
 def _remote_call(path, payload):
@@ -90,7 +91,7 @@ def _remote_call(path, payload):
         return None
     headers = _auth_headers(token, hub_token)
     total = _float_env("FUNES_REMOTE_TIMEOUT", 180, 10, 300)
-    attempts = _int_env("FUNES_REMOTE_ATTEMPTS", 3, 1, 5)
+    attempts = _int_env("FUNES_REMOTE_ATTEMPTS", 5, 1, 5)
     attempt_timeout = _float_env("FUNES_REMOTE_ATTEMPT_TIMEOUT", 50, 5, 55)
     deadline = time.monotonic() + total
 

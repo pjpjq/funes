@@ -36,7 +36,7 @@ const remoteTimeoutMs = (() => {
   if (milliseconds !== undefined) return bounded(milliseconds, 180_000, 5_000, 300_000);
   return bounded((envNumber("FUNES_REMOTE_TIMEOUT") ?? 180) * 1_000, 180_000, 5_000, 300_000);
 })();
-const remoteAttempts = Math.floor(bounded(envNumber("FUNES_REMOTE_ATTEMPTS"), 3, 1, 5));
+const remoteAttempts = Math.floor(bounded(envNumber("FUNES_REMOTE_ATTEMPTS"), 5, 1, 5));
 const remoteAttemptTimeoutMs = bounded(
   (envNumber("FUNES_REMOTE_ATTEMPT_TIMEOUT_MS") ?? (envNumber("FUNES_REMOTE_ATTEMPT_TIMEOUT") ?? 50) * 1_000),
   50_000,
@@ -94,13 +94,13 @@ function isRetryableStatus(status: number): boolean {
 }
 
 function retryDelay(response: FetchResult | undefined, attempt: number): number {
-  const exponential = Math.min(8_000, 1_000 * 2 ** attempt);
+  const exponential = Math.min(30_000, 1_000 * 2 ** (attempt + 1));
   const retryAfter = response?.headers?.get("retry-after");
   if (!retryAfter) return exponential;
   const seconds = Number(retryAfter);
-  if (Number.isFinite(seconds) && seconds >= 0) return Math.min(8_000, seconds * 1_000);
+  if (Number.isFinite(seconds) && seconds >= 0) return Math.max(exponential, Math.min(30_000, seconds * 1_000));
   const date = Date.parse(retryAfter);
-  if (Number.isFinite(date)) return Math.min(8_000, Math.max(0, date - now()));
+  if (Number.isFinite(date)) return Math.max(exponential, Math.min(30_000, Math.max(0, date - now())));
   return exponential;
 }
 

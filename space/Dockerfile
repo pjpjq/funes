@@ -1,11 +1,26 @@
 FROM rust:1.94-bookworm AS build
 WORKDIR /src
-COPY . .
 RUN apt-get update \
     && apt-get install -y --no-install-recommends curl libprotobuf-dev protobuf-compiler \
     && curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh \
-        | sh -s -- -b /usr/local/bin v3.95.5 \
-    && cargo build --release --no-default-features --features blas
+        | sh -s -- -b /usr/local/bin v3.95.5
+
+# The HF cpu-basic builder previously stopped during a highly parallel Rust
+# build. Keep the dependency graph serial and isolate it from Python/docs-only
+# changes so a retry can reuse the downloaded crate layer.
+ENV CARGO_BUILD_JOBS=1 \
+    CARGO_INCREMENTAL=0 \
+    CARGO_PROFILE_RELEASE_LTO=off
+COPY Cargo.toml Cargo.lock ./
+RUN cargo fetch --locked
+COPY build.rs ./
+COPY src ./src
+COPY scripts/automation/funes-index.sh scripts/automation/funes-push.sh ./scripts/automation/
+COPY integrations/claude-plugin/.claude-plugin/marketplace.json ./integrations/claude-plugin/.claude-plugin/marketplace.json
+COPY integrations/claude-plugin/funes/.claude-plugin/plugin.json ./integrations/claude-plugin/funes/.claude-plugin/plugin.json
+COPY integrations/codex/SKILL.md ./integrations/codex/SKILL.md
+COPY integrations/pi/index.ts integrations/pi/package.json ./integrations/pi/
+RUN cargo build --locked --release --no-default-features --features blas --bin funes
 
 FROM python:3.12-slim-bookworm
 COPY --from=build /src/target/release/funes /usr/local/bin/funes

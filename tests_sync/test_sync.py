@@ -32,6 +32,14 @@ def test_launchagent(monkeypatch):
     assert "FUNES_API_TOKEN" not in d["EnvironmentVariables"]
 
 
+def test_memory_only_daemon_does_not_require_native_binary(tmp_path):
+    c=cfg(tmp_path); c.native_primary=True; c.memory_only=True
+    s=Store(config=c)
+    d=SyncDaemon(c, s, type("Client", (), {})())
+    assert d.native is None
+    s.close()
+
+
 def test_empty_remote_ack_is_not_durable(tmp_path, monkeypatch):
     class EmptyResponse:
         status = 204

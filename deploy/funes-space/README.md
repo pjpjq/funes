@@ -15,8 +15,9 @@ the existing TruffleHog fail-closed push gate.
   front door; `/ready` additionally checks the application bearer);
 - bearer-authenticated `POST /ingest`, `/search`, `/recall`, and `/get`.
 
-Source discovery, backfill, reindex, and sync status are local-daemon/CLI
-operations (`funes sync status`, `funes sources`, `funes reindex`); the Space
+Source discovery, backfill, index rebuild, and sync status are local-daemon/CLI
+operations (`funes sync status`, `funes sources`, `funes index --yes`, then
+`funes push <memory> --force-reindex`); the Space
 does not pretend to access the Mac filesystem.
 
 The raw source text remains the durable source of truth. Set `FUNES_MEMORY` to a private

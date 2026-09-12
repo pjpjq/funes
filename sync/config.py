@@ -23,6 +23,9 @@ class Config:
     source_codex: bool = True
     source_pi: bool = True
     retrieval_language_mode: str = "auto"
+    native_memory: str = ""
+    native_primary: bool = False
+    native_bin: str = ""
     def __post_init__(self):
         raw = self.device_id or os.environ.get("FUNES_DEVICE_ID") or socket.gethostname()
         self.device_id = "dev-" + hashlib.sha256(("funes:" + raw).encode()).hexdigest()[:20]
@@ -57,6 +60,9 @@ class Config:
                    truth(os.environ.get("FUNES_SYNC_AUTO_DISCOVER", section.get("auto_discover", True))),
                    truth(os.environ.get("FUNES_SOURCE_CODEX", os.environ.get("FUNES_SYNC_SOURCE_CODEX", codex_source))),
                    truth(os.environ.get("FUNES_SOURCE_PI", os.environ.get("FUNES_SYNC_SOURCE_PI", pi_source))),
-                   os.environ.get("FUNES_RETRIEVAL_LANGUAGE_MODE", retrieval.get("language_mode", section.get("retrieval_language_mode", "auto"))))
+                   os.environ.get("FUNES_RETRIEVAL_LANGUAGE_MODE", retrieval.get("language_mode", section.get("retrieval_language_mode", "auto"))),
+                   os.environ.get("FUNES_MEMORY", remote.get("memory", "")),
+                   truth(os.environ.get("FUNES_NATIVE_PRIMARY", section.get("native_primary", False))),
+                   os.environ.get("FUNES_BIN", ""))
     def ensure(self):
         self.state_dir.mkdir(parents=True, exist_ok=True)

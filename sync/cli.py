@@ -22,12 +22,12 @@ def main(argv=None):
             print(json.dumps({"flushed": d.drain(), "remaining": store.pending_count()}, ensure_ascii=False))
         elif a.cmd=="status":
             from .client import SyncClient
-            status=store.stats(); status.update({"remote_url":cfg.remote_url,"remote_ready":SyncClient(cfg).health(),"device_id":cfg.device_id,"interval":cfg.interval})
+            status=store.stats(); status.update({"remote_url":cfg.remote_url,"native_memory":cfg.native_memory,"native_primary":cfg.native_primary,"remote_ready":SyncClient(cfg).health(),"device_id":cfg.device_id,"interval":cfg.interval})
             print(json.dumps(status,ensure_ascii=False,indent=2))
         elif a.cmd=="sources": print(json.dumps([s.as_dict() for s in discover_sources(cfg)],ensure_ascii=False,indent=2))
         elif a.cmd=="doctor":
             from .client import SyncClient
-            checks={"state_dir":str(cfg.state_dir),"db":str(store.path),"remote_url":cfg.remote_url,"token_configured":bool(os.environ.get("FUNES_API_TOKEN")),"sources":store.stats()["sources"],"remote_ready":SyncClient(cfg).health(),"launch_agent":str(plist_path(cfg.home))}
+            checks={"state_dir":str(cfg.state_dir),"db":str(store.path),"remote_url":cfg.remote_url,"native_memory":cfg.native_memory,"native_primary":cfg.native_primary,"token_configured":bool(os.environ.get("FUNES_API_TOKEN")),"sources":store.stats()["sources"],"remote_ready":SyncClient(cfg).health(),"launch_agent":str(plist_path(cfg.home))}
             print(json.dumps(checks,ensure_ascii=False,indent=2))
         elif a.cmd=="install":
             print(install(cfg.home))

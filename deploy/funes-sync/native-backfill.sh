@@ -56,17 +56,31 @@ fi
 [ -n "${HF_TOKEN:-}" ] || { printf '%s HF token unavailable\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" >>"$LOG"; exit 1; }
 export FUNES_TRUFFLEHOG="${FUNES_TRUFFLEHOG:-$HOME/.local/bin/trufflehog}"
 
+CURRENT_TMP=""
+cleanup_tmp() {
+  case "${CURRENT_TMP:-}" in
+    "$STATE_DIR"/native-backfill.*.out)
+      "$PYTHON" -c 'import os,sys; os.path.exists(sys.argv[1]) and os.unlink(sys.argv[1])' "$CURRENT_TMP" 2>/dev/null || true
+      ;;
+  esac
+}
+trap 'cleanup_tmp' EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
 index_source() {
   index_harness="$1"
   shift
-  tmp="$STATE_DIR/native-backfill.$$.out"
-  if "$BIN" index "$@" --harness "$index_harness" --yes >"$tmp" 2>&1; then
-    cat "$tmp" >>"$LOG"
-    grep -Eq 'chunks=[1-9][0-9]*' "$tmp" && changed=1 || true
+  CURRENT_TMP="$STATE_DIR/native-backfill.$$.out"
+  if "$BIN" index "$@" --harness "$index_harness" --yes >"$CURRENT_TMP" 2>&1; then
+    cat "$CURRENT_TMP" >>"$LOG"
+    grep -Eq 'chunks=[1-9][0-9]*' "$CURRENT_TMP" && changed=1 || true
   else
     printf '%s harness=%s index_failed\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$index_harness" >>"$LOG"
   fi
-  "$PYTHON" -c 'import os,sys; os.unlink(sys.argv[1])' "$tmp" 2>/dev/null || true
+  cleanup_tmp
+  CURRENT_TMP=""
 }
 
 ITER_FILE="$STATE_DIR/native-backfill.iteration"
@@ -75,21 +89,25 @@ while :; do
   case "$iteration" in ''|*[!0-9]*) iteration=0 ;; esac
   iteration=$((iteration + 1)); printf '%s\n' "$iteration" >"$ITER_FILE"
   changed=0
-  for harness in codex pi claude hermes; do
-    index_source "$harness"
-  done
+  # Explicit roots use the unit-major path: each session is parsed once for
+  # text/tool-use/tool-result instead of three tier-major passes.
+  CODEX_ROOT="${CODEX_HOME:-$HOME/.codex}"
+  [ -d "$CODEX_ROOT/sessions" ] && index_source codex "$CODEX_ROOT/sessions"
+  PI_ROOT="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}"
+  [ -d "$PI_ROOT/sessions" ] && index_source pi "$PI_ROOT/sessions"
+  CLAUDE_ROOT="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+  [ -d "$CLAUDE_ROOT/projects" ] && index_source claude "$CLAUDE_ROOT/projects"
+  [ -f "$HOME/.hermes/state.db" ] && index_source hermes "$HOME/.hermes/state.db"
   # Native Funes intentionally keeps one canonical auto-discovery root per
   # harness.  Index the additional locations used by older/current clients
   # with the same official parser so archived and subagent sessions are not
   # silently omitted.
-  CODEX_ROOT="${CODEX_HOME:-$HOME/.codex}"
   for source_path in "$CODEX_ROOT/archived_sessions" "$CODEX_ROOT/subagents"; do
     [ -d "$source_path" ] && index_source codex "$source_path"
   done
   for source_path in "$HOME/.pi/sessions" "${PI_CODING_AGENT_SESSION_DIR:-}" "${PI_CODING_AGENT_DIR:-}" "${PI_SESSION_DIR:-}"; do
     [ -d "$source_path" ] && index_source pi "$source_path"
   done
-  CLAUDE_ROOT="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
   for source_path in "$CLAUDE_ROOT/history"; do
     [ -d "$source_path" ] && index_source claude "$source_path"
   done

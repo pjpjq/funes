@@ -970,6 +970,9 @@ def test_canonical_source_version_has_unambiguous_field_boundaries():
     left = {**base, "source_version": "ab", "content_hash": "c"}
     right = {**base, "source_version": "a", "content_hash": "bc"}
     assert bridge.canonical_source_version(left) != bridge.canonical_source_version(right)
+    assert bridge.canonical_source_version(
+        {**base, "native_generation": 1}
+    ) != bridge.canonical_source_version({**base, "native_generation": 2})
 
 
 def test_pending_translation_is_not_sent_to_native(monkeypatch, tmp_path):

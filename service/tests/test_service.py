@@ -9,7 +9,7 @@ from http.client import HTTPConnection
 from pathlib import Path
 from http.server import ThreadingHTTPServer
 
-from service.server import QUERY_PROMPT_VERSION, QUERY_RETRIEVAL_PROMPT, RETRIEVAL_PROMPT, App, Store, Translator, make_handler
+from service.server import QUERY_PROMPT_VERSION, QUERY_RETRIEVAL_PROMPT, RETRIEVAL_PROMPT, App, Store, Translator, make_handler, persist_translation_documents
 
 
 class ServiceTests(unittest.TestCase):
@@ -530,6 +530,13 @@ class ServiceTests(unittest.TestCase):
                     "native_index_status": "indexed",
                 },
                 {
+                    "source_identity": "old-raw-mode-row",
+                    "raw_text": "需要按当前模式重新判断",
+                    "retrieval_text": "旧 raw mode shadow",
+                    "translation_status": "skipped_raw_mode",
+                    "native_index_status": "indexed",
+                },
+                {
                     "source_identity": "waiting-row",
                     "raw_text": "等待持久化",
                     "retrieval_text": "old waiting shadow",
@@ -542,7 +549,7 @@ class ServiceTests(unittest.TestCase):
         store.record_reindex_control(
             {"generation": 2, "scope": "retrieval_text", "created_at": "2026-09-13T00:00:02Z"}
         )
-        store.apply_pending_reindex_controls(1)
+        store.drain_reindex_controls(1)
 
         provider = store.get("provider-row")
         self.assertEqual(provider["raw_text"], original["raw_text"])
@@ -553,11 +560,19 @@ class ServiceTests(unittest.TestCase):
         self.assertIsNone(provider["native_index_status"])
         self.assertEqual(provider["retrieval_generation"], 2)
         self.assertEqual(provider["native_generation"], 2)
-        self.assertEqual(store.get("english-row")["native_index_status"], "indexed")
+        english = store.get("english-row")
+        self.assertEqual(english["translation_status"], "pending_provider")
+        self.assertIsNone(english["native_index_status"])
+        self.assertEqual(
+            store.get("old-raw-mode-row")["translation_status"], "pending_provider"
+        )
         waiting = store.get("waiting-row")
         self.assertEqual(waiting["translation_status"], "pending_provider")
         self.assertEqual(waiting["native_index_status"], "waiting_durability")
-        self.assertEqual(store.pending_translations(10)[0]["source_identity"], "provider-row")
+        self.assertEqual(
+            {item["source_identity"] for item in store.pending_translations(10)},
+            {"provider-row", "english-row", "old-raw-mode-row"},
+        )
 
         # A pre-control derived delta must not overwrite generation 2.
         store.ingest([original])
@@ -568,9 +583,105 @@ class ServiceTests(unittest.TestCase):
         store.record_reindex_control(
             {"generation": 1, "scope": "all", "created_at": "2026-09-13T00:00:01Z"}
         )
-        store.apply_pending_reindex_controls(1)
+        store.drain_reindex_controls(1)
         self.assertIsNone(store.get("english-row")["native_index_status"])
         self.assertEqual(store.get("waiting-row")["native_index_status"], "waiting_durability")
+        store.close()
+
+    def test_reindex_row_cursor_is_bounded_and_survives_restart(self):
+        directory = tempfile.TemporaryDirectory()
+        store = Store(directory.name)
+        store.ingest(
+            [
+                {
+                    "source_identity": f"row-{index}",
+                    "raw_text": f"raw {index}",
+                    "retrieval_text": f"old shadow {index}",
+                    "translation_status": "skipped_non_cjk",
+                    "native_index_status": "indexed",
+                }
+                for index in range(5)
+            ]
+        )
+        control = {
+            "generation": 1,
+            "scope": "retrieval_text",
+            "created_at": "2026-09-13T00:00:01Z",
+        }
+        store.record_reindex_control(control)
+        first = store.apply_pending_reindex_controls(2)
+        state = store.conn.execute(
+            "SELECT row_cursor, applied_at FROM reindex_controls WHERE generation=1"
+        ).fetchone()
+        self.assertEqual(first["scanned"], 2)
+        self.assertEqual(first["applied"], 0)
+        self.assertEqual(state["row_cursor"], 2)
+        self.assertIsNone(state["applied_at"])
+        self.assertEqual(store.get("row-1")["translation_status"], "pending_provider")
+        self.assertEqual(store.get("row-2")["translation_status"], "skipped_non_cjk")
+        store.close()
+
+        restored = Store(directory.name)
+        restored.record_reindex_control(control, replay_applied=True)
+        resumed = restored.conn.execute(
+            "SELECT row_cursor FROM reindex_controls WHERE generation=1"
+        ).fetchone()
+        self.assertEqual(resumed["row_cursor"], 2)
+        second = restored.apply_pending_reindex_controls(2)
+        final = restored.apply_pending_reindex_controls(2)
+        state = restored.conn.execute(
+            "SELECT row_cursor, applied_at FROM reindex_controls WHERE generation=1"
+        ).fetchone()
+        self.assertEqual(second["scanned"], 2)
+        self.assertEqual(second["applied"], 0)
+        self.assertEqual(final["scanned"], 1)
+        self.assertEqual(final["applied"], 1)
+        self.assertEqual(state["row_cursor"], 5)
+        self.assertIsNotNone(state["applied_at"])
+        self.assertEqual(
+            {restored.get(f"row-{index}")["translation_status"] for index in range(5)},
+            {"pending_provider"},
+        )
+        restored.close()
+        directory.cleanup()
+
+    def test_reindex_rechecks_raw_with_current_translation_configuration(self):
+        store = Store(self.tmp.name)
+        store.ingest(
+            [
+                {
+                    "source_identity": "old-skipped",
+                    "raw_text": "原始内容",
+                    "retrieval_text": "old shadow",
+                    "translation_hash": "old-model-hash",
+                    "translation_status": "skipped_non_cjk",
+                }
+            ]
+        )
+        store.record_reindex_control(
+            {"generation": 1, "scope": "retrieval_text", "created_at": "2026-09-13T00:00:01Z"}
+        )
+        store.drain_reindex_controls(10)
+        self.assertEqual(store.get("old-skipped")["translation_status"], "pending_provider")
+
+        class Syncer:
+            def upload(self, _documents):
+                return {"durable": True}
+
+        with mock.patch.dict(
+            os.environ,
+            {"FUNES_RETRIEVAL_LANGUAGE_MODE": "raw", "TRANSLATION_MODEL": "current-model"},
+        ):
+            app = mock.Mock()
+            app.store = store
+            app.translator = Translator(store)
+            app.syncer = Syncer()
+            app.translation_lock = threading.Lock()
+            result = persist_translation_documents(app, store.pending_translations(10))
+        item = store.get("old-skipped")
+        self.assertTrue(result["durable"])
+        self.assertEqual(item["translation_status"], "skipped_raw_mode")
+        self.assertNotEqual(item["translation_hash"], "old-model-hash")
         store.close()
 
     def test_reindex_http_returns_202_only_after_durable_queue(self):

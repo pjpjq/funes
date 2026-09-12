@@ -36,6 +36,8 @@ FIELDS = (
     "ingested_at", "updated_at", "content_type", "source_missing", "agent_type",
     "parent_session_id", "agent_id",
     "translation_hash", "translation_version", "translation_status",
+    "retrieval_updated_at", "native_index_version", "native_index_status",
+    "native_indexed_at", "native_index_error",
 )
 CJK_RE = re.compile(r"[\u3400-\u9fff\uf900-\ufaff]")
 PROMPT_VERSION = "funes-retrieval-v2"
@@ -95,10 +97,13 @@ class Store:
                     source_agent TEXT, source_type TEXT, device_id TEXT, project TEXT,
                     repo TEXT, worktree TEXT, session_id TEXT, message_id TEXT, role TEXT,
                     timestamp TEXT, source_path TEXT, content_hash TEXT NOT NULL,
-                    ingested_at TEXT NOT NULL, updated_at TEXT NOT NULL, content_type TEXT,
+                    ingested_at TEXT NOT NULL, updated_at TEXT NOT NULL, retrieval_updated_at TEXT,
+                    content_type TEXT,
                     source_missing INTEGER NOT NULL DEFAULT 0, agent_type TEXT,
                     parent_session_id TEXT, agent_id TEXT,
                     translation_hash TEXT, translation_version TEXT, translation_status TEXT,
+                    native_index_version TEXT, native_index_status TEXT,
+                    native_indexed_at TEXT, native_index_error TEXT,
                     UNIQUE(source_identity)
                 );
                 CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
@@ -128,7 +133,16 @@ class Store:
             # Upgrades from the first HTTP prototype are additive and safe on a
             # restarted Space; derived translation fields never replace raw_text.
             columns = {row[1] for row in self.conn.execute("PRAGMA table_info(memories)")}
-            for name in ("translation_hash", "translation_version", "translation_status"):
+            for name in (
+                "translation_hash",
+                "translation_version",
+                "translation_status",
+                "retrieval_updated_at",
+                "native_index_version",
+                "native_index_status",
+                "native_indexed_at",
+                "native_index_error",
+            ):
                 if name not in columns:
                     self.conn.execute(f"ALTER TABLE memories ADD COLUMN {name} TEXT")
             cache_columns = {row[1] for row in self.conn.execute("PRAGMA table_info(translation_cache)")}
@@ -157,7 +171,9 @@ class Store:
                 incoming_updated = doc.get("updated_at", metadata.get("updated_at")) or now
                 row = self.conn.execute(
                     """SELECT id, content_hash, source_version, updated_at, retrieval_text,
-                    translation_hash, translation_version, translation_status
+                    translation_hash, translation_version, translation_status,
+                    retrieval_updated_at, native_index_version, native_index_status,
+                    native_indexed_at, native_index_error, source_missing
                     FROM memories WHERE source_identity=?""",
                     (source_identity,),
                 ).fetchone()
@@ -171,9 +187,15 @@ class Store:
                             "translation_hash",
                             "translation_version",
                             "translation_status",
+                            "retrieval_updated_at",
+                            "native_index_version",
+                            "native_index_status",
+                            "native_indexed_at",
+                            "native_index_error",
+                            "source_missing",
                         )
                     )
-                    incoming_status = values.get("translation_status")
+                    incoming_status = values.get("translation_status") if "translation_status" in doc else row["translation_status"]
                     current_status = row["translation_status"]
                     retryable = {"pending_provider", "fallback_provider_error", "fallback_no_provider"}
                     final = {
@@ -184,17 +206,77 @@ class Store:
                         "skipped_low_value",
                     }
                     would_regress = current_status in final and incoming_status in retryable
-                    incoming_derived = (
-                        retrieval,
-                        values.get("translation_hash"),
-                        values.get("translation_version"),
+                    incoming_retrieval = retrieval if "retrieval_text" in doc else row["retrieval_text"]
+                    incoming_translation_hash = values.get("translation_hash") if "translation_hash" in doc else row["translation_hash"]
+                    incoming_translation_version = values.get("translation_version") if "translation_version" in doc else row["translation_version"]
+                    translation_changed = (
+                        incoming_retrieval,
+                        incoming_translation_hash,
+                        incoming_translation_version,
                         incoming_status,
+                    ) != (
+                        row["retrieval_text"],
+                        row["translation_hash"],
+                        row["translation_version"],
+                        current_status,
+                    )
+                    incoming_source_missing = (
+                        values["source_missing"]
+                        if "source_missing" in doc
+                        else row["source_missing"]
+                    )
+                    source_missing_changed = incoming_source_missing != row["source_missing"]
+                    incoming_native = (
+                        values.get("native_index_version") if "native_index_version" in doc else row["native_index_version"],
+                        values.get("native_index_status") if "native_index_status" in doc else row["native_index_status"],
+                        values.get("native_indexed_at") if "native_indexed_at" in doc else row["native_indexed_at"],
+                        values.get("native_index_error") if "native_index_error" in doc else row["native_index_error"],
+                    )
+                    if source_missing_changed and not any(
+                        name in doc
+                        for name in (
+                            "native_index_version",
+                            "native_index_status",
+                            "native_indexed_at",
+                            "native_index_error",
+                        )
+                    ):
+                        incoming_native = (None, None, None, None)
+                    if (
+                        row["native_index_status"] in {"indexed", "held_secret"}
+                        and incoming_native[1] not in {"indexed", "held_secret"}
+                        and not translation_changed
+                        and not source_missing_changed
+                    ):
+                        # Immutable Hub deltas restore in filename order. An
+                        # older raw/retry delta for this exact source+shadow must
+                        # not regress a terminal native checkpoint.
+                        incoming_native = (
+                            row["native_index_version"],
+                            row["native_index_status"],
+                            row["native_indexed_at"],
+                            row["native_index_error"],
+                        )
+                    incoming_derived = (
+                        incoming_retrieval,
+                        incoming_translation_hash,
+                        incoming_translation_version,
+                        incoming_status,
+                        values.get("retrieval_updated_at") if "retrieval_updated_at" in doc else row["retrieval_updated_at"],
+                        incoming_source_missing,
+                        *incoming_native,
                     )
                     current_derived = (
                         row["retrieval_text"],
                         row["translation_hash"],
                         row["translation_version"],
                         current_status,
+                        row["retrieval_updated_at"],
+                        row["source_missing"],
+                        row["native_index_version"],
+                        row["native_index_status"],
+                        row["native_indexed_at"],
+                        row["native_index_error"],
                     )
                     if derived_supplied and not would_regress and incoming_derived != current_derived:
                         # Raw revisions and derived retrieval shadows have separate
@@ -202,7 +284,10 @@ class Store:
                         # when the source bytes/version are unchanged.
                         self.conn.execute(
                             """UPDATE memories SET retrieval_text=?, translation_hash=?,
-                            translation_version=?, translation_status=? WHERE id=?""",
+                            translation_version=?, translation_status=?, retrieval_updated_at=?,
+                            source_missing=?,
+                            native_index_version=?, native_index_status=?, native_indexed_at=?,
+                            native_index_error=? WHERE id=?""",
                             (*incoming_derived, row["id"]),
                         )
                         updated += 1
@@ -221,14 +306,16 @@ class Store:
                     self.conn.execute(
                         """UPDATE memories SET source_version=?, raw_text=?, retrieval_text=?, metadata_json=?,
                         source_agent=?, source_type=?, device_id=?, project=?, repo=?, worktree=?, session_id=?,
-                        message_id=?, role=?, timestamp=?, source_path=?, content_hash=?, updated_at=?, content_type=?,
-                        source_missing=?, agent_type=?, parent_session_id=?, agent_id=?, translation_hash=?, translation_version=?, translation_status=? WHERE id=?""",
+                        message_id=?, role=?, timestamp=?, source_path=?, content_hash=?, updated_at=?, retrieval_updated_at=?, content_type=?,
+                        source_missing=?, agent_type=?, parent_session_id=?, agent_id=?, translation_hash=?, translation_version=?, translation_status=?,
+                        native_index_version=?, native_index_status=?, native_indexed_at=?, native_index_error=? WHERE id=?""",
                         (source_version, raw, retrieval, json.dumps(metadata, ensure_ascii=False),
                          values.get("source_agent"), values.get("source_type"), values.get("device_id"),
                          values.get("project"), values.get("repo"), values.get("worktree"), values.get("session_id"),
                          values.get("message_id"), values.get("role"), values.get("timestamp"), values.get("source_path"),
-                         content_hash, incoming_updated, values.get("content_type"), values["source_missing"], values.get("agent_type"),
-                         values.get("parent_session_id"), values.get("agent_id"), values.get("translation_hash"), values.get("translation_version"), values.get("translation_status"), row["id"]),
+                         content_hash, incoming_updated, values.get("retrieval_updated_at"), values.get("content_type"), values["source_missing"], values.get("agent_type"),
+                         values.get("parent_session_id"), values.get("agent_id"), values.get("translation_hash"), values.get("translation_version"), values.get("translation_status"),
+                         values.get("native_index_version"), values.get("native_index_status"), values.get("native_indexed_at"), values.get("native_index_error"), row["id"]),
                     )
                     updated += 1
                     results.append({"id": row["id"], "status": "updated", "source_identity": source_identity})
@@ -236,14 +323,16 @@ class Store:
                     cur = self.conn.execute(
                         """INSERT INTO memories(source_identity,source_version,raw_text,retrieval_text,metadata_json,
                         source_agent,source_type,device_id,project,repo,worktree,session_id,message_id,role,timestamp,
-                        source_path,content_hash,ingested_at,updated_at,content_type,source_missing,agent_type,parent_session_id,agent_id,translation_hash,translation_version,translation_status)
-                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        source_path,content_hash,ingested_at,updated_at,retrieval_updated_at,content_type,source_missing,agent_type,parent_session_id,agent_id,translation_hash,translation_version,translation_status,
+                        native_index_version,native_index_status,native_indexed_at,native_index_error)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                         (source_identity, source_version, raw, retrieval, json.dumps(metadata, ensure_ascii=False),
                          values.get("source_agent"), values.get("source_type"), values.get("device_id"), values.get("project"),
                          values.get("repo"), values.get("worktree"), values.get("session_id"), values.get("message_id"),
-                         values.get("role"), values.get("timestamp"), values.get("source_path"), content_hash, values.get("ingested_at") or now, incoming_updated,
+                         values.get("role"), values.get("timestamp"), values.get("source_path"), content_hash, values.get("ingested_at") or now, incoming_updated, values.get("retrieval_updated_at"),
                          values.get("content_type"), values["source_missing"], values.get("agent_type"),
-                         values.get("parent_session_id"), values.get("agent_id"), values.get("translation_hash"), values.get("translation_version"), values.get("translation_status")),
+                         values.get("parent_session_id"), values.get("agent_id"), values.get("translation_hash"), values.get("translation_version"), values.get("translation_status"),
+                         values.get("native_index_version"), values.get("native_index_status"), values.get("native_indexed_at"), values.get("native_index_error")),
                     )
                     created += 1
                     results.append({"id": cur.lastrowid, "status": "created", "source_identity": source_identity})
@@ -290,7 +379,12 @@ class Store:
 
     def get(self, ident: str | int) -> dict[str, Any] | None:
         with self.lock:
-            row = self.conn.execute("SELECT * FROM memories WHERE id=? OR source_identity=?", (str(ident), str(ident))).fetchone()
+            row = self.conn.execute(
+                "SELECT * FROM memories WHERE source_identity=? ORDER BY id LIMIT 1",
+                (str(ident),),
+            ).fetchone()
+            if row is None:
+                row = self.conn.execute("SELECT * FROM memories WHERE id=?", (str(ident),)).fetchone()
             return self._row(row) if row else None
 
     def get_many(self, identities: list[str]) -> list[dict[str, Any]]:
@@ -320,6 +414,45 @@ class Store:
             ).fetchall()
             return [self._row(row) for row in rows]
 
+    def canonical_index_candidates(self, limit: int) -> list[dict[str, Any]]:
+        """Return final non-session retrieval shadows for native reconciliation."""
+        with self.lock:
+            rows = self.conn.execute(
+                """SELECT * FROM memories
+                WHERE translation_status IN ('ok','skipped_non_cjk','skipped_raw_mode')
+                AND lower(COALESCE(source_type, '')) NOT IN
+                    ('session','codex','codex_session','pi','pi_session','claude','claude_session')
+                AND lower(COALESCE(content_type, '')) NOT IN
+                    ('tool_call','tool_result','shell_output','progress')
+                AND COALESCE(native_index_status, '') NOT IN
+                    ('indexed','held_secret','waiting_durability')
+                ORDER BY COALESCE(retrieval_updated_at, updated_at), id LIMIT ?""",
+                (max(1, int(limit)),),
+            ).fetchall()
+            return [self._row(row) for row in rows]
+
+    def update_native_index(self, updates: list[dict[str, Any]]) -> int:
+        """Persist derived native state only when the raw source revision still matches."""
+        changed = 0
+        with self.lock, self.conn:
+            for item in updates:
+                cursor = self.conn.execute(
+                    """UPDATE memories SET native_index_version=?, native_index_status=?,
+                    native_indexed_at=?, native_index_error=?
+                    WHERE source_identity=? AND source_version=? AND content_hash=?""",
+                    (
+                        item.get("native_index_version"),
+                        item.get("native_index_status"),
+                        item.get("native_indexed_at"),
+                        item.get("native_index_error"),
+                        str(item.get("source_identity", "")),
+                        str(item.get("source_version", "")),
+                        str(item.get("content_hash", "")),
+                    ),
+                )
+                changed += cursor.rowcount
+        return changed
+
     def mark_translations_pending(self, documents: list[dict[str, Any]]) -> None:
         """Requeue derived writes whose encrypted delta did not become durable."""
         with self.lock, self.conn:
@@ -347,6 +480,9 @@ class Store:
             if value:
                 clauses.append(f"m.{key} = ?")
                 params.append(str(value))
+        if filters.get("source_missing") is not None:
+            clauses.append("m.source_missing = ?")
+            params.append(int(bool(filters["source_missing"])))
         if filters.get("since"):
             clauses.append("m.timestamp >= ?"); params.append(str(filters["since"]))
         if filters.get("until"):
@@ -497,9 +633,8 @@ class Translator:
         self.threshold = float(os.getenv("TRANSLATE_CHINESE_THRESHOLD", os.getenv("TRANSLATION_CJK_THRESHOLD", "0.15")))
         self.batch_size = max(1, int(os.getenv("TRANSLATION_BATCH_SIZE", "16")))
         self.concurrency = max(1, int(os.getenv("TRANSLATION_CONCURRENCY", "4")))
-        # Raw durability must not wait on an external provider. Operators may
-        # opt into a small synchronous budget, while the default leaves all
-        # provider work to the restart-safe background reconciler.
+        # Kept for environment compatibility; HTTP ingest never consumes this
+        # budget because all provider work belongs to the background reconciler.
         self.max_per_ingest = max(0, int(os.getenv("TRANSLATION_MAX_PER_INGEST", "0")))
         self.retries = max(1, int(os.getenv("TRANSLATION_RETRIES", "2")))
         self.timeout = max(1.0, float(os.getenv("TRANSLATION_TIMEOUT", "12")))
@@ -931,6 +1066,11 @@ def prepare_ingest_documents(app: Any, docs: list[dict[str, Any]]) -> list[dict[
         item.setdefault("translation_hash", translation_hash)
         item.setdefault("translation_version", translation_version)
         item.setdefault("translation_status", translation_status)
+        if translation_status in FINAL_TRANSLATION_STATUSES:
+            item.setdefault(
+                "retrieval_updated_at",
+                item.get("updated_at", metadata.get("updated_at")) or utc_now(),
+            )
         prepared.append(item)
     return prepared
 
@@ -972,6 +1112,11 @@ def _persist_translation_documents(app: Any, documents: list[dict[str, Any]]) ->
         updated["translation_hash"] = translation_hash
         updated["translation_version"] = translation_version
         updated["translation_status"] = translation_status
+        updated["retrieval_updated_at"] = utc_now()
+        updated["native_index_version"] = None
+        updated["native_index_status"] = None
+        updated["native_indexed_at"] = None
+        updated["native_index_error"] = None
         updates.append(updated)
     if not updates:
         return {"attempted": len(active), "updated": 0, "durable": True}
@@ -1017,8 +1162,15 @@ def persist_translation_documents(app: Any, documents: list[dict[str, Any]]) -> 
 
 
 def ingest_documents(app: Any, docs: list[dict[str, Any]]) -> dict[str, Any]:
-    """Persist every raw source first, then perform a bounded derived pass."""
+    """Persist and upload raw-first rows without provider or native work."""
     prepared = prepare_ingest_documents(app, docs)
+    for item in prepared:
+        existing = app.store.get(str(item["source_identity"]))
+        if existing and existing.get("native_index_status") == "waiting_durability":
+            item["native_index_version"] = None
+            item["native_index_status"] = "retry"
+            item["native_indexed_at"] = None
+            item["native_index_error"] = None
     result = app.store.ingest(prepared)
     identities = [str(item["source_identity"]) for item in result["items"]]
     canonical = app.store.get_many(identities)
@@ -1030,13 +1182,22 @@ def ingest_documents(app: Any, docs: list[dict[str, Any]]) -> dict[str, Any]:
     )
     result["translation"] = {"attempted": 0, "updated": 0, "durable": True}
     if not result["durable"]:
+        app.store.update_native_index(
+            [
+                {
+                    "source_identity": item["source_identity"],
+                    "source_version": item.get("source_version", ""),
+                    "content_hash": item["content_hash"],
+                    "native_index_version": None,
+                    "native_index_status": "waiting_durability",
+                    "native_indexed_at": None,
+                    "native_index_error": "durability_pending",
+                }
+                for item in canonical
+            ]
+        )
         result["error"] = "durability_pending"
         return result
-    pending = [item for item in canonical if item.get("translation_status") == "pending_provider"]
-    result["translation"] = persist_translation_documents(
-        app,
-        pending[: max(0, int(getattr(app.translator, "max_per_ingest", 0)))],
-    )
     return result
 
 
@@ -1149,11 +1310,9 @@ def make_handler(app: App):
 
         @staticmethod
         def _public(item: dict[str, Any]) -> dict[str, Any]:
-            # Raw text is the source of truth.  Derived retrieval text is opt-in
-            # for diagnostics and never replaces the context an agent receives.
-            if os.getenv("RETURN_RETRIEVAL_TEXT", "false").lower() not in {"1", "true", "yes"}:
-                item = dict(item)
-                item.pop("retrieval_text", None)
+            # HTTP always returns raw source truth, never its English shadow.
+            item = dict(item)
+            item.pop("retrieval_text", None)
             return item
 
         def do_GET(self) -> None:
@@ -1177,7 +1336,8 @@ def make_handler(app: App):
                 if route == "/sync/status":
                     return self._json(200, app.store.sync_status())
                 if route == "/get":
-                    ident = parse_qs(urlparse(self.path).query).get("id", [""])[0]
+                    params = parse_qs(urlparse(self.path).query)
+                    ident = params.get("source_identity", params.get("id", [""]))[0]
                     item = app.store.get(ident)
                     return self._json(200 if item else 404, self._public(item) if item else {"error": "not_found"})
             return self._json(404, {"error": "not_found"})
@@ -1208,13 +1368,31 @@ def make_handler(app: App):
                     if not query:
                         raise ValueError("query is required")
                     rewritten = app.translator.rewrite(query)
-                    filters = {key: body.get(key) for key in ("source_agent", "source_type", "project", "repo", "device_id", "role", "content_type", "since", "until") if body.get(key)}
+                    facet_values = body.get("facets") or {}
+                    if not isinstance(facet_values, dict):
+                        raise ValueError("facets must be an object")
+                    filters = {
+                        key: body.get(key, facet_values.get(key))
+                        for key in (
+                            "source_agent",
+                            "source_type",
+                            "project",
+                            "repo",
+                            "device_id",
+                            "role",
+                            "content_type",
+                            "source_missing",
+                            "since",
+                            "until",
+                        )
+                        if body.get(key, facet_values.get(key)) is not None
+                    }
                     hits = app.store.search(rewritten, int(body.get("limit", 20)), filters=filters)
                     if rewritten != query and not hits:
                         hits = app.store.search(query, int(body.get("limit", 20)), filters=filters)
                     return self._json(200, {"query": query, "rewritten_query": rewritten, "results": [self._public(x) for x in hits]})
                 if self.path == "/get":
-                    item = app.store.get(body.get("id", body.get("source_identity", "")))
+                    item = app.store.get(body.get("source_identity", body.get("id", "")))
                     return self._json(200 if item else 404, self._public(item) if item else {"error": "not_found"})
                 if self.path == "/reindex":
                     return self._json(200, {"reindexed": app.store.reindex()})

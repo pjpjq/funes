@@ -6,6 +6,7 @@ container's /data/.funes directory is only a warm cache and may be recreated.
 """
 import hashlib
 import atexit
+import base64
 import json
 import os
 import re
@@ -33,6 +34,9 @@ PORT = int(os.getenv("PORT", "7860"))
 TRANSLATION_THRESHOLD = float(os.getenv("TRANSLATE_CHINESE_THRESHOLD", "0.15"))
 INGEST_INDEX_TIMEOUT = int(os.getenv("FUNES_INGEST_INDEX_TIMEOUT", "900"))
 INGEST_PUSH_TIMEOUT = int(os.getenv("FUNES_INGEST_PUSH_TIMEOUT", "1800"))
+CANONICAL_INDEX_BATCH = max(1, int(os.getenv("FUNES_CANONICAL_INDEX_BATCH", "32")))
+CANONICAL_INDEX_INTERVAL = max(0.01, float(os.getenv("FUNES_CANONICAL_INDEX_INTERVAL", "30")))
+CANONICAL_INDEX_TIMEOUT = max(1, int(os.getenv("FUNES_CANONICAL_INDEX_TIMEOUT", "900")))
 MCP_PROTOCOL_VERSION = "2024-11-05"
 MCP_TIMEOUT = float(os.getenv("FUNES_MCP_TIMEOUT", "180"))
 MCP_HANDSHAKE_TIMEOUT = float(os.getenv("FUNES_MCP_HANDSHAKE_TIMEOUT", "10"))
@@ -68,6 +72,7 @@ def source_app():
             os.environ.setdefault("FUNES_LAZY_RESTORE", "true")
             os.environ.setdefault("FUNES_REQUIRE_DURABLE_ACK", "true")
             SOURCE_APP = SourceApp()
+            start_canonical_reconciler(SOURCE_APP)
     return SOURCE_APP
 
 
@@ -95,6 +100,7 @@ def close_source_app() -> None:
         SOURCE_APP = None
     if app is not None:
         try:
+            stop_canonical_reconciler(app)
             app.close()
         except Exception:
             pass
@@ -112,7 +118,11 @@ def ingest_source_documents(docs: list[dict]) -> tuple[int, dict, list[dict]] | 
     if app.syncer.restoring or app.syncer.restore_failed:
         error = "restore_in_progress" if app.syncer.restoring else "restore_failed"
         return 503, {"ok": False, "durable": False, "error": error}, []
-    result = persist_source_ingest(app, docs)
+    # Serialize raw Hub durability with canonical commits. A failed raw delta is
+    # marked waiting_durability before this lock is released, so native can
+    # never publish a shadow whose sidecar source was not durable.
+    with WRITE_LOCK:
+        result = persist_source_ingest(app, docs)
     identities = [str(item.get("source_identity", "")) for item in result["items"]]
     canonical = app.store.get_many(identities)
     result["ok"] = bool(result["durable"])
@@ -136,8 +146,7 @@ def search_source_documents(query: str, limit: int, filters: dict[str, object]) 
             not in {"session", "codex", "codex_session", "pi", "pi_session", "claude", "claude_session"}
         ]
     for item in hits:
-        if os.getenv("RETURN_RETRIEVAL_TEXT", "false").lower() not in {"1", "true", "yes", "on"}:
-            item.pop("retrieval_text", None)
+        item.pop("retrieval_text", None)
     return rewritten, hits
 
 # A remote Lance memory can take longer than the Space ingress timeout to open
@@ -150,6 +159,7 @@ _WARM_STATE = {
     "state": "not_started",
     "started_at": None,
     "finished_at": None,
+    "refresh_pending": False,
 }
 
 
@@ -183,13 +193,22 @@ def _warm_native_memory(*, replace: bool = False) -> None:
     else:
         state = "ready"
     with _WARM_STATE_LOCK:
-        _WARM_STATE.update(state=state, finished_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+        refresh_pending = bool(_WARM_STATE.get("refresh_pending"))
+        _WARM_STATE.update(
+            state=state,
+            finished_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            refresh_pending=False,
+        )
+    if refresh_pending:
+        request_warm(force=True)
 
 
 def request_warm(*, force: bool = False) -> dict[str, object]:
     """Start one background refresh, optionally replacing an old remote worker."""
     with _WARM_STATE_LOCK:
         if _WARM_STATE.get("state") == "warming":
+            if force:
+                _WARM_STATE["refresh_pending"] = True
             return dict(_WARM_STATE)
         # Reserve the state before starting the thread.  Thread.start() may be
         # delayed, and a second /warm or ingest call must not launch another
@@ -198,6 +217,7 @@ def request_warm(*, force: bool = False) -> dict[str, object]:
             state="warming",
             started_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             finished_at=None,
+            refresh_pending=False,
         )
     threading.Thread(
         target=_warm_native_memory,
@@ -339,6 +359,313 @@ def run(*args: str, timeout: int = 180) -> tuple[int, str, str]:
     env["FUNES_HOME"] = str(HOME)
     p = subprocess.run([FUNES_BIN, *args], text=True, capture_output=True, timeout=timeout, env=env)
     return p.returncode, p.stdout, p.stderr
+
+
+CANONICAL_TRANSLATION_STATUSES = {"ok", "skipped_non_cjk", "skipped_raw_mode"}
+CANONICAL_FACETS = (
+    "source_agent",
+    "source_type",
+    "project",
+    "repo",
+    "device_id",
+    "content_type",
+    "source_missing",
+    "role",
+    "timestamp",
+    "source_path",
+    "worktree",
+    "message_id",
+)
+NATIVE_GET_RE = re.compile(
+    r"(?m)^\s*→\s*get\s+(.+?)(?=\s+--(?:from|to|memory)\b|$)"
+)
+NATIVE_REPORT_RE = re.compile(
+    r"\bingested\s+sources=(\d+)\s+chunks=(\d+)\s+unchanged=(\d+)\s+stale=(\d+)\s+held=(\d+)(?:\s+commit=(\S+))?"
+)
+CANONICAL_REF_PREFIX = "funes-doc:"
+
+
+def canonical_reference(source_identity: str) -> str:
+    encoded = base64.urlsafe_b64encode(source_identity.encode()).decode().rstrip("=")
+    return CANONICAL_REF_PREFIX + encoded
+
+
+def canonical_reference_identity(reference: str) -> str | None:
+    if not reference.startswith(CANONICAL_REF_PREFIX):
+        return None
+    encoded = reference.removeprefix(CANONICAL_REF_PREFIX)
+    try:
+        return base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)).decode()
+    except (ValueError, UnicodeDecodeError):
+        return None
+
+
+def _strip_raw_fields(value):
+    """Remove raw-bearing keys recursively before writing canonical JSONL."""
+    if isinstance(value, dict):
+        return {
+            key: _strip_raw_fields(item)
+            for key, item in value.items()
+            if key not in {"raw_text", "text"}
+        }
+    if isinstance(value, list):
+        return [_strip_raw_fields(item) for item in value]
+    return value
+
+
+def canonical_source_version(item: dict) -> str:
+    retrieval_hash = hashlib.sha256(str(item.get("retrieval_text", "")).encode()).hexdigest()
+    parts = [
+        str(item.get("source_version", "")),
+        str(item.get("content_hash", "")),
+        str(item.get("translation_hash", "")),
+        str(item.get("translation_version", "")),
+        retrieval_hash,
+        "1" if item.get("source_missing") else "0",
+    ]
+    encoded = json.dumps(parts, ensure_ascii=False, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def canonical_document(item: dict) -> dict:
+    """Build the native canonical envelope without copying raw source fields."""
+    metadata = _strip_raw_fields(dict(item.get("metadata") or {}))
+    metadata["source_version"] = str(item.get("source_version", ""))
+    if item.get("session_id") is not None:
+        metadata.setdefault("session_id", item["session_id"])
+    document = {
+        "source_identity": str(item["source_identity"]),
+        "source_version": canonical_source_version(item),
+        "retrieval_text": str(item["retrieval_text"]),
+        "content_hash": str(item["content_hash"]),
+        "updated_at": str(item.get("retrieval_updated_at") or item.get("updated_at")),
+        "metadata": metadata,
+    }
+    for name in CANONICAL_FACETS:
+        if item.get(name) is not None:
+            document[name] = item[name]
+    # Native recall renders the canonical session coordinate in `→ get`.
+    # Encode a reserved sidecar reference even when source metadata came from a
+    # session, so a missing raw row can never fall through to native get.
+    document["session_id"] = canonical_reference(document["source_identity"])
+    return document
+
+
+def _native_update(item: dict, status: str, version: str | None, error: str | None = None) -> dict:
+    return {
+        "source_identity": str(item["source_identity"]),
+        "source_version": str(item.get("source_version", "")),
+        "content_hash": str(item["content_hash"]),
+        "native_index_version": version,
+        "native_index_status": status,
+        "native_indexed_at": (
+            time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            if status == "indexed"
+            else None
+        ),
+        "native_index_error": error,
+    }
+
+
+def _write_canonical_jsonl(path: Path, records: list[tuple[dict, dict]]) -> None:
+    with path.open("w", encoding="utf-8") as stream:
+        for _, document in records:
+            stream.write(json.dumps(document, ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def _ingest_canonical_subset(
+    records: list[tuple[dict, dict]], directory: Path, sequence: list[int]
+) -> tuple[list[dict], bool]:
+    sequence[0] += 1
+    path = directory / f"batch-{sequence[0]:06d}.jsonl"
+    _write_canonical_jsonl(path, records)
+    try:
+        code, output, _ = run(
+            "ingest-docs",
+            str(path),
+            "--memory",
+            REMOTE,
+            timeout=CANONICAL_INDEX_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        return [
+            _native_update(item, "retry", None, "TimeoutExpired")
+            for item, _ in records
+        ], False
+    except (OSError, subprocess.SubprocessError) as exc:
+        return [
+            _native_update(item, "retry", None, type(exc).__name__)
+            for item, _ in records
+        ], False
+    if code != 0:
+        return [
+            _native_update(item, "retry", None, "native_exit")
+            for item, _ in records
+        ], False
+    report = NATIVE_REPORT_RE.search(output)
+    if report is None:
+        return [
+            _native_update(item, "retry", None, "invalid_report")
+            for item, _ in records
+        ], False
+    sources = int(report.group(1))
+    unchanged = int(report.group(3))
+    stale = int(report.group(4))
+    held = int(report.group(5))
+    committed = bool(report.group(6))
+    if sources + unchanged + stale + held != len(records):
+        return [
+            _native_update(item, "retry", None, "invalid_report")
+            for item, _ in records
+        ], committed
+    if held == 0 and stale == 0:
+        return [
+            _native_update(item, "indexed", document["source_version"])
+            for item, document in records
+        ], committed
+    if len(records) == 1:
+        item, document = records[0]
+        if held == 1:
+            return [_native_update(item, "held_secret", document["source_version"])], committed
+        return [_native_update(item, "retry", None, "native_stale")], committed
+    middle = len(records) // 2
+    left, left_commit = _ingest_canonical_subset(records[:middle], directory, sequence)
+    right, right_commit = _ingest_canonical_subset(records[middle:], directory, sequence)
+    return left + right, committed or left_commit or right_commit
+
+
+def reconcile_canonical_index(app) -> dict[str, object]:
+    """Index one restart-safe batch and persist only derived status in the sidecar."""
+    if not REMOTE or app.syncer.restoring or app.syncer.restore_failed:
+        return {"attempted": 0, "indexed": 0, "held": 0, "durable": False}
+
+    def select_and_ingest(directory: Path):
+        if app.syncer.restoring or app.syncer.restore_failed:
+            return [], [], False
+        rows = app.store.canonical_index_candidates(CANONICAL_INDEX_BATCH)
+        selected = []
+        for item in rows:
+            if item.get("translation_status") not in CANONICAL_TRANSLATION_STATUSES:
+                continue
+            document = canonical_document(item)
+            if (
+                item.get("native_index_status") in {"indexed", "held_secret"}
+                and item.get("native_index_version") == document["source_version"]
+            ):
+                continue
+            selected.append((item, document))
+        if not selected:
+            return selected, [], False
+        updates, committed = _ingest_canonical_subset(selected, directory, [0])
+        return selected, updates, committed
+
+    with tempfile.TemporaryDirectory(prefix="funes-canonical-") as temporary:
+        with WRITE_LOCK:
+            translation_lock = getattr(app, "translation_lock", None)
+            if translation_lock is None:
+                records, updates, committed = select_and_ingest(Path(temporary))
+            else:
+                with translation_lock:
+                    records, updates, committed = select_and_ingest(Path(temporary))
+    if not records:
+        durable = not app.syncer.restoring and not app.syncer.restore_failed
+        return {"attempted": 0, "indexed": 0, "held": 0, "durable": durable}
+    if committed:
+        request_warm(force=True)
+    status_documents = []
+    for update in updates:
+        current = app.store.get(update["source_identity"])
+        if (
+            current is None
+            or str(current.get("source_version", "")) != update["source_version"]
+            or str(current.get("content_hash", "")) != update["content_hash"]
+        ):
+            continue
+        status_documents.append({**current, **update})
+    sync = app.syncer.upload(status_documents) if status_documents else {"durable": False}
+    durable = bool(sync.get("durable"))
+    if durable:
+        app.store.update_native_index(updates)
+    return {
+        "attempted": len(records),
+        "indexed": sum(item["native_index_status"] == "indexed" for item in updates) if durable else 0,
+        "held": sum(item["native_index_status"] == "held_secret" for item in updates) if durable else 0,
+        "durable": durable,
+    }
+
+
+def _canonical_reconcile_background(app) -> None:
+    app.restore_done.wait()
+    while not app.canonical_index_stop.is_set():
+        try:
+            reconcile_canonical_index(app)
+        except Exception:
+            # Retry state remains in the encrypted source store. Never log raw
+            # rows, subprocess output, provider payloads, or credentials.
+            pass
+        if app.canonical_index_stop.wait(CANONICAL_INDEX_INTERVAL):
+            break
+
+
+def start_canonical_reconciler(app) -> None:
+    if not REMOTE or getattr(app, "canonical_index_thread", None) is not None:
+        return
+    app.canonical_index_stop = threading.Event()
+    app.canonical_index_thread = threading.Thread(
+        target=_canonical_reconcile_background,
+        args=(app,),
+        name="funes-canonical-index-reconcile",
+        daemon=True,
+    )
+    app.canonical_index_thread.start()
+
+
+def stop_canonical_reconciler(app) -> None:
+    stop = getattr(app, "canonical_index_stop", None)
+    thread = getattr(app, "canonical_index_thread", None)
+    if stop is not None:
+        stop.set()
+    if thread is not None and thread is not threading.current_thread():
+        thread.join(timeout=CANONICAL_INDEX_TIMEOUT + 5)
+
+
+def native_result_ids(output: str) -> list[str]:
+    return list(dict.fromkeys(value.strip() for value in NATIVE_GET_RE.findall(output)))
+
+
+def _public_source_item(item: dict) -> dict:
+    public = dict(item)
+    public.pop("retrieval_text", None)
+    return public
+
+
+def materialize_native_results(output: str, app, limit: int) -> list[dict]:
+    """Resolve native rank coordinates to raw sidecar documents or sessions."""
+    results = []
+    for identity in native_result_ids(output)[:limit]:
+        is_canonical_reference = identity.startswith(CANONICAL_REF_PREFIX)
+        canonical_identity = canonical_reference_identity(identity)
+        lookup_identity = canonical_identity or identity
+        item = app.store.get(lookup_identity) if app is not None else None
+        if item is not None:
+            public = _public_source_item(item)
+            public["retrieval_backend"] = "native_funes"
+            results.append(public)
+            continue
+        if is_canonical_reference:
+            # A canonical native reference without its encrypted sidecar raw is
+            # unsafe to render: native get would expose retrieval_text.
+            continue
+        session = get(identity)
+        results.append(
+            {
+                "raw_text": session,
+                "source_type": "session",
+                "session_id": identity,
+                "retrieval_backend": "native_funes",
+            }
+        )
+    return results
 
 
 class NativeMcpError(subprocess.SubprocessError):
@@ -813,8 +1140,11 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json(400, {"error": "query is required"})
                     return
                 limit = min(int(obj.get("limit", obj.get("k", 8))), 50)
+                facet_values = obj.get("facets") or {}
+                if not isinstance(facet_values, dict):
+                    raise ValueError("facets must be an object")
                 filters = {
-                    key: obj.get(key)
+                    key: obj.get(key, facet_values.get(key))
                     for key in (
                         "source_agent",
                         "source_type",
@@ -823,13 +1153,22 @@ class Handler(BaseHTTPRequestHandler):
                         "device_id",
                         "role",
                         "content_type",
+                        "source_missing",
                         "since",
                         "until",
                     )
-                    if obj.get(key) is not None
+                    if obj.get(key, facet_values.get(key)) is not None
                 }
+                app = source_app()
+                if app is not None and (app.syncer.restoring or app.syncer.restore_failed):
+                    error = "restore_in_progress" if app.syncer.restoring else "restore_failed"
+                    self.send_json(503, {"ok": False, "results": [], "results_text": "", "error": error})
+                    return
                 source_query, source_hits = search_source_documents(raw_query, limit, filters)
-                query = query_text(raw_query)
+                # The source-side translator is cached and uses the full
+                # normalization prompt. Reuse its rewrite for native semantic
+                # retrieval instead of paying for a second provider call.
+                query = source_query if source_query != raw_query else query_text(raw_query)
                 # CJK queries use the ASCII shadow above.  Keep the native
                 # search bounded so the CPU Space does not spend its entire
                 # request window reranking broad generic terms.
@@ -840,25 +1179,22 @@ class Handler(BaseHTTPRequestHandler):
                         "neighbors": 0,
                         "half_life": 0,
                     }
-                for name in ("harness", "repo"):
+                for name in ("harness",):
                     if obj.get(name):
                         tuning[name] = str(obj[name])
-                if obj.get("source_agent") and not obj.get("harness"):
-                    tuning["harness"] = {
-                        "claude_code": "claude",
-                    }.get(str(obj["source_agent"]), str(obj["source_agent"]))
-                # Native CLI output is intentionally human-readable.  Keep it
-                # lossless while also exposing the list shape expected by MCP
-                # clients; the service backend can later provide structured
-                # per-chunk metadata without changing this contract.
-                # Native Funes presently filters only harness/repo. For a
-                # stricter metadata/date filter, returning an unfiltered native
-                # block would violate the caller's contract; the authoritative
-                # source store handles those filters instead.
-                native_allowed = not any(
-                    key in filters
-                    for key in ("source_type", "project", "device_id", "role", "content_type", "since", "until")
-                )
+                for name in (
+                    "source_agent",
+                    "source_type",
+                    "project",
+                    "repo",
+                    "device_id",
+                    "content_type",
+                    "source_missing",
+                ):
+                    if name in filters:
+                        tuning[name] = filters[name]
+                # Date/role filtering remains authoritative in the sidecar.
+                native_allowed = not any(key in filters for key in ("role", "since", "until"))
                 try:
                     # The native CLI defaults to 30 fused candidates, recency
                     # weighting, and neighbor expansion. Those defaults are
@@ -870,30 +1206,49 @@ class Handler(BaseHTTPRequestHandler):
                     tuning.setdefault("neighbors", 0)
                     tuning.setdefault("half_life", 0)
                     out = recall(query, k=limit, **tuning) if native_allowed else ""
+                    results = materialize_native_results(out, app, limit) if out else []
                 except NativeMcpBusyError:
                     self.send_json(429, {"ok": False, "query": raw_query, "retrieval_query": query, "results": [], "results_text": "", "error": "native_mcp_busy", "retry_after": 3}, {"Retry-After": "3"})
                     return
                 except NativeMcpError:
                     self.send_json(503, {"ok": False, "query": raw_query, "retrieval_query": query, "results": [], "results_text": "", "error": "native_mcp_unavailable"})
                     return
-                results = list(source_hits)
-                if out.strip():
-                    results.append({"raw_text": out, "source_type": "session", "retrieval_backend": "native_funes"})
-                source_text = "\n\n".join(str(item.get("raw_text", "")) for item in source_hits if item.get("raw_text"))
-                results_text = "\n\n".join(part for part in (source_text, out) if part.strip())
+                seen = {
+                    str(item.get("source_identity"))
+                    for item in results
+                    if item.get("source_identity") is not None
+                }
+                for item in source_hits:
+                    if len(results) >= limit:
+                        break
+                    identity = str(item.get("source_identity", ""))
+                    if identity and identity in seen:
+                        continue
+                    results.append(item)
+                    if identity:
+                        seen.add(identity)
+                results_text = "\n\n".join(
+                    str(item.get("raw_text", ""))
+                    for item in results
+                    if item.get("raw_text")
+                )
                 self.send_json(200, {"ok": True, "query": raw_query, "retrieval_query": source_query if source_query != raw_query else query, "results": results, "results_text": results_text, "error": ""})
                 return
             if self.path == "/get":
-                sid = str(obj.get("session_id", obj.get("id", ""))).strip()
+                sid = str(obj.get("source_identity", obj.get("id", obj.get("session_id", "")))).strip()
                 if not sid:
                     self.send_json(400, {"error": "session_id is required"})
                     return
                 app = source_app()
-                item = app.store.get(sid) if app is not None and not app.syncer.restoring and not app.syncer.restore_failed else None
+                is_canonical_reference = sid.startswith(CANONICAL_REF_PREFIX)
+                canonical_identity = canonical_reference_identity(sid)
+                lookup_identity = canonical_identity or sid
+                item = app.store.get(lookup_identity) if app is not None and not app.syncer.restoring and not app.syncer.restore_failed else None
                 if item is not None:
-                    if os.getenv("RETURN_RETRIEVAL_TEXT", "false").lower() not in {"1", "true", "yes", "on"}:
-                        item.pop("retrieval_text", None)
-                    self.send_json(200, {"ok": True, "result": item, "error": ""})
+                    self.send_json(200, {"ok": True, "result": _public_source_item(item), "error": ""})
+                    return
+                if is_canonical_reference:
+                    self.send_json(404, {"ok": False, "result": "", "error": "not_found"})
                     return
                 try:
                     out = get(sid, from_=obj.get("from"), to=obj.get("to"))
@@ -920,6 +1275,11 @@ class Handler(BaseHTTPRequestHandler):
                     status, result, _canonical = source_result
                     self.send_json(status, result)
                     return
+                # The raw encrypted sidecar is mandatory for HTTP ingestion.
+                # Never fall through to the legacy synchronous transcript
+                # indexer: request threads must not run native embeddings.
+                self.send_json(503, {"error": "FUNES_STORAGE_REPO is not configured", "durable": False})
+                return
                 if not REMOTE:
                     self.send_json(503, {"error": "FUNES_MEMORY is not configured", "durable": False})
                     return

@@ -15,10 +15,10 @@ from service.server import App, Store, Translator, make_handler
 class ServiceTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.old = {k: os.environ.get(k) for k in ("FUNES_DATA_DIR", "FUNES_AUTH_TOKEN", "FUNES_API_TOKEN", "FUNES_STORAGE_KEY", "FUNES_STORAGE_REPO", "FUNES_SNAPSHOT_FILE", "HF_TOKEN", "FUNES_REQUIRE_DURABLE_ACK", "FUNES_ALLOW_EMPTY_REMOTE", "TRANSLATION_BASE_URL", "TRANSLATION_API_KEY", "TRANSLATION_MODEL", "TRANSLATION_MAX_PER_INGEST", "TRANSLATION_RECONCILE_INTERVAL")}
+        self.old = {k: os.environ.get(k) for k in ("FUNES_DATA_DIR", "FUNES_AUTH_TOKEN", "FUNES_API_TOKEN", "FUNES_STORAGE_KEY", "FUNES_STORAGE_REPO", "FUNES_SNAPSHOT_FILE", "HF_TOKEN", "FUNES_REQUIRE_DURABLE_ACK", "FUNES_ALLOW_EMPTY_REMOTE", "TRANSLATION_BASE_URL", "TRANSLATION_API_KEY", "TRANSLATION_MODEL", "TRANSLATION_MAX_PER_INGEST", "TRANSLATION_RECONCILE_INTERVAL", "RETURN_RETRIEVAL_TEXT")}
         os.environ["FUNES_DATA_DIR"] = self.tmp.name
         os.environ["FUNES_AUTH_TOKEN"] = "test-token"
-        for k in ("FUNES_API_TOKEN", "FUNES_STORAGE_KEY", "FUNES_STORAGE_REPO", "FUNES_SNAPSHOT_FILE", "HF_TOKEN", "FUNES_REQUIRE_DURABLE_ACK", "FUNES_ALLOW_EMPTY_REMOTE", "TRANSLATION_BASE_URL", "TRANSLATION_API_KEY", "TRANSLATION_MODEL", "TRANSLATION_MAX_PER_INGEST", "TRANSLATION_RECONCILE_INTERVAL"):
+        for k in ("FUNES_API_TOKEN", "FUNES_STORAGE_KEY", "FUNES_STORAGE_REPO", "FUNES_SNAPSHOT_FILE", "HF_TOKEN", "FUNES_REQUIRE_DURABLE_ACK", "FUNES_ALLOW_EMPTY_REMOTE", "TRANSLATION_BASE_URL", "TRANSLATION_API_KEY", "TRANSLATION_MODEL", "TRANSLATION_MAX_PER_INGEST", "TRANSLATION_RECONCILE_INTERVAL", "RETURN_RETRIEVAL_TEXT"):
             os.environ.pop(k, None)
 
     def tearDown(self):
@@ -79,6 +79,95 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(store.get("derived-only")["translation_status"], "ok")
         store.close()
 
+    def test_same_revision_native_status_update_preserves_raw_and_retrieval(self):
+        store = Store(self.tmp.name)
+        raw = "原始正文"
+        store.ingest(
+            [{
+                "source_identity": "native-state",
+                "source_version": "v1",
+                "raw_text": raw,
+                "retrieval_text": "english retrieval shadow",
+                "translation_status": "ok",
+                "retrieval_updated_at": "2026-09-13T01:00:00Z",
+            }]
+        )
+        result = store.ingest(
+            [{
+                "source_identity": "native-state",
+                "source_version": "v1",
+                "raw_text": raw,
+                "native_index_version": "canonical-v1",
+                "native_index_status": "indexed",
+                "native_indexed_at": "2026-09-13T02:00:00Z",
+            }]
+        )
+        item = store.get("native-state")
+        self.assertEqual(result["items"][0]["status"], "derived_updated")
+        self.assertEqual(item["raw_text"], raw)
+        self.assertEqual(item["retrieval_text"], "english retrieval shadow")
+        self.assertEqual(item["translation_status"], "ok")
+        self.assertEqual(item["native_index_status"], "indexed")
+        changed = store.ingest(
+            [{
+                "source_identity": "native-state",
+                "source_version": "v1",
+                "raw_text": raw,
+                "source_missing": True,
+            }]
+        )
+        item = store.get("native-state")
+        self.assertEqual(changed["items"][0]["status"], "derived_updated")
+        self.assertTrue(item["source_missing"])
+        self.assertIsNone(item["native_index_status"])
+        store.close()
+
+    def test_restore_does_not_regress_terminal_native_state(self):
+        store = Store(self.tmp.name)
+        base = {
+            "source_identity": "monotonic-native",
+            "source_version": "raw-v1",
+            "raw_text": "原始正文",
+            "retrieval_text": "english retrieval shadow",
+            "translation_hash": "translation-hash",
+            "translation_version": "translation-version",
+            "translation_status": "ok",
+            "retrieval_updated_at": "2026-09-13T01:00:00Z",
+            "native_index_version": None,
+            "native_index_status": None,
+            "native_indexed_at": None,
+            "native_index_error": None,
+        }
+        store.ingest([base])
+        indexed = {
+            **base,
+            "native_index_version": "canonical-v1",
+            "native_index_status": "indexed",
+            "native_indexed_at": "2026-09-13T02:00:00Z",
+        }
+        store.ingest([indexed])
+        store.restore_documents([base])
+        item = store.get("monotonic-native")
+        self.assertEqual(item["native_index_status"], "indexed")
+        self.assertEqual(item["native_index_version"], "canonical-v1")
+        held = {
+            **indexed,
+            "native_index_status": "held_secret",
+            "native_indexed_at": None,
+        }
+        store.ingest([held])
+        store.restore_documents(
+            [{
+                **base,
+                "native_index_status": "retry",
+                "native_index_error": "native_exit",
+            }]
+        )
+        item = store.get("monotonic-native")
+        self.assertEqual(item["native_index_status"], "held_secret")
+        self.assertIsNone(item["native_index_error"])
+        store.close()
+
     def test_multiple_chunks_same_source_path(self):
         store = Store(self.tmp.name)
         result = store.ingest([
@@ -88,6 +177,17 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(result["created"], 2)
         self.assertEqual(store.count(), 2)
         self.assertEqual({r["source_identity"] for r in store.sources()}, {"a.md#chunk:0", "a.md#chunk:1"})
+        store.close()
+
+    def test_numeric_source_identity_precedes_sqlite_id(self):
+        store = Store(self.tmp.name)
+        store.ingest(
+            [
+                {"source_identity": "first", "raw_text": "row one"},
+                {"source_identity": "1", "raw_text": "numeric identity"},
+            ]
+        )
+        self.assertEqual(store.get("1")["raw_text"], "numeric identity")
         store.close()
 
     def _server(self):
@@ -177,6 +277,49 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(target.search("durable")[0]["raw_text"], "durable text")
         self.assertEqual(target.translation_get("cache-key"), "cached retrieval text")
         source.close(); target.close(); second_dir.cleanup()
+
+    def test_snapshot_roundtrip_preserves_retrieval_and_native_state(self):
+        source = Store(self.tmp.name)
+        source.ingest(
+            [{
+                "source_identity": "stateful",
+                "source_version": "raw-v1",
+                "raw_text": "原文",
+                "retrieval_text": "retrieval shadow",
+                "translation_status": "ok",
+                "retrieval_updated_at": "2026-09-13T01:00:00Z",
+                "native_index_version": "canonical-v1",
+                "native_index_status": "indexed",
+                "native_indexed_at": "2026-09-13T02:00:00Z",
+                "native_index_error": None,
+            }]
+        )
+        snapshot = Path(self.tmp.name) / "state.jsonl.gz"
+        source.snapshot(snapshot)
+        second_dir = tempfile.TemporaryDirectory()
+        target = Store(second_dir.name)
+        self.assertEqual(target.restore(snapshot), 1)
+        item = target.get("stateful")
+        self.assertEqual(item["retrieval_updated_at"], "2026-09-13T01:00:00Z")
+        self.assertEqual(item["native_index_version"], "canonical-v1")
+        self.assertEqual(item["native_index_status"], "indexed")
+        self.assertEqual(item["native_indexed_at"], "2026-09-13T02:00:00Z")
+        source.close(); target.close(); second_dir.cleanup()
+
+    def test_http_never_returns_retrieval_text_even_when_legacy_flag_is_set(self):
+        os.environ["RETURN_RETRIEVAL_TEXT"] = "true"
+        server = self._server()
+        status, _ = self._request(
+            server,
+            "POST",
+            "/ingest",
+            {"source_identity": "raw-only", "raw_text": "原文", "retrieval_text": "english shadow"},
+        )
+        self.assertEqual(status, 200)
+        status, item = self._request(server, "POST", "/get", {"id": "raw-only"})
+        self.assertEqual(status, 200)
+        self.assertEqual(item["raw_text"], "原文")
+        self.assertNotIn("retrieval_text", item)
 
     def test_ingest_does_not_ack_before_durable_snapshot(self):
         os.environ["FUNES_REQUIRE_DURABLE_ACK"] = "true"

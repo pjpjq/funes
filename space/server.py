@@ -97,7 +97,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def body(self) -> dict:
         n = int(self.headers.get("Content-Length", "0"))
-        return json.loads(self.rfile.read(min(n, 2_000_000)) or b"{}")
+        max_bytes = int(os.getenv("FUNES_MAX_BODY_BYTES", "64000000"))
+        if n > max_bytes:
+            raise ValueError("request too large")
+        return json.loads(self.rfile.read(n) or b"{}")
 
     def do_GET(self) -> None:
         if self.path == "/health":

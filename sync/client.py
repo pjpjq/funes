@@ -22,11 +22,12 @@ class SyncClient:
             headers["X-Funes-Authorization"] = "Bearer " + token
         else:
             headers["Authorization"] = "Bearer " + token
+        timeout = float(os.environ.get("FUNES_REMOTE_TIMEOUT", "900"))
         last = None
         for attempt in range(4):
             req=request.Request(url,data=body,headers=headers,method="POST")
             try:
-                with request.urlopen(req,timeout=30) as r:
+                with request.urlopen(req,timeout=timeout) as r:
                     raw=r.read()
                     result = json.loads(raw) if raw else {"accepted": len(records), "durable": True}
                     # The daemon may acknowledge a local queue row only after

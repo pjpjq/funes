@@ -12,6 +12,8 @@ import json
 import os
 import re
 import sqlite3
+import shutil
+import subprocess
 import threading
 import time
 import urllib.error
@@ -325,6 +327,7 @@ class Translator:
         self.batch_size = max(1, int(os.getenv("TRANSLATION_BATCH_SIZE", "16")))
         self.concurrency = max(1, int(os.getenv("TRANSLATION_CONCURRENCY", "4")))
         self.retries = max(1, int(os.getenv("TRANSLATION_RETRIES", "2")))
+        self.mode = os.getenv("FUNES_RETRIEVAL_LANGUAGE_MODE", "auto").lower()
 
     def _cache_key(self, query: str) -> str:
         return json.dumps({"raw": query, "model": self.model, "prompt_version": PROMPT_VERSION}, ensure_ascii=False, sort_keys=True)
@@ -332,7 +335,7 @@ class Translator:
     def rewrite(self, query: str) -> str:
         raw_query = query
         query = normalize_text(query)
-        if not self.base or not self.key or not self.model or cjk_ratio(query) < self.threshold:
+        if self.mode == "raw" or not self.base or not self.key or not self.model or (self.mode == "auto" and cjk_ratio(query) < self.threshold):
             return query
         cache_key = self._cache_key(raw_query)
         cached = self.store.translation_get(cache_key)
@@ -361,7 +364,9 @@ class Translator:
         """Return derived retrieval text plus hash/version/status metadata."""
         normalized = normalize_text(raw)
         translation_hash = hashlib.sha256((raw + self.model + PROMPT_VERSION).encode("utf-8")).hexdigest()
-        if cjk_ratio(normalized) < self.threshold:
+        if self.mode == "raw":
+            return normalized, translation_hash, PROMPT_VERSION, "skipped_raw_mode"
+        if self.mode == "auto" and cjk_ratio(normalized) < self.threshold:
             return normalized, translation_hash, PROMPT_VERSION, "skipped_non_cjk"
         if not self.base or not self.key or not self.model:
             return normalized, translation_hash, PROMPT_VERSION, "fallback_no_provider"
@@ -400,6 +405,21 @@ class SnapshotSync:
         self.repo = os.getenv("FUNES_STORAGE_REPO", "")
         self.token = os.getenv("HF_TOKEN", "")
         self.filename = os.getenv("FUNES_SNAPSHOT_FILE", "funes-snapshot.jsonl")
+        self.restore_failed = False
+        self.restore_error = None
+        self.restored = False
+
+    @staticmethod
+    def _truth(name: str, default: bool = False) -> bool:
+        return os.getenv(name, str(default)).lower() in {"1", "true", "yes", "on"}
+
+    def _fail_restore(self, exc: Exception) -> int:
+        # A failed remote restore is a safety boundary: serving an empty/partial
+        # database and later uploading it could destroy the only durable copy.
+        self.restore_failed = True
+        self.restore_error = type(exc).__name__
+        self.store.set_sync(last_error=self.restore_error)
+        return -1
 
     def snapshot_path(self) -> Path:
         return self.store.data_dir / self.filename
@@ -409,26 +429,72 @@ class SnapshotSync:
             try:
                 from huggingface_hub import hf_hub_download
                 downloaded = hf_hub_download(repo_id=self.repo, repo_type="dataset", filename=self.filename, token=self.token, local_dir=str(self.store.data_dir))
-                return self.store.restore(Path(downloaded))
+                restored = self.store.restore(Path(downloaded))
+                self.restored = True
+                return restored
             except Exception as exc:  # optional recovery must never stop serving
-                self.store.set_sync(last_error=type(exc).__name__)
-        return self.store.restore(self.snapshot_path())
+                status = getattr(getattr(exc, "response", None), "status_code", None)
+                if status == 404 and self._truth("FUNES_ALLOW_EMPTY_REMOTE"):
+                    self.restored = True
+                    return 0
+                return self._fail_restore(exc)
+        local = self.snapshot_path()
+        if not local.exists():
+            self.restored = True
+            return 0
+        try:
+            restored = self.store.restore(local)
+            self.restored = True
+            return restored
+        except Exception as exc:
+            return self._fail_restore(exc)
+
+    def _secret_gate(self, path: Path) -> tuple[bool, str]:
+        """Run the same TruffleHog CLI contract used by native `funes push`.
+
+        The gate is deliberately fail-closed.  Its stdout/stderr are never
+        logged because TruffleHog may include secret material in findings.
+        """
+        binary = os.getenv("FUNES_TRUFFLEHOG") or shutil.which("trufflehog")
+        if not binary:
+            return False, "secret_scanner_unavailable"
+        try:
+            result = subprocess.run(
+                [binary, "filesystem", str(path.parent), "--json", "--no-verification",
+                 "--no-update", "--fail", "--fail-on-scan-errors",
+                 "--results=verified,unknown,unverified"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=int(os.getenv("FUNES_SECRET_SCAN_TIMEOUT", "120")),
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False, "secret_scan_error"
+        return (result.returncode == 0), ("clean" if result.returncode == 0 else "secret_detected")
 
     def upload(self) -> dict[str, Any]:
         with self.upload_lock:
+            if self.restore_failed:
+                return {"uploaded": False, "durable": False, "reason": "restore_failed"}
             path = self.snapshot_path()
             self.store.snapshot(path)
             if not self.repo or not self.token:
                 self.store.set_sync(last_sync=utc_now(), snapshot_path=str(path), last_error=None)
-                return {"uploaded": False, "path": str(path), "reason": "HF storage not configured"}
+                if self._truth("FUNES_REQUIRE_DURABLE_ACK"):
+                    return {"uploaded": False, "durable": False, "path": str(path), "reason": "HF storage not configured"}
+                return {"uploaded": False, "durable": True, "path": str(path), "reason": "local durable store"}
+            clean, gate_reason = self._secret_gate(path)
+            if not clean:
+                self.store.set_sync(last_error=gate_reason, snapshot_path=str(path))
+                return {"uploaded": False, "durable": False, "path": str(path), "reason": gate_reason}
             try:
                 from huggingface_hub import HfApi
                 HfApi(token=self.token).upload_file(path_or_fileobj=str(path), path_in_repo=self.filename, repo_id=self.repo, repo_type="dataset", commit_message="funes snapshot")
                 self.store.set_sync(last_sync=utc_now(), snapshot_path=str(path), last_error=None)
-                return {"uploaded": True, "path": str(path)}
+                return {"uploaded": True, "durable": True, "path": str(path)}
             except Exception as exc:
                 self.store.set_sync(last_error=type(exc).__name__, snapshot_path=str(path))
-                return {"uploaded": False, "path": str(path), "reason": type(exc).__name__}
+                return {"uploaded": False, "durable": False, "path": str(path), "reason": type(exc).__name__}
 
 
 class App:
@@ -503,6 +569,8 @@ def make_handler(app: App):
                 return self._json(200, {"status": "ok", "service": "funes"})
             if route == "/ready":
                 try:
+                    if app.syncer.restore_failed:
+                        return self._json(503, {"status": "not_ready", "error": "restore_failed"})
                     count = app.store.count()
                     return self._json(200, {"status": "ready", "documents": count, "restored": app.restore_result})
                 except Exception as exc:
@@ -526,6 +594,8 @@ def make_handler(app: App):
             try:
                 body = self._body()
                 if self.path == "/ingest":
+                    if app.syncer.restore_failed:
+                        return self._json(503, {"error": "restore_failed", "durable": False})
                     docs = body.get("documents", body.get("records", body.get("items")))
                     if docs is None:
                         docs = [body]
@@ -547,8 +617,13 @@ def make_handler(app: App):
                         item.setdefault("translation_status", translation_status)
                         prepared.append(item)
                     result = app.store.ingest(prepared)
-                    if body.get("sync"):
-                        result["sync"] = app.syncer.upload()
+                    result["accepted"] = result["created"] + result["updated"] + result["deduped"]
+                    # A remote caller must not receive an ACK that can be lost
+                    # between SQLite commit and HF persistence.  The upload is
+                    # idempotent; retrying the same source identities is safe.
+                    result["sync"] = app.syncer.upload()
+                    if not result["sync"].get("durable"):
+                        return self._json(503, {"error": "durability_pending", **result})
                     return self._json(200, result)
                 if self.path in ("/search", "/recall"):
                     query = normalize_text(str(body.get("query", body.get("q", ""))))
@@ -566,7 +641,8 @@ def make_handler(app: App):
                 if self.path == "/reindex":
                     return self._json(200, {"reindexed": app.store.reindex()})
                 if self.path == "/sync":
-                    return self._json(200, app.syncer.upload())
+                    result = app.syncer.upload()
+                    return self._json(200 if result.get("durable") else 503, result)
                 if self.path == "/sync/status":
                     return self._json(200, app.store.sync_status())
             except (ValueError, json.JSONDecodeError) as exc:

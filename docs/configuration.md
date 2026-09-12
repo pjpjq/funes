@@ -75,6 +75,9 @@ file-grained cache design and cold-versus-warm behavior.
 | `FUNES_HOME` | Local memory and funes state directory; default `~/.funes`. |
 | `FUNES_BIN` | Binary path recorded in supported MCP registrations and used by the pi bridge. Hook workers instead find `funes` on `PATH` or in common install directories. |
 | `FUNES_MEMORY` | Per-run memory override understood by the pi extension; otherwise its binding from `funes add pi [memory]` is used. |
+| `FUNES_NATIVE_PRIMARY` | When `true`, `funes-sync` delegates production index/push to native Funes instead of the migration HTTP path. |
+| `FUNES_SYNC_INTERVAL` | Continuous reconciliation interval in seconds; default `300`. |
+| `FUNES_API_TOKEN` | Bearer token for the compatibility HTTP bridge; never written to launchd plist, loaded from Keychain on macOS. |
 | `FUNES_TRUFFLEHOG` | Explicit TruffleHog binary for secret scanning. Index-time redaction is best-effort; push and scrub scanning fail closed. |
 | `HF_TOKEN`, `HUGGING_FACE_HUB_TOKEN`, `HUGGINGFACE_TOKEN` | Hugging Face authentication, in the precedence shown above. |
 | `HF_HOME` | Hugging Face home, including the default backend's model cache. |

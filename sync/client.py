@@ -8,8 +8,9 @@ class SyncClient:
     def ingest(self, records:list[dict]):
         if not records: return {"accepted":0}
         url=self.config.remote_url.rstrip("/")+"/ingest"
-        # service/server.py accepts either documents or items; use its canonical
-        # field while retaining a flat document schema for older deployments.
+        # The native Space bridge and the migration compatibility service both
+        # accept this canonical envelope; durable=true is mandatory in either
+        # implementation.
         body=json.dumps({"device_id":self.config.device_id,"documents":records}, ensure_ascii=False).encode()
         headers={"Content-Type":"application/json","User-Agent":"funes-sync/1"}
         token=os.environ.get("FUNES_API_TOKEN")
@@ -27,8 +28,8 @@ class SyncClient:
                     # the remote confirms a durable commit.  A 2xx response
                     # without that contract is treated as retryable rather
                     # than silently losing the pending record.
-                    if result.get("durable") is False:
-                        raise RuntimeError("remote acknowledged before durable commit")
+                    if result.get("durable") is not True:
+                        raise RuntimeError("remote did not confirm a durable commit")
                     accepted = int(result.get("accepted", result.get("created", 0) + result.get("updated", 0) + result.get("deduped", 0)))
                     if accepted < len(records):
                         raise RuntimeError(f"remote accepted {accepted}/{len(records)} records")
@@ -56,4 +57,7 @@ class SyncClient:
             raise RuntimeError("FUNES_API_TOKEN is not configured")
         req=request.Request(self.config.remote_url.rstrip("/")+"/sync",data=b"{}",headers={"Content-Type":"application/json","Authorization":"Bearer "+token},method="POST")
         with request.urlopen(req,timeout=120) as r:
-            raw=r.read(); return json.loads(raw) if raw else {}
+            raw=r.read(); result=json.loads(raw) if raw else {}
+            if result.get("durable") is not True:
+                raise RuntimeError("remote snapshot sync did not confirm a durable commit")
+            return result

@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import time
@@ -24,6 +25,7 @@ HOME = Path(os.getenv("FUNES_HOME", "/data/.funes"))
 PORT = int(os.getenv("PORT", "7860"))
 TRANSLATION_THRESHOLD = float(os.getenv("TRANSLATE_CHINESE_THRESHOLD", "0.15"))
 PROMPT_VERSION = "funes-retrieval-v1"
+LANGUAGE_MODE = os.getenv("FUNES_RETRIEVAL_LANGUAGE_MODE", "auto").lower()
 
 
 def cjk_ratio(text: str) -> float:
@@ -34,7 +36,9 @@ def cjk_ratio(text: str) -> float:
 
 def query_text(raw: str) -> str:
     """Expand Chinese queries; original text is always retained for BM25."""
-    if cjk_ratio(raw) < TRANSLATION_THRESHOLD:
+    if LANGUAGE_MODE == "raw":
+        return raw
+    if LANGUAGE_MODE == "auto" and cjk_ratio(raw) < TRANSLATION_THRESHOLD:
         return raw
     # Keep technical entities verbatim even when the optional provider is absent.
     entities = re.findall(r"[A-Za-z][A-Za-z0-9_.*:/-]{1,}", raw)
@@ -67,9 +71,7 @@ def run(*args: str, timeout: int = 180) -> tuple[int, str, str]:
 
 
 def auth_ok(handler: BaseHTTPRequestHandler) -> bool:
-    if not TOKEN:
-        return True
-    return handler.headers.get("Authorization", "") == "Bearer " + TOKEN
+    return bool(TOKEN) and handler.headers.get("Authorization", "") == "Bearer " + TOKEN
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -77,7 +79,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, fmt: str, *args) -> None:
         # Never log request bodies, Authorization, or raw memory text.
-        super().log_message(fmt, *args)
+        return
 
     def send_json(self, code: int, obj: object) -> None:
         data = json.dumps(obj, ensure_ascii=False).encode()
@@ -140,28 +142,66 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(200 if code == 0 else 503, {"ok": code == 0, "result": out, "error": err[-1000:]})
                 return
             if self.path == "/ingest":
-                raw = str(obj.get("raw_text", ""))
-                if not raw:
-                    self.send_json(400, {"error": "raw_text is required"})
+                docs = obj.get("documents", obj.get("records", obj.get("items")))
+                if docs is None:
+                    docs = [obj]
+                if not isinstance(docs, list) or not docs:
+                    self.send_json(400, {"error": "documents must be a non-empty list"})
                     return
-                sid = str(obj.get("session_id") or hashlib.sha256(raw.encode()).hexdigest()[:32])
+                if not REMOTE:
+                    self.send_json(503, {"error": "FUNES_MEMORY is not configured", "durable": False})
+                    return
                 now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
                 source = Path(tempfile.mkdtemp(prefix="funes-ingest-", dir=HOME / "sources"))
-                line = {"type": "session_meta", "timestamp": now, "payload": {"id": sid, "cwd": str(obj.get("workdir", "remote"))}}
-                msg = {"type": "response_item", "timestamp": now, "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": raw}]}}
-                (source / (sid + ".jsonl")).write_text(json.dumps(line) + "\n" + json.dumps(msg) + "\n")
-                code, out, err = run("index", str(source), "--harness", "codex", "--yes", timeout=300)
-                if code == 0 and REMOTE:
-                    code, pout, perr = run("push", REMOTE, "--yes", "--force-reindex", timeout=300)
-                    out += pout
-                    err += perr
-                self.send_json(200 if code == 0 else 503, {"ok": code == 0, "session_id": sid, "output": out[-3000:], "error": err[-1000:]})
+                try:
+                    harnesses = set()
+                    session_ids = []
+                    for index, doc in enumerate(docs):
+                        if not isinstance(doc, dict):
+                            self.send_json(400, {"error": "each document must be an object"})
+                            return
+                        raw = str(doc.get("raw_text", doc.get("text", "")))
+                        if not raw:
+                            self.send_json(400, {"error": "raw_text is required"})
+                            return
+                        sid = str(doc.get("source_identity") or doc.get("session_id") or hashlib.sha256(raw.encode()).hexdigest()[:32])
+                        # Native Funes owns parsing, chunking, embedding, and the
+                        # TruffleHog push gate.  Keep one synthetic transcript per
+                        # source identity so retries remain idempotent.
+                        agent = str(doc.get("source_agent", "codex")).lower()
+                        harness = agent if agent in {"codex", "pi", "claude", "hermes"} else "codex"
+                        harnesses.add(harness)
+                        session_ids.append(sid)
+                        metadata = {k: doc[k] for k in ("source_identity", "source_type", "project", "repo", "worktree", "message_id", "content_type") if doc.get(k) is not None}
+                        line = {"type": "session_meta", "timestamp": now, "payload": {"id": sid, "cwd": str(doc.get("worktree", doc.get("project", "remote"))), "metadata": metadata}}
+                        msg = {"type": "response_item", "timestamp": now, "payload": {"type": "message", "role": str(doc.get("role", "user")), "content": [{"type": "input_text", "text": raw}]}}
+                        (source / f"{index:08d}-{hashlib.sha256(sid.encode()).hexdigest()[:16]}.jsonl").write_text(json.dumps(line, ensure_ascii=False) + "\n" + json.dumps(msg, ensure_ascii=False) + "\n", encoding="utf-8")
+                    outputs = []
+                    errors = []
+                    for harness in sorted(harnesses):
+                        code, out, err = run("index", str(source), "--harness", harness, "--yes", timeout=300)
+                        outputs.append(out)
+                        errors.append(err)
+                        if code != 0:
+                            self.send_json(503, {"ok": False, "durable": False, "session_ids": session_ids, "error": "native_index_failed"})
+                            return
+                    code, pout, perr = run("push", REMOTE, "--yes", "--force-reindex", timeout=600)
+                    outputs.append(pout)
+                    errors.append(perr)
+                    durable = code == 0
+                    self.send_json(200 if durable else 503, {"ok": durable, "durable": durable, "accepted": len(docs) if durable else 0, "session_ids": session_ids, "output": "".join(outputs)[-3000:] if durable else "", "error": "" if durable else "native_push_failed"})
+                finally:
+                    shutil.rmtree(source, ignore_errors=True)
                 return
             self.send_json(404, {"error": "not found"})
         except (ValueError, OSError, subprocess.SubprocessError) as exc:
             self.send_json(500, {"error": str(exc)})
 
 
-if __name__ == "__main__":
+def serve(host: str = "0.0.0.0", port: int = PORT) -> None:
     (HOME / "sources").mkdir(parents=True, exist_ok=True)
-    ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
+    ThreadingHTTPServer((host, port), Handler).serve_forever()
+
+
+if __name__ == "__main__":
+    serve()

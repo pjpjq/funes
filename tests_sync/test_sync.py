@@ -1,11 +1,12 @@
 import json, os, tempfile, time
+from unittest import mock
 from pathlib import Path
 from sync.config import Config
 from sync.discovery import discover_sources
 from sync.parsers import parse_file
 from sync.store import Store
 from sync.daemon import SyncDaemon
-from sync.launchd import render_plist
+from sync.launchd import render_plist, persist_keychain_token
 
 def cfg(tmp):
     h=Path(tmp); return Config(h,h/'.state',h/'config.toml',interval=1)
@@ -27,6 +28,26 @@ def test_launchagent(monkeypatch):
     monkeypatch.setenv("FUNES_API_TOKEN", "redacted-test-token")
     d=render_plist('/usr/bin/python3'); assert d['Label']=='com.funes.sync'; assert d['RunAtLoad']
     assert "FUNES_API_TOKEN" not in d["EnvironmentVariables"]
+
+
+def test_keychain_token_is_stored_and_verified(monkeypatch):
+    monkeypatch.setenv("FUNES_API_TOKEN", "redacted-test-token")
+    monkeypatch.setenv("USER", "tester")
+    calls = []
+
+    class Result:
+        returncode = 0
+        stdout = "redacted-test-token\n"
+
+    def run(args, **kwargs):
+        calls.append(args)
+        return Result()
+
+    monkeypatch.setattr("sync.launchd.shutil.which", lambda name: "/usr/bin/security")
+    monkeypatch.setattr("sync.launchd.subprocess.run", run)
+    assert persist_keychain_token()
+    assert calls[0][1:3] == ["add-generic-password", "-U"]
+    assert calls[1][1:3] == ["find-generic-password", "-a"]
 
 
 def test_one_shot_backfill_drains_all_pending(tmp_path):

@@ -5,11 +5,12 @@ from .discovery import discover_sources
 from .parsers import parse_file
 from .store import Store
 from .client import SyncClient
+from .native import NativeFunes
 log=logging.getLogger("funes.sync")
 
 class SyncDaemon:
     def __init__(self, config=None, store=None, client=None):
-        self.config=config or Config.load(); self.store=store or Store(config=self.config); self.client=client or SyncClient(self.config); self.running=False
+        self.config=config or Config.load(); self.store=store or Store(config=self.config); self.client=client or SyncClient(self.config); self.native=NativeFunes(self.config) if self.config.native_primary else None; self.running=False
     def scan_once(self):
         if not self.config.enabled or not self.config.auto_discover:
             return 0
@@ -68,6 +69,14 @@ class SyncDaemon:
         signal.signal(signal.SIGTERM,stop); signal.signal(signal.SIGINT,stop)
         while self.running:
             self.scan_once()
+            if self.native:
+                result = self.native.sync()
+                if not result.ok:
+                    log.warning("native funes sync unavailable: %s", result.error)
+                if once:
+                    break
+                time.sleep(max(1,self.config.interval))
+                continue
             # A one-shot backfill must drain the durable queue completely when
             # the remote is available; otherwise the first startup would leave
             # most history pending until the next 5-minute pass.  The continuous

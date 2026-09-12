@@ -3,6 +3,7 @@ import os
 import tempfile
 import threading
 import unittest
+from unittest import mock
 from http.client import HTTPConnection
 from pathlib import Path
 from http.server import ThreadingHTTPServer
@@ -13,10 +14,10 @@ from service.server import App, Store, Translator, make_handler
 class ServiceTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.old = {k: os.environ.get(k) for k in ("FUNES_DATA_DIR", "FUNES_AUTH_TOKEN", "FUNES_API_TOKEN", "TRANSLATION_BASE_URL", "TRANSLATION_API_KEY", "TRANSLATION_MODEL")}
+        self.old = {k: os.environ.get(k) for k in ("FUNES_DATA_DIR", "FUNES_AUTH_TOKEN", "FUNES_API_TOKEN", "FUNES_STORAGE_REPO", "HF_TOKEN", "FUNES_REQUIRE_DURABLE_ACK", "FUNES_ALLOW_EMPTY_REMOTE", "TRANSLATION_BASE_URL", "TRANSLATION_API_KEY", "TRANSLATION_MODEL")}
         os.environ["FUNES_DATA_DIR"] = self.tmp.name
         os.environ["FUNES_AUTH_TOKEN"] = "test-token"
-        for k in ("TRANSLATION_BASE_URL", "TRANSLATION_API_KEY", "TRANSLATION_MODEL"):
+        for k in ("FUNES_STORAGE_REPO", "HF_TOKEN", "FUNES_REQUIRE_DURABLE_ACK", "FUNES_ALLOW_EMPTY_REMOTE", "TRANSLATION_BASE_URL", "TRANSLATION_API_KEY", "TRANSLATION_MODEL"):
             os.environ.pop(k, None)
 
     def tearDown(self):
@@ -114,6 +115,39 @@ class ServiceTests(unittest.TestCase):
         target.reindex()
         self.assertEqual(target.search("durable")[0]["raw_text"], "durable text")
         source.close(); target.close(); second_dir.cleanup()
+
+    def test_ingest_does_not_ack_before_durable_snapshot(self):
+        os.environ["FUNES_REQUIRE_DURABLE_ACK"] = "true"
+        server = self._server()
+        status, result = self._request(server, "POST", "/ingest", {"source_path": "pending", "raw_text": "must persist"})
+        self.assertEqual(status, 503)
+        self.assertEqual(result["error"], "durability_pending")
+        self.assertFalse(result["sync"]["durable"])
+
+    def test_secret_gate_blocks_remote_snapshot(self):
+        from service.server import SnapshotSync
+        store = Store(self.tmp.name)
+        store.ingest([{"source_path": "secret", "raw_text": "bearer token"}])
+        os.environ.update(FUNES_STORAGE_REPO="owner/private", HF_TOKEN="hf-test")
+        syncer = SnapshotSync(store)
+        with mock.patch.object(syncer, "_secret_gate", return_value=(False, "secret_detected")):
+            result = syncer.upload()
+        self.assertFalse(result["durable"])
+        self.assertEqual(result["reason"], "secret_detected")
+        store.close()
+
+    def test_restore_failure_is_fail_closed(self):
+        from service.server import SnapshotSync
+        store = Store(self.tmp.name)
+        os.environ.update(FUNES_STORAGE_REPO="owner/private", HF_TOKEN="hf-test")
+        syncer = SnapshotSync(store)
+        with mock.patch.dict("sys.modules", {"huggingface_hub": mock.Mock(hf_hub_download=mock.Mock(side_effect=RuntimeError("offline")))}):
+            self.assertEqual(syncer.restore(), -1)
+        self.assertTrue(syncer.restore_failed)
+        result = syncer.upload()
+        self.assertFalse(result["durable"])
+        self.assertEqual(result["reason"], "restore_failed")
+        store.close()
 
 
 if __name__ == "__main__":

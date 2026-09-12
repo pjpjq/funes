@@ -1,4 +1,4 @@
-"""Space entry point; the same service also runs in the Docker image."""
+"""Space entry point; the same native Funes bridge runs in the Docker image."""
 import os
 
 try:
@@ -29,10 +29,8 @@ def _report_zero_gpu_startup():
     startup()
 
 
-from service.server import serve
+from space.server import serve
 
 if __name__ == "__main__":
     _report_zero_gpu_startup()
-    # Spaces reserves PORT for its front proxy; the user process listens on
-    # APP_PORT (7860 by default) so the proxy can reach the service.
-    serve(os.getenv("FUNES_HOST", "0.0.0.0"), int(os.getenv("APP_PORT", "7860")))
+    serve(os.getenv("FUNES_HOST", "0.0.0.0"), int(os.getenv("APP_PORT", os.getenv("PORT", "7860"))))

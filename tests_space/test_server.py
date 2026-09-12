@@ -4,6 +4,8 @@ from collections import deque
 from http.client import HTTPConnection
 from http.server import ThreadingHTTPServer
 
+import pytest
+
 import space.server as bridge
 
 
@@ -182,6 +184,57 @@ def test_native_mcp_worker_restarts_after_eof(monkeypatch, tmp_path):
     assert processes[0].terminated is True
 
 
+def test_request_warm_reserves_state_before_start(monkeypatch):
+    starts = []
+
+    class FakeThread:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def start(self):
+            starts.append(self.kwargs)
+
+    monkeypatch.setattr(bridge.threading, "Thread", FakeThread)
+    with bridge._WARM_STATE_LOCK:
+        bridge._WARM_STATE.update(state="not_started", started_at=None, finished_at=None)
+
+    first = bridge.request_warm()
+    second = bridge.request_warm()
+
+    assert first["state"] == "warming"
+    assert second["state"] == "warming"
+    assert len(starts) == 1
+
+
+def test_initial_warm_does_not_wait_on_recall_lock(monkeypatch):
+    called = threading.Event()
+
+    def fake_refresh():
+        called.set()
+
+    monkeypatch.setattr(bridge, "_refresh_native_worker", fake_refresh)
+    with bridge._WARM_STATE_LOCK:
+        bridge._WARM_STATE.update(state="not_started", started_at=None, finished_at=None)
+    bridge.INDEX_LOCK.acquire()
+    thread = threading.Thread(target=bridge._warm_native_memory, kwargs={"replace": False})
+    thread.start()
+    try:
+        assert called.wait(0.25), "initial warm must not hold INDEX_LOCK while loading native recall"
+    finally:
+        bridge.INDEX_LOCK.release()
+        thread.join(timeout=1)
+    assert not thread.is_alive()
+
+
+def test_native_worker_does_not_spawn_during_initial_warm(monkeypatch):
+    monkeypatch.setattr(bridge, "MCP_WORKER", None)
+    monkeypatch.setattr(bridge, "_MCP_WORKER_CONFIG", None)
+    with bridge._WARM_STATE_LOCK:
+        bridge._WARM_STATE.update(state="warming", started_at="now", finished_at=None)
+    with pytest.raises(bridge.NativeMcpError, match="warming"):
+        bridge.native_worker()
+
+
 def test_search_and_get_use_native_worker_and_keep_raw_query(monkeypatch):
     calls = []
 
@@ -251,10 +304,12 @@ def _request(server, payload, token="test-token"):
 
 def test_native_bridge_ack_requires_push(monkeypatch, tmp_path):
     calls = []
+    warm_calls = []
     monkeypatch.setattr(bridge, "HOME", tmp_path)
     (tmp_path / "sources").mkdir()
     monkeypatch.setattr(bridge, "REMOTE", "owner/memory")
     monkeypatch.setattr(bridge, "TOKEN", "test-token")
+    monkeypatch.setattr(bridge, "request_warm", lambda **kwargs: warm_calls.append(kwargs))
 
     def fake_run(*args, **kwargs):
         calls.append(args)
@@ -275,6 +330,7 @@ def test_native_bridge_ack_requires_push(monkeypatch, tmp_path):
     assert body["accepted"] == 1
     assert any(call[0] == "push" for call in calls)
     assert any(call[0] == "index" for call in calls)
+    assert warm_calls == []
 
 
 def test_native_bridge_keeps_queue_when_push_fails(monkeypatch, tmp_path):
@@ -301,3 +357,36 @@ def test_native_bridge_keeps_queue_when_push_fails(monkeypatch, tmp_path):
     assert status == 503
     assert body["durable"] is False
     assert body["accepted"] == 0
+
+
+def test_sync_status_alias_returns_ready_payload(monkeypatch):
+    monkeypatch.setattr(bridge, "TOKEN", "test-token")
+    monkeypatch.setattr(bridge, "REMOTE", "owner/memory")
+
+    def fake_run(*args, **kwargs):
+        assert args[:2] == ("status", "owner/memory")
+        return 0, "chunks: 12\n", ""
+
+    monkeypatch.setattr(bridge, "run", fake_run)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        conn = HTTPConnection(*server.server_address)
+        conn.request(
+            "POST",
+            "/sync/status",
+            b"{}",
+            {"Authorization": "Bearer test-token", "Content-Type": "application/json"},
+        )
+        response = conn.getresponse()
+        body = json.loads(response.read())
+        conn.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+    assert response.status == 200
+    assert body["ok"] is True
+    assert body["remote"] == "owner/memory"
+    assert "chunks: 12" in body["status"]

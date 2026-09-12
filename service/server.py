@@ -17,6 +17,7 @@ import sqlite3
 import shutil
 import struct
 import subprocess
+import tempfile
 import threading
 import time
 import uuid

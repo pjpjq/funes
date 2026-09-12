@@ -181,6 +181,26 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(result["reason"], "RuntimeError")
         store.close()
 
+    def test_restore_file_decrypts_inside_temporary_directory(self):
+        from service.server import SnapshotSync
+        source = Store(self.tmp.name)
+        source.ingest([{"source_identity": "restore-one", "raw_text": "encrypted restore"}])
+        os.environ["FUNES_STORAGE_KEY"] = "test-storage-key"
+        writer = SnapshotSync(source)
+        plaintext = Path(self.tmp.name) / "funes-delta-test.jsonl.gz"
+        encrypted = Path(self.tmp.name) / "funes-delta-test.jsonl.gz.enc"
+        writer._write_jsonl_gzip(source.get_many(["restore-one"]), plaintext)
+        writer._encrypt_file(plaintext, encrypted)
+        target_dir = tempfile.TemporaryDirectory()
+        target = Store(target_dir.name)
+        reader = SnapshotSync(target)
+        with mock.patch(
+            "huggingface_hub.hf_hub_download", return_value=str(encrypted)
+        ):
+            self.assertEqual(reader._restore_file(encrypted.name), 1)
+        self.assertEqual(target.get("restore-one")["raw_text"], "encrypted restore")
+        source.close(); target.close(); target_dir.cleanup()
+
     def test_restore_failure_is_fail_closed(self):
         from service.server import SnapshotSync
         store = Store(self.tmp.name)

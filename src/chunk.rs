@@ -2,7 +2,7 @@
 //! All indexing is by Unicode code point (char), not bytes.
 
 use crate::traces::Turn;
-use arrow_array::{Array, Int64Array, RecordBatch, StringArray};
+use arrow_array::{Array, BooleanArray, Int64Array, RecordBatch, StringArray};
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
 use std::borrow::Cow;
@@ -64,7 +64,23 @@ pub struct Chunk {
     pub split_idx: i64,
     pub harness: String,
     /// The session's source repo(s) as `owner/name`, space-joined; empty when unresolvable.
-    pub repo: String,
+    pub repo: Option<String>,
+    /// Stable identity of a canonical document. Transcript chunks leave every field below null.
+    pub source_identity: Option<String>,
+    /// Revision identity supplied by the canonical source.
+    pub source_version: Option<String>,
+    /// Hash of the canonical source content (not of an individual split).
+    pub content_hash: Option<String>,
+    /// Canonical source revision timestamp.
+    pub updated_at: Option<String>,
+    pub source_agent: Option<String>,
+    pub source_type: Option<String>,
+    pub project: Option<String>,
+    pub device_id: Option<String>,
+    pub content_type: Option<String>,
+    pub source_missing: Option<bool>,
+    /// Canonical JSON metadata. Source raw text is deliberately excluded before this is built.
+    pub metadata_json: Option<String>,
 }
 
 /// A missing tool name renders as the literal "None".
@@ -257,6 +273,12 @@ pub(crate) fn chunks_from_batches(batches: &[RecordBatch]) -> Vec<Chunk> {
             .map(|c| c.value(i))
             .unwrap_or(0)
     };
+    let bo = |b: &RecordBatch, name: &str, i: usize| -> Option<bool> {
+        b.column_by_name(name)
+            .and_then(|c| c.as_any().downcast_ref::<BooleanArray>())
+            .filter(|c| !c.is_null(i))
+            .map(|c| c.value(i))
+    };
     let mut out = Vec::new();
     for b in batches {
         for i in 0..b.num_rows() {
@@ -276,7 +298,18 @@ pub(crate) fn chunks_from_batches(batches: &[RecordBatch]) -> Vec<Chunk> {
                 block_idx: iv(b, "block_idx", i),
                 split_idx: iv(b, "split_idx", i),
                 harness: sv(b, "harness", i),
-                repo: sv(b, "repo", i),
+                repo: so(b, "repo", i),
+                source_identity: so(b, "source_identity", i),
+                source_version: so(b, "source_version", i),
+                content_hash: so(b, "content_hash", i),
+                updated_at: so(b, "updated_at", i),
+                source_agent: so(b, "source_agent", i),
+                source_type: so(b, "source_type", i),
+                project: so(b, "project", i),
+                device_id: so(b, "device_id", i),
+                content_type: so(b, "content_type", i),
+                source_missing: bo(b, "source_missing", i),
+                metadata_json: so(b, "metadata_json", i),
             });
         }
     }
@@ -307,12 +340,28 @@ pub(crate) fn resplit(template: &Chunk, text: &str) -> Vec<Chunk> {
         .into_iter()
         .enumerate()
         .map(|(si, piece)| Chunk {
-            id: cid(&template.session_id, &template.turn_uuid, template.block_idx, si as i64),
+            id: template.source_identity.as_deref().map_or_else(
+                || cid(&template.session_id, &template.turn_uuid, template.block_idx, si as i64),
+                |identity| canonical_cid(identity, si as i64),
+            ),
             text: piece,
             split_idx: si as i64,
             ..(*template).clone()
         })
         .collect()
+}
+
+/// Split canonical retrieval text with the same bounds as transcripts. Kept separate from
+/// [`chunks_from_turns`] so canonical documents never masquerade as synthetic agent turns.
+pub(crate) fn split_document(text: &str) -> Vec<String> {
+    split(text)
+}
+
+/// A canonical document's split id. Its source version is intentionally absent: a new revision
+/// updates matching splits in place, while merge-insert deletes any now-unmatched tail splits.
+pub(crate) fn canonical_cid(source_identity: &str, split_idx: i64) -> String {
+    let raw = format!("canonical\0{source_identity}\0{split_idx}");
+    hex::encode(Sha1::digest(raw.as_bytes()))[..16].to_string()
 }
 
 /// Whether a pass over `tiers` (with `include_thinking`) indexes a block of this type: its tier is
@@ -349,7 +398,18 @@ pub fn chunks_from_turns(turns: &[Turn], tiers: &[Tier], include_thinking: bool)
                     block_idx: bi as i64,
                     split_idx: si as i64,
                     harness: turn.harness.clone(),
-                    repo: String::new(),
+                    repo: None,
+                    source_identity: None,
+                    source_version: None,
+                    content_hash: None,
+                    updated_at: None,
+                    source_agent: None,
+                    source_type: None,
+                    project: None,
+                    device_id: None,
+                    content_type: None,
+                    source_missing: None,
+                    metadata_json: None,
                 });
             }
         }

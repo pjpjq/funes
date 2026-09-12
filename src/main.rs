@@ -5,7 +5,7 @@
 //! `$FUNES_HOME` or `~/.funes`.
 
 use funes::agents::{claude, codex, hermes, pi};
-use funes::commands::{ask, index, mcp, push, recall, scrub, sketch, update};
+use funes::commands::{ask, index, ingest_docs, mcp, push, recall, scrub, sketch, update};
 use funes::hub;
 use funes::memory;
 use funes::scan;
@@ -27,6 +27,9 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+// Parsed once at process startup; keeping recall's filters flat gives CLI/MCP users one stable
+// surface and avoids boxing individual optional strings only to shrink this transient enum.
+#[allow(clippy::large_enum_variant)]
 enum Cmd {
     /// Recall passages from past sessions (hybrid → rerank → recency → neighbors).
     Recall {
@@ -51,6 +54,39 @@ enum Cmd {
         /// Restrict to a harness: claude | codex | pi | hermes.
         #[arg(long)]
         harness: Option<String>,
+        /// Restrict to one canonical source identity.
+        #[arg(long)]
+        source_identity: Option<String>,
+        /// Restrict to one canonical source revision.
+        #[arg(long)]
+        source_version: Option<String>,
+        /// Restrict to one canonical source content hash.
+        #[arg(long)]
+        content_hash: Option<String>,
+        /// Restrict to an exact canonical revision timestamp.
+        #[arg(long)]
+        updated_at: Option<String>,
+        /// Restrict to the source agent facet.
+        #[arg(long)]
+        source_agent: Option<String>,
+        /// Restrict to the source type facet.
+        #[arg(long)]
+        source_type: Option<String>,
+        /// Restrict to the project facet.
+        #[arg(long)]
+        project: Option<String>,
+        /// Restrict to the repo facet.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Restrict to the device id facet.
+        #[arg(long)]
+        device_id: Option<String>,
+        /// Restrict to the canonical content type.
+        #[arg(long)]
+        content_type: Option<String>,
+        /// Restrict to present (`false`) or soft-missing (`true`) canonical sources.
+        #[arg(long)]
+        source_missing: Option<bool>,
         #[command(flatten)]
         memory: MemoryOpts,
     },
@@ -100,6 +136,14 @@ enum Cmd {
         /// an explicit path skips the first-index size confirmation.
         #[arg(long)]
         yes: bool,
+    },
+    /// Ingest canonical document JSONL directly into a memory, replacing each source revision.
+    IngestDocs {
+        /// Canonical JSONL containing source identity, revision, retrieval text, and metadata.
+        #[arg(value_name = "JSONL")]
+        path: PathBuf,
+        #[command(flatten)]
+        memory: MemoryOpts,
     },
     /// Find a literal string everywhere in one session — exhaustive, unranked.
     Scan {
@@ -356,6 +400,17 @@ async fn main() -> Result<()> {
             neighbors,
             block_type,
             harness,
+            source_identity,
+            source_version,
+            content_hash,
+            updated_at,
+            source_agent,
+            source_type,
+            project,
+            repo,
+            device_id,
+            content_type,
+            source_missing,
             memory,
         } => {
             let memory = memory.resolve();
@@ -366,8 +421,29 @@ async fn main() -> Result<()> {
                     s.set(label);
                 }
             };
-            let (note, memory_label, hits) = recall::recall_hits(
-                memory, query, k, candidates, half_life, neighbors, block_type, harness, &progress,
+            let (note, memory_label, hits) = recall::recall_hits_filtered(
+                memory,
+                query,
+                k,
+                candidates,
+                half_life,
+                neighbors,
+                recall::FacetFilter {
+                    block_type,
+                    harness,
+                    source_identity,
+                    source_version,
+                    content_hash,
+                    updated_at,
+                    source_agent,
+                    source_type,
+                    project,
+                    repo,
+                    device_id,
+                    content_type,
+                    source_missing,
+                },
+                &progress,
             )
             .await?;
             drop(spinner);
@@ -508,6 +584,10 @@ async fn main() -> Result<()> {
                 index::run_index_roots(&roots, no_thinking, limit, yes).await
             }
         }
+        Cmd::IngestDocs { path, memory } => {
+            print!("{}", ingest_docs::run(&path, memory.resolve()).await?);
+            Ok(())
+        }
         Cmd::Status { memory } => {
             print!("{}", recall::status(memory::Memory::resolve(memory)).await?);
             // Show the status body before the (bounded, best-effort) update check, so a slow or
@@ -610,7 +690,10 @@ fn run_sync_command(command: SyncCommand) -> Result<()> {
         SyncCommand::Mcp => "mcp",
     };
     let mut child = std::process::Command::new(std::env::var("FUNES_SYNC_BIN").unwrap_or_else(|_| "funes-sync".into()));
-    let status = child.arg(name).status().context("running funes-sync (set FUNES_SYNC_BIN to its absolute path)")?;
+    let status = child
+        .arg(name)
+        .status()
+        .context("running funes-sync (set FUNES_SYNC_BIN to its absolute path)")?;
     if status.success() {
         Ok(())
     } else {

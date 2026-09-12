@@ -171,6 +171,7 @@ fn esc(s: &str) -> String {
 }
 
 /// `block_type = '…' AND harness = '…'` over whichever filters are set, else None.
+#[cfg(test)]
 fn build_where(block_type: Option<&str>, harness: Option<&str>) -> Option<String> {
     let mut clauses = Vec::new();
     if let Some(bt) = block_type {
@@ -184,6 +185,51 @@ fn build_where(block_type: Option<&str>, harness: Option<&str>) -> Option<String
     } else {
         Some(clauses.join(" AND "))
     }
+}
+
+/// Optional provenance facets for canonical-document recall. A requested facet that an old
+/// memory does not carry matches no rows instead of leaking a Lance missing-column error.
+#[derive(Default, Clone)]
+pub struct FacetFilter {
+    pub block_type: Option<String>,
+    pub harness: Option<String>,
+    pub source_identity: Option<String>,
+    pub source_version: Option<String>,
+    pub content_hash: Option<String>,
+    pub updated_at: Option<String>,
+    pub source_agent: Option<String>,
+    pub source_type: Option<String>,
+    pub project: Option<String>,
+    pub repo: Option<String>,
+    pub device_id: Option<String>,
+    pub content_type: Option<String>,
+    pub source_missing: Option<bool>,
+}
+
+fn build_facet_where(filter: &FacetFilter) -> Option<String> {
+    let mut clauses = Vec::new();
+    for (name, value) in [
+        ("block_type", filter.block_type.as_deref()),
+        ("harness", filter.harness.as_deref()),
+        ("source_identity", filter.source_identity.as_deref()),
+        ("source_version", filter.source_version.as_deref()),
+        ("content_hash", filter.content_hash.as_deref()),
+        ("updated_at", filter.updated_at.as_deref()),
+        ("source_agent", filter.source_agent.as_deref()),
+        ("source_type", filter.source_type.as_deref()),
+        ("project", filter.project.as_deref()),
+        ("repo", filter.repo.as_deref()),
+        ("device_id", filter.device_id.as_deref()),
+        ("content_type", filter.content_type.as_deref()),
+    ] {
+        if let Some(value) = value {
+            clauses.push(format!("{name} = '{}'", esc(value)));
+        }
+    }
+    if let Some(value) = filter.source_missing {
+        clauses.push(format!("source_missing = {value}"));
+    }
+    (!clauses.is_empty()).then(|| clauses.join(" AND "))
 }
 
 /// 0.5^(age/half_life): 1.0 for fresh, decaying with age. half_life <= 0 disables.
@@ -342,18 +388,35 @@ pub async fn recall(
     block_type: Option<String>,
     harness: Option<String>,
 ) -> Result<String> {
-    let (note, memory_label, hits) = recall_hits(
+    recall_filtered(
         memory,
         query,
         k,
         candidates,
         half_life,
         neighbors,
-        block_type,
-        harness,
-        &|_| (),
+        FacetFilter {
+            block_type,
+            harness,
+            ..FacetFilter::default()
+        },
     )
-    .await?;
+    .await
+}
+
+/// Recall with canonical provenance filters in addition to the legacy block/harness filters.
+#[allow(clippy::too_many_arguments)]
+pub async fn recall_filtered(
+    memory: Memory,
+    query: String,
+    k: usize,
+    candidates: usize,
+    half_life: f64,
+    neighbors: i64,
+    filter: FacetFilter,
+) -> Result<String> {
+    let (note, memory_label, hits) =
+        recall_hits_filtered(memory, query, k, candidates, half_life, neighbors, filter, &|_| ()).await?;
     if hits.is_empty() {
         return Ok(format!("{note}no results"));
     }
@@ -381,10 +444,41 @@ pub async fn recall_hits(
     harness: Option<String>,
     progress: &(dyn Fn(&str) + Sync),
 ) -> Result<(String, Option<String>, Vec<(Hit, f64)>)> {
+    recall_hits_filtered(
+        memory,
+        query,
+        k,
+        candidates,
+        half_life,
+        neighbors,
+        FacetFilter {
+            block_type,
+            harness,
+            ..FacetFilter::default()
+        },
+        progress,
+    )
+    .await
+}
+
+/// Structured recall with all canonical provenance filters.
+#[allow(clippy::too_many_arguments)]
+pub async fn recall_hits_filtered(
+    memory: Memory,
+    query: String,
+    k: usize,
+    candidates: usize,
+    half_life: f64,
+    neighbors: i64,
+    mut filter: FacetFilter,
+    progress: &(dyn Fn(&str) + Sync),
+) -> Result<(String, Option<String>, Vec<(Hit, f64)>)> {
     // `--harness` accepts the same spellings as `index`/`add` (claude|codex|pi); normalize to the
     // stored facet (Claude's is `claude_code`) so `--harness claude` filters instead of silently
     // matching nothing, and an unknown value errors here rather than returning zero hits.
-    let harness = harness
+    filter.harness = filter
+        .harness
+        .take()
         .map(|h| Harness::parse(&h))
         .transpose()?
         .map(|h| h.as_str().to_string());
@@ -405,12 +499,15 @@ pub async fn recall_hits(
     let ds = &read.ds;
     // A `--harness` filter needs the column; on an un-migrated memory it would fail deep inside Lance
     // with an opaque schema error, so refuse with a clear message instead.
-    if harness.is_some() && !has_harness_col(ds) {
+    if filter.harness.is_some() && !has_harness_col(ds) {
         return Err(anyhow!(
             "this memory predates the harness facet — reindex it, or drop --harness"
         ));
     }
-    let where_clause = build_where(block_type.as_deref(), harness.as_deref());
+    if !facet_columns_present(ds, &filter) {
+        return Ok((note, read.memory_label.clone(), Vec::new()));
+    }
+    let where_clause = build_facet_where(&filter);
 
     // Hybrid retrieval: a vector ANN scan and a BM25 scan, fused by reciprocal rank. The FTS index
     // can be absent (it's best-effort at index time), so the FTS leg is skipped when it errors —
@@ -504,6 +601,26 @@ async fn fts_candidates(ds: &Dataset, query: &str, limit: usize, filter: Option<
 /// migrated column is asked for before it is read.
 fn has_col(ds: &Dataset, name: &str) -> bool {
     arrow_schema::Schema::from(ds.schema()).column_with_name(name).is_some()
+}
+
+fn facet_columns_present(ds: &Dataset, filter: &FacetFilter) -> bool {
+    [
+        ("block_type", filter.block_type.is_some()),
+        ("harness", filter.harness.is_some()),
+        ("source_identity", filter.source_identity.is_some()),
+        ("source_version", filter.source_version.is_some()),
+        ("content_hash", filter.content_hash.is_some()),
+        ("updated_at", filter.updated_at.is_some()),
+        ("source_agent", filter.source_agent.is_some()),
+        ("source_type", filter.source_type.is_some()),
+        ("project", filter.project.is_some()),
+        ("repo", filter.repo.is_some()),
+        ("device_id", filter.device_id.is_some()),
+        ("content_type", filter.content_type.is_some()),
+        ("source_missing", filter.source_missing.is_some()),
+    ]
+    .into_iter()
+    .all(|(name, requested)| !requested || has_col(ds, name))
 }
 
 /// Whether the memory carries the `harness` column — false for one built before the facet existed.
@@ -696,7 +813,13 @@ pub async fn get_turns(memory: Memory, session_id: String, range: TurnRange) -> 
 
     let cols = ["turn_uuid", "seq", "ts", "role", "text", "block_idx", "split_idx"];
     let filter = format!("session_id = '{}'", esc(&session_id));
-    let batches = dataset::scan_rows(ds, &cols, Some(filter.as_str()), None).await?;
+    let mut batches = dataset::scan_rows(ds, &cols, Some(filter.as_str()), None).await?;
+    // Canonical documents may retain their original session id. Let callers address one directly
+    // by the source identity a filtered recall exposed when no session has that name.
+    if batches.iter().all(|batch| batch.num_rows() == 0) && has_col(ds, "source_identity") {
+        let filter = format!("source_identity = '{}'", esc(&session_id));
+        batches = dataset::scan_rows(ds, &cols, Some(filter.as_str()), None).await?;
+    }
 
     // `text` is already the rendered chunk as stored by the indexer — do not re-render.
     let mut rows: Vec<TurnRow> = Vec::new();
@@ -1411,6 +1534,16 @@ mod tests {
         );
         // values are escaped against filter-string injection.
         assert_eq!(build_where(None, Some("a'b")).as_deref(), Some("harness = 'a''b'"));
+        let facets = FacetFilter {
+            source_agent: Some("codex".to_string()),
+            project: Some("owner's repo".to_string()),
+            source_missing: Some(false),
+            ..FacetFilter::default()
+        };
+        assert_eq!(
+            build_facet_where(&facets).as_deref(),
+            Some("source_agent = 'codex' AND project = 'owner''s repo' AND source_missing = false")
+        );
     }
 
     #[test]

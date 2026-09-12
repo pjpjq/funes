@@ -9,11 +9,11 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use arrow_array::types::Float32Type;
-use arrow_array::{FixedSizeListArray, Int64Array, RecordBatch, StringArray};
+use arrow_array::{new_null_array, ArrayRef, BooleanArray, FixedSizeListArray, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use futures::TryStreamExt;
 use lance::dataset::builder::DatasetBuilder;
-use lance::dataset::Dataset;
+use lance::dataset::{BatchUDF, Dataset, NewColumnTransform};
 use lance::index::vector::VectorIndexParams;
 use lance::index::DatasetIndexExt;
 use lance_index::scalar::InvertedIndexParams;
@@ -31,6 +31,24 @@ pub const TABLE: &str = "chunks";
 /// can't be queried with funes's embeddings.
 pub const MODEL: &str = "BAAI/bge-small-en-v1.5";
 pub const DIM: i32 = 384;
+
+/// Columns introduced additively after the original transcript schema. The order matches
+/// [`schema`], because `add_columns` appends fields in exactly the order supplied here.
+const EVOLVABLE_COLUMNS: &[&str] = &[
+    "harness",
+    "repo",
+    "source_identity",
+    "source_version",
+    "content_hash",
+    "updated_at",
+    "source_agent",
+    "source_type",
+    "project",
+    "device_id",
+    "content_type",
+    "source_missing",
+    "metadata_json",
+];
 
 /// funes's home directory: `$FUNES_HOME`, else `~/.funes`. Holds the incremental state and the
 /// local memory.
@@ -195,42 +213,126 @@ pub(crate) fn schema() -> Arc<Schema> {
             // came first, then `repo` — each appended in turn.
             utf8("harness"),
             utf8("repo"),
+            utf8("source_identity"),
+            utf8("source_version"),
+            utf8("content_hash"),
+            utf8("updated_at"),
+            utf8("source_agent"),
+            utf8("source_type"),
+            utf8("project"),
+            utf8("device_id"),
+            utf8("content_type"),
+            Field::new("source_missing", DataType::Boolean, true),
+            utf8("metadata_json"),
         ],
         HashMap::from([("embedding_model".to_string(), MODEL.to_string())]),
     ))
 }
 
+/// Build the null-valued additive migration needed before canonical rows can be merged into `ds`.
+/// Existing transcript rows intentionally receive null provenance rather than invented values.
+pub(crate) fn canonical_column_migration(ds: &Dataset) -> Option<(NewColumnTransform, Vec<String>)> {
+    let current = Schema::from(ds.schema());
+    let desired = schema();
+    let fields: Vec<Field> = EVOLVABLE_COLUMNS
+        .iter()
+        .filter(|name| current.column_with_name(name).is_none())
+        .map(|name| {
+            desired
+                .field_with_name(name)
+                .expect("evolvable field is in schema")
+                .clone()
+        })
+        .collect();
+    if fields.is_empty() {
+        return None;
+    }
+    let output_schema = Arc::new(Schema::new(fields));
+    let mapper_schema = output_schema.clone();
+    let transform = NewColumnTransform::BatchUDF(BatchUDF {
+        mapper: Box::new(move |batch: &RecordBatch| {
+            let columns = mapper_schema
+                .fields()
+                .iter()
+                .map(|field| new_null_array(field.data_type(), batch.num_rows()))
+                .collect();
+            RecordBatch::try_new(mapper_schema.clone(), columns).map_err(lance::Error::from)
+        }),
+        output_schema,
+        result_checkpoint: None,
+    });
+    Some((transform, vec!["id".to_string()]))
+}
+
+/// Add every missing canonical facet to a local or wrapped dataset in one schema-evolution commit.
+pub(crate) async fn ensure_canonical_columns(ds: &mut Dataset) -> Result<bool> {
+    let Some((transform, read_columns)) = canonical_column_migration(ds) else {
+        return Ok(false);
+    };
+    ds.add_columns(transform, Some(read_columns), None)
+        .await
+        .context("adding canonical document columns")?;
+    Ok(true)
+}
+
 pub(crate) fn build_batch(chunks: &[chunk::Chunk], vectors: &[Vec<f32>]) -> Result<RecordBatch> {
-    let s = |f: &dyn Fn(&chunk::Chunk) -> Option<String>| -> StringArray { chunks.iter().map(f).collect() };
-    let i = |f: &dyn Fn(&chunk::Chunk) -> i64| -> Int64Array { chunks.iter().map(|c| Some(f(c))).collect() };
+    build_batch_for_schema(chunks, vectors, schema())
+}
+
+/// Build rows against `target`, preserving its column order. This keeps ordinary transcript
+/// appends compatible with older memories while new memories use the extended canonical schema.
+pub(crate) fn build_batch_for_schema(
+    chunks: &[chunk::Chunk],
+    vectors: &[Vec<f32>],
+    target: Arc<Schema>,
+) -> Result<RecordBatch> {
+    let s = |f: &dyn Fn(&chunk::Chunk) -> Option<String>| -> ArrayRef {
+        Arc::new(chunks.iter().map(f).collect::<StringArray>())
+    };
+    let i = |f: &dyn Fn(&chunk::Chunk) -> i64| -> ArrayRef {
+        Arc::new(chunks.iter().map(|c| Some(f(c))).collect::<Int64Array>())
+    };
     let vector = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
         vectors
             .iter()
             .map(|v| Some(v.iter().map(|&x| Some(x)).collect::<Vec<_>>())),
         DIM,
     );
-    Ok(RecordBatch::try_new(
-        schema(),
-        vec![
-            Arc::new(s(&|c| Some(c.id.clone()))),
-            Arc::new(s(&|c| Some(c.text.clone()))),
-            Arc::new(s(&|c| Some(c.session_id.clone()))),
-            Arc::new(s(&|c| Some(c.workdir.clone()))),
-            Arc::new(s(&|c| Some(c.turn_uuid.clone()))),
-            Arc::new(s(&|c| c.parent_uuid.clone())),
-            Arc::new(i(&|c| c.seq)),
-            Arc::new(s(&|c| Some(c.ts.clone()))),
-            Arc::new(s(&|c| Some(c.role.clone()))),
-            Arc::new(s(&|c| Some(c.block_type.clone()))),
-            Arc::new(s(&|c| c.tool_name.clone())),
-            Arc::new(s(&|c| Some(c.source_path.clone()))),
-            Arc::new(i(&|c| c.block_idx)),
-            Arc::new(i(&|c| c.split_idx)),
-            Arc::new(vector),
-            Arc::new(s(&|c| Some(c.harness.clone()))),
-            Arc::new(s(&|c| Some(c.repo.clone()))),
-        ],
-    )?)
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(target.fields().len());
+    for field in target.fields() {
+        columns.push(match field.name().as_str() {
+            "id" => s(&|c| Some(c.id.clone())),
+            "text" => s(&|c| Some(c.text.clone())),
+            "session_id" => s(&|c| Some(c.session_id.clone())),
+            "workdir" => s(&|c| Some(c.workdir.clone())),
+            "turn_uuid" => s(&|c| Some(c.turn_uuid.clone())),
+            "parent_uuid" => s(&|c| c.parent_uuid.clone()),
+            "seq" => i(&|c| c.seq),
+            "ts" => s(&|c| Some(c.ts.clone())),
+            "role" => s(&|c| Some(c.role.clone())),
+            "block_type" => s(&|c| Some(c.block_type.clone())),
+            "tool_name" => s(&|c| c.tool_name.clone()),
+            "source_path" => s(&|c| Some(c.source_path.clone())),
+            "block_idx" => i(&|c| c.block_idx),
+            "split_idx" => i(&|c| c.split_idx),
+            "vector" => Arc::new(vector.clone()),
+            "harness" => s(&|c| Some(c.harness.clone())),
+            "repo" => s(&|c| c.repo.clone()),
+            "source_identity" => s(&|c| c.source_identity.clone()),
+            "source_version" => s(&|c| c.source_version.clone()),
+            "content_hash" => s(&|c| c.content_hash.clone()),
+            "updated_at" => s(&|c| c.updated_at.clone()),
+            "source_agent" => s(&|c| c.source_agent.clone()),
+            "source_type" => s(&|c| c.source_type.clone()),
+            "project" => s(&|c| c.project.clone()),
+            "device_id" => s(&|c| c.device_id.clone()),
+            "content_type" => s(&|c| c.content_type.clone()),
+            "source_missing" => Arc::new(chunks.iter().map(|c| c.source_missing).collect::<BooleanArray>()),
+            "metadata_json" => s(&|c| c.metadata_json.clone()),
+            other => anyhow::bail!("unsupported memory column {other:?}"),
+        });
+    }
+    Ok(RecordBatch::try_new(target, columns)?)
 }
 
 #[cfg(test)]
@@ -263,6 +365,17 @@ mod tests {
                 "vector",
                 "harness",
                 "repo",
+                "source_identity",
+                "source_version",
+                "content_hash",
+                "updated_at",
+                "source_agent",
+                "source_type",
+                "project",
+                "device_id",
+                "content_type",
+                "source_missing",
+                "metadata_json",
             ]
         );
     }

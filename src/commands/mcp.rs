@@ -31,6 +31,28 @@ pub struct RecallRequest {
     pub block_type: Option<String>,
     #[schemars(description = "Restrict to a harness: claude | codex | pi | hermes")]
     pub harness: Option<String>,
+    #[schemars(description = "Restrict to one canonical source identity")]
+    pub source_identity: Option<String>,
+    #[schemars(description = "Restrict to one canonical source revision")]
+    pub source_version: Option<String>,
+    #[schemars(description = "Restrict to one canonical source content hash")]
+    pub content_hash: Option<String>,
+    #[schemars(description = "Restrict to an exact canonical revision timestamp")]
+    pub updated_at: Option<String>,
+    #[schemars(description = "Restrict to the canonical source agent")]
+    pub source_agent: Option<String>,
+    #[schemars(description = "Restrict to the canonical source type")]
+    pub source_type: Option<String>,
+    #[schemars(description = "Restrict to the canonical project")]
+    pub project: Option<String>,
+    #[schemars(description = "Restrict to the canonical source repo")]
+    pub repo: Option<String>,
+    #[schemars(description = "Restrict to the canonical device id")]
+    pub device_id: Option<String>,
+    #[schemars(description = "Restrict to the canonical content type")]
+    pub content_type: Option<String>,
+    #[schemars(description = "Restrict to present (false) or soft-missing (true) canonical sources")]
+    pub source_missing: Option<bool>,
     #[schemars(
         description = "Memory to read for this call — `<org>/<repo>`, an `hf://…` URI, a local path, or `local`. Defaults to the server's memory."
     )]
@@ -170,18 +192,42 @@ impl Funes {
             candidates,
             block_type,
             harness,
+            source_identity,
+            source_version,
+            content_hash,
+            updated_at,
+            source_agent,
+            source_type,
+            project,
+            repo,
+            device_id,
+            content_type,
+            source_missing,
             memory,
         }): Parameters<RecallRequest>,
     ) -> String {
-        match recall::recall(
+        match recall::recall_filtered(
             self.memory(memory),
             query,
             k.unwrap_or(recall::DEFAULT_K),
             candidates.unwrap_or(recall::DEFAULT_CANDIDATES),
             half_life.unwrap_or(recall::DEFAULT_HALF_LIFE),
             neighbors.unwrap_or(recall::DEFAULT_NEIGHBORS),
-            block_type,
-            harness,
+            recall::FacetFilter {
+                block_type,
+                harness,
+                source_identity,
+                source_version,
+                content_hash,
+                updated_at,
+                source_agent,
+                source_type,
+                project,
+                repo,
+                device_id,
+                content_type,
+                source_missing,
+            },
         )
         .await
         {

@@ -126,6 +126,24 @@ impl Memory {
         Ok(ds)
     }
 
+    /// Open a remote memory at one immutable Hub commit. Canonical ingestion selects revisions
+    /// from this exact snapshot and later uses the same SHA as `parent_commit`.
+    pub(crate) async fn open_remote_revision(&self, revision: &str) -> Result<Dataset> {
+        let Memory::Remote { uri } = self else {
+            return Err(anyhow!("an immutable Hub revision requires a remote memory"));
+        };
+        let (owner, name, _) = parse_hf(uri)?;
+        let token = hf_token();
+        let mut opts = HashMap::from([("hf_revision".to_string(), revision.to_string())]);
+        if let Some(token) = &token {
+            opts.insert("hf_token".to_string(), token.clone());
+        }
+        let wrapper = remote::fetch_wrapper_at(&owner, &name, token.as_deref(), revision)?;
+        let ds = dataset::open_wrapped(&dataset::table_uri(uri), opts, wrapper).await?;
+        check_compat(&ds)?;
+        Ok(ds)
+    }
+
     /// What state this memory is in — the one answer the commands act on, so none of them has to
     /// read it out of an error. A remote is probed first (an unreachable or absent repo costs no
     /// open), then the open decides between ready, empty and refused.
@@ -261,7 +279,7 @@ pub async fn remote_reachability(uri: &str) -> Reachability {
 /// [`check_compat`] rejection, a transport failure). Callers must treat only the former as
 /// "empty": mistaking an unreadable memory for an absent one turns a mixed-version teammate's
 /// push into a first publish over live data.
-fn dataset_absent(err: &anyhow::Error) -> bool {
+pub(crate) fn dataset_absent(err: &anyhow::Error) -> bool {
     err.chain().any(|cause| {
         if let Some(hf) = cause.downcast_ref::<HFError>() {
             return matches!(hf, HFError::EntryNotFound { .. });

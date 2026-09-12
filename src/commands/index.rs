@@ -10,7 +10,7 @@
 use crate::chunk::{self, Tier};
 use crate::hub;
 use crate::inference::{self, embed_batched, Embedder};
-use crate::memory::dataset::{self, build_batch, schema, MODEL};
+use crate::memory::dataset::{self, build_batch_for_schema, schema, MODEL};
 use crate::memory::lock;
 use crate::scan;
 use crate::traces::harness::Harness;
@@ -23,6 +23,7 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::io::{IsTerminal, Write as _};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Take the memory lock. An interactive caller (a human at `funes index`/`funes add`) waits out a
@@ -317,7 +318,7 @@ impl Indexer {
         let _lock = acquire_lock(interactive).await?;
 
         let uri = dataset::table_uri(&dataset::local_memory_dir());
-        let ds = dataset::open(&uri, HashMap::new()).await.ok();
+        let mut ds = dataset::open(&uri, HashMap::new()).await.ok();
 
         // Model-pin: refuse to add to a memory built with a different embedding model. The id rides
         // in the dataset's schema metadata; a pre-metadata memory (no id) is tolerated and guarded
@@ -329,6 +330,9 @@ impl Indexer {
                     return Err(anyhow!("index built with model {em:?}, refusing to mix with {MODEL:?}"));
                 }
             }
+        }
+        if let Some(ds) = &mut ds {
+            dataset::ensure_canonical_columns(ds).await?;
         }
 
         let first_index = ds.is_none();
@@ -464,7 +468,7 @@ impl Indexer {
         let repo = self.repo_for(&key);
         if !repo.is_empty() {
             for c in &mut chunks {
-                c.repo.clone_from(&repo);
+                c.repo = Some(repo.clone());
             }
         }
         let total_chunks = chunks.len();
@@ -534,8 +538,13 @@ impl Indexer {
             t0.elapsed().as_secs_f64()
         );
 
-        let batch = build_batch(new_chunks, &vectors)?;
-        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema());
+        let target_schema = self
+            .ds
+            .as_ref()
+            .map(|d| Arc::new(arrow_schema::Schema::from(d.schema())))
+            .unwrap_or_else(schema);
+        let batch = build_batch_for_schema(new_chunks, &vectors, target_schema.clone())?;
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], target_schema);
         let uri = self.uri.clone();
         match &mut self.ds {
             Some(d) => {

@@ -21,7 +21,18 @@ class SyncClient:
             req=request.Request(url,data=body,headers=headers,method="POST")
             try:
                 with request.urlopen(req,timeout=30) as r:
-                    raw=r.read(); return json.loads(raw) if raw else {"accepted":len(records)}
+                    raw=r.read()
+                    result = json.loads(raw) if raw else {"accepted": len(records), "durable": True}
+                    # The daemon may acknowledge a local queue row only after
+                    # the remote confirms a durable commit.  A 2xx response
+                    # without that contract is treated as retryable rather
+                    # than silently losing the pending record.
+                    if result.get("durable") is False:
+                        raise RuntimeError("remote acknowledged before durable commit")
+                    accepted = int(result.get("accepted", result.get("created", 0) + result.get("updated", 0) + result.get("deduped", 0)))
+                    if accepted < len(records):
+                        raise RuntimeError(f"remote accepted {accepted}/{len(records)} records")
+                    return result
             except error.HTTPError as exc:
                 last = exc
                 if exc.code not in (408, 425, 429) and exc.code < 500:

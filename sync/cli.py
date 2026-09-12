@@ -10,13 +10,16 @@ from .launchd import install, uninstall, plist_path
 def main(argv=None):
     ap=argparse.ArgumentParser(prog="funes-sync")
     sub=ap.add_subparsers(dest="cmd",required=True)
-    for n in ("backfill","run","status","sources","doctor","install","uninstall","start","stop","restart","logs","mcp"): sub.add_parser(n)
+    for n in ("backfill","run","drain","status","sources","doctor","install","uninstall","start","stop","restart","logs","mcp"): sub.add_parser(n)
     ap.add_argument("--root", type=str, help="override the home directory for a dry-run")
     a=ap.parse_args(argv); cfg=Config.load(Path(a.root).expanduser() if a.root else None); store=Store(config=cfg)
     try:
         if a.cmd in ("backfill","run"):
             d=SyncDaemon(cfg,store)
             d.run(once=a.cmd=="backfill")
+        elif a.cmd=="drain":
+            d=SyncDaemon(cfg,store)
+            print(json.dumps({"flushed": d.drain(), "remaining": store.pending_count()}, ensure_ascii=False))
         elif a.cmd=="status":
             from .client import SyncClient
             status=store.stats(); status.update({"remote_url":cfg.remote_url,"remote_ready":SyncClient(cfg).health(),"device_id":cfg.device_id,"interval":cfg.interval})

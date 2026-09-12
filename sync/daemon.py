@@ -43,6 +43,23 @@ class SyncDaemon:
         except Exception as exc:
             for r in rows:self.store.fail(r['record_id'],str(exc),min(3600,30*(2**min(r['attempts'],6))))
             log.warning("ingest failed: %s",exc); return 0
+    def drain(self, wait: bool = True) -> int:
+        """Flush the existing durable queue without rescanning local sources."""
+        total = 0
+        while self.store.pending_count():
+            sent = self.flush_once()
+            if sent:
+                total += sent
+                continue
+            if not wait:
+                break
+            row = self.store.db.execute("SELECT min(next_at) FROM queue").fetchone()
+            next_at = row[0] if row else None
+            if next_at is None:
+                break
+            delay = max(1.0, min(60.0, float(next_at) - time.time()))
+            time.sleep(delay)
+        return total
     def run(self,once=False):
         if not self.config.enabled:
             return 0

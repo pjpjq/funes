@@ -146,12 +146,12 @@ def serve(store=None):
             msg=json.loads(line); method=msg.get("method"); ident=msg.get("id"); p=msg.get("params") or {}
             if method=="initialize": result={"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"funes-sync","version":"1"}}
             elif method=="notifications/initialized": continue
-            elif method=="tools/list": result={"tools":[{"name":"recall","description":"Search the unified Codex, Pi and Claude memory; return original raw context","inputSchema":{"type":"object","properties":{"query":{"type":"string"},"limit":{"type":"integer"},"source_agent":{"type":"string"},"project":{"type":"string"}} ,"required":["query"]}},{"name":"get","description":"Get one original memory record","inputSchema":{"type":"object","properties":{"record_id":{"type":"string"}},"required":["record_id"]}},{"name":"status","description":"Show unified memory sync status","inputSchema":{"type":"object","properties":{}}}]}
+            elif method=="tools/list": result={"tools":[{"name":"recall","description":"Search the unified Codex, Pi and Claude memory; return original raw context","inputSchema":{"type":"object","properties":{"query":{"type":"string"},"limit":{"type":"integer"},"source_agent":{"type":"string"},"source_type":{"type":"string"},"project":{"type":"string"},"repo":{"type":"string"},"device_id":{"type":"string"},"role":{"type":"string"},"content_type":{"type":"string"},"since":{"type":"string"},"until":{"type":"string"}} ,"required":["query"]}},{"name":"get","description":"Get one original memory record","inputSchema":{"type":"object","properties":{"record_id":{"type":"string"}},"required":["record_id"]}},{"name":"status","description":"Show unified memory sync status","inputSchema":{"type":"object","properties":{}}}]}
             elif method=="tools/call":
                 name=p.get("name"); args=p.get("arguments") or {}
                 if remote:
                     if name=="recall": val=_remote_call("/search", args)
-                    elif name=="get": val=_remote_call("/get", {"session_id":args.get("record_id","")})
+                    elif name=="get": val=_remote_call("/get", {"source_identity":args.get("record_id","")})
                     elif name=="status": val=_remote_call("/sync/status", {})
                     else: val={"error":"unknown_tool"}
                 else:

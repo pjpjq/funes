@@ -1,3 +1,4 @@
+import io
 import json
 from types import SimpleNamespace
 from urllib.error import HTTPError
@@ -81,3 +82,44 @@ def test_remote_call_reads_url_from_config(monkeypatch):
     monkeypatch.setattr(bridge, "open_no_redirect", fake_urlopen)
     assert bridge._remote_call("/sync/status", {})["ok"] is True
     assert calls == ["https://configured-memory.example/sync/status"]
+
+
+def test_mcp_get_uses_source_identity_and_recall_exposes_filters(monkeypatch):
+    monkeypatch.setenv("FUNES_REMOTE_URL", "https://memory.example")
+    monkeypatch.setenv("FUNES_API_TOKEN", "api-token")
+    calls = []
+
+    def fake_remote(path, payload):
+        calls.append((path, payload))
+        return {"ok": True}
+
+    requests = [
+        {"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {"name": "get", "arguments": {"record_id": "memory-1"}},
+        },
+    ]
+    stdin = io.StringIO("".join(json.dumps(item) + "\n" for item in requests))
+    stdout = io.StringIO()
+    monkeypatch.setattr(bridge, "_remote_call", fake_remote)
+    monkeypatch.setattr(bridge.sys, "stdin", stdin)
+    monkeypatch.setattr(bridge.sys, "stdout", stdout)
+
+    bridge.serve(SimpleNamespace())
+
+    responses = [json.loads(line) for line in stdout.getvalue().splitlines()]
+    recall = responses[0]["result"]["tools"][0]
+    assert {
+        "source_agent",
+        "source_type",
+        "project",
+        "repo",
+        "device_id",
+        "content_type",
+        "since",
+        "until",
+    } <= set(recall["inputSchema"]["properties"])
+    assert calls == [("/get", {"source_identity": "memory-1"})]

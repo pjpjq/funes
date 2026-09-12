@@ -54,13 +54,14 @@ class SyncClient:
         try:
             headers = {"User-Agent": "funes-sync/1"}
             token = os.environ.get("FUNES_API_TOKEN")
-            if token:
-                hub_token = os.environ.get("FUNES_HF_TOKEN") or os.environ.get("HF_TOKEN")
-                if hub_token:
-                    headers["Authorization"] = "Bearer " + hub_token
-                    headers["X-Funes-Authorization"] = "Bearer " + token
-                else:
-                    headers["Authorization"] = "Bearer " + token
+            if not token:
+                return False
+            hub_token = os.environ.get("FUNES_HF_TOKEN") or os.environ.get("HF_TOKEN")
+            if hub_token:
+                headers["Authorization"] = "Bearer " + hub_token
+                headers["X-Funes-Authorization"] = "Bearer " + token
+            else:
+                headers["Authorization"] = "Bearer " + token
             req = request.Request(
                 self.config.remote_url.rstrip("/") + "/ready",
                 headers=headers,

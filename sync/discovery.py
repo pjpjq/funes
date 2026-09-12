@@ -65,8 +65,13 @@ def discover_sources(cfg: Config|None=None) -> list[Source]:
         if not memory_only:
             for root in (codex/"sessions", codex/"archived_sessions", codex/"subagents", codex/"sessions"/"archive"):
                 for p in _files(root,("**/*.jsonl",)): add("codex",p)
-        for root in (codex/"memories", codex/"automations"):
-            for p in _files(root,("**/*.md","**/*.jsonl","**/*.txt")): add("codex_memory",p)
+        for p in _files(codex / "memories", ("**/*.md", "**/*.jsonl", "**/*.txt")):
+            add("codex_memory", p)
+        # Automation run logs/evaluations are operational output, not durable
+        # agent memory; importing them would swamp retrieval with shell output.
+        # Keep only the automation's instructions/config and its explicit memory.md.
+        for p in _files(codex / "automations", ("**/*.md", "**/*.toml")):
+            add("codex_memory", p)
     # Codex top-level persistent instruction files
     for p in (codex/"AGENTS.md", codex/"MEMORY.md", codex/"memory.md"):
         add("codex_memory",p)

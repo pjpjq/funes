@@ -2,7 +2,7 @@ FROM rust:1.94-bookworm AS build
 WORKDIR /src
 COPY . .
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends curl \
+    && apt-get install -y --no-install-recommends curl protobuf-compiler \
     && curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh \
         | sh -s -- -b /usr/local/bin v3.95.5 \
     && cargo build --release --no-default-features --features blas

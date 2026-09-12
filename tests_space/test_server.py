@@ -1341,6 +1341,82 @@ def test_sidecar_search_rrf_queries_raw_and_rewrite_with_filters(monkeypatch):
     ]
 
 
+def test_sidecar_search_partitions_native_sessions_and_filters_harness(monkeypatch):
+    class Store:
+        def search(self, query, _limit, filters):
+            assert filters == {}
+            if query == "raw query":
+                return [
+                    {"source_identity": "memory", "source_type": "memory", "raw_text": "memory raw", "retrieval_text": "shadow"},
+                    {"source_identity": "codex", "source_type": "session", "source_agent": "codex", "raw_text": "codex raw", "retrieval_text": "shadow"},
+                    {"source_identity": "claude", "source_type": "claude_session", "source_agent": "claude", "raw_text": "claude raw", "retrieval_text": "shadow"},
+                    {"source_identity": "claude-code", "source_type": "session", "source_agent": "claude_code", "raw_text": "claude code raw", "retrieval_text": "shadow"},
+                ]
+            return [
+                {"source_identity": "pi", "source_type": "pi_session", "source_agent": "pi", "raw_text": "pi raw", "retrieval_text": "shadow"}
+            ]
+
+    app = SimpleNamespace(
+        translator=SimpleNamespace(rewrite_query=lambda _query: "provider query"),
+        store=Store(),
+        syncer=SimpleNamespace(restoring=False, restore_failed=False),
+    )
+    monkeypatch.setattr(bridge, "SOURCE_APP", app)
+
+    rewritten, primary, fallback = bridge.search_source_rankings("raw query", 5, {})
+    assert rewritten == "provider query"
+    assert [[item["source_identity"] for item in ranking] for ranking in primary] == [["memory"]]
+    assert [[item["source_identity"] for item in ranking] for ranking in fallback] == [
+        ["codex", "claude", "claude-code"],
+        ["pi"],
+    ]
+    assert all(
+        "retrieval_text" not in item
+        for ranking in [*primary, *fallback]
+        for item in ranking
+    )
+
+    _, _, claude_fallback = bridge.search_source_rankings(
+        "raw query", 5, {}, harness="claude_code"
+    )
+    assert [item["source_identity"] for item in claude_fallback[0]] == [
+        "claude",
+        "claude-code",
+    ]
+    _, _, unknown_fallback = bridge.search_source_rankings(
+        "raw query", 5, {}, harness="unknown"
+    )
+    assert unknown_fallback == []
+
+
+@pytest.mark.parametrize(
+    "filters",
+    (
+        {"role": "user"},
+        {"since": "2026-09-01"},
+        {"until": "2026-09-02"},
+        {"source_type": "session"},
+    ),
+)
+def test_explicit_sidecar_filters_keep_sessions_primary(monkeypatch, filters):
+    session = {
+        "source_identity": "filtered-session",
+        "source_type": "session",
+        "source_agent": "codex",
+        "raw_text": "filtered raw",
+        "retrieval_text": "shadow",
+    }
+    app = SimpleNamespace(
+        translator=SimpleNamespace(rewrite_query=lambda query: query),
+        store=SimpleNamespace(search=lambda _query, _limit, filters: [session]),
+        syncer=SimpleNamespace(restoring=False, restore_failed=False),
+    )
+    monkeypatch.setattr(bridge, "SOURCE_APP", app)
+    _, primary, fallback = bridge.search_source_rankings("query", 3, filters)
+    assert primary == [[{key: value for key, value in session.items() if key != "retrieval_text"}]]
+    assert fallback == []
+
+
 def test_http_rrf_promotes_dual_hit_and_keeps_sidecar_raw(monkeypatch, tmp_path):
     app = _source_app(tmp_path)
     for identity, raw in (
@@ -1363,7 +1439,11 @@ def test_http_rrf_promotes_dual_hit_and_keeps_sidecar_raw(monkeypatch, tmp_path)
     monkeypatch.setattr(
         bridge,
         "search_source_rankings",
-        lambda query, limit, filters: ("provider query", source_rankings),
+        lambda query, limit, filters, harness: (
+            "provider query",
+            source_rankings,
+            [[{"source_identity": "session-fallback", "raw_text": "fallback raw"}]],
+        ),
     )
     monkeypatch.setattr(
         bridge,
@@ -1393,6 +1473,7 @@ def test_http_rrf_promotes_dual_hit_and_keeps_sidecar_raw(monkeypatch, tmp_path)
     ]
     assert body["results_text"] == "triple raw\n\nraw BM25\n\nprovider raw"
     assert "ENGLISH SHADOW" not in json.dumps(body["results"], ensure_ascii=False)
+    assert "fallback raw" not in body["results_text"]
 
 
 @pytest.mark.parametrize(
@@ -1406,13 +1487,17 @@ def test_http_native_failure_returns_raw_sidecar_results(
     monkeypatch, tmp_path, native_error, degraded
 ):
     app = _source_app(tmp_path)
-    source_rankings = [[{"source_identity": "sidecar", "raw_text": "原始 sidecar 结果"}]]
+    source_rankings = [[{
+        "source_identity": "sidecar-session",
+        "source_type": "session",
+        "raw_text": "原始 sidecar session 结果",
+    }]]
     monkeypatch.setattr(bridge, "SOURCE_APP", app)
     monkeypatch.setattr(bridge, "TOKEN", "test-token")
     monkeypatch.setattr(
         bridge,
         "search_source_rankings",
-        lambda query, limit, filters: ("provider query", source_rankings),
+        lambda query, limit, filters, harness: ("provider query", [], source_rankings),
     )
     monkeypatch.setattr(
         bridge,
@@ -1431,8 +1516,39 @@ def test_http_native_failure_returns_raw_sidecar_results(
         app.store.close()
     assert status == 200
     assert body["retrieval_degraded"] == degraded
-    assert body["results_text"] == "原始 sidecar 结果"
+    assert body["results_text"] == "原始 sidecar session 结果"
     assert body["results"] == source_rankings[0]
+
+
+def test_http_native_empty_uses_session_sidecar_fallback(monkeypatch, tmp_path):
+    app = _source_app(tmp_path)
+    fallback = [[{
+        "source_identity": "empty-native-session",
+        "source_type": "session",
+        "raw_text": "native 空结果时的原始 session",
+    }]]
+    monkeypatch.setattr(bridge, "SOURCE_APP", app)
+    monkeypatch.setattr(bridge, "TOKEN", "test-token")
+    monkeypatch.setattr(
+        bridge,
+        "search_source_rankings",
+        lambda query, limit, filters, harness: ("provider query", [], fallback),
+    )
+    monkeypatch.setattr(bridge, "recall", lambda *_args, **_kwargs: "")
+    server = ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        status, body = _post(server, "/search", {"query": "raw query", "limit": 3})
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+        app.store.close()
+    assert status == 200
+    assert body["results"] == fallback[0]
+    assert body["results_text"] == "native 空结果时的原始 session"
+    assert "retrieval_degraded" not in body
 
 
 @pytest.mark.parametrize(
@@ -1451,7 +1567,7 @@ def test_http_native_failure_without_sidecar_stays_retryable(
     monkeypatch.setattr(
         bridge,
         "search_source_rankings",
-        lambda query, limit, filters: ("provider query", []),
+        lambda query, limit, filters, harness: ("provider query", [], []),
     )
     monkeypatch.setattr(
         bridge,
@@ -1483,7 +1599,11 @@ def test_http_caps_cjk_native_candidates_after_query_tuning(monkeypatch, tmp_pat
     monkeypatch.setattr(
         bridge,
         "search_source_rankings",
-        lambda query, limit, filters: ("CPA previous_response_id context loss", []),
+        lambda query, limit, filters, harness: (
+            "CPA previous_response_id context loss",
+            [],
+            [],
+        ),
     )
 
     def fake_recall(query, **kwargs):

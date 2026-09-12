@@ -24,6 +24,7 @@ from pathlib import Path
 from service.server import App as SourceApp
 from service.server import expanded_candidate_limit
 from service.server import ingest_documents as persist_source_ingest
+from service.server import NATIVE_SESSION_TYPES
 from service.server import prepare_ingest_documents as prepare_source_ingest_documents
 from service.server import queue_reindex as queue_source_reindex
 from service.server import stable_rrf
@@ -136,10 +137,21 @@ def ingest_source_documents(docs: list[dict]) -> tuple[int, dict, list[dict]] | 
     return (200 if result["durable"] else 503), result, canonical
 
 
-def search_source_rankings(query: str, limit: int, filters: dict[str, object]) -> tuple[str, list[list[dict]]]:
+def _normalized_harness_agent(value: object) -> str | None:
+    normalized = str(value or "").strip().lower().replace("-", "_")
+    normalized = "claude" if normalized == "claude_code" else normalized
+    return normalized if normalized in {"codex", "pi", "claude", "hermes"} else None
+
+
+def search_source_rankings(
+    query: str,
+    limit: int,
+    filters: dict[str, object],
+    harness: str | None = None,
+) -> tuple[str, list[list[dict]], list[list[dict]]]:
     app = source_app()
     if app is None or app.syncer.restoring or app.syncer.restore_failed:
-        return query, []
+        return query, [], []
     rewritten = app.translator.rewrite_query(query)
     candidate_limit = expanded_candidate_limit(limit)
     raw_hits = app.store.search(query, candidate_limit, filters=filters)
@@ -149,28 +161,36 @@ def search_source_rankings(query: str, limit: int, filters: dict[str, object]) -
         else []
     )
     native_filterable = set(filters).issubset({"source_agent", "repo"})
-    excluded_types = {
-        "session", "codex", "codex_session", "pi", "pi_session",
-        "claude", "claude_session",
-    }
-    rankings = []
+    expected_agent = _normalized_harness_agent(harness) if harness else None
+    fallback_enabled = not harness or expected_agent is not None
+    primary_rankings = []
+    session_fallback_rankings = []
     for hits in (raw_hits, rewritten_hits):
-        public_hits = []
+        primary_hits = []
+        fallback_hits = []
         for item in hits:
-            if native_filterable and str(item.get("source_type", "")).lower() in excluded_types:
-                continue
             public_item = dict(item)
             public_item.pop("retrieval_text", None)
-            public_hits.append(public_item)
-        if public_hits:
-            rankings.append(public_hits)
-    return rewritten, rankings
+            is_session = str(item.get("source_type", "")).lower() in NATIVE_SESSION_TYPES
+            if native_filterable and is_session:
+                source_agent = _normalized_harness_agent(item.get("source_agent"))
+                if fallback_enabled and (
+                    expected_agent is None or source_agent == expected_agent
+                ):
+                    fallback_hits.append(public_item)
+                continue
+            primary_hits.append(public_item)
+        if primary_hits:
+            primary_rankings.append(primary_hits)
+        if fallback_hits:
+            session_fallback_rankings.append(fallback_hits)
+    return rewritten, primary_rankings, session_fallback_rankings
 
 
 def search_source_documents(query: str, limit: int, filters: dict[str, object]) -> tuple[str, list[dict]]:
     """Compatibility helper for callers that consume a fused sidecar ranking."""
-    rewritten, rankings = search_source_rankings(query, limit, filters)
-    return rewritten, stable_rrf(rankings, limit)
+    rewritten, rankings, fallback_rankings = search_source_rankings(query, limit, filters)
+    return rewritten, stable_rrf([*rankings, *fallback_rankings], limit)
 
 # A remote Lance memory can take longer than the Space ingress timeout to open
 # on the first recall (model + snapshot + ANN/FTS handles).  Warm it in the
@@ -1264,7 +1284,10 @@ class Handler(BaseHTTPRequestHandler):
                     error = "restore_in_progress" if app.syncer.restoring else "restore_failed"
                     self.send_json(503, {"ok": False, "results": [], "results_text": "", "error": error})
                     return
-                source_query, source_rankings = search_source_rankings(raw_query, limit, filters)
+                harness = str(obj.get("harness", "")).strip() or None
+                source_query, source_rankings, session_fallback_rankings = (
+                    search_source_rankings(raw_query, limit, filters, harness)
+                )
                 # Reuse the source-side query rewrite for native semantic
                 # retrieval. query_text is deterministic fallback only, so a
                 # search can make at most one provider request.
@@ -1328,20 +1351,23 @@ class Handler(BaseHTTPRequestHandler):
                         else []
                     )
                 except NativeMcpBusyError:
-                    if not any(source_rankings):
+                    if not any(source_rankings) and not any(session_fallback_rankings):
                         self.send_json(429, {"ok": False, "results": [], "results_text": "", "error": "native_mcp_busy", "retry_after": 3}, {"Retry-After": "3"})
                         return
                     results = []
                     retrieval_degraded = "native_mcp_busy"
                 except NativeMcpError:
-                    if not any(source_rankings):
+                    if not any(source_rankings) and not any(session_fallback_rankings):
                         self.send_json(503, {"ok": False, "results": [], "results_text": "", "error": "native_mcp_unavailable"})
                         return
                     results = []
                     retrieval_degraded = "native_mcp_unavailable"
                 else:
                     retrieval_degraded = ""
-                results = stable_rrf([*source_rankings, results], limit)
+                rankings = [*source_rankings, results]
+                if not results:
+                    rankings.extend(session_fallback_rankings)
+                results = stable_rrf(rankings, limit)
                 results_text = "\n\n".join(
                     str(item.get("raw_text", ""))
                     for item in results

@@ -1,6 +1,0 @@
-.git
-target
-.venv
-__pycache__
-*.pyc
-/tmp

@@ -1,7 +1,7 @@
 from __future__ import annotations
-import json,sys,os
+import json,sys,os,time
 import subprocess
-from urllib import request
+from urllib import error, request
 from .store import Store
 
 def _keychain(service):
@@ -15,26 +15,123 @@ def _keychain(service):
     except OSError:
         return ""
 
+
+def _float_env(name, default, lower, upper):
+    try:
+        value = float(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        value = float(default)
+    return min(float(upper), max(float(lower), value))
+
+
+def _int_env(name, default, lower, upper):
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        value = int(default)
+    return min(int(upper), max(int(lower), value))
+
+
+def _auth_headers(token, hub_token):
+    headers = {"Content-Type": "application/json", "User-Agent": "funes-sync-mcp/1"}
+    if hub_token:
+        headers["Authorization"] = "Bearer " + hub_token
+        headers["X-Funes-Authorization"] = "Bearer " + token
+    else:
+        headers["Authorization"] = "Bearer " + token
+    return headers
+
+
+def _ready_state(base, headers, timeout):
+    """Read the Space warm state without exposing its response body to callers."""
+    req = request.Request(base + "/ready", headers=headers, method="GET")
+    try:
+        with request.urlopen(req, timeout=timeout) as resp:
+            value = json.loads(resp.read() or b"{}")
+    except (error.HTTPError, error.URLError, TimeoutError, OSError, ValueError):
+        return ""
+    warm = value.get("native_warm") if isinstance(value, dict) else None
+    if isinstance(warm, dict):
+        return str(warm.get("state", ""))
+    return "ready" if isinstance(value, dict) and value.get("ok") else ""
+
+
+def _wait_until_ready(base, headers, deadline):
+    """Avoid sending a recall into the known cold/warming window."""
+    timeout = _float_env("FUNES_REMOTE_READY_TIMEOUT", 8, 1, 15)
+    polls = _int_env("FUNES_REMOTE_READY_POLLS", 8, 1, 30)
+    state = ""
+    for _ in range(polls):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        state = _ready_state(base, headers, min(timeout, remaining))
+        if state != "warming":
+            break
+        time.sleep(min(2.0, max(0.0, deadline - time.monotonic())))
+    return state
+
+
+def _retry_after(exc, attempt):
+    if isinstance(exc, error.HTTPError):
+        try:
+            value = float(exc.headers.get("Retry-After", ""))
+            return min(10.0, max(0.0, value))
+        except (AttributeError, TypeError, ValueError):
+            pass
+    return min(8.0, float(2**attempt))
+
+
 def _remote_call(path, payload):
     base=os.environ.get("FUNES_REMOTE_URL", "").rstrip("/")
     token=os.environ.get("FUNES_API_TOKEN", "") or _keychain("funes-api-token")
     hub_token=os.environ.get("FUNES_HF_TOKEN", "") or os.environ.get("HF_TOKEN", "") or _keychain("funes-hf-token")
     if not base or not token:
         return None
-    headers={"Content-Type":"application/json","User-Agent":"funes-sync-mcp/1"}
-    if hub_token:
-        headers["Authorization"]="Bearer "+hub_token
-        headers["X-Funes-Authorization"]="Bearer "+token
-    else:
-        headers["Authorization"]="Bearer "+token
-    req=request.Request(base+path, data=json.dumps(payload,ensure_ascii=False).encode(), headers=headers, method="POST")
-    try:
-        timeout = float(os.environ.get("FUNES_REMOTE_TIMEOUT", "90"))
-    except ValueError:
-        timeout = 90.0
-    timeout = min(180.0, max(5.0, timeout))
-    with request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read() or b"{}")
+    headers = _auth_headers(token, hub_token)
+    total = _float_env("FUNES_REMOTE_TIMEOUT", 180, 10, 300)
+    attempts = _int_env("FUNES_REMOTE_ATTEMPTS", 3, 1, 5)
+    attempt_timeout = _float_env("FUNES_REMOTE_ATTEMPT_TIMEOUT", 50, 5, 55)
+    deadline = time.monotonic() + total
+
+    # The Space reports HTTP 200 while its native worker is warming.  Waiting
+    # here is materially better than sending a request that sits behind the
+    # warm lock until the HF front door closes the connection.
+    if path in ("/search", "/recall"):
+        state = _wait_until_ready(base, headers, deadline)
+        if state == "warming" and time.monotonic() >= deadline:
+            raise TimeoutError("remote native worker is still warming")
+
+    last = None
+    for attempt in range(attempts):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        req=request.Request(
+            base+path,
+            data=json.dumps(payload,ensure_ascii=False).encode(),
+            headers=headers,
+            method="POST",
+        )
+        try:
+            with request.urlopen(req, timeout=min(attempt_timeout, remaining)) as resp:
+                raw = resp.read()
+            if not raw:
+                raise RuntimeError("remote returned an empty response")
+            return json.loads(raw)
+        except error.HTTPError as exc:
+            # Authentication and malformed requests are caller errors; retry
+            # only transient gateway/provider failures.
+            if exc.code < 500 and exc.code not in (408, 425, 429):
+                raise
+            last = exc
+        except (error.URLError, TimeoutError, OSError, ValueError, RuntimeError) as exc:
+            last = exc
+        if attempt + 1 < attempts:
+            delay = min(_retry_after(last, attempt), max(0.0, deadline - time.monotonic()))
+            if delay:
+                time.sleep(delay)
+    raise RuntimeError("remote request failed after retries") from last
 
 def serve(store=None):
     store=store or Store()

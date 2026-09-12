@@ -61,18 +61,20 @@ def warm_state() -> dict[str, object]:
 def _warm_native_memory(*, replace: bool = False) -> None:
     started = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     with _WARM_STATE_LOCK:
-        _WARM_STATE.update(state="warming", started_at=started, finished_at=None)
+        if _WARM_STATE.get("state") != "warming":
+            _WARM_STATE.update(state="warming", started_at=started, finished_at=None)
     try:
         # A minimal recall initializes the same remote dataset, embedding model,
         # text index, and reranker used by real requests.  It is intentionally
         # run outside the HTTP request lifecycle.  Refreshes use a second child
         # and swap it in only after it is ready, so an old worker can keep
         # serving while a newly-pushed remote snapshot is opened.
-        if replace:
-            _refresh_native_worker()
-        else:
-            with INDEX_LOCK:
-                native_worker().recall("memory", k=1, candidates=1, half_life=0, neighbors=0)
+        # Always build a replacement child outside INDEX_LOCK.  The first warm
+        # used to call the active worker while holding that lock, so the first
+        # real HTTP recall could wait for the full cold-open duration.  A
+        # replacement is safe for both startup and post-push refreshes: the
+        # old worker remains available until the candidate is ready.
+        _refresh_native_worker()
     except Exception:
         # Readiness remains useful when a provider/HF endpoint is temporarily
         # unavailable; the next request will retry through the normal worker
@@ -89,7 +91,14 @@ def request_warm(*, force: bool = False) -> dict[str, object]:
     with _WARM_STATE_LOCK:
         if _WARM_STATE.get("state") == "warming":
             return dict(_WARM_STATE)
-        _WARM_STATE.update(state="not_started", started_at=None, finished_at=None)
+        # Reserve the state before starting the thread.  Thread.start() may be
+        # delayed, and a second /warm or ingest call must not launch another
+        # native MCP child in that gap.
+        _WARM_STATE.update(
+            state="warming",
+            started_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            finished_at=None,
+        )
     threading.Thread(
         target=_warm_native_memory,
         kwargs={"replace": force},
@@ -514,6 +523,13 @@ def native_worker() -> NativeMcpWorker:
         return MCP_WORKER
     config = (FUNES_BIN, REMOTE, str(HOME), MCP_TIMEOUT, MCP_HANDSHAKE_TIMEOUT)
     with _MCP_WORKER_LOCK:
+        # During the initial background warm there is intentionally no active
+        # worker yet.  Do not race it by spawning a second native MCP child;
+        # callers receive a bounded retryable error instead.
+        with _WARM_STATE_LOCK:
+            warming = _WARM_STATE.get("state") == "warming"
+        if MCP_WORKER is None and warming:
+            raise NativeMcpError("native MCP warming")
         if isinstance(MCP_WORKER, NativeMcpWorker) and _MCP_WORKER_CONFIG == config:
             return MCP_WORKER
         if isinstance(MCP_WORKER, NativeMcpWorker):
@@ -586,6 +602,23 @@ def auth_ok(handler: BaseHTTPRequestHandler) -> bool:
     return bool(TOKEN) and handler.headers.get("Authorization", "") == "Bearer " + TOKEN
 
 
+def ready_payload() -> tuple[int, dict[str, object]]:
+    """Return the authenticated readiness/status payload shared by both APIs."""
+    if not REMOTE:
+        return 503, {"ok": False, "error": "FUNES_MEMORY is not configured", "native_warm": warm_state()}
+    code, out, err = run("status", REMOTE, timeout=30)
+    return (
+        200 if code == 0 else 503,
+        {
+            "ok": code == 0,
+            "remote": REMOTE,
+            "status": out[-2000:],
+            "error": err[-500:],
+            "native_warm": warm_state(),
+        },
+    )
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "funes-http/1"
 
@@ -612,24 +645,12 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/health":
             self.send_json(200, {"ok": True, "service": "funes"})
             return
-        if self.path == "/ready":
+        if self.path in ("/ready", "/sync/status"):
             if not auth_ok(self):
                 self.send_json(401, {"error": "unauthorized"})
                 return
-            if not REMOTE:
-                self.send_json(503, {"ok": False, "error": "FUNES_MEMORY is not configured"})
-                return
-            code, out, err = run("status", REMOTE, timeout=30)
-            self.send_json(
-                200 if code == 0 else 503,
-                {
-                    "ok": code == 0,
-                    "remote": REMOTE,
-                    "status": out[-2000:],
-                    "error": err[-500:],
-                    "native_warm": warm_state(),
-                },
-            )
+            code, payload = ready_payload()
+            self.send_json(code, payload)
             return
         self.send_json(404, {"error": "not found"})
 
@@ -639,6 +660,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             obj = self.body()
+            if self.path == "/sync/status":
+                code, payload = ready_payload()
+                self.send_json(code, payload)
+                return
             if self.path == "/warm":
                 if not REMOTE:
                     self.send_json(503, {"ok": False, "error": "FUNES_MEMORY is not configured"})
@@ -770,8 +795,6 @@ class Handler(BaseHTTPRequestHandler):
                     outputs.append(pout)
                     errors.append(perr)
                     durable = code == 0
-                    if durable:
-                        request_warm(force=True)
                     self.send_json(200 if durable else 503, {"ok": durable, "durable": durable, "accepted": len(docs) if durable else 0, "session_ids": session_ids, "output": "".join(outputs)[-3000:] if durable else "", "error": "" if durable else "native_push_failed"})
                 finally:
                     shutil.rmtree(source, ignore_errors=True)

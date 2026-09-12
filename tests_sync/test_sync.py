@@ -72,3 +72,22 @@ def test_one_shot_backfill_drains_all_pending(tmp_path):
     SyncDaemon(c, s, Client()).run(once=True)
     assert s.stats()['pending'] == 0
     s.close()
+
+
+def test_remote_failure_keeps_pending_for_recovery(tmp_path):
+    class OfflineClient:
+        def ingest(self, records):
+            raise RuntimeError("durable commit unavailable")
+
+    c = cfg(tmp_path)
+    c.auto_discover = False
+    s = Store(config=c)
+    p = tmp_path / "x.jsonl"
+    p.write_text('{"role":"user","text":"must survive outage"}\n')
+    from sync.discovery import Source
+    chunk = parse_file(Source("pi:~/x", "pi", p, "d"))[0]
+    s.upsert_chunks([chunk])
+    daemon = SyncDaemon(c, s, OfflineClient())
+    assert daemon.flush_once() == 0
+    assert s.pending_count() == 1
+    s.close()

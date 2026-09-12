@@ -32,6 +32,14 @@ def test_launchagent(monkeypatch):
     assert "FUNES_API_TOKEN" not in d["EnvironmentVariables"]
 
 
+def test_state_dir_can_be_selected_in_toml(tmp_path, monkeypatch):
+    cfg_path=tmp_path / "config.toml"
+    cfg_path.write_text('[sync]\nstate_dir = "~/.local/share/funes-memory-sync-v2"\n', encoding="utf-8")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("FUNES_CONFIG", str(cfg_path))
+    assert Config.load().state_dir == tmp_path / ".local/share/funes-memory-sync-v2"
+
+
 def test_memory_only_daemon_does_not_require_native_binary(tmp_path):
     c=cfg(tmp_path); c.native_primary=True; c.memory_only=True
     s=Store(config=c)

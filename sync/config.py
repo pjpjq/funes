@@ -50,7 +50,7 @@ class Config:
         if not section:
             section = data
         truth=lambda v: str(v).lower() not in ("0", "false", "no", "off")
-        return cls(home, Path(os.environ.get("FUNES_STATE_DIR", home / ".local/share/funes-sync")).expanduser(), cfg,
+        return cls(home, Path(os.environ.get("FUNES_STATE_DIR", section.get("state_dir", home / ".local/share/funes-sync"))).expanduser(), cfg,
                    os.environ.get("FUNES_REMOTE_URL", remote.get("url", section.get("remote_url", "http://127.0.0.1:7860"))),
                    int(os.environ.get("FUNES_SYNC_INTERVAL", section.get("interval", 300))),
                    int(os.environ.get("FUNES_SYNC_BATCH", section.get("batch_size", 50))),

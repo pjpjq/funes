@@ -1473,6 +1473,10 @@ FINAL_TRANSLATION_STATUSES = {
 def prepare_ingest_documents(app: Any, docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Build the raw-first durable representation without calling a provider."""
     prepared = []
+    # Reindex generation is constant for this serialized ingest batch.  Query it
+    # once: each lookup computes MAX values over the current source table, so a
+    # per-document lookup turns a historical backfill into O(batch * rows).
+    generation = app.store.latest_reindex_generation()
     for doc in docs:
         if not isinstance(doc, dict):
             raise ValueError("each document must be an object")
@@ -1485,7 +1489,6 @@ def prepare_ingest_documents(app: Any, docs: list[dict[str, Any]]) -> list[dict[
             raise ValueError("metadata must be an object")
         identity = str(item.get("source_identity") or app.store._identity(item, metadata, raw))
         item["source_identity"] = identity
-        generation = app.store.latest_reindex_generation()
         item["retrieval_generation"] = generation
         item["native_generation"] = generation
         source_version = str(item.get("source_version", metadata.get("source_version", "")))

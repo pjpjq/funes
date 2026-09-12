@@ -48,6 +48,113 @@ def test_memory_only_daemon_does_not_require_native_binary(tmp_path):
     s.close()
 
 
+def test_native_primary_daemon_does_not_queue_http_records(tmp_path):
+    class Native:
+        def __init__(self):
+            self.calls = 0
+
+        def sync(self):
+            self.calls += 1
+            return type("Result", (), {"ok": True, "error": ""})()
+
+    c=cfg(tmp_path); c.native_primary=True; c.memory_only=False
+    (tmp_path/'.pi').mkdir()
+    (tmp_path/'.pi/session.jsonl').write_text(
+        '{"role":"user","text":"native only"}\n', encoding="utf-8"
+    )
+    s=Store(config=c)
+    d=SyncDaemon(c, s, type("Client", (), {})())
+    native=Native(); d.native=native
+
+    d.run(once=True)
+
+    assert native.calls == 1
+    assert s.pending_count() == 0
+    assert s.stats()["sources"] == 0
+    assert not (c.state_dir / "source-schema-v2.complete").exists()
+    s.close()
+
+
+def test_schema_epoch_reprocesses_unchanged_source_once(tmp_path, monkeypatch):
+    from sync.discovery import Source
+
+    c=cfg(tmp_path)
+    p=tmp_path/'memory.md'; p.write_text('stable memory', encoding='utf-8')
+    source=Source('memory:~/memory.md','persistent',p,c.device_id)
+    monkeypatch.setattr('sync.daemon.discover_sources', lambda _config: [source])
+    calls=[]
+    real_parse=parse_file
+
+    def tracked_parse(item, start=0):
+        calls.append(item.source_key)
+        return real_parse(item, start)
+
+    monkeypatch.setattr('sync.daemon.parse_file', tracked_parse)
+    s=Store(config=c); d=SyncDaemon(c, s, type("Client", (), {})())
+    d.scan_once()
+    marker=c.state_dir/'source-schema-v2.complete'
+    marker.unlink(missing_ok=True)
+    calls.clear()
+
+    d.scan_once()
+
+    assert calls == [source.source_key]
+    assert marker.exists()
+    calls.clear()
+    d.scan_once()
+    assert calls == []
+    s.close()
+
+
+def test_schema_epoch_bypasses_initial_backfill_eof_seed(tmp_path, monkeypatch):
+    from sync.discovery import Source
+
+    c=cfg(tmp_path); c.initial_backfill=False
+    p=tmp_path/'memory.md'; p.write_text('migrate metadata', encoding='utf-8')
+    source=Source('memory:~/memory.md','persistent',p,c.device_id)
+    monkeypatch.setattr('sync.daemon.discover_sources', lambda _config: [source])
+    starts=[]
+    real_parse=parse_file
+
+    def tracked_parse(item, start=0):
+        starts.append(start)
+        return real_parse(item, start)
+
+    monkeypatch.setattr('sync.daemon.parse_file', tracked_parse)
+    s=Store(config=c)
+    s.db.execute(
+        "INSERT INTO sources(source_key,kind,path) VALUES(?,?,?)",
+        ("legacy", "persistent", str(p)),
+    )
+    s.db.commit()
+    d=SyncDaemon(c, s, type("Client", (), {})())
+
+    d.scan_once()
+
+    assert starts == [0]
+    assert (c.state_dir/'source-schema-v2.complete').exists()
+    assert (c.state_dir/'initial-backfill.complete').exists()
+    s.close()
+
+
+def test_fresh_install_without_initial_backfill_seeds_eof(tmp_path, monkeypatch):
+    from sync.discovery import Source
+
+    c=cfg(tmp_path); c.initial_backfill=False
+    p=tmp_path/'memory.md'; p.write_text('existing history', encoding='utf-8')
+    source=Source('memory:~/memory.md','persistent',p,c.device_id)
+    monkeypatch.setattr('sync.daemon.discover_sources', lambda _config: [source])
+    s=Store(config=c); d=SyncDaemon(c, s, type("Client", (), {})())
+
+    assert d.scan_once() == 0
+
+    assert s.pending_count() == 0
+    assert s.cursor(source.source_key)["offset"] == p.stat().st_size
+    assert (c.state_dir/'initial-backfill.complete').exists()
+    assert (c.state_dir/'source-schema-v2.complete').exists()
+    s.close()
+
+
 def test_empty_remote_ack_is_not_durable(tmp_path, monkeypatch):
     class EmptyResponse:
         status = 204

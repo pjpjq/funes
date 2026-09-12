@@ -1,10 +1,16 @@
 from __future__ import annotations
-import json, sqlite3, time
+
+import hashlib
+import json
+import sqlite3
+import time
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+
 from .config import Config
 from .discovery import Source
 from .parsers import Chunk
+
 
 class Store:
     def __init__(self, path: Path|str|None=None, config: Config|None=None):
@@ -35,12 +41,19 @@ class Store:
         now=time.time(); count=0
         with self.db:
             for c in chunks:
-                payload=json.dumps(c.as_dict(),ensure_ascii=False,sort_keys=True)
-                import hashlib; h=hashlib.sha256(c.raw_text.encode("utf-8")).hexdigest()
-                old=self.db.execute("SELECT content_hash,version FROM records WHERE record_id=?",(c.record_id,)).fetchone()
-                if old and old[0] == h:
+                h=hashlib.sha256(c.raw_text.encode("utf-8")).hexdigest()
+                old=self.db.execute("SELECT content_hash,version,payload FROM records WHERE record_id=?",(c.record_id,)).fetchone()
+                value=c.as_dict()
+                prior=json.loads(old[2]) if old else {}
+                stamp=datetime.fromtimestamp(now, timezone.utc).isoformat()
+                value["ingested_at"]=prior.get("ingested_at", stamp)
+                value["updated_at"]=prior.get("updated_at", stamp)
+                payload=json.dumps(value,ensure_ascii=False,sort_keys=True)
+                if old and old[0] == h and old[2] == payload:
                     count += 1
                     continue
+                value["updated_at"]=stamp
+                payload=json.dumps(value,ensure_ascii=False,sort_keys=True)
                 version=(old[1]+1 if old and old[0]!=h else (old[1] if old else 1))
                 self.db.execute("INSERT INTO records(record_id,source_key,content_hash,version,payload,updated_at) VALUES(?,?,?,?,?,?) ON CONFLICT(record_id) DO UPDATE SET content_hash=excluded.content_hash,version=excluded.version,payload=excluded.payload,updated_at=excluded.updated_at",(c.record_id,c.source_key,h,version,payload,now))
                 self.db.execute("INSERT INTO queue(record_id,attempts,next_at,last_error,queued_at) VALUES(?,?,?,?,?) ON CONFLICT(record_id) DO UPDATE SET next_at=MIN(queue.next_at,excluded.next_at),last_error=NULL",(c.record_id,0,0,None,now)); count+=1
@@ -53,6 +66,7 @@ class Store:
         """
         rows=self.db.execute("SELECT record_id FROM records WHERE source_key=?",(source_key,)).fetchall()
         stale=[r[0] for r in rows if r[0] not in current_ids]
+        changed=0
         if stale:
             # Keep the local source-of-truth row and send a soft-missing update;
             # the remote service defaults to the same keep policy.  Physical
@@ -62,11 +76,17 @@ class Store:
                     row=self.db.execute("SELECT payload FROM records WHERE record_id=?",(record_id,)).fetchone()
                     if not row:
                         continue
-                    payload=json.loads(row[0]); payload["source_missing"]=True
+                    payload=json.loads(row[0])
+                    if payload.get("source_missing"):
+                        continue
+                    payload["source_missing"]=True
+                    source_version=str(payload.get("source_version") or payload.get("content_hash") or "")
+                    payload["source_version"]=hashlib.sha256((source_version+":source_missing=true").encode()).hexdigest()
                     payload["updated_at"]=str(time.time())
                     self.db.execute("UPDATE records SET payload=?,updated_at=? WHERE record_id=?",(json.dumps(payload,ensure_ascii=False,sort_keys=True),time.time(),record_id))
                     self.db.execute("INSERT INTO queue(record_id,attempts,next_at,last_error,queued_at) VALUES(?,?,?,?,?) ON CONFLICT(record_id) DO UPDATE SET next_at=MIN(queue.next_at,excluded.next_at),last_error=NULL",(record_id,0,0,None,time.time()))
-        return len(stale)
+                    changed += 1
+        return changed
     def pending(self,limit=50,now=None):
         now=now or time.time(); rows=self.db.execute("SELECT q.*,r.payload FROM queue q JOIN records r ON r.record_id=q.record_id WHERE q.next_at<=? ORDER BY q.queued_at LIMIT ?",(now,limit)).fetchall(); return [dict(r) for r in rows]
     def pending_count(self) -> int:

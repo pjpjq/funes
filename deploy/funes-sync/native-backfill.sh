@@ -11,6 +11,8 @@ LOCK="$STATE_DIR/native-backfill.lock"
 LOG="${FUNES_NATIVE_BACKFILL_LOG:-$HOME/Library/Logs/funes-native-backfill.log}"
 BIN="${FUNES_BIN:-$HOME/.local/bin/funes}"
 REMOTE="${FUNES_NATIVE_MEMORY:?FUNES_NATIVE_MEMORY is required}"
+WARM_HELPER="${FUNES_NATIVE_WARM_HELPER:-$HOME/.local/share/funes-sync/warm-space.py}"
+PYTHON="${PYTHON:-python3}"
 PUSH_EVERY="${FUNES_NATIVE_BACKFILL_PUSH_EVERY:-4}"
 RECONCILE_INTERVAL="${FUNES_NATIVE_BACKFILL_RECONCILE_INTERVAL:-300}"
 
@@ -32,6 +34,8 @@ fi
 if command -v security >/dev/null 2>&1; then
   HF_TOKEN="$(security find-generic-password -a "${USER:-$(id -un)}" -s funes-hf-token -w 2>/dev/null || true)"
   [ -n "$HF_TOKEN" ] && export HF_TOKEN
+  FUNES_API_TOKEN="$(security find-generic-password -a "${USER:-$(id -un)}" -s funes-api-token -w 2>/dev/null || true)"
+  [ -n "$FUNES_API_TOKEN" ] && export FUNES_API_TOKEN
 fi
 if [ -z "${HF_TOKEN:-}" ] && [ -r "$HOME/.zshrc" ] && command -v zsh >/dev/null 2>&1; then
   HF_TOKEN="$(zsh -c 'source "$HOME/.zshrc" >/dev/null 2>&1; printf %s "${FUNES_HF_TOKEN:-${HF_TOKEN:-}}"' 2>/dev/null || true)"
@@ -60,7 +64,16 @@ while :; do
   [ "$changed" -eq 1 ] && [ $((iteration % PUSH_EVERY)) -eq 0 ] && push_now=1
   if [ "$changed" -eq 1 ] && ! "$BIN" status 2>/dev/null | grep -q 'pending indexing:'; then push_now=1; fi
   if [ "$push_now" -eq 1 ]; then
-    "$BIN" push "$REMOTE" --yes >>"$LOG" 2>&1 || printf '%s push_failed; local index retained\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" >>"$LOG"
+    if "$BIN" push "$REMOTE" --yes >>"$LOG" 2>&1; then
+      # The remote snapshot changed. Ask the Space to refresh its native MCP
+      # worker in the background so the next agent query does not pay a cold
+      # remote-index load through the ingress timeout.
+      if [ -r "$WARM_HELPER" ] && [ -n "${FUNES_REMOTE_URL:-}" ] && [ -n "${FUNES_API_TOKEN:-}" ]; then
+        "$PYTHON" "$WARM_HELPER" >/dev/null 2>&1 || true
+      fi
+    else
+      printf '%s push_failed; local index retained\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" >>"$LOG"
+    fi
   fi
   if ! "$BIN" status 2>/dev/null | grep -q 'pending indexing:'; then
     printf '%s native backfill complete; next reconciliation in %ss\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$RECONCILE_INTERVAL" >>"$LOG"

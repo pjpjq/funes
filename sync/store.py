@@ -69,6 +69,9 @@ class Store:
         return len(stale)
     def pending(self,limit=50,now=None):
         now=now or time.time(); rows=self.db.execute("SELECT q.*,r.payload FROM queue q JOIN records r ON r.record_id=q.record_id WHERE q.next_at<=? ORDER BY q.queued_at LIMIT ?",(now,limit)).fetchall(); return [dict(r) for r in rows]
+    def pending_count(self) -> int:
+        """Return queue size without the JSON aggregation used by ``stats``."""
+        return int(self.db.execute("SELECT count(*) FROM queue").fetchone()[0])
     def ack(self,ids:list[str]):
         if ids:
             self.db.executemany("DELETE FROM queue WHERE record_id=?",((i,) for i in ids)); self.db.commit()

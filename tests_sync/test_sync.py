@@ -21,7 +21,7 @@ def test_discover_and_parse_all(tmp_path, monkeypatch):
 def test_store_dedupe_queue(tmp_path):
     c=cfg(tmp_path); s=Store(config=c); p=tmp_path/'x.jsonl'; p.write_text('{"role":"user","text":"x"}\n')
     from sync.discovery import Source
-    src=Source('pi:~/x','pi',p,'d'); chunks=parse_file(src); assert s.upsert_chunks(chunks)==1; assert s.upsert_chunks(chunks)==1; assert s.stats()['pending']==1; s.ack([chunks[0].record_id]); assert s.stats()['pending']==0
+    src=Source('pi:~/x','pi',p,'d'); chunks=parse_file(src); assert s.upsert_chunks(chunks)==1; assert s.upsert_chunks(chunks)==1; assert s.stats()['pending']==1; assert s.pending_count()==1; s.ack([chunks[0].record_id]); assert s.stats()['pending']==0; assert s.pending_count()==0
 
 def test_launchagent(monkeypatch):
     monkeypatch.setenv("FUNES_API_TOKEN", "redacted-test-token")

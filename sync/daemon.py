@@ -58,14 +58,14 @@ class SyncDaemon:
             # the remote is offline, flush_once leaves the queue intact and this
             # exits promptly for a later retry.
             if once:
-                while self.store.stats()["pending"]:
+                while self.store.pending_count():
                     if not self.flush_once():
                         break
             else:
                 for _ in range(8):
                     if not self.flush_once():
                         break
-            if self.store.stats()["pending"] == 0 and self.client.health():
+            if self.store.pending_count() == 0 and self.client.health():
                 try:
                     self.client.sync_snapshot()
                 except Exception as exc:

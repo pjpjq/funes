@@ -145,15 +145,7 @@ const VECTOR_INDEX_NAME: &str = "vector_idx";
 /// `on_phase` is called with a human label before each index is built, so a caller can report
 /// progress around these opaque (no incremental hook), potentially slow Lance calls. Pass `|_| {}`
 /// to stay silent.
-pub async fn build_indexes(ds: &mut Dataset, on_phase: impl Fn(&str)) {
-    if let Err(error) = build_indexes_checked(ds, on_phase).await {
-        eprintln!("funes: index creation failed — {error:#}");
-    }
-}
-
-/// Checked variant for callers, such as local indexing, that can return an index failure to the
-/// invoking user instead of only reporting it on stderr.
-pub(crate) async fn build_indexes_checked(
+pub async fn build_indexes(
     ds: &mut Dataset,
     on_phase: impl Fn(&str),
 ) -> Result<()> {
@@ -469,7 +461,7 @@ mod tests {
         // This is the state after append + persisted source state, then a crash before finalize:
         // the retry will find no new source chunks, but FTS is still absent.
         assert!(indexes_need_rebuild(&ds).await.unwrap());
-        build_indexes_checked(&mut ds, |_| {}).await.unwrap();
+        build_indexes(&mut ds, |_| {}).await.unwrap();
         assert!(!indexes_need_rebuild(&ds).await.unwrap());
 
         // An append after an existing FTS leaves an index delta. A no-new-source retry must also
@@ -482,7 +474,32 @@ mod tests {
         .await
         .unwrap();
         assert!(indexes_need_rebuild(&ds).await.unwrap());
-        build_indexes_checked(&mut ds, |_| {}).await.unwrap();
+        build_indexes(&mut ds, |_| {}).await.unwrap();
         assert!(!indexes_need_rebuild(&ds).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn build_indexes_returns_text_index_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().join("chunks.lance");
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(vec!["row"]))],
+        )
+        .unwrap();
+        let mut ds = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema),
+            uri.to_str().unwrap(),
+            Some(WriteParams::default()),
+        )
+        .await
+        .unwrap();
+
+        let error = build_indexes(&mut ds, |_| {}).await.unwrap_err();
+        assert!(
+            error.to_string().contains("creating text search index"),
+            "missing text column should propagate the FTS creation error: {error:#}"
+        );
     }
 }

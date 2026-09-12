@@ -549,7 +549,7 @@ async fn ingest_local(path: PathBuf, docs: &[Document], held: usize, embedder: &
         let mut created = Dataset::write(reader, &uri, Some(WriteParams::default()))
             .await
             .context("creating canonical document memory")?;
-        dataset::build_indexes(&mut created, |_| {}).await;
+        dataset::build_indexes(&mut created, |_| {}).await?;
     }
     Ok(Report {
         sources: selection.changed.len(),

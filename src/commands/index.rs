@@ -566,7 +566,7 @@ impl Indexer {
             // completed. Check the stored index health even on a no-new-chunk retry, so that debt
             // heals rather than becoming permanent.
             if self.n_chunks > 0 || dataset::indexes_need_rebuild(d).await? {
-                dataset::build_indexes_checked(d, |phase| eprintln!("building {phase}…")).await?;
+                dataset::build_indexes(d, |phase| eprintln!("building {phase}…")).await?;
 
                 // Reap superseded versions — best-effort; on failure the reap waits for next run.
                 match d.cleanup_old_versions(chrono::Duration::minutes(10), None, None).await {

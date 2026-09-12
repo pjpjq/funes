@@ -7,14 +7,15 @@
 
 use funes::agents;
 use funes::commands::target::Target;
-use funes::commands::{add, ask, bind, compact, index, mcp, push, recall, scrub, sketch, update};
+use funes::commands::{add, ask, bind, compact, index, ingest_docs, mcp, push, recall, scrub, sketch, update};
 use funes::hub;
 use funes::memory;
 use funes::ui::banner::Banner;
 
-use anyhow::Result;
+use anyhow::{anyhow, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use std::io::Write;
+use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(name = "funes", version, about = "Recall over your past AI agent sessions.")]
@@ -24,6 +25,9 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+// Parsed once at process startup; keeping recall's filters flat gives CLI/MCP users one stable
+// surface and avoids boxing individual optional strings only to shrink this transient enum.
+#[allow(clippy::large_enum_variant)]
 enum Cmd {
     /// Recall passages from past sessions (hybrid → reranked when the pool exceeds -k → neighbors).
     Recall {
@@ -61,6 +65,36 @@ enum Cmd {
         /// Restrict to turns on or before this date (`YYYY-MM-DD`).
         #[arg(long, value_name = "DATE")]
         until: Option<String>,
+        /// Restrict to one canonical source identity.
+        #[arg(long)]
+        source_identity: Option<String>,
+        /// Restrict to one canonical source revision.
+        #[arg(long)]
+        source_version: Option<String>,
+        /// Restrict to one canonical source content hash.
+        #[arg(long)]
+        content_hash: Option<String>,
+        /// Restrict to an exact canonical revision timestamp.
+        #[arg(long)]
+        updated_at: Option<String>,
+        /// Restrict to the source agent facet.
+        #[arg(long)]
+        source_agent: Option<String>,
+        /// Restrict to the source type facet.
+        #[arg(long)]
+        source_type: Option<String>,
+        /// Restrict to the project facet.
+        #[arg(long)]
+        project: Option<String>,
+        /// Restrict to the device id facet.
+        #[arg(long)]
+        device_id: Option<String>,
+        /// Restrict to the canonical content type.
+        #[arg(long)]
+        content_type: Option<String>,
+        /// Restrict to present (`false`) or soft-missing (`true`) canonical sources.
+        #[arg(long)]
+        source_missing: Option<bool>,
         #[command(flatten)]
         memory: MemoryOpts,
     },
@@ -118,6 +152,14 @@ enum Cmd {
         /// A memory keeps the model it was created with, so an existing English memory refuses it.
         #[arg(long, conflicts_with = "check")]
         multilingual: bool,
+    },
+    /// Ingest canonical document JSONL directly into a memory, replacing each source revision.
+    IngestDocs {
+        /// Canonical JSONL containing source identity, revision, retrieval text, and metadata.
+        #[arg(value_name = "JSONL")]
+        path: PathBuf,
+        #[command(flatten)]
+        memory: MemoryOpts,
     },
     /// Find a literal string everywhere in one session — exhaustive, unranked.
     Scan {
@@ -372,6 +414,16 @@ async fn run() -> Result<()> {
             repo,
             since,
             until,
+            source_identity,
+            source_version,
+            content_hash,
+            updated_at,
+            source_agent,
+            source_type,
+            project,
+            device_id,
+            content_type,
+            source_missing,
             memory,
         } => {
             let memory = memory.resolve()?;
@@ -390,6 +442,16 @@ async fn run() -> Result<()> {
                     repo,
                     since,
                     until,
+                    source_identity,
+                    source_version,
+                    content_hash,
+                    updated_at,
+                    source_agent,
+                    source_type,
+                    project,
+                    device_id,
+                    content_type,
+                    source_missing,
                 },
                 &|label| spinner.set(label),
             )
@@ -479,6 +541,13 @@ async fn run() -> Result<()> {
             })
             .await
         }
+        Cmd::IngestDocs { path, memory } => {
+            print!(
+                "{}",
+                ingest_docs::run(&path, memory::Memory::resolve(memory.memory)).await?
+            );
+            Ok(())
+        }
         Cmd::Status => {
             let bound = memory::binding()?;
             let note = bind::legacy_note(bound.as_deref())?;
@@ -540,7 +609,10 @@ fn run_sync_command(command: SyncCommand) -> Result<()> {
         SyncCommand::Mcp => "mcp",
     };
     let mut child = std::process::Command::new(std::env::var("FUNES_SYNC_BIN").unwrap_or_else(|_| "funes-sync".into()));
-    let status = child.arg(name).status().context("running funes-sync (set FUNES_SYNC_BIN to its absolute path)")?;
+    let status = child
+        .arg(name)
+        .status()
+        .context("running funes-sync (set FUNES_SYNC_BIN to its absolute path)")?;
     if status.success() {
         Ok(())
     } else {

@@ -463,7 +463,7 @@ pub async fn recall_hits(
 }
 
 /// What narrows a search.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct RecallFilter {
     /// Keep chunks of this block type: `text`, `thinking`, `tool_use` or `tool_result`.
     pub block_type: Option<String>,
@@ -477,9 +477,43 @@ pub struct RecallFilter {
     pub since: Option<String>,
     /// Keep turns on or before this `YYYY-MM-DD`.
     pub until: Option<String>,
+    /// Exact canonical provenance; absent columns match no rows.
+    pub source_identity: Option<String>,
+    pub source_version: Option<String>,
+    pub content_hash: Option<String>,
+    pub updated_at: Option<String>,
+    pub source_agent: Option<String>,
+    pub source_type: Option<String>,
+    pub project: Option<String>,
+    pub device_id: Option<String>,
+    pub content_type: Option<String>,
+    pub source_missing: Option<bool>,
 }
 
 impl RecallFilter {
+    fn canonical_predicates(&self) -> Vec<(&'static str, String)> {
+        let mut clauses = Vec::new();
+        for (name, value) in [
+            ("source_identity", self.source_identity.as_deref()),
+            ("source_version", self.source_version.as_deref()),
+            ("content_hash", self.content_hash.as_deref()),
+            ("updated_at", self.updated_at.as_deref()),
+            ("source_agent", self.source_agent.as_deref()),
+            ("source_type", self.source_type.as_deref()),
+            ("project", self.project.as_deref()),
+            ("device_id", self.device_id.as_deref()),
+            ("content_type", self.content_type.as_deref()),
+        ] {
+            if let Some(value) = value {
+                clauses.push((name, dataset::eq(name, value)));
+            }
+        }
+        if let Some(value) = self.source_missing {
+            clauses.push(("source_missing", format!("source_missing = {value}")));
+        }
+        clauses
+    }
+
     fn days(&self) -> DayRange<'_> {
         DayRange {
             since: self.since.as_deref(),
@@ -496,6 +530,7 @@ pub struct Search {
     candidates: usize,
     /// The columns `where_clause` reads that a migration added, which an older memory lacks.
     migrated: Vec<&'static str>,
+    canonical_columns: Vec<&'static str>,
     where_clause: Option<String>,
 }
 
@@ -536,15 +571,22 @@ impl Search {
         if filter.repo.is_some() {
             migrated.push("repo");
         }
+        let predicates = filter.canonical_predicates();
+        let canonical_columns = predicates.iter().map(|(name, _)| *name).collect();
+        let mut clauses: Vec<String> = build_where(
+            filter.block_type.as_deref(),
+            filter.role.as_deref(),
+            &harness,
+            filter.repo.as_deref(),
+            &filter.days(),
+        )?
+        .into_iter()
+        .collect();
+        clauses.extend(predicates.into_iter().map(|(_, clause)| clause));
         Ok(Self {
-            where_clause: build_where(
-                filter.block_type.as_deref(),
-                filter.role.as_deref(),
-                &harness,
-                filter.repo.as_deref(),
-                &filter.days(),
-            )?,
+            where_clause: (!clauses.is_empty()).then(|| clauses.join(" AND ")),
             migrated,
+            canonical_columns,
             query,
             qv: OnceCell::new(),
             candidates,
@@ -556,6 +598,18 @@ impl Search {
     pub async fn candidates(&self, memory: &Memory, progress: &(dyn Fn(&str) + Sync)) -> Result<Candidates> {
         progress(&format!("searching {}…", memory.label()));
         let read = open_read(memory).await?;
+        // An older transcript memory has no canonical provenance to match.
+        if self
+            .canonical_columns
+            .iter()
+            .any(|column| !dataset::has_column(&read.ds, column))
+        {
+            return Ok(Candidates {
+                ds: read.ds,
+                note: read.note.unwrap_or_default(),
+                hits: Vec::new(),
+            });
+        }
         // A filter on a migrated column needs the column. On an un-migrated memory it would fail
         // deep inside Lance with an opaque schema error, so refuse with a clear message instead.
         if let Some(column) = self.migrated.iter().find(|c| !dataset::has_column(&read.ds, c)) {
@@ -875,7 +929,12 @@ pub async fn get_turns(memory: Memory, session_id: String, range: TurnRange) -> 
 
     let cols = ["turn_uuid", "seq", "ts", "role", "text", "block_idx", "split_idx"];
     let filter = dataset::eq("session_id", &session_id);
-    let batches = dataset::scan_rows(ds, &cols, Some(filter.as_str()), None).await?;
+    let mut batches = dataset::scan_rows(ds, &cols, Some(filter.as_str()), None).await?;
+    // Canonical documents can retain their original session id; the source identity is also addressable.
+    if batches.iter().all(|batch| batch.num_rows() == 0) && dataset::has_column(ds, "source_identity") {
+        let filter = dataset::eq("source_identity", &session_id);
+        batches = dataset::scan_rows(ds, &cols, Some(filter.as_str()), None).await?;
+    }
 
     // `text` is already the rendered chunk as stored by the indexer — do not re-render.
     let mut rows: Vec<TurnRow> = Vec::new();
@@ -1945,6 +2004,26 @@ mod tests {
     }
 
     #[test]
+    fn canonical_filter_port_escapes_values_and_tracks_missing_columns() {
+        let search = Search::new(
+            "query".into(),
+            4,
+            RecallFilter {
+                source_agent: Some("codex".into()),
+                project: Some("owner's repo".into()),
+                source_missing: Some(false),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            search.where_clause.as_deref(),
+            Some("source_agent = 'codex' AND project = 'owner''s repo' AND source_missing = false")
+        );
+        assert_eq!(search.canonical_columns, ["source_agent", "project", "source_missing"]);
+    }
+
+    #[test]
     fn build_where_combines_set_filters() {
         let one = |h: &str| vec![h.to_string()];
         let any = DayRange::default();
@@ -2035,7 +2114,7 @@ mod tests {
         let mut chunks = chunk::chunks_from_turns(&turns, true);
         for c in &mut chunks {
             let (_, repo) = repos.iter().find(|(session, _)| *session == c.session_id).unwrap();
-            c.repo = repo.to_string();
+            c.repo = Some(repo.to_string());
         }
         let vectors = vec![vec![0.0f32; dataset::DIM as usize]; chunks.len()];
         let batch = dataset::build_batch(dataset::model::ENGLISH, &chunks, Some(&vectors)).unwrap();

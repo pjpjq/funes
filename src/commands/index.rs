@@ -12,7 +12,7 @@ use super::compact;
 use crate::chunk::{self, Tier};
 use crate::home;
 use crate::inference::{self, embed_batched, Embedder};
-use crate::memory::dataset::{self, build_batch, model};
+use crate::memory::dataset::{self, model};
 use crate::memory::lock;
 use crate::memory::Memory;
 use crate::scan;
@@ -26,6 +26,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{IsTerminal, Write as _};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Take the memory lock. An interactive caller (a human at `funes index`/`funes add`) waits out a
@@ -540,7 +541,10 @@ impl Indexer {
         let _lock = acquire_lock(interactive).await?;
 
         let uri = dataset::table_uri(home::memory_dir());
-        let ds = Memory::local().dataset().await?;
+        let mut ds = Memory::local().dataset().await?;
+        if let Some(ds) = &mut ds {
+            dataset::ensure_canonical_columns(ds).await?;
+        }
 
         let model = match &ds {
             Some(ds) => dataset::embedding_model(ds)?,
@@ -717,7 +721,7 @@ impl Indexer {
         }
         for c in &mut chunks {
             if let Some(repo) = repo_by_turn.get(&(c.session_id.as_str(), c.turn_uuid.as_str())) {
-                c.repo.clone_from(repo);
+                c.repo = Some(repo.clone());
             }
         }
         let total_chunks = chunks.len();
@@ -790,7 +794,12 @@ impl Indexer {
         if chunks.is_empty() {
             return Ok(0);
         }
-        let batch = build_batch(self.embedder.model(), chunks, None)?;
+        let target_schema = self
+            .ds
+            .as_ref()
+            .map(|ds| Arc::new(arrow_schema::Schema::from(ds.schema())))
+            .unwrap_or_else(|| dataset::schema(self.embedder.model()));
+        let batch = dataset::build_batch_optional_for_schema(chunks, None, target_schema)?;
         if let Some(languages) = &mut self.languages {
             languages.add(&batch);
         }
@@ -1345,13 +1354,24 @@ mod tests {
                     block_idx: 0,
                     split_idx: 0,
                     harness: "test".into(),
-                    repo: String::new(),
+                    repo: None,
+                    source_identity: None,
+                    source_version: None,
+                    content_hash: None,
+                    updated_at: None,
+                    source_agent: None,
+                    source_type: None,
+                    project: None,
+                    device_id: None,
+                    content_type: None,
+                    source_missing: None,
+                    metadata_json: None,
                 })
             })
             .collect();
         dataset::create(
             path.to_str().unwrap(),
-            build_batch(model::ENGLISH, &chunks, None).unwrap(),
+            dataset::build_batch(model::ENGLISH, &chunks, None).unwrap(),
         )
         .await
         .unwrap()

@@ -48,6 +48,26 @@ pub struct RecallRequest {
         description = "Memory to read for this call, as it stands — `<org>/<repo>`, an `hf://…` URI, a local path, or `local`. Omitted, the server's memory, with this host's turns not yet pushed to it when the host is bound to it."
     )]
     pub memory: Option<String>,
+    #[schemars(description = "Restrict to exact canonical source identity")]
+    pub source_identity: Option<String>,
+    #[schemars(description = "Restrict to exact canonical source version")]
+    pub source_version: Option<String>,
+    #[schemars(description = "Restrict to exact canonical content hash")]
+    pub content_hash: Option<String>,
+    #[schemars(description = "Restrict to exact canonical updated at")]
+    pub updated_at: Option<String>,
+    #[schemars(description = "Restrict to exact canonical source agent")]
+    pub source_agent: Option<String>,
+    #[schemars(description = "Restrict to exact canonical source type")]
+    pub source_type: Option<String>,
+    #[schemars(description = "Restrict to exact canonical project")]
+    pub project: Option<String>,
+    #[schemars(description = "Restrict to exact canonical device id")]
+    pub device_id: Option<String>,
+    #[schemars(description = "Restrict to exact canonical content type")]
+    pub content_type: Option<String>,
+    #[schemars(description = "Restrict to present (false) or soft-missing (true) canonical sources")]
+    pub source_missing: Option<bool>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -198,6 +218,16 @@ impl Funes {
             repo,
             since,
             until,
+            source_identity,
+            source_version,
+            content_hash,
+            updated_at,
+            source_agent,
+            source_type,
+            project,
+            device_id,
+            content_type,
+            source_missing,
             memory,
         }): Parameters<RecallRequest>,
     ) -> String {
@@ -216,6 +246,16 @@ impl Funes {
                         repo,
                         since,
                         until,
+                        source_identity,
+                        source_version,
+                        content_hash,
+                        updated_at,
+                        source_agent,
+                        source_type,
+                        project,
+                        device_id,
+                        content_type,
+                        source_missing,
                     },
                 )
                 .await

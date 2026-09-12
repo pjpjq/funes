@@ -1,0 +1,125 @@
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+import pytest
+
+NODE = shutil.which("node")
+EXTENSION = Path(__file__).parents[1] / "integrations" / "pi" / "funes-remote.ts"
+
+
+def run_harness(
+    tmp_path: Path, source: str, body: str
+) -> subprocess.CompletedProcess[str]:
+    config = tmp_path / "config.toml"
+    config.write_text(source, encoding="utf-8")
+    harness = tmp_path / "harness.mjs"
+    harness.write_text(
+        f"import extension, {{ configuredRemoteUrl }} from {json.dumps(EXTENSION.as_uri())};\n"
+        + body,
+        encoding="utf-8",
+    )
+    env = {
+        **os.environ,
+        "HOME": str(tmp_path),
+        "FUNES_CONFIG": str(config),
+        "FUNES_API_TOKEN": "synthetic-api-token",
+        "FUNES_HF_TOKEN": "synthetic-hf-token",
+    }
+    return subprocess.run(
+        [NODE, "--experimental-strip-types", str(harness)],
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+
+@pytest.mark.skipif(NODE is None, reason="node is unavailable")
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ('[remote]\nurl = "https://remote.example"\n', "https://remote.example"),
+        ('[sync]\nremote_url = "https://sync.example"\n', "https://sync.example"),
+        ('remote_url = "https://top.example"\n', "https://top.example"),
+    ],
+)
+def test_pi_reads_current_and_legacy_remote_config(tmp_path, source, expected):
+    result = run_harness(tmp_path, source, "console.log(configuredRemoteUrl());\n")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == expected
+
+
+@pytest.mark.skipif(NODE is None, reason="node is unavailable")
+def test_pi_does_not_follow_or_retry_redirect(tmp_path):
+    sink_requests = []
+    source_requests = []
+
+    class SinkHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            sink_requests.append(dict(self.headers.items()))
+            self.send_response(204)
+            self.end_headers()
+
+        def log_message(self, format, *args):
+            return
+
+    sink = ThreadingHTTPServer(("127.0.0.1", 0), SinkHandler)
+
+    class SourceHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            source_requests.append(self.path)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"ok":true,"native_warm":{"state":"ready"}}')
+
+        def do_POST(self):
+            source_requests.append(self.path)
+            self.send_response(302)
+            self.send_header("Location", f"http://127.0.0.1:{sink.server_port}/capture")
+            self.end_headers()
+
+        def log_message(self, format, *args):
+            return
+
+    source = ThreadingHTTPServer(("127.0.0.1", 0), SourceHandler)
+    threads = [
+        threading.Thread(target=server.serve_forever, daemon=True)
+        for server in (source, sink)
+    ]
+    for thread in threads:
+        thread.start()
+    try:
+        body = (
+            "const tools = {};\n"
+            "const pi = {registerTool(tool) { tools[tool.name] = tool; }, on() {}};\n"
+            "extension(pi);\n"
+            "const result = await tools.funes_recall.execute('test', {query: 'history'});\n"
+            "console.log(result.content[0].text);\n"
+        )
+        started = time.monotonic()
+        result = run_harness(
+            tmp_path,
+            f'[remote]\nurl = "http://127.0.0.1:{source.server_port}"\n',
+            body,
+        )
+        elapsed = time.monotonic() - started
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "null"
+        assert source_requests == ["/ready", "/search"]
+        assert sink_requests == []
+        assert elapsed < 3
+    finally:
+        source.shutdown()
+        sink.shutdown()
+        source.server_close()
+        sink.server_close()

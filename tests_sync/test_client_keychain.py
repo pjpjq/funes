@@ -75,7 +75,7 @@ def test_sync_methods_use_keychain_credentials_when_environment_is_empty(tmp_pat
             return Response({"durable": True})
         return Response({})
 
-    monkeypatch.setattr(client_module.request, "urlopen", urlopen)
+    monkeypatch.setattr(client_module, "open_no_redirect", urlopen)
     client = SyncClient(cfg(tmp_path))
 
     assert client.health()
@@ -113,5 +113,5 @@ def test_environment_credentials_take_precedence_over_keychain(tmp_path, monkeyp
         assert headers["x-funes-authorization"] == "Bearer api-environment-value"
         return Response()
 
-    monkeypatch.setattr(client_module.request, "urlopen", urlopen)
+    monkeypatch.setattr(client_module, "open_no_redirect", urlopen)
     assert SyncClient(cfg(tmp_path)).health()

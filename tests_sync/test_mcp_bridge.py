@@ -1,4 +1,5 @@
 import json
+from types import SimpleNamespace
 from urllib.error import HTTPError
 
 import pytest
@@ -40,7 +41,7 @@ def test_remote_search_waits_for_ready_and_retries_transient(monkeypatch):
             raise OSError("connection reset")
         return _Response({"ok": True, "results": [{"raw_text": "原始中文"}]})
 
-    monkeypatch.setattr(bridge.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(bridge, "open_no_redirect", fake_urlopen)
     result = bridge._remote_call("/search", {"query": "之前的决定"})
 
     assert result["ok"] is True
@@ -57,7 +58,26 @@ def test_remote_call_does_not_retry_auth_failure(monkeypatch):
         calls.append(req.full_url)
         raise HTTPError(req.full_url, 401, "unauthorized", {}, None)
 
-    monkeypatch.setattr(bridge.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(bridge, "open_no_redirect", fake_urlopen)
     with pytest.raises(HTTPError):
         bridge._remote_call("/get", {"id": "record-1"})
     assert calls == ["https://memory.example/get"]
+
+
+def test_remote_call_reads_url_from_config(monkeypatch):
+    monkeypatch.delenv("FUNES_REMOTE_URL", raising=False)
+    monkeypatch.setenv("FUNES_API_TOKEN", "api-token")
+    monkeypatch.setattr(
+        bridge.Config,
+        "load",
+        lambda: SimpleNamespace(remote_url="https://configured-memory.example"),
+    )
+    calls = []
+
+    def fake_urlopen(req, timeout):
+        calls.append(req.full_url)
+        return _Response({"ok": True})
+
+    monkeypatch.setattr(bridge, "open_no_redirect", fake_urlopen)
+    assert bridge._remote_call("/sync/status", {})["ok"] is True
+    assert calls == ["https://configured-memory.example/sync/status"]

@@ -1,7 +1,9 @@
 import json, os, tempfile, time
 from unittest import mock
 from pathlib import Path
+import pytest
 from sync.config import Config
+from sync.client import SyncClient
 from sync.discovery import discover_sources
 from sync.parsers import parse_file
 from sync.store import Store
@@ -28,6 +30,27 @@ def test_launchagent(monkeypatch):
     monkeypatch.setenv("FUNES_API_TOKEN", "redacted-test-token")
     d=render_plist('/usr/bin/python3'); assert d['Label']=='com.funes.sync'; assert d['RunAtLoad']
     assert "FUNES_API_TOKEN" not in d["EnvironmentVariables"]
+
+
+def test_empty_remote_ack_is_not_durable(tmp_path, monkeypatch):
+    class EmptyResponse:
+        status = 204
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+        def read(self):
+            return b""
+
+    c = cfg(tmp_path)
+    monkeypatch.setenv("FUNES_API_TOKEN", "redacted-test-token")
+    monkeypatch.setattr("sync.client.request.urlopen", lambda *args, **kwargs: EmptyResponse())
+    monkeypatch.setattr("sync.client.time.sleep", lambda _seconds: None)
+    with pytest.raises(RuntimeError, match="remote ingest failed after retries"):
+        SyncClient(c).ingest([{"raw_text": "must not be acknowledged"}])
 
 
 def test_keychain_token_is_stored_and_verified(monkeypatch):

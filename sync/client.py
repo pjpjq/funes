@@ -29,7 +29,9 @@ class SyncClient:
             try:
                 with request.urlopen(req,timeout=timeout) as r:
                     raw=r.read()
-                    result = json.loads(raw) if raw else {"accepted": len(records), "durable": True}
+                    if not raw:
+                        raise RuntimeError("remote returned an empty durable-ingest response")
+                    result = json.loads(raw)
                     # The daemon may acknowledge a local queue row only after
                     # the remote confirms a durable commit.  A 2xx response
                     # without that contract is treated as retryable rather
@@ -44,6 +46,8 @@ class SyncClient:
                 last = exc
                 if exc.code not in (408, 425, 429) and exc.code < 500:
                     raise
+            except RuntimeError as exc:
+                last = exc
             except (error.URLError, TimeoutError, OSError) as exc:
                 last = exc
             if attempt < 3:

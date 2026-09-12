@@ -9,7 +9,7 @@ RUN apt-get update \
     && curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh \
         | sh -s -- -b /usr/local/bin v3.95.5 \
     && rm -rf /var/lib/apt/lists/*
-COPY space/server.py /app/server.py
+COPY server.py /app/server.py
 ENV FUNES_HOME=/data/.funes PYTHONUNBUFFERED=1 PORT=7860
 RUN mkdir -p /data/.funes/sources
 WORKDIR /app

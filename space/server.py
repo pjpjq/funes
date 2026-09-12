@@ -5,9 +5,11 @@ The durable source of truth is the configured HF Hub dataset (FUNES_MEMORY).  Th
 container's /data/.funes directory is only a warm cache and may be recreated.
 """
 import hashlib
+import atexit
 import json
 import os
 import re
+import select
 import shutil
 import subprocess
 import tempfile
@@ -27,6 +29,9 @@ PORT = int(os.getenv("PORT", "7860"))
 TRANSLATION_THRESHOLD = float(os.getenv("TRANSLATE_CHINESE_THRESHOLD", "0.15"))
 INGEST_INDEX_TIMEOUT = int(os.getenv("FUNES_INGEST_INDEX_TIMEOUT", "900"))
 INGEST_PUSH_TIMEOUT = int(os.getenv("FUNES_INGEST_PUSH_TIMEOUT", "1800"))
+MCP_PROTOCOL_VERSION = "2024-11-05"
+MCP_TIMEOUT = float(os.getenv("FUNES_MCP_TIMEOUT", "180"))
+MCP_HANDSHAKE_TIMEOUT = float(os.getenv("FUNES_MCP_HANDSHAKE_TIMEOUT", "10"))
 PROMPT_VERSION = "funes-retrieval-v1"
 LANGUAGE_MODE = os.getenv("FUNES_RETRIEVAL_LANGUAGE_MODE", "auto").lower()
 INDEX_LOCK = threading.Lock()
@@ -122,6 +127,325 @@ def run(*args: str, timeout: int = 180) -> tuple[int, str, str]:
     return p.returncode, p.stdout, p.stderr
 
 
+class NativeMcpError(subprocess.SubprocessError):
+    """A native MCP failure without carrying process output into logs or HTTP responses."""
+
+
+class NativeMcpWorker:
+    """Keep one ``funes mcp`` process warm for model and remote-cache reuse."""
+
+    def __init__(
+        self,
+        binary: str,
+        remote: str,
+        home: Path,
+        *,
+        timeout: float = MCP_TIMEOUT,
+        handshake_timeout: float = MCP_HANDSHAKE_TIMEOUT,
+    ) -> None:
+        self.binary = binary
+        self.remote = remote
+        self.home = Path(home)
+        self.timeout = float(timeout)
+        self.handshake_timeout = float(handshake_timeout)
+        self._process = None
+        self._next_id = 1
+        self._lock = threading.RLock()
+
+    @property
+    def process(self):
+        """Expose the child for focused tests without making it part of the HTTP contract."""
+        return self._process
+
+    def close(self) -> None:
+        with self._lock:
+            self._stop_locked()
+
+    def _environment(self) -> dict[str, str]:
+        # Keep HF_TOKEN/HF_HOME and any other caller-provided Hub settings.  Only
+        # FUNES_HOME is pinned to the Space's durable warm-cache directory.
+        env = os.environ.copy()
+        env["FUNES_HOME"] = str(self.home)
+        return env
+
+    @staticmethod
+    def _alive(process) -> bool:
+        try:
+            return process.poll() is None
+        except AttributeError:
+            return True
+
+    @staticmethod
+    def _close_stream(stream) -> None:
+        if stream is None:
+            return
+        try:
+            stream.close()
+        except (OSError, ValueError):
+            pass
+
+    def _stop_locked(self) -> None:
+        process = self._process
+        self._process = None
+        if process is None:
+            return
+        if self._alive(process):
+            try:
+                process.terminate()
+            except (OSError, AttributeError):
+                pass
+            try:
+                process.wait(timeout=0.5)
+            except (OSError, subprocess.TimeoutExpired, AttributeError, TypeError):
+                try:
+                    process.kill()
+                except (OSError, AttributeError):
+                    pass
+                try:
+                    process.wait(timeout=0.5)
+                except (OSError, subprocess.TimeoutExpired, AttributeError, TypeError):
+                    pass
+        self._close_stream(getattr(process, "stdin", None))
+        self._close_stream(getattr(process, "stdout", None))
+
+    def _start_locked(self) -> None:
+        args = [self.binary, "mcp"]
+        if self.remote:
+            args.append(self.remote)
+        try:
+            process = subprocess.Popen(
+                args,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                bufsize=1,
+                env=self._environment(),
+            )
+        except OSError as exc:
+            raise NativeMcpError("native MCP unavailable") from exc
+        self._process = process
+        # JSON-RPC ids are local to one child.  Resetting here also makes a
+        # restarted worker interoperable with strict fake/native servers.
+        self._next_id = 1
+        try:
+            self._request_locked(
+                "initialize",
+                {
+                    "protocolVersion": MCP_PROTOCOL_VERSION,
+                    "capabilities": {},
+                    "clientInfo": {"name": "funes-space-bridge", "version": "1"},
+                },
+                self.handshake_timeout,
+            )
+            self._send_locked({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}})
+        except NativeMcpError:
+            self._stop_locked()
+            raise
+
+    def _ensure_started_locked(self) -> None:
+        if self._process is not None and self._alive(self._process):
+            return
+        self._stop_locked()
+        self._start_locked()
+
+    def _send_locked(self, message: dict) -> None:
+        process = self._process
+        if process is None or not self._alive(process):
+            raise NativeMcpError("native MCP process exited")
+        stdin = getattr(process, "stdin", None)
+        if stdin is None:
+            raise NativeMcpError("native MCP stdin unavailable")
+        try:
+            stdin.write(json.dumps(message, ensure_ascii=False, separators=(",", ":")) + "\n")
+            stdin.flush()
+        except (BrokenPipeError, OSError, ValueError) as exc:
+            raise NativeMcpError("native MCP write failed") from exc
+
+    @staticmethod
+    def _read_line(stream, deadline: float) -> str:
+        """Read one newline-delimited frame without ever blocking past deadline."""
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise NativeMcpError("native MCP request timed out")
+            try:
+                fd = stream.fileno()
+            except (AttributeError, OSError, ValueError):
+                # Small in-memory fakes used by tests do not expose a file
+                # descriptor.  Their readline is non-blocking by contract.
+                readable = True
+            else:
+                try:
+                    readable = bool(select.select([fd], [], [], remaining)[0])
+                except (OSError, ValueError):
+                    readable = True
+            if not readable:
+                raise NativeMcpError("native MCP request timed out")
+            try:
+                line = stream.readline()
+            except (OSError, ValueError) as exc:
+                raise NativeMcpError("native MCP read failed") from exc
+            if line in ("", b""):
+                raise NativeMcpError("native MCP process closed stdout")
+            if isinstance(line, bytes):
+                line = line.decode("utf-8", "replace")
+            return line.strip()
+
+    def _request_locked(self, method: str, params: dict, timeout: float) -> object:
+        request_id = self._next_id
+        self._next_id += 1
+        self._send_locked({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
+        process = self._process
+        stdout = getattr(process, "stdout", None) if process is not None else None
+        if stdout is None:
+            raise NativeMcpError("native MCP stdout unavailable")
+        deadline = time.monotonic() + max(0.001, float(timeout))
+        while True:
+            line = self._read_line(stdout, deadline)
+            if not line:
+                continue
+            try:
+                message = json.loads(line)
+            except (TypeError, ValueError):
+                # A native server must keep stdout JSON-RPC, but ignoring a
+                # stray line avoids reflecting it (which could contain data).
+                continue
+            if not isinstance(message, dict) or message.get("id") != request_id:
+                continue
+            if message.get("error") is not None:
+                raise NativeMcpError("native MCP request failed")
+            return message.get("result")
+
+    def _call(self, method: str, params: dict, *, timeout: float | None = None) -> object:
+        # A read-only recall/get can safely be retried once after a dead child;
+        # the retry also covers a child that exits during initialization.
+        last_error = None
+        with self._lock:
+            for attempt in range(2):
+                try:
+                    self._ensure_started_locked()
+                    return self._request_locked(method, params, self.timeout if timeout is None else timeout)
+                except NativeMcpError as exc:
+                    last_error = exc
+                    self._stop_locked()
+                    if attempt == 0:
+                        continue
+                    raise
+        raise last_error or NativeMcpError("native MCP request failed")
+
+    @staticmethod
+    def _text(result: object) -> str:
+        if isinstance(result, str):
+            return result
+        if not isinstance(result, dict):
+            raise NativeMcpError("native MCP response malformed")
+        if result.get("isError"):
+            raise NativeMcpError("native MCP tool failed")
+        content = result.get("content")
+        if isinstance(content, list):
+            return "".join(
+                item.get("text", "")
+                for item in content
+                if isinstance(item, dict) and item.get("type") == "text" and isinstance(item.get("text", ""), str)
+            )
+        text = result.get("text")
+        return text if isinstance(text, str) else ""
+
+    def call_tool(self, name: str, arguments: dict, *, timeout: float | None = None) -> str:
+        result = self._call("tools/call", {"name": name, "arguments": arguments}, timeout=timeout)
+        return self._text(result)
+
+    def recall(
+        self,
+        query: str,
+        *,
+        k: int = 8,
+        candidates: int | None = None,
+        half_life: float | None = None,
+        neighbors: int | None = None,
+        block_type: str | None = None,
+        harness: str | None = None,
+        **extra,
+    ) -> str:
+        arguments = {"query": str(query), "k": int(k)}
+        for name, value in (
+            ("candidates", candidates),
+            ("half_life", half_life),
+            ("neighbors", neighbors),
+            ("block_type", block_type),
+            ("harness", harness),
+        ):
+            if value is not None:
+                arguments[name] = value
+        # Keep compatibility with callers that used the old HTTP filter names;
+        # rmcp/serde ignores unknown optional fields while native recall still
+        # receives the same query and bounded tuning values.
+        arguments.update({name: value for name, value in extra.items() if value is not None})
+        return self.call_tool("recall", arguments)
+
+    def get(self, session_id: str, *, from_: int | None = None, to: int | None = None, **extra) -> str:
+        if from_ is None and "from" in extra:
+            from_ = extra.pop("from")
+        arguments = {"session_id": str(session_id)}
+        if from_ is not None:
+            arguments["from"] = from_
+        if to is not None:
+            arguments["to"] = to
+        arguments.update({name: value for name, value in extra.items() if value is not None})
+        return self.call_tool("get", arguments)
+
+
+MCP_WORKER = None
+_MCP_WORKER_CONFIG = None
+_MCP_WORKER_LOCK = threading.Lock()
+
+
+def native_worker() -> NativeMcpWorker:
+    """Return the process singleton, rebuilding it only when runtime config changes."""
+    global MCP_WORKER, _MCP_WORKER_CONFIG
+    # Tests and embedders may supply a small fake directly; do not replace it.
+    if MCP_WORKER is not None and not isinstance(MCP_WORKER, NativeMcpWorker):
+        return MCP_WORKER
+    config = (FUNES_BIN, REMOTE, str(HOME), MCP_TIMEOUT, MCP_HANDSHAKE_TIMEOUT)
+    with _MCP_WORKER_LOCK:
+        if isinstance(MCP_WORKER, NativeMcpWorker) and _MCP_WORKER_CONFIG == config:
+            return MCP_WORKER
+        if isinstance(MCP_WORKER, NativeMcpWorker):
+            MCP_WORKER.close()
+        MCP_WORKER = NativeMcpWorker(
+            FUNES_BIN,
+            REMOTE,
+            HOME,
+            timeout=MCP_TIMEOUT,
+            handshake_timeout=MCP_HANDSHAKE_TIMEOUT,
+        )
+        _MCP_WORKER_CONFIG = config
+        return MCP_WORKER
+
+
+def close_native_worker() -> None:
+    global MCP_WORKER, _MCP_WORKER_CONFIG
+    with _MCP_WORKER_LOCK:
+        if isinstance(MCP_WORKER, NativeMcpWorker):
+            MCP_WORKER.close()
+        MCP_WORKER = None
+        _MCP_WORKER_CONFIG = None
+
+
+atexit.register(close_native_worker)
+
+
+def recall(query: str, **kwargs) -> str:
+    with INDEX_LOCK:
+        return native_worker().recall(query, **kwargs)
+
+
+def get(session_id: str, **kwargs) -> str:
+    with INDEX_LOCK:
+        return native_worker().get(session_id, **kwargs)
+
+
 def auth_ok(handler: BaseHTTPRequestHandler) -> bool:
     supplied = handler.headers.get("X-Funes-Authorization", "") or handler.headers.get("X-Funes-Token", "")
     if supplied:
@@ -183,39 +507,42 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json(400, {"error": "query is required"})
                     return
                 limit = min(int(obj.get("limit", obj.get("k", 8))), 50)
-                args = ["recall", query, "--k", str(limit)]
                 # CJK queries use the ASCII shadow above.  Keep the native
                 # search bounded so the CPU Space does not spend its entire
                 # request window reranking broad generic terms.
+                tuning = {}
                 if LANGUAGE_MODE == "auto" and cjk_ratio(raw_query) >= TRANSLATION_THRESHOLD:
-                    args += ["--candidates", str(max(6, min(20, limit * 3))), "--neighbors", "0", "--half-life", "0"]
-                if REMOTE:
-                    args += ["--memory", REMOTE]
+                    tuning = {
+                        "candidates": max(6, min(20, limit * 3)),
+                        "neighbors": 0,
+                        "half_life": 0,
+                    }
                 for name in ("harness", "repo"):
                     if obj.get(name):
-                        args += ["--" + name, str(obj[name])]
-                code, out, err = run(*args)
+                        tuning[name] = str(obj[name])
                 # Native CLI output is intentionally human-readable.  Keep it
                 # lossless while also exposing the list shape expected by MCP
                 # clients; the service backend can later provide structured
                 # per-chunk metadata without changing this contract.
-                results = ([{"raw_text": out}] if code == 0 and out.strip() else [])
-                self.send_json(200 if code == 0 else 503, {"ok": code == 0, "query": raw_query, "retrieval_query": query, "results": results, "results_text": out, "error": err[-1000:]})
+                try:
+                    out = recall(query, k=limit, **tuning)
+                except NativeMcpError:
+                    self.send_json(503, {"ok": False, "query": raw_query, "retrieval_query": query, "results": [], "results_text": "", "error": "native_mcp_unavailable"})
+                    return
+                results = ([{"raw_text": out}] if out.strip() else [])
+                self.send_json(200, {"ok": True, "query": raw_query, "retrieval_query": query, "results": results, "results_text": out, "error": ""})
                 return
             if self.path == "/get":
                 sid = str(obj.get("session_id", obj.get("id", ""))).strip()
                 if not sid:
                     self.send_json(400, {"error": "session_id is required"})
                     return
-                args = ["get", sid]
-                if obj.get("from") is not None:
-                    args += ["--from", str(obj["from"])]
-                if obj.get("to") is not None:
-                    args += ["--to", str(obj["to"])]
-                if REMOTE:
-                    args += ["--memory", REMOTE]
-                code, out, err = run(*args)
-                self.send_json(200 if code == 0 else 503, {"ok": code == 0, "result": out, "error": err[-1000:]})
+                try:
+                    out = get(sid, from_=obj.get("from"), to=obj.get("to"))
+                except NativeMcpError:
+                    self.send_json(503, {"ok": False, "result": "", "error": "native_mcp_unavailable"})
+                    return
+                self.send_json(200, {"ok": True, "result": out, "error": ""})
                 return
             if self.path == "/ingest":
                 docs = obj.get("documents", obj.get("records", obj.get("items")))
@@ -269,6 +596,10 @@ class Handler(BaseHTTPRequestHandler):
                     outputs = []
                     errors = []
                     with INDEX_LOCK:
+                        # The long-lived MCP process keeps its own model/index handles.  Stop it
+                        # before replacing the local cache so the next read observes the freshly
+                        # pushed snapshot instead of a pre-ingest view.
+                        close_native_worker()
                         for harness in sorted(harnesses):
                             code, out, err = run("index", str(source / harness), "--harness", harness, "--yes", timeout=INGEST_INDEX_TIMEOUT)
                             outputs.append(out)

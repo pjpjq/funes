@@ -52,7 +52,11 @@ def render_plist(python=None):
     # launchd does not guarantee that HOME/USER are inherited for a GUI
     # LaunchAgent.  The launcher uses both values when resolving the login
     # Keychain, so make the lookup deterministic without persisting secrets.
-    env={"PYTHONPATH":str(root), "HOME":str(Path.home()), "USER":os.environ.get("USER") or str(os.getuid())}
+    # launchd does not inherit the interactive shell's PATH.  Pin the
+    # interpreter selected at install time so the daemon does not silently
+    # fall back to Apple's system Python (which may lack the user's packages
+    # and has different Keychain/runtime behavior).
+    env={"PYTHON":str(Path(python).expanduser()), "PYTHONPATH":str(root), "HOME":str(Path.home()), "USER":os.environ.get("USER") or str(os.getuid())}
     # The launcher loads FUNES_API_TOKEN from macOS Keychain at runtime; never
     # persist the bearer token in a world-readable plist.
     for key in (

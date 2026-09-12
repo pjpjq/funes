@@ -1,0 +1,17 @@
+.git
+.codex
+.claude
+.pi
+target
+.venv
+__pycache__
+*.pyc
+*.db
+*.sqlite*
+logs
+tmp
+*.log
+.env
+.env.*
+service/tests
+tests

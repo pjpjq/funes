@@ -73,6 +73,8 @@ def test_sync_methods_use_keychain_credentials_when_environment_is_empty(tmp_pat
             return Response({"durable": True, "accepted": 1})
         if req.full_url.endswith("/sync"):
             return Response({"durable": True})
+        if req.full_url.endswith("/reindex"):
+            return Response({"durable": True, "queued": True, "scope": "all"})
         return Response({})
 
     monkeypatch.setattr(client_module, "open_no_redirect", urlopen)
@@ -81,12 +83,14 @@ def test_sync_methods_use_keychain_credentials_when_environment_is_empty(tmp_pat
     assert client.health()
     assert client.ingest([{"raw_text": "one"}])["accepted"] == 1
     assert client.sync_snapshot()["durable"] is True
+    assert client.reindex("all")["queued"] is True
 
-    assert len(requests) == 3
+    assert len(requests) == 4
     for req in requests:
         headers = {key.lower(): value for key, value in req.header_items()}
         assert headers["authorization"] == "Bearer hf-keychain-value"
         assert headers["x-funes-authorization"] == "Bearer api-keychain-value"
+    assert json.loads(requests[-1].data) == {"scope": "all"}
 
 
 def test_environment_credentials_take_precedence_over_keychain(tmp_path, monkeypatch):

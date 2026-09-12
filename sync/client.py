@@ -36,15 +36,12 @@ def _keychain_token(service: str) -> str:
 
 class SyncClient:
     def __init__(self, config: Config|None=None): self.config=config or Config.load()
-    def ingest(self, records:list[dict]):
-        if not records: return {"accepted":0}
-        url=self.config.remote_url.rstrip("/")+"/ingest"
-        # The native Space bridge and the migration compatibility service both
-        # accept this canonical envelope; durable=true is mandatory in either
-        # implementation.
-        body=json.dumps({"device_id":self.config.device_id,"documents":records}, ensure_ascii=False).encode()
-        headers={"Content-Type":"application/json","User-Agent":"funes-sync/1"}
-        token=os.environ.get("FUNES_API_TOKEN") or _keychain_token("funes-api-token")
+
+    def _auth_headers(self, *, json_content: bool = False) -> dict[str, str]:
+        headers = {"User-Agent": "funes-sync/1"}
+        if json_content:
+            headers["Content-Type"] = "application/json"
+        token = os.environ.get("FUNES_API_TOKEN") or _keychain_token("funes-api-token")
         if not token:
             raise RuntimeError("FUNES_API_TOKEN is not configured")
         hub_token = os.environ.get("FUNES_HF_TOKEN") or os.environ.get("HF_TOKEN") or _keychain_token("funes-hf-token")
@@ -53,6 +50,16 @@ class SyncClient:
             headers["X-Funes-Authorization"] = "Bearer " + token
         else:
             headers["Authorization"] = "Bearer " + token
+        return headers
+
+    def ingest(self, records:list[dict]):
+        if not records: return {"accepted":0}
+        url=self.config.remote_url.rstrip("/")+"/ingest"
+        # The native Space bridge and the migration compatibility service both
+        # accept this canonical envelope; durable=true is mandatory in either
+        # implementation.
+        body=json.dumps({"device_id":self.config.device_id,"documents":records}, ensure_ascii=False).encode()
+        headers=self._auth_headers(json_content=True)
         timeout = float(os.environ.get("FUNES_REMOTE_TIMEOUT", "900"))
         last = None
         for attempt in range(4):
@@ -87,16 +94,7 @@ class SyncClient:
 
     def health(self) -> bool:
         try:
-            headers = {"User-Agent": "funes-sync/1"}
-            token = os.environ.get("FUNES_API_TOKEN") or _keychain_token("funes-api-token")
-            if not token:
-                return False
-            hub_token = os.environ.get("FUNES_HF_TOKEN") or os.environ.get("HF_TOKEN") or _keychain_token("funes-hf-token")
-            if hub_token:
-                headers["Authorization"] = "Bearer " + hub_token
-                headers["X-Funes-Authorization"] = "Bearer " + token
-            else:
-                headers["Authorization"] = "Bearer " + token
+            headers = self._auth_headers()
             req = request.Request(
                 self.config.remote_url.rstrip("/") + "/ready",
                 headers=headers,
@@ -104,23 +102,32 @@ class SyncClient:
             )
             with open_no_redirect(req, timeout=8) as r:
                 return 200 <= r.status < 300
-        except (OSError, error.URLError):
+        except (OSError, error.URLError, RuntimeError):
             return False
 
     def sync_snapshot(self) -> dict:
-        token = os.environ.get("FUNES_API_TOKEN") or _keychain_token("funes-api-token")
-        if not token:
-            raise RuntimeError("FUNES_API_TOKEN is not configured")
-        headers={"Content-Type":"application/json"}
-        hub_token=os.environ.get("FUNES_HF_TOKEN") or os.environ.get("HF_TOKEN") or _keychain_token("funes-hf-token")
-        if hub_token:
-            headers["Authorization"]="Bearer "+hub_token
-            headers["X-Funes-Authorization"]="Bearer "+token
-        else:
-            headers["Authorization"]="Bearer "+token
+        headers=self._auth_headers(json_content=True)
         req=request.Request(self.config.remote_url.rstrip("/")+"/sync",data=b"{}",headers=headers,method="POST")
         with open_no_redirect(req,timeout=120) as r:
             raw=r.read(); result=json.loads(raw) if raw else {}
             if result.get("durable") is not True:
                 raise RuntimeError("remote snapshot sync did not confirm a durable commit")
+            return result
+
+    def reindex(self, scope: str) -> dict:
+        if scope not in {"retrieval_text", "all"}:
+            raise ValueError("scope must be retrieval_text or all")
+        body = json.dumps({"scope": scope}, separators=(",", ":")).encode()
+        req = request.Request(
+            self.config.remote_url.rstrip("/") + "/reindex",
+            data=body,
+            headers=self._auth_headers(json_content=True),
+            method="POST",
+        )
+        timeout = float(os.environ.get("FUNES_REMOTE_TIMEOUT", "900"))
+        with open_no_redirect(req, timeout=timeout) as response:
+            raw = response.read()
+            result = json.loads(raw) if raw else {}
+            if result.get("durable") is not True or result.get("queued") is not True:
+                raise RuntimeError("remote reindex did not confirm a durable queue record")
             return result

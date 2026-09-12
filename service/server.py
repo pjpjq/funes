@@ -38,13 +38,20 @@ FIELDS = (
     "parent_session_id", "agent_id",
     "translation_hash", "translation_version", "translation_status",
     "retrieval_updated_at", "native_index_version", "native_index_status",
-    "native_indexed_at", "native_index_error",
+    "native_indexed_at", "native_index_error", "retrieval_generation",
+    "native_generation",
 )
 CJK_RE = re.compile(r"[\u3400-\u9fff\uf900-\ufaff]")
 PROMPT_VERSION = "funes-retrieval-v2"
 QUERY_PROMPT_VERSION = "funes-query-retrieval-v1"
 ENCRYPTED_MAGIC = b"FUNES-SOURCE-V1\0"
 ENCRYPTED_AAD = b"funes-source-snapshot-v1"
+REINDEX_SCOPES = {"retrieval_text", "all"}
+NATIVE_SESSION_TYPES = {
+    "session", "codex", "codex_session", "pi", "pi_session",
+    "claude", "claude_session",
+}
+LOW_VALUE_CONTENT_TYPES = {"tool_call", "tool_result", "shell_output", "progress"}
 RETRIEVAL_PROMPT = """You are a retrieval normalization engine.
 Convert the natural-language Chinese portions of the input into concise English optimized for semantic retrieval.
 Rules:
@@ -162,6 +169,8 @@ class Store:
                     translation_hash TEXT, translation_version TEXT, translation_status TEXT,
                     native_index_version TEXT, native_index_status TEXT,
                     native_indexed_at TEXT, native_index_error TEXT,
+                    retrieval_generation INTEGER NOT NULL DEFAULT 0,
+                    native_generation INTEGER NOT NULL DEFAULT 0,
                     UNIQUE(source_identity)
                 );
                 CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
@@ -186,6 +195,12 @@ class Store:
                     snapshot_path TEXT, restored_at TEXT
                 );
                 INSERT OR IGNORE INTO sync_state(id) VALUES(1);
+                CREATE TABLE IF NOT EXISTS reindex_controls (
+                    generation INTEGER PRIMARY KEY,
+                    scope TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    applied_at TEXT
+                );
                 """
             )
             # Upgrades from the first HTTP prototype are additive and safe on a
@@ -203,6 +218,11 @@ class Store:
             ):
                 if name not in columns:
                     self.conn.execute(f"ALTER TABLE memories ADD COLUMN {name} TEXT")
+            for name in ("retrieval_generation", "native_generation"):
+                if name not in columns:
+                    self.conn.execute(
+                        f"ALTER TABLE memories ADD COLUMN {name} INTEGER NOT NULL DEFAULT 0"
+                    )
             cache_columns = {row[1] for row in self.conn.execute("PRAGMA table_info(translation_cache)")}
             for name in ("translation_hash", "translation_version", "translation_status"):
                 if name not in cache_columns:
@@ -231,12 +251,15 @@ class Store:
                     """SELECT id, content_hash, source_version, updated_at, retrieval_text,
                     translation_hash, translation_version, translation_status,
                     retrieval_updated_at, native_index_version, native_index_status,
-                    native_indexed_at, native_index_error, source_missing
+                    native_indexed_at, native_index_error, source_missing,
+                    retrieval_generation, native_generation
                     FROM memories WHERE source_identity=?""",
                     (source_identity,),
                 ).fetchone()
                 values = {k: doc.get(k, metadata.get(k)) for k in FIELDS if k not in ("content_hash", "ingested_at", "updated_at")}
                 values["source_missing"] = int(bool(values.get("source_missing", False)))
+                values["retrieval_generation"] = int(values.get("retrieval_generation") or 0)
+                values["native_generation"] = int(values.get("native_generation") or 0)
                 if row and row["content_hash"] == content_hash and row["source_version"] == source_version:
                     derived_supplied = any(
                         name in doc
@@ -250,6 +273,8 @@ class Store:
                             "native_index_status",
                             "native_indexed_at",
                             "native_index_error",
+                            "retrieval_generation",
+                            "native_generation",
                             "source_missing",
                         )
                     )
@@ -267,6 +292,25 @@ class Store:
                     incoming_retrieval = retrieval if "retrieval_text" in doc else row["retrieval_text"]
                     incoming_translation_hash = values.get("translation_hash") if "translation_hash" in doc else row["translation_hash"]
                     incoming_translation_version = values.get("translation_version") if "translation_version" in doc else row["translation_version"]
+                    incoming_retrieval_updated_at = (
+                        values.get("retrieval_updated_at")
+                        if "retrieval_updated_at" in doc
+                        else row["retrieval_updated_at"]
+                    )
+                    # Legacy deltas have no generation and therefore belong to
+                    # generation zero; they must not overwrite a queued reset.
+                    incoming_retrieval_generation = values["retrieval_generation"]
+                    would_regress = (
+                        would_regress
+                        and incoming_retrieval_generation <= row["retrieval_generation"]
+                    )
+                    if incoming_retrieval_generation < row["retrieval_generation"]:
+                        incoming_retrieval = row["retrieval_text"]
+                        incoming_translation_hash = row["translation_hash"]
+                        incoming_translation_version = row["translation_version"]
+                        incoming_status = row["translation_status"]
+                        incoming_retrieval_updated_at = row["retrieval_updated_at"]
+                        incoming_retrieval_generation = row["retrieval_generation"]
                     translation_changed = (
                         incoming_retrieval,
                         incoming_translation_hash,
@@ -290,6 +334,15 @@ class Store:
                         values.get("native_indexed_at") if "native_indexed_at" in doc else row["native_indexed_at"],
                         values.get("native_index_error") if "native_index_error" in doc else row["native_index_error"],
                     )
+                    incoming_native_generation = values["native_generation"]
+                    if incoming_native_generation < row["native_generation"]:
+                        incoming_native = (
+                            row["native_index_version"],
+                            row["native_index_status"],
+                            row["native_indexed_at"],
+                            row["native_index_error"],
+                        )
+                        incoming_native_generation = row["native_generation"]
                     if source_missing_changed and not any(
                         name in doc
                         for name in (
@@ -320,9 +373,11 @@ class Store:
                         incoming_translation_hash,
                         incoming_translation_version,
                         incoming_status,
-                        values.get("retrieval_updated_at") if "retrieval_updated_at" in doc else row["retrieval_updated_at"],
+                        incoming_retrieval_updated_at,
+                        incoming_retrieval_generation,
                         incoming_source_missing,
                         *incoming_native,
+                        incoming_native_generation,
                     )
                     current_derived = (
                         row["retrieval_text"],
@@ -330,11 +385,13 @@ class Store:
                         row["translation_version"],
                         current_status,
                         row["retrieval_updated_at"],
+                        row["retrieval_generation"],
                         row["source_missing"],
                         row["native_index_version"],
                         row["native_index_status"],
                         row["native_indexed_at"],
                         row["native_index_error"],
+                        row["native_generation"],
                     )
                     if derived_supplied and not would_regress and incoming_derived != current_derived:
                         # Raw revisions and derived retrieval shadows have separate
@@ -343,9 +400,10 @@ class Store:
                         self.conn.execute(
                             """UPDATE memories SET retrieval_text=?, translation_hash=?,
                             translation_version=?, translation_status=?, retrieval_updated_at=?,
+                            retrieval_generation=?,
                             source_missing=?,
                             native_index_version=?, native_index_status=?, native_indexed_at=?,
-                            native_index_error=? WHERE id=?""",
+                            native_index_error=?, native_generation=? WHERE id=?""",
                             (*incoming_derived, row["id"]),
                         )
                         updated += 1
@@ -366,14 +424,16 @@ class Store:
                         source_agent=?, source_type=?, device_id=?, project=?, repo=?, worktree=?, session_id=?,
                         message_id=?, role=?, timestamp=?, source_path=?, content_hash=?, updated_at=?, retrieval_updated_at=?, content_type=?,
                         source_missing=?, agent_type=?, parent_session_id=?, agent_id=?, translation_hash=?, translation_version=?, translation_status=?,
-                        native_index_version=?, native_index_status=?, native_indexed_at=?, native_index_error=? WHERE id=?""",
+                        native_index_version=?, native_index_status=?, native_indexed_at=?, native_index_error=?,
+                        retrieval_generation=?, native_generation=? WHERE id=?""",
                         (source_version, raw, retrieval, json.dumps(metadata, ensure_ascii=False),
                          values.get("source_agent"), values.get("source_type"), values.get("device_id"),
                          values.get("project"), values.get("repo"), values.get("worktree"), values.get("session_id"),
                          values.get("message_id"), values.get("role"), values.get("timestamp"), values.get("source_path"),
                          content_hash, incoming_updated, values.get("retrieval_updated_at"), values.get("content_type"), values["source_missing"], values.get("agent_type"),
                          values.get("parent_session_id"), values.get("agent_id"), values.get("translation_hash"), values.get("translation_version"), values.get("translation_status"),
-                         values.get("native_index_version"), values.get("native_index_status"), values.get("native_indexed_at"), values.get("native_index_error"), row["id"]),
+                         values.get("native_index_version"), values.get("native_index_status"), values.get("native_indexed_at"), values.get("native_index_error"),
+                         values["retrieval_generation"], values["native_generation"], row["id"]),
                     )
                     updated += 1
                     results.append({"id": row["id"], "status": "updated", "source_identity": source_identity})
@@ -382,15 +442,17 @@ class Store:
                         """INSERT INTO memories(source_identity,source_version,raw_text,retrieval_text,metadata_json,
                         source_agent,source_type,device_id,project,repo,worktree,session_id,message_id,role,timestamp,
                         source_path,content_hash,ingested_at,updated_at,retrieval_updated_at,content_type,source_missing,agent_type,parent_session_id,agent_id,translation_hash,translation_version,translation_status,
-                        native_index_version,native_index_status,native_indexed_at,native_index_error)
-                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        native_index_version,native_index_status,native_indexed_at,native_index_error,
+                        retrieval_generation,native_generation)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                         (source_identity, source_version, raw, retrieval, json.dumps(metadata, ensure_ascii=False),
                          values.get("source_agent"), values.get("source_type"), values.get("device_id"), values.get("project"),
                          values.get("repo"), values.get("worktree"), values.get("session_id"), values.get("message_id"),
                          values.get("role"), values.get("timestamp"), values.get("source_path"), content_hash, values.get("ingested_at") or now, incoming_updated, values.get("retrieval_updated_at"),
                          values.get("content_type"), values["source_missing"], values.get("agent_type"),
                          values.get("parent_session_id"), values.get("agent_id"), values.get("translation_hash"), values.get("translation_version"), values.get("translation_status"),
-                         values.get("native_index_version"), values.get("native_index_status"), values.get("native_indexed_at"), values.get("native_index_error")),
+                         values.get("native_index_version"), values.get("native_index_status"), values.get("native_indexed_at"), values.get("native_index_error"),
+                         values["retrieval_generation"], values["native_generation"]),
                     )
                     created += 1
                     results.append({"id": cur.lastrowid, "status": "created", "source_identity": source_identity})
@@ -467,10 +529,142 @@ class Store:
         with self.lock:
             rows = self.conn.execute(
                 """SELECT * FROM memories WHERE translation_status='pending_provider'
+                AND COALESCE(native_index_status, '') != 'waiting_durability'
                 ORDER BY updated_at, id LIMIT ?""",
                 (max(1, int(limit)),),
             ).fetchall()
             return [self._row(row) for row in rows]
+
+    def latest_reindex_generation(self) -> int:
+        with self.lock:
+            return int(
+                self.conn.execute(
+                    """SELECT max(value) FROM (
+                    SELECT COALESCE(max(generation), 0) AS value FROM reindex_controls
+                    UNION ALL SELECT COALESCE(max(retrieval_generation), 0) FROM memories
+                    UNION ALL SELECT COALESCE(max(native_generation), 0) FROM memories
+                    )"""
+                ).fetchone()[0]
+            )
+
+    def next_reindex_control(self, scope: str) -> dict[str, Any]:
+        if scope not in REINDEX_SCOPES:
+            raise ValueError("scope must be retrieval_text or all")
+        return {
+            "_funes_record": "reindex_control",
+            "generation": self.latest_reindex_generation() + 1,
+            "scope": scope,
+            "created_at": utc_now(),
+        }
+
+    def record_reindex_control(self, control: dict[str, Any]) -> bool:
+        scope = str(control.get("scope", ""))
+        generation = int(control.get("generation", 0))
+        created_at = str(control.get("created_at") or utc_now())
+        if scope not in REINDEX_SCOPES or generation < 1:
+            raise ValueError("invalid reindex control")
+        with self.lock, self.conn:
+            cursor = self.conn.execute(
+                """INSERT OR IGNORE INTO reindex_controls(
+                generation, scope, created_at, applied_at
+                ) VALUES(?,?,?,NULL)""",
+                (generation, scope, created_at),
+            )
+            return cursor.rowcount == 1
+
+    @staticmethod
+    def _provider_reindex_eligible(item: dict[str, Any]) -> bool:
+        source_type = str(item.get("source_type") or "").lower()
+        content_type = str(item.get("content_type") or "").lower()
+        status = str(item.get("translation_status") or "")
+        return (
+            source_type not in NATIVE_SESSION_TYPES
+            and content_type not in LOW_VALUE_CONTENT_TYPES
+            and status not in {
+                "skipped_non_cjk", "skipped_raw_mode", "skipped_native_session",
+                "skipped_low_value",
+            }
+        )
+
+    @staticmethod
+    def _canonical_reindex_eligible(item: dict[str, Any]) -> bool:
+        return (
+            str(item.get("source_type") or "").lower() not in NATIVE_SESSION_TYPES
+            and str(item.get("content_type") or "").lower()
+            not in LOW_VALUE_CONTENT_TYPES
+        )
+
+    def apply_pending_reindex_controls(
+        self, limit: int = 1, *, replay: bool = False
+    ) -> dict[str, int]:
+        """Apply a bounded control batch without changing raw source truth."""
+        applied = retrieval_reset = native_reset = 0
+        with self.lock, self.conn:
+            where = "" if replay else "WHERE applied_at IS NULL"
+            controls = self.conn.execute(
+                f"""SELECT generation, scope FROM reindex_controls
+                {where} ORDER BY generation LIMIT ?""",
+                (max(1, int(limit)),),
+            ).fetchall()
+            for control in controls:
+                generation = int(control["generation"])
+                scope = str(control["scope"])
+                rows = self.conn.execute("SELECT * FROM memories ORDER BY id").fetchall()
+                for row in rows:
+                    item = dict(row)
+                    retrieval_generation = int(item.get("retrieval_generation") or 0)
+                    native_generation = int(item.get("native_generation") or 0)
+                    retrieval_values = (
+                        item.get("retrieval_text"), item.get("translation_hash"),
+                        item.get("translation_version"), item.get("translation_status"),
+                        item.get("retrieval_updated_at"),
+                    )
+                    native_values = (
+                        item.get("native_index_version"), item.get("native_index_status"),
+                        item.get("native_indexed_at"), item.get("native_index_error"),
+                    )
+                    if generation > retrieval_generation:
+                        retrieval_generation = generation
+                        if self._provider_reindex_eligible(item):
+                            retrieval_values = (
+                                item["raw_text"], None, PROMPT_VERSION,
+                                "pending_provider", None,
+                            )
+                            retrieval_reset += 1
+                            if generation > native_generation:
+                                native_generation = generation
+                                if item.get("native_index_status") != "waiting_durability":
+                                    native_values = (None, None, None, None)
+                                    native_reset += 1
+                    if scope == "all" and generation > native_generation:
+                        native_generation = generation
+                        if (
+                            self._canonical_reindex_eligible(item)
+                            and item.get("native_index_status") != "waiting_durability"
+                        ):
+                            native_values = (None, None, None, None)
+                            native_reset += 1
+                    self.conn.execute(
+                        """UPDATE memories SET retrieval_text=?, translation_hash=?,
+                        translation_version=?, translation_status=?, retrieval_updated_at=?,
+                        retrieval_generation=?, native_index_version=?, native_index_status=?,
+                        native_indexed_at=?, native_index_error=?, native_generation=?
+                        WHERE id=?""",
+                        (
+                            *retrieval_values, retrieval_generation, *native_values,
+                            native_generation, row["id"],
+                        ),
+                    )
+                self.conn.execute(
+                    "UPDATE reindex_controls SET applied_at=? WHERE generation=?",
+                    (utc_now(), generation),
+                )
+                applied += 1
+        return {
+            "applied": applied,
+            "retrieval_reset": retrieval_reset,
+            "native_reset": native_reset,
+        }
 
     def canonical_index_candidates(self, limit: int) -> list[dict[str, Any]]:
         """Return final non-session retrieval shadows for native reconciliation."""
@@ -497,7 +691,8 @@ class Store:
                 cursor = self.conn.execute(
                     """UPDATE memories SET native_index_version=?, native_index_status=?,
                     native_indexed_at=?, native_index_error=?
-                    WHERE source_identity=? AND source_version=? AND content_hash=?""",
+                    WHERE source_identity=? AND source_version=? AND content_hash=?
+                    AND native_generation=?""",
                     (
                         item.get("native_index_version"),
                         item.get("native_index_status"),
@@ -506,6 +701,7 @@ class Store:
                         str(item.get("source_identity", "")),
                         str(item.get("source_version", "")),
                         str(item.get("content_hash", "")),
+                        int(item.get("native_generation") or 0),
                     ),
                 )
                 changed += cursor.rowcount
@@ -518,13 +714,15 @@ class Store:
                 self.conn.execute(
                     """UPDATE memories SET retrieval_text=raw_text, translation_status='pending_provider'
                     WHERE source_identity=? AND content_hash=? AND source_version=?
-                    AND retrieval_text=? AND translation_status=?""",
+                    AND retrieval_text=? AND translation_status=?
+                    AND retrieval_generation=?""",
                     (
                         item.get("source_identity"),
                         item.get("content_hash"),
                         str(item.get("source_version", "")),
                         item.get("retrieval_text"),
                         item.get("translation_status"),
+                        int(item.get("retrieval_generation") or 0),
                     ),
                 )
 
@@ -612,6 +810,10 @@ class Store:
                 "SELECT query,rewritten,created_at,translation_hash,translation_version,translation_status "
                 "FROM translation_cache ORDER BY query"
             ).fetchall()
+            controls = self.conn.execute(
+                """SELECT generation,scope,created_at FROM reindex_controls
+                ORDER BY generation"""
+            ).fetchall()
             path.parent.mkdir(parents=True, exist_ok=True)
             opener = gzip.open if path.name.endswith(".gz") else open
             with opener(path, "wt", encoding="utf-8") as f:
@@ -622,6 +824,10 @@ class Store:
                 for row in cache:
                     d = dict(row)
                     d["_funes_record"] = "translation_cache"
+                    f.write(json.dumps(d, ensure_ascii=False) + "\n")
+                for row in controls:
+                    d = dict(row)
+                    d["_funes_record"] = "reindex_control"
                     f.write(json.dumps(d, ensure_ascii=False) + "\n")
 
     def iter_documents(self, batch_size: int = 500):
@@ -646,6 +852,13 @@ class Store:
                 continue
             item = dict(item)
             record_type = item.pop("_funes_record", "memory")
+            if record_type == "reindex_control":
+                if batch:
+                    result = self.ingest(batch)
+                    total += result["created"] + result["updated"]
+                    batch = []
+                self.record_reindex_control(item)
+                continue
             if record_type == "translation_cache":
                 query = str(item.get("query", ""))
                 rewritten = str(item.get("rewritten", ""))
@@ -669,6 +882,8 @@ class Store:
         if batch:
             result = self.ingest(batch)
             total += result["created"] + result["updated"]
+        controls = max(1, self.latest_reindex_generation())
+        self.apply_pending_reindex_controls(controls, replay=True)
         return total
 
     def restore(self, path: Path) -> int:
@@ -851,6 +1066,7 @@ class SnapshotSync:
         self.filename = os.getenv("FUNES_SNAPSHOT_FILE", "funes-snapshot.jsonl.gz")
         self.prefix = os.getenv("FUNES_SNAPSHOT_PREFIX", "funes-snapshot-")
         self.delta_prefix = os.getenv("FUNES_DELTA_PREFIX", "funes-delta-")
+        self.control_prefix = os.getenv("FUNES_REINDEX_PREFIX", "funes-reindex-")
         self.restore_batch = max(50, int(os.getenv("FUNES_RESTORE_BATCH", "500")))
         self.restore_failed = False
         self.restore_error = None
@@ -884,12 +1100,20 @@ class SnapshotSync:
         files = []
         for item in api.list_repo_tree(self.repo, repo_type="dataset", recursive=True, token=self.token):
             name = getattr(item, "path", "")
-            if name == self.filename + ".enc" or name.startswith(self.prefix) or name.startswith(self.delta_prefix):
+            if (
+                name == self.filename + ".enc"
+                or name.startswith(self.prefix)
+                or name.startswith(self.delta_prefix)
+                or name.startswith(self.control_prefix)
+            ):
                 if name.endswith((".jsonl.enc", ".jsonl.gz.enc")):
                     files.append(name)
         snapshots = sorted(name for name in files if name == self.filename + ".enc" or name.startswith(self.prefix))
         deltas = sorted(name for name in files if name.startswith(self.delta_prefix))
-        return snapshots + deltas
+        controls = sorted(name for name in files if name.startswith(self.control_prefix))
+        # Controls replay last and carry monotonic per-derived-field generations.
+        # This makes immutable hash-named deltas safe regardless of their order.
+        return snapshots + deltas + controls
 
     def _restore_file(self, filename: str) -> int:
         from huggingface_hub import hf_hub_download
@@ -1040,6 +1264,69 @@ class SnapshotSync:
             finally:
                 temporary.unlink(missing_ok=True)
 
+    def upload_reindex_control(self, control: dict[str, Any]) -> dict[str, Any]:
+        """Persist one encrypted reindex command before it becomes runnable."""
+        generation = int(control.get("generation", 0))
+        scope = str(control.get("scope", ""))
+        if generation < 1 or scope not in REINDEX_SCOPES:
+            raise ValueError("invalid reindex control")
+        with self.upload_lock:
+            if self.restore_failed:
+                return {"uploaded": False, "durable": False, "reason": "restore_failed"}
+            digest = hashlib.sha256(
+                json.dumps(
+                    control, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+                ).encode()
+            ).hexdigest()[:16]
+            name = f"{self.control_prefix}{generation:020d}-{digest}.jsonl.gz.enc"
+            encrypted = self.store.data_dir / "reindex-queue" / name
+            try:
+                with tempfile.TemporaryDirectory(prefix="funes-reindex-control-") as directory:
+                    plaintext = Path(directory) / name.removesuffix(".enc")
+                    temporary = encrypted.with_name(encrypted.name + ".partial")
+                    self._write_jsonl_gzip([control], plaintext)
+                    self._encrypt_file(plaintext, temporary)
+                    with temporary.open("rb") as stream:
+                        os.fsync(stream.fileno())
+                    os.replace(temporary, encrypted)
+                    directory_fd = os.open(encrypted.parent, os.O_RDONLY)
+                    try:
+                        os.fsync(directory_fd)
+                    finally:
+                        os.close(directory_fd)
+            except Exception as exc:
+                encrypted.with_name(encrypted.name + ".partial").unlink(missing_ok=True)
+                reason = type(exc).__name__
+                self.store.set_sync(last_error=reason)
+                return {"uploaded": False, "durable": False, "reason": reason}
+            if self.repo:
+                if not self.token:
+                    return {
+                        "uploaded": False,
+                        "durable": False,
+                        "reason": "HF storage not configured",
+                    }
+                try:
+                    from huggingface_hub import HfApi
+                    HfApi(token=self.token).upload_file(
+                        path_or_fileobj=str(encrypted),
+                        path_in_repo=name,
+                        repo_id=self.repo,
+                        repo_type="dataset",
+                        commit_message="funes encrypted reindex control",
+                    )
+                except Exception as exc:
+                    reason = type(exc).__name__
+                    self.store.set_sync(last_error=reason)
+                    return {"uploaded": False, "durable": False, "reason": reason}
+            self.store.set_sync(last_sync=utc_now(), snapshot_path=str(encrypted), last_error=None)
+            return {
+                "uploaded": bool(self.repo),
+                "durable": True,
+                "generation": generation,
+                "scope": scope,
+            }
+
     def upload(self, docs: list[dict[str, Any]] | None = None) -> dict[str, Any]:
         with self.upload_lock:
             if self.restore_failed:
@@ -1108,6 +1395,9 @@ def prepare_ingest_documents(app: Any, docs: list[dict[str, Any]]) -> list[dict[
             raise ValueError("metadata must be an object")
         identity = str(item.get("source_identity") or app.store._identity(item, metadata, raw))
         item["source_identity"] = identity
+        generation = app.store.latest_reindex_generation()
+        item["retrieval_generation"] = generation
+        item["native_generation"] = generation
         source_version = str(item.get("source_version", metadata.get("source_version", "")))
         content_hash = hashlib.sha256(raw.encode("utf-8")).hexdigest()
         existing = app.store.get(identity)
@@ -1180,11 +1470,17 @@ def _persist_translation_documents(app: Any, documents: list[dict[str, Any]]) ->
     active = []
     for selected in documents:
         current = app.store.get(str(selected["source_identity"]))
-        if not current or current.get("translation_status") != "pending_provider":
+        if (
+            not current
+            or current.get("translation_status") != "pending_provider"
+            or current.get("native_index_status") == "waiting_durability"
+        ):
             continue
         if (
             current.get("content_hash") == selected.get("content_hash")
             and str(current.get("source_version", "")) == str(selected.get("source_version", ""))
+            and int(current.get("retrieval_generation") or 0)
+            == int(selected.get("retrieval_generation") or 0)
         ):
             active.append(current)
     if not active:
@@ -1198,6 +1494,8 @@ def _persist_translation_documents(app: Any, documents: list[dict[str, Any]]) ->
         if (
             current.get("content_hash") != selected.get("content_hash")
             or str(current.get("source_version", "")) != str(selected.get("source_version", ""))
+            or int(current.get("retrieval_generation") or 0)
+            != int(selected.get("retrieval_generation") or 0)
         ):
             # A newer source revision won the race while the provider was in
             # flight.  Never attach an old shadow to new raw content.
@@ -1290,6 +1588,7 @@ def ingest_documents(app: Any, docs: list[dict[str, Any]]) -> dict[str, Any]:
                     "native_index_status": "waiting_durability",
                     "native_indexed_at": None,
                     "native_index_error": "durability_pending",
+                    "native_generation": int(item.get("native_generation") or 0),
                 }
                 for item in canonical
             ]
@@ -1297,6 +1596,41 @@ def ingest_documents(app: Any, docs: list[dict[str, Any]]) -> dict[str, Any]:
         result["error"] = "durability_pending"
         return result
     return result
+
+
+def queue_reindex(app: Any, scope: str) -> dict[str, Any]:
+    """Durably enqueue a reindex control without provider or native work."""
+    if scope not in REINDEX_SCOPES:
+        raise ValueError("scope must be retrieval_text or all")
+    def persist_control() -> dict[str, Any]:
+        if app.syncer.restoring or app.syncer.restore_failed:
+            return {
+                "queued": False,
+                "durable": False,
+                "error": "restore_in_progress" if app.syncer.restoring else "restore_failed",
+            }
+        control = app.store.next_reindex_control(scope)
+        sync = app.syncer.upload_reindex_control(control)
+        if not sync.get("durable"):
+            return {
+                "queued": False,
+                "durable": False,
+                "scope": scope,
+                "error": str(sync.get("reason") or "durability_pending"),
+            }
+        app.store.record_reindex_control(control)
+        wake = getattr(app, "reindex_wake", None)
+        if wake is not None:
+            wake.set()
+        return {
+            "queued": True,
+            "durable": True,
+            "scope": scope,
+            "generation": int(control["generation"]),
+        }
+    lock = getattr(app, "reindex_lock", None) or threading.Lock()
+    with lock:
+        return persist_control()
 
 
 class App:
@@ -1310,6 +1644,10 @@ class App:
         self.restore_result = 0
         self.restore_done = threading.Event()
         self.reconcile_stop = threading.Event()
+        self.reconcile_wake = threading.Event()
+        self.reindex_stop = threading.Event()
+        self.reindex_wake = threading.Event()
+        self.reindex_lock = threading.Lock()
         self.translation_lock = threading.Lock()
         self.reconcile_interval = max(0.01, float(os.getenv("TRANSLATION_RECONCILE_INTERVAL", "300")))
         self.restore_thread = None
@@ -1325,6 +1663,12 @@ class App:
             daemon=True,
         )
         self.reconcile_thread.start()
+        self.reindex_thread = threading.Thread(
+            target=self._reindex_background,
+            name="funes-reindex-control",
+            daemon=True,
+        )
+        self.reindex_thread.start()
 
     def _restore_background(self) -> None:
         try:
@@ -1355,15 +1699,42 @@ class App:
                 # Pending state is already durable.  A later interval retries;
                 # never log raw text, provider payloads, or credentials here.
                 pass
-            if self.reconcile_stop.wait(self.reconcile_interval):
+            wake = getattr(self, "reconcile_wake", None)
+            if wake is None:
+                self.reconcile_stop.wait(self.reconcile_interval)
+            else:
+                wake.wait(self.reconcile_interval)
+                wake.clear()
+            if self.reconcile_stop.is_set():
                 break
+
+    def _reindex_background(self) -> None:
+        self.restore_done.wait()
+        while not self.reindex_stop.is_set():
+            result = self.store.apply_pending_reindex_controls(1)
+            if result["applied"]:
+                self.reconcile_wake.set()
+                continue
+            self.reindex_wake.wait(self.reconcile_interval)
+            self.reindex_wake.clear()
 
     def close(self):
         self.reconcile_stop.set()
+        if getattr(self, "reconcile_wake", None) is not None:
+            self.reconcile_wake.set()
+        if getattr(self, "reindex_stop", None) is not None:
+            self.reindex_stop.set()
+        if getattr(self, "reindex_wake", None) is not None:
+            self.reindex_wake.set()
         if self.reconcile_thread is not threading.current_thread():
             self.reconcile_thread.join()
         if self.restore_thread is not None and self.restore_thread is not threading.current_thread():
             self.restore_thread.join()
+        if (
+            getattr(self, "reindex_thread", None) is not None
+            and self.reindex_thread is not threading.current_thread()
+        ):
+            self.reindex_thread.join()
         self.store.close()
 
 
@@ -1499,7 +1870,8 @@ def make_handler(app: App):
                     item = app.store.get(body.get("source_identity", body.get("id", "")))
                     return self._json(200 if item else 404, self._public(item) if item else {"error": "not_found"})
                 if self.path == "/reindex":
-                    return self._json(200, {"reindexed": app.store.reindex()})
+                    result = queue_reindex(app, str(body.get("scope", "")))
+                    return self._json(202 if result.get("durable") else 503, result)
                 if self.path == "/sync":
                     result = app.syncer.upload()
                     return self._json(200 if result.get("durable") else 503, result)

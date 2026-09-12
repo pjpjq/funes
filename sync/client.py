@@ -2,6 +2,7 @@ from __future__ import annotations
 import json, os, subprocess, sys, time
 from urllib import request, error
 from .config import Config
+from .http import open_no_redirect
 
 
 def _keychain_token(service: str) -> str:
@@ -57,7 +58,7 @@ class SyncClient:
         for attempt in range(4):
             req=request.Request(url,data=body,headers=headers,method="POST")
             try:
-                with request.urlopen(req,timeout=timeout) as r:
+                with open_no_redirect(req,timeout=timeout) as r:
                     raw=r.read()
                     if not raw:
                         raise RuntimeError("remote returned an empty durable-ingest response")
@@ -101,7 +102,7 @@ class SyncClient:
                 headers=headers,
                 method="GET",
             )
-            with request.urlopen(req, timeout=8) as r:
+            with open_no_redirect(req, timeout=8) as r:
                 return 200 <= r.status < 300
         except (OSError, error.URLError):
             return False
@@ -118,7 +119,7 @@ class SyncClient:
         else:
             headers["Authorization"]="Bearer "+token
         req=request.Request(self.config.remote_url.rstrip("/")+"/sync",data=b"{}",headers=headers,method="POST")
-        with request.urlopen(req,timeout=120) as r:
+        with open_no_redirect(req,timeout=120) as r:
             raw=r.read(); result=json.loads(raw) if raw else {}
             if result.get("durable") is not True:
                 raise RuntimeError("remote snapshot sync did not confirm a durable commit")

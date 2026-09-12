@@ -2,6 +2,8 @@ from __future__ import annotations
 import json,sys,os,time
 import subprocess
 from urllib import error, request
+from .config import Config
+from .http import open_no_redirect
 from .store import Store
 
 def _keychain(service):
@@ -46,7 +48,7 @@ def _ready_state(base, headers, timeout):
     """Read the Space warm state without exposing its response body to callers."""
     req = request.Request(base + "/ready", headers=headers, method="GET")
     try:
-        with request.urlopen(req, timeout=timeout) as resp:
+        with open_no_redirect(req, timeout=timeout) as resp:
             value = json.loads(resp.read() or b"{}")
     except (error.HTTPError, error.URLError, TimeoutError, OSError, ValueError):
         return ""
@@ -84,7 +86,8 @@ def _retry_after(exc, attempt):
 
 
 def _remote_call(path, payload):
-    base=os.environ.get("FUNES_REMOTE_URL", "").rstrip("/")
+    config = Config.load()
+    base=(os.environ.get("FUNES_REMOTE_URL") or config.remote_url).rstrip("/")
     token=os.environ.get("FUNES_API_TOKEN", "") or _keychain("funes-api-token")
     hub_token=os.environ.get("FUNES_HF_TOKEN", "") or os.environ.get("HF_TOKEN", "") or _keychain("funes-hf-token")
     if not base or not token:
@@ -115,7 +118,7 @@ def _remote_call(path, payload):
             method="POST",
         )
         try:
-            with request.urlopen(req, timeout=min(attempt_timeout, remaining)) as resp:
+            with open_no_redirect(req, timeout=min(attempt_timeout, remaining)) as resp:
                 raw = resp.read()
             if not raw:
                 raise RuntimeError("remote returned an empty response")
@@ -136,7 +139,8 @@ def _remote_call(path, payload):
 
 def serve(store=None):
     store=store or Store()
-    remote=bool(os.environ.get("FUNES_REMOTE_URL") and (os.environ.get("FUNES_API_TOKEN") or _keychain("funes-api-token")))
+    config = Config.load()
+    remote=bool((os.environ.get("FUNES_REMOTE_URL") or config.remote_url) and (os.environ.get("FUNES_API_TOKEN") or _keychain("funes-api-token")))
     for line in sys.stdin:
         try:
             msg=json.loads(line); method=msg.get("method"); ident=msg.get("id"); p=msg.get("params") or {}

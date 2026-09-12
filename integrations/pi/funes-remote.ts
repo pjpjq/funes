@@ -1,21 +1,65 @@
-// Funes remote recall for pi. The URL/token stay in the process environment;
-// this file contains no credential or machine-specific value.
+// Funes remote recall for pi. This file contains no credential or
+// machine-specific value; settings come from env/config/Keychain at runtime.
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { execFileSync } from "node:child_process";
+import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
 
-const base = (process.env.FUNES_REMOTE_URL || "").replace(/\/+$/, "");
+export function configuredRemoteUrl(): string {
+  if (process.env.FUNES_REMOTE_URL) return process.env.FUNES_REMOTE_URL;
+  const path = process.env.FUNES_CONFIG || `${process.env.HOME || homedir()}/.config/funes/config.toml`;
+  try {
+    let section = "";
+    let remoteUrl = "";
+    let legacySyncUrl = "";
+    let legacyTopLevelUrl = "";
+    for (const sourceLine of readFileSync(path, "utf8").split(/\r?\n/)) {
+      const line = sourceLine.trim();
+      const sectionLine = line.match(/^\[([^\]]+)\]$/);
+      if (sectionLine) {
+        section = sectionLine[1];
+        continue;
+      }
+      const value = line.match(/^(url|remote_url)\s*=\s*["']([^"']+)["']/);
+      if (!value) continue;
+      if (section === "remote" && value[1] === "url") remoteUrl = value[2];
+      else if (section === "sync" && value[1] === "remote_url") legacySyncUrl = value[2];
+      else if (!section && value[1] === "remote_url") legacyTopLevelUrl = value[2];
+    }
+    return remoteUrl || legacySyncUrl || legacyTopLevelUrl;
+  } catch {}
+  return "";
+}
+
+const base = configuredRemoteUrl().replace(/\/+$/, "");
 
 function keychain(service: string): string {
   if (process.platform !== "darwin") return "";
   try {
     return execFileSync("/usr/bin/security", [
       "find-generic-password", "-a", process.env.USER || "", "-s", service, "-w",
-    ], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+    ], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 5_000 }).trim();
   } catch { return ""; }
 }
 
-const token = process.env.FUNES_API_TOKEN || keychain("funes-api-token");
-const hubToken = process.env.FUNES_HF_TOKEN || process.env.HF_TOKEN || keychain("funes-hf-token");
+function zshrcEnv(name: "FUNES_API_TOKEN" | "FUNES_HF_TOKEN" | "HF_TOKEN"): string {
+  if (process.platform !== "darwin") return "";
+  const expressions = {
+    FUNES_API_TOKEN: '"${FUNES_API_TOKEN:-}"',
+    FUNES_HF_TOKEN: '"${FUNES_HF_TOKEN:-}"',
+    HF_TOKEN: '"${HF_TOKEN:-}"',
+  };
+  try {
+    return execFileSync(
+      "/bin/zsh",
+      ["-lc", `source "$HOME/.zshrc" >/dev/null 2>&1; printf %s ${expressions[name]}`],
+      { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 5_000 },
+    ).trim();
+  } catch { return ""; }
+}
+
+const token = process.env.FUNES_API_TOKEN || keychain("funes-api-token") || zshrcEnv("FUNES_API_TOKEN");
+const hubToken = process.env.FUNES_HF_TOKEN || process.env.HF_TOKEN || keychain("funes-hf-token") || zshrcEnv("FUNES_HF_TOKEN") || zshrcEnv("HF_TOKEN");
 
 function envNumber(name: string): number | undefined {
   const raw = process.env[name];
@@ -62,7 +106,7 @@ function now(): number {
 async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<FetchResult> {
   const controller = new AbortController();
   let timer: ReturnType<typeof setTimeout> | undefined;
-  const request = fetch(url, { ...init, signal: controller.signal });
+  const request = fetch(url, { ...init, redirect: "manual", signal: controller.signal });
   const timeout = new Promise<never>((_, reject) => {
     timer = setTimeout(() => {
       controller.abort();

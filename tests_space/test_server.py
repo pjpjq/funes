@@ -96,6 +96,37 @@ def test_mixed_english_query_is_left_unchanged(monkeypatch):
     assert bridge.query_text(query) == query
 
 
+def test_translation_provider_accepts_base_url_with_or_without_v1(monkeypatch):
+    seen = []
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+        def read(self):
+            return b'{"choices":[{"message":{"content":"context loss CPA"}}]}'
+
+    def fake_urlopen(request, timeout):
+        seen.append(request.full_url)
+        return Response()
+
+    monkeypatch.setattr(bridge, "LANGUAGE_MODE", "translate")
+    monkeypatch.setenv("TRANSLATION_API_KEY", "test-key")
+    monkeypatch.setenv("TRANSLATION_MODEL", "test-model")
+    monkeypatch.setattr(bridge.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setenv("TRANSLATION_BASE_URL", "https://provider.example/v1")
+    assert bridge.query_text("中文 CPA 问题").startswith("context loss CPA")
+    monkeypatch.setenv("TRANSLATION_BASE_URL", "https://provider.example")
+    assert bridge.query_text("中文 CPA 问题").startswith("context loss CPA")
+    assert seen == [
+        "https://provider.example/v1/chat/completions",
+        "https://provider.example/v1/chat/completions",
+    ]
+
+
 def test_native_mcp_worker_reuses_child_and_passes_hf_environment(monkeypatch, tmp_path):
     processes = []
 

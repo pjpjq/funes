@@ -58,16 +58,21 @@ def warm_state() -> dict[str, object]:
         return dict(_WARM_STATE)
 
 
-def _warm_native_memory() -> None:
+def _warm_native_memory(*, replace: bool = False) -> None:
     started = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     with _WARM_STATE_LOCK:
         _WARM_STATE.update(state="warming", started_at=started, finished_at=None)
     try:
         # A minimal recall initializes the same remote dataset, embedding model,
         # text index, and reranker used by real requests.  It is intentionally
-        # run outside the HTTP request lifecycle.
-        with INDEX_LOCK:
-            native_worker().recall("memory", k=1, candidates=1, half_life=0, neighbors=0)
+        # run outside the HTTP request lifecycle.  Refreshes use a second child
+        # and swap it in only after it is ready, so an old worker can keep
+        # serving while a newly-pushed remote snapshot is opened.
+        if replace:
+            _refresh_native_worker()
+        else:
+            with INDEX_LOCK:
+                native_worker().recall("memory", k=1, candidates=1, half_life=0, neighbors=0)
     except Exception:
         # Readiness remains useful when a provider/HF endpoint is temporarily
         # unavailable; the next request will retry through the normal worker
@@ -85,12 +90,12 @@ def request_warm(*, force: bool = False) -> dict[str, object]:
         if _WARM_STATE.get("state") == "warming":
             return dict(_WARM_STATE)
         _WARM_STATE.update(state="not_started", started_at=None, finished_at=None)
-    def refresh() -> None:
-        if force:
-            close_native_worker()
-        _warm_native_memory()
-
-    threading.Thread(target=refresh, name="funes-native-warm", daemon=True).start()
+    threading.Thread(
+        target=_warm_native_memory,
+        kwargs={"replace": force},
+        name="funes-native-warm",
+        daemon=True,
+    ).start()
     return warm_state()
 
 # The default Funes embedding model is English-oriented.  Keep this small,
@@ -531,6 +536,31 @@ def close_native_worker() -> None:
             MCP_WORKER.close()
         MCP_WORKER = None
         _MCP_WORKER_CONFIG = None
+
+
+def _refresh_native_worker() -> None:
+    """Warm a replacement child and atomically swap it with the active one."""
+    global MCP_WORKER, _MCP_WORKER_CONFIG
+    config = (FUNES_BIN, REMOTE, str(HOME), MCP_TIMEOUT, MCP_HANDSHAKE_TIMEOUT)
+    candidate = NativeMcpWorker(
+        FUNES_BIN,
+        REMOTE,
+        HOME,
+        timeout=MCP_TIMEOUT,
+        handshake_timeout=MCP_HANDSHAKE_TIMEOUT,
+    )
+    try:
+        candidate.recall("memory", k=1, candidates=1, half_life=0, neighbors=0)
+    except Exception:
+        candidate.close()
+        raise
+    with INDEX_LOCK:
+        with _MCP_WORKER_LOCK:
+            previous = MCP_WORKER
+            MCP_WORKER = candidate
+            _MCP_WORKER_CONFIG = config
+        if isinstance(previous, NativeMcpWorker):
+            previous.close()
 
 
 atexit.register(close_native_worker)

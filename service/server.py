@@ -393,6 +393,10 @@ class Translator:
 class SnapshotSync:
     def __init__(self, store: Store):
         self.store = store
+        # Snapshot creation and Hub upload must be one serialized operation.
+        # Without this lock, concurrent /sync requests can upload an older
+        # snapshot after a newer one and roll the durable dataset backwards.
+        self.upload_lock = threading.Lock()
         self.repo = os.getenv("FUNES_STORAGE_REPO", "")
         self.token = os.getenv("HF_TOKEN", "")
         self.filename = os.getenv("FUNES_SNAPSHOT_FILE", "funes-snapshot.jsonl")
@@ -411,24 +415,28 @@ class SnapshotSync:
         return self.store.restore(self.snapshot_path())
 
     def upload(self) -> dict[str, Any]:
-        path = self.snapshot_path()
-        self.store.snapshot(path)
-        if not self.repo or not self.token:
-            self.store.set_sync(last_sync=utc_now(), snapshot_path=str(path), last_error=None)
-            return {"uploaded": False, "path": str(path), "reason": "HF storage not configured"}
-        try:
-            from huggingface_hub import HfApi
-            HfApi(token=self.token).upload_file(path_or_fileobj=str(path), path_in_repo=self.filename, repo_id=self.repo, repo_type="dataset", commit_message="funes snapshot")
-            self.store.set_sync(last_sync=utc_now(), snapshot_path=str(path), last_error=None)
-            return {"uploaded": True, "path": str(path)}
-        except Exception as exc:
-            self.store.set_sync(last_error=type(exc).__name__, snapshot_path=str(path))
-            return {"uploaded": False, "path": str(path), "reason": type(exc).__name__}
+        with self.upload_lock:
+            path = self.snapshot_path()
+            self.store.snapshot(path)
+            if not self.repo or not self.token:
+                self.store.set_sync(last_sync=utc_now(), snapshot_path=str(path), last_error=None)
+                return {"uploaded": False, "path": str(path), "reason": "HF storage not configured"}
+            try:
+                from huggingface_hub import HfApi
+                HfApi(token=self.token).upload_file(path_or_fileobj=str(path), path_in_repo=self.filename, repo_id=self.repo, repo_type="dataset", commit_message="funes snapshot")
+                self.store.set_sync(last_sync=utc_now(), snapshot_path=str(path), last_error=None)
+                return {"uploaded": True, "path": str(path)}
+            except Exception as exc:
+                self.store.set_sync(last_error=type(exc).__name__, snapshot_path=str(path))
+                return {"uploaded": False, "path": str(path), "reason": type(exc).__name__}
 
 
 class App:
     def __init__(self):
-        self.store = Store(os.getenv("FUNES_DATA_DIR", "/data"))
+        # Free Gradio Spaces do not expose /data.  The Hub snapshot remains the
+        # durable source of truth; operators can override this with a writable
+        # mounted volume when one is available.
+        self.store = Store(os.getenv("FUNES_DATA_DIR", "/tmp/funes-data"))
         self.translator = Translator(self.store)
         self.syncer = SnapshotSync(self.store)
         self.restore_result = self.syncer.restore()

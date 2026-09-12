@@ -11,6 +11,8 @@ FROM python:3.12-slim-bookworm
 COPY --from=build /src/target/release/funes /usr/local/bin/funes
 COPY --from=build /usr/local/bin/trufflehog /usr/local/bin/trufflehog
 COPY space/server.py /app/server.py
+COPY service /app/service
+RUN pip install --no-cache-dir -r /app/service/requirements.txt
 ENV FUNES_HOME=/data/.funes PYTHONUNBUFFERED=1 PORT=7860
 RUN mkdir -p /data/.funes/sources
 WORKDIR /app

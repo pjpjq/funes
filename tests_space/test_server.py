@@ -3,10 +3,13 @@ import threading
 from collections import deque
 from http.client import HTTPConnection
 from http.server import ThreadingHTTPServer
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 import space.server as bridge
+from service.server import Store as SourceStore
 
 
 class _FakeStdout:
@@ -432,3 +435,204 @@ def test_sync_status_alias_returns_ready_payload(monkeypatch):
     assert body["ok"] is True
     assert body["remote"] == "owner/memory"
     assert "chunks: 12" in body["status"]
+
+
+def test_sync_checkpoint_acknowledges_existing_durable_push(monkeypatch):
+    monkeypatch.setattr(bridge, "TOKEN", "test-token")
+    monkeypatch.setattr(bridge, "REMOTE", "owner/memory")
+    calls = []
+    monkeypatch.setattr(bridge, "run", lambda *args, **kwargs: calls.append(args))
+    server = ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        conn = HTTPConnection(*server.server_address)
+        conn.request(
+            "POST",
+            "/sync",
+            b"{}",
+            {"Authorization": "Bearer test-token", "Content-Type": "application/json"},
+        )
+        response = conn.getresponse()
+        body = json.loads(response.read())
+        conn.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+    assert response.status == 200
+    assert body == {"ok": True, "durable": True, "remote": "owner/memory"}
+    assert calls == []
+
+
+def test_ingest_preserves_source_metadata_and_timestamp(monkeypatch, tmp_path):
+    captured = {}
+    monkeypatch.setattr(bridge, "HOME", tmp_path)
+    (tmp_path / "sources").mkdir()
+    monkeypatch.setattr(bridge, "REMOTE", "owner/memory")
+    monkeypatch.setattr(bridge, "TOKEN", "test-token")
+
+    def fake_run(*args, **kwargs):
+        if args and args[0] == "index":
+            path = next(Path(args[1]).glob("*.jsonl"))
+            captured["records"] = [json.loads(line) for line in path.read_text().splitlines()]
+        return 0, "", ""
+
+    monkeypatch.setattr(bridge, "run", fake_run)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    document = {
+        "source_identity": "stable-memory",
+        "source_agent": "codex",
+        "source_type": "agents_md",
+        "device_id": "device-safe-hash",
+        "source_path": "~/code/project/AGENTS.md",
+        "content_hash": "content-hash",
+        "timestamp": "2026-09-01T01:02:03Z",
+        "updated_at": "2026-09-01T02:03:04Z",
+        "raw_text": "原始中文",
+    }
+    try:
+        status, body = _request(server, {"documents": [document]})
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+    assert status == 200
+    assert body["durable"] is True
+    session = captured["records"][0]
+    assert session["timestamp"] == document["timestamp"]
+    metadata = session["payload"]["metadata"]
+    assert metadata["source_agent"] == "codex"
+    assert metadata["source_type"] == "agents_md"
+    assert metadata["device_id"] == "device-safe-hash"
+    assert metadata["source_path"] == "~/code/project/AGENTS.md"
+    assert metadata["content_hash"] == "content-hash"
+    assert metadata["updated_at"] == "2026-09-01T02:03:04Z"
+
+
+class _SourceTranslator:
+    def normalize_many(self, raws):
+        return [
+            (
+                "english retrieval needle",
+                "translation-hash",
+                "translation-version",
+                "ok",
+            )
+            for _raw in raws
+        ]
+
+    def rewrite(self, query):
+        return query
+
+
+class _SourceSyncer:
+    restoring = False
+    restore_failed = False
+
+    def __init__(self, durable=True):
+        self.durable = durable
+        self.uploads = []
+
+    def upload(self, docs=None):
+        self.uploads.append(docs)
+        return {"uploaded": self.durable, "durable": self.durable}
+
+
+def _source_app(tmp_path, durable=True):
+    store = SourceStore(str(tmp_path / "source-store"))
+    return SimpleNamespace(
+        store=store,
+        translator=_SourceTranslator(),
+        syncer=_SourceSyncer(durable),
+        restore_result=0,
+    )
+
+
+def _post(server, path, payload):
+    conn = HTTPConnection(*server.server_address)
+    conn.request(
+        "POST",
+        path,
+        json.dumps(payload, ensure_ascii=False).encode(),
+        {"Authorization": "Bearer test-token", "Content-Type": "application/json"},
+    )
+    response = conn.getresponse()
+    body = json.loads(response.read())
+    conn.close()
+    return response.status, body
+
+
+def test_source_sidecar_updates_in_place_and_returns_only_raw_text(monkeypatch, tmp_path):
+    app = _source_app(tmp_path)
+    monkeypatch.setattr(bridge, "SOURCE_APP", app)
+    monkeypatch.setattr(bridge, "TOKEN", "test-token")
+    monkeypatch.setattr(
+        bridge,
+        "run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("native ingest must not run")),
+    )
+    server = ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = {
+        "source_identity": "memory-section",
+        "source_version": "v1",
+        "source_agent": "codex",
+        "source_type": "memory",
+        "project": "demo",
+        "raw_text": "旧的中文正文",
+    }
+    try:
+        status, first = _post(server, "/ingest", {"documents": [base]})
+        status2, second = _post(
+            server,
+            "/ingest",
+            {"documents": [{**base, "source_version": "v2", "raw_text": "新的中文正文"}]},
+        )
+        search_status, found = _post(
+            server,
+            "/search",
+            {"query": "english retrieval needle", "source_type": "memory", "limit": 3},
+        )
+        get_status, item = _post(server, "/get", {"id": "memory-section"})
+        count = app.store.count()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+        app.store.close()
+    assert status == status2 == search_status == get_status == 200
+    assert first["created"] == 1
+    assert second["updated"] == 1
+    assert len(app.syncer.uploads) == 2
+    assert app.syncer.uploads[-1][0]["raw_text"] == "新的中文正文"
+    assert found["results"][0]["raw_text"] == "新的中文正文"
+    assert "retrieval_text" not in found["results"][0]
+    assert item["result"]["raw_text"] == "新的中文正文"
+    assert count == 1
+
+
+def test_source_sidecar_does_not_ack_before_encrypted_durability(monkeypatch, tmp_path):
+    app = _source_app(tmp_path, durable=False)
+    monkeypatch.setattr(bridge, "SOURCE_APP", app)
+    monkeypatch.setattr(bridge, "TOKEN", "test-token")
+    server = ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        status, body = _post(
+            server,
+            "/ingest",
+            {"source_identity": "pending", "raw_text": "must remain queued"},
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+        app.store.close()
+    assert status == 503
+    assert body["durable"] is False
+    assert body["error"] == "durability_pending"

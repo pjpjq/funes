@@ -25,6 +25,7 @@ from service.server import App as SourceApp
 from service.server import expanded_candidate_limit
 from service.server import ingest_documents as persist_source_ingest
 from service.server import prepare_ingest_documents as prepare_source_ingest_documents
+from service.server import queue_reindex as queue_source_reindex
 from service.server import stable_rrf
 
 
@@ -465,6 +466,7 @@ def _native_update(item: dict, status: str, version: str | None, error: str | No
             else None
         ),
         "native_index_error": error,
+        "native_generation": int(item.get("native_generation") or 0),
     }
 
 
@@ -1204,6 +1206,26 @@ class Handler(BaseHTTPRequestHandler):
                 # This compatibility checkpoint therefore acknowledges that
                 # durable state without rebuilding or pushing the index again.
                 self.send_json(200, {"ok": True, "durable": True, "remote": REMOTE})
+                return
+            if self.path == "/reindex":
+                scope = str(obj.get("scope", ""))
+                if scope not in {"retrieval_text", "all"}:
+                    self.send_json(400, {"error": "scope must be retrieval_text or all"})
+                    return
+                app = source_app()
+                if app is None:
+                    self.send_json(
+                        503,
+                        {
+                            "queued": False,
+                            "durable": False,
+                            "error": "FUNES_STORAGE_REPO is not configured",
+                        },
+                    )
+                    return
+                with WRITE_LOCK:
+                    result = queue_source_reindex(app, scope)
+                self.send_json(202 if result.get("durable") else 503, result)
                 return
             if self.path == "/warm":
                 if not REMOTE:

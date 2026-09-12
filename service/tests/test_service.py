@@ -504,6 +504,132 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(result["error"], "durability_pending")
         self.assertFalse(result["sync"]["durable"])
 
+    def test_reindex_generations_reset_only_derived_state(self):
+        store = Store(self.tmp.name)
+        original = {
+            "source_identity": "provider-row",
+            "source_version": "raw-v1",
+            "raw_text": "原始中文",
+            "retrieval_text": "english shadow",
+            "translation_hash": "old-hash",
+            "translation_version": "old-version",
+            "translation_status": "ok",
+            "native_index_version": "native-v1",
+            "native_index_status": "indexed",
+            "metadata": {"keep": "unchanged"},
+        }
+        store.ingest(
+            [
+                original,
+                {
+                    "source_identity": "english-row",
+                    "raw_text": "plain english",
+                    "retrieval_text": "plain english",
+                    "translation_status": "skipped_non_cjk",
+                    "native_index_version": "native-en",
+                    "native_index_status": "indexed",
+                },
+                {
+                    "source_identity": "waiting-row",
+                    "raw_text": "等待持久化",
+                    "retrieval_text": "old waiting shadow",
+                    "translation_status": "ok",
+                    "native_index_status": "waiting_durability",
+                    "native_index_error": "durability_pending",
+                },
+            ]
+        )
+        store.record_reindex_control(
+            {"generation": 2, "scope": "retrieval_text", "created_at": "2026-09-13T00:00:02Z"}
+        )
+        store.apply_pending_reindex_controls(1)
+
+        provider = store.get("provider-row")
+        self.assertEqual(provider["raw_text"], original["raw_text"])
+        self.assertEqual(provider["source_version"], original["source_version"])
+        self.assertEqual(provider["metadata"], original["metadata"])
+        self.assertEqual(provider["retrieval_text"], original["raw_text"])
+        self.assertEqual(provider["translation_status"], "pending_provider")
+        self.assertIsNone(provider["native_index_status"])
+        self.assertEqual(provider["retrieval_generation"], 2)
+        self.assertEqual(provider["native_generation"], 2)
+        self.assertEqual(store.get("english-row")["native_index_status"], "indexed")
+        waiting = store.get("waiting-row")
+        self.assertEqual(waiting["translation_status"], "pending_provider")
+        self.assertEqual(waiting["native_index_status"], "waiting_durability")
+        self.assertEqual(store.pending_translations(10)[0]["source_identity"], "provider-row")
+
+        # A pre-control derived delta must not overwrite generation 2.
+        store.ingest([original])
+        self.assertEqual(store.get("provider-row")["translation_status"], "pending_provider")
+
+        # An older all-control arriving after generation 2 still clears the
+        # independent native generation of canonical-eligible English rows.
+        store.record_reindex_control(
+            {"generation": 1, "scope": "all", "created_at": "2026-09-13T00:00:01Z"}
+        )
+        store.apply_pending_reindex_controls(1)
+        self.assertIsNone(store.get("english-row")["native_index_status"])
+        self.assertEqual(store.get("waiting-row")["native_index_status"], "waiting_durability")
+        store.close()
+
+    def test_reindex_http_returns_202_only_after_durable_queue(self):
+        class Syncer:
+            restoring = False
+            restore_failed = False
+
+            def __init__(self, durable):
+                self.durable = durable
+                self.controls = []
+
+            def upload_reindex_control(self, control):
+                self.controls.append(dict(control))
+                return {"durable": self.durable, "reason": "not_durable"}
+
+        def request(durable):
+            directory = tempfile.TemporaryDirectory()
+            app = mock.Mock()
+            app.store = Store(directory.name)
+            app.syncer = Syncer(durable)
+            app.reindex_lock = threading.Lock()
+            app.translation_lock = threading.Lock()
+            app.reindex_wake = threading.Event()
+            server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(app))
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                status, body = self._request(
+                    server, "POST", "/reindex", {"scope": "retrieval_text"}
+                )
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+                app.store.close()
+                directory.cleanup()
+            return status, body, app.syncer.controls
+
+        status, body, controls = request(True)
+        self.assertEqual(status, 202)
+        self.assertEqual(body, {"queued": True, "durable": True, "scope": "retrieval_text", "generation": 1})
+        self.assertEqual(controls[0]["_funes_record"], "reindex_control")
+        self.assertNotIn("raw_text", json.dumps(body))
+        status, body, _ = request(False)
+        self.assertEqual(status, 503)
+        self.assertFalse(body["queued"])
+
+    def test_reindex_control_is_encrypted_before_local_durable_ack(self):
+        from service.server import SnapshotSync
+        store = Store(self.tmp.name)
+        syncer = SnapshotSync(store)
+        control = store.next_reindex_control("all")
+        result = syncer.upload_reindex_control(control)
+        encrypted = next((Path(self.tmp.name) / "reindex-queue").glob("*.enc"))
+        self.assertTrue(result["durable"])
+        self.assertTrue(encrypted.read_bytes().startswith(b"FUNES-SOURCE-V1\0"))
+        self.assertNotIn(b"reindex_control", encrypted.read_bytes())
+        store.close()
+
     def test_configured_remote_without_hf_token_is_not_durable(self):
         from service.server import SnapshotSync
         store = Store(self.tmp.name)

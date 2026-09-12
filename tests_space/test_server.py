@@ -635,9 +635,14 @@ class _SourceSyncer:
     def __init__(self, durable=True):
         self.durable = durable
         self.uploads = []
+        self.controls = []
 
     def upload(self, docs=None):
         self.uploads.append(docs)
+        return {"uploaded": self.durable, "durable": self.durable}
+
+    def upload_reindex_control(self, control):
+        self.controls.append(dict(control))
         return {"uploaded": self.durable, "durable": self.durable}
 
 
@@ -663,6 +668,40 @@ def _post(server, path, payload):
     body = json.loads(response.read())
     conn.close()
     return response.status, body
+
+
+def test_reindex_queues_durable_control_without_native_or_provider_work(monkeypatch, tmp_path):
+    app = _source_app(tmp_path)
+    app.reindex_lock = threading.Lock()
+    app.translation_lock = threading.Lock()
+    app.reindex_wake = threading.Event()
+    monkeypatch.setattr(bridge, "SOURCE_APP", app)
+    monkeypatch.setattr(bridge, "TOKEN", "test-token")
+    monkeypatch.setattr(
+        bridge,
+        "run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("HTTP reindex must not run native work")
+        ),
+    )
+    app.translator.normalize_many = lambda _raws: (_ for _ in ()).throw(
+        AssertionError("HTTP reindex must not call the provider")
+    )
+    server = ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        status, body = _post(server, "/reindex", {"scope": "all"})
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+        app.store.close()
+    assert status == 202
+    assert body == {"queued": True, "durable": True, "scope": "all", "generation": 1}
+    assert app.syncer.controls[0]["_funes_record"] == "reindex_control"
+    assert "retrieval_text" not in body
+    assert "raw_text" not in body
 
 
 def test_native_session_and_low_value_records_skip_provider_translation(tmp_path):

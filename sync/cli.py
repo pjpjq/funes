@@ -11,6 +11,10 @@ def main(argv=None):
     ap=argparse.ArgumentParser(prog="funes-sync")
     sub=ap.add_subparsers(dest="cmd",required=True)
     for n in ("backfill","run","drain","status","sources","doctor","install","uninstall","start","stop","restart","logs","mcp"): sub.add_parser(n)
+    reindex = sub.add_parser("reindex")
+    scope = reindex.add_mutually_exclusive_group(required=True)
+    scope.add_argument("--retrieval-text", action="store_true")
+    scope.add_argument("--all", action="store_true")
     ap.add_argument("--root", type=str, help="override the home directory for a dry-run")
     a=ap.parse_args(argv); cfg=Config.load(Path(a.root).expanduser() if a.root else None)
     if a.cmd=="install":
@@ -34,6 +38,11 @@ def main(argv=None):
             print(json.dumps(exc.as_dict(), ensure_ascii=False, indent=2), file=sys.stderr)
             return 2
         for path in managed: print(path)
+        return 0
+    if a.cmd=="reindex":
+        from .client import SyncClient
+        selected="all" if a.all else "retrieval_text"
+        print(json.dumps(SyncClient(cfg).reindex(selected),ensure_ascii=False,indent=2))
         return 0
     store=Store(config=cfg)
     try:

@@ -235,6 +235,16 @@ def test_native_worker_does_not_spawn_during_initial_warm(monkeypatch):
         bridge.native_worker()
 
 
+def test_recall_fails_fast_when_another_read_is_active(monkeypatch):
+    monkeypatch.setattr(bridge, "RECALL_LOCK_TIMEOUT", 0.01)
+    bridge.INDEX_LOCK.acquire()
+    try:
+        with pytest.raises(bridge.NativeMcpBusyError, match="busy"):
+            bridge.recall("query")
+    finally:
+        bridge.INDEX_LOCK.release()
+
+
 def test_search_and_get_use_native_worker_and_keep_raw_query(monkeypatch):
     calls = []
 
@@ -331,6 +341,38 @@ def test_native_bridge_ack_requires_push(monkeypatch, tmp_path):
     assert any(call[0] == "push" for call in calls)
     assert any(call[0] == "index" for call in calls)
     assert warm_calls == []
+
+
+def test_ingest_does_not_wait_for_recall_lock(monkeypatch, tmp_path):
+    monkeypatch.setattr(bridge, "HOME", tmp_path)
+    (tmp_path / "sources").mkdir()
+    monkeypatch.setattr(bridge, "REMOTE", "owner/memory")
+    monkeypatch.setattr(bridge, "TOKEN", "test-token")
+    monkeypatch.setattr(bridge, "run", lambda *args, **kwargs: (0, "", ""))
+    server = ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    bridge.INDEX_LOCK.acquire()
+    result = {}
+    done = threading.Event()
+
+    def submit():
+        try:
+            result["value"] = _request(server, {"raw_text": "写入但不阻塞读取"})
+        finally:
+            done.set()
+
+    request_thread = threading.Thread(target=submit)
+    request_thread.start()
+    try:
+        assert done.wait(0.25), "ingest must use WRITE_LOCK, not the recall lock"
+    finally:
+        bridge.INDEX_LOCK.release()
+        request_thread.join(timeout=2)
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=2)
+    assert result["value"][0] == 200
 
 
 def test_native_bridge_keeps_queue_when_push_fails(monkeypatch, tmp_path):

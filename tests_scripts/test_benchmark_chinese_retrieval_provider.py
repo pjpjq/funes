@@ -24,6 +24,144 @@ def _read_jsonl(path: Path) -> list[dict[str, object]]:
 
 
 class ProviderBenchmarkTest(unittest.TestCase):
+    def test_provider_uses_role_specific_prompts_and_query_validation(self) -> None:
+        class Response:
+            def __init__(self, content: str):
+                self.content = content
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return json.dumps(
+                    {"choices": [{"message": {"content": self.content}}]}
+                ).encode("utf-8")
+
+        normalizer = benchmark.ProviderNormalizer(
+            endpoint="https://provider.example/v1/chat/completions",
+            model="test-model",
+            token="test-token",
+            timeout=1.0,
+            retries=1,
+        )
+        raw_query = "Funes MCP 2.0 怎么检索？"
+        with mock.patch.object(
+            benchmark.urllib.request,
+            "urlopen",
+            side_effect=[
+                Response("English CPA document"),
+                Response("Funes MCP 2.0 retrieval"),
+                Response("unrelated answer 1024"),
+            ],
+        ) as request:
+            document = normalizer.normalize_document("中文 CPA 文档")
+            query = normalizer.normalize_query(raw_query)
+            rejected = normalizer.normalize_query("Funes MCP previous_response_id 怎么检索？")
+
+        document_payload = json.loads(request.call_args_list[0].args[0].data)
+        query_payload = json.loads(request.call_args_list[1].args[0].data)
+        self.assertEqual(document_payload["messages"][0]["content"], benchmark.RETRIEVAL_PROMPT)
+        self.assertNotIn("max_tokens", document_payload)
+        self.assertEqual(query_payload["messages"][0]["content"], benchmark.QUERY_RETRIEVAL_PROMPT)
+        self.assertEqual(query_payload["max_tokens"], 128)
+        self.assertEqual(document.validation_status, "accepted")
+        self.assertEqual(query.effective_output, "Funes MCP 2.0 retrieval")
+        self.assertEqual(rejected.provider_output, "unrelated answer 1024")
+        self.assertEqual(
+            rejected.effective_output,
+            "Funes MCP previous_response_id 怎么检索？",
+        )
+        self.assertEqual(rejected.validation_status, "fallback_invalid_query")
+        self.assertEqual(normalizer.stats.calls, 3)
+
+    def test_checkpoint_separates_roles_and_rejects_single_prompt_format(self) -> None:
+        shared_input = "Funes 中文检索"
+        document_outputs = {
+            shared_input: benchmark.ProviderOutput(
+                provider_output="Funes document retrieval",
+                effective_output="Funes document retrieval",
+                validation_status="accepted",
+            )
+        }
+        query_outputs = {
+            shared_input: benchmark.ProviderOutput(
+                provider_output="unrelated answer 1024",
+                effective_output=shared_input,
+                validation_status="fallback_invalid_query",
+            )
+        }
+        provider = {
+            "endpoint": "https://provider.example/v1/chat/completions",
+            "model": "test-model",
+            **benchmark._prompt_metadata(),
+        }
+        checkpoint = {
+            "benchmark_kind": benchmark.BENCHMARK_KIND,
+            "provider": provider,
+            "provider_outputs": benchmark._provider_outputs(
+                [shared_input], document_outputs, "document"
+            )
+            + benchmark._provider_outputs([shared_input], query_outputs, "query"),
+        }
+
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "checkpoint.json"
+
+            def load(value):
+                path.write_text(json.dumps(value), encoding="utf-8")
+                return benchmark._load_provider_checkpoint(
+                    path,
+                    endpoint=provider["endpoint"],
+                    model=provider["model"],
+                    document_inputs=[shared_input],
+                    query_inputs=[shared_input],
+                )
+
+            loaded = load(checkpoint)
+            self.assertIsNotNone(loaded)
+            loaded_documents, loaded_queries, _metadata = loaded
+            self.assertEqual(
+                loaded_documents[shared_input].effective_output,
+                "Funes document retrieval",
+            )
+            self.assertEqual(loaded_queries[shared_input].provider_output, "unrelated answer 1024")
+            self.assertEqual(loaded_queries[shared_input].effective_output, shared_input)
+
+            stale_query_prompt = json.loads(json.dumps(checkpoint))
+            stale_query_prompt["provider"]["query_prompt_sha256"] = "stale"
+            self.assertIsNone(load(stale_query_prompt))
+
+            single_prompt = json.loads(json.dumps(checkpoint))
+            single_prompt["provider"] = {
+                "endpoint": provider["endpoint"],
+                "model": provider["model"],
+                "prompt_version": benchmark.PROMPT_VERSION,
+                "prompt_sha256": hashlib.sha256(
+                    benchmark.RETRIEVAL_PROMPT.encode("utf-8")
+                ).hexdigest(),
+            }
+            self.assertIsNone(load(single_prompt))
+
+            tampered_hash = json.loads(json.dumps(checkpoint))
+            tampered_hash["provider_outputs"][0]["input_sha256"] = "tampered"
+            self.assertIsNone(load(tampered_hash))
+
+            duplicate_row = json.loads(json.dumps(checkpoint))
+            duplicate_row["provider_outputs"].append(
+                duplicate_row["provider_outputs"][0]
+            )
+            self.assertIsNone(load(duplicate_row))
+
+            unexpected_row = json.loads(json.dumps(checkpoint))
+            extra = dict(unexpected_row["provider_outputs"][0])
+            extra["input"] = "unexpected"
+            extra["input_sha256"] = hashlib.sha256(b"unexpected").hexdigest()
+            unexpected_row["provider_outputs"].append(extra)
+            self.assertIsNone(load(unexpected_row))
+
     def test_canonical_sources_keep_after_index_shadow_only(self) -> None:
         memories = benchmark._memories()[:3]
         shadows = {memory.raw: f"English shadow {index}" for index, memory in enumerate(memories)}

@@ -749,6 +749,51 @@ class ServiceTests(unittest.TestCase):
         self.assertIsNotNone(state["applied_at"])
         store.close()
 
+    def test_restore_compacts_history_and_skips_satisfied_updates(self):
+        store = Store(self.tmp.name)
+        store.ingest(
+            [
+                {
+                    "source_identity": f"compact-row-{index}",
+                    "raw_text": f"raw {index}",
+                    "retrieval_text": f"old shadow {index}",
+                    "translation_status": "ok",
+                    "native_index_status": "indexed",
+                }
+                for index in range(20)
+            ]
+        )
+        for generation, scope in enumerate(
+            ("all", "retrieval_text", "retrieval_text", "all", "retrieval_text"),
+            start=1,
+        ):
+            store.record_reindex_control(
+                {
+                    "generation": generation,
+                    "scope": scope,
+                    "created_at": f"2026-09-13T00:00:0{generation}Z",
+                }
+            )
+
+        compacted = store.compact_reindex_controls(replay=True)
+        first = store.drain_reindex_controls(7)
+        controls = store.conn.execute(
+            "SELECT generation, scope FROM reindex_controls ORDER BY generation"
+        ).fetchall()
+        self.assertEqual(compacted, {"kept": 2, "deleted": 3})
+        self.assertEqual(
+            [(row["generation"], row["scope"]) for row in controls],
+            [(4, "all"), (5, "retrieval_text")],
+        )
+        self.assertEqual(first["scanned"], 40)
+        self.assertEqual(first["updated"], 20)
+
+        store.compact_reindex_controls(replay=True)
+        replay = store.drain_reindex_controls(7)
+        self.assertEqual(replay["scanned"], 40)
+        self.assertEqual(replay["updated"], 0)
+        store.close()
+
     def test_reindex_http_returns_202_only_after_durable_queue(self):
         class Syncer:
             restoring = False

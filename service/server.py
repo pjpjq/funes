@@ -600,16 +600,17 @@ class Store:
 
     def apply_pending_reindex_controls(self, batch_size: int = 500) -> dict[str, int]:
         """Apply one restart-safe row batch without changing raw source truth."""
-        applied = retrieval_reset = native_reset = scanned = 0
+        applied = retrieval_reset = native_reset = scanned = updated = 0
         with self.lock, self.conn:
             control = self.conn.execute(
                 """SELECT generation, scope, row_cursor FROM reindex_controls
-                WHERE applied_at IS NULL ORDER BY generation LIMIT 1"""
+                WHERE applied_at IS NULL ORDER BY generation DESC LIMIT 1"""
             ).fetchone()
             if control is None:
                 return {
                     "applied": 0,
                     "scanned": 0,
+                    "updated": 0,
                     "retrieval_reset": 0,
                     "native_reset": 0,
                 }
@@ -633,6 +634,10 @@ class Store:
                     item.get("native_index_version"), item.get("native_index_status"),
                     item.get("native_indexed_at"), item.get("native_index_error"),
                 )
+                current_values = (
+                    *retrieval_values, retrieval_generation, *native_values,
+                    native_generation,
+                )
                 if generation > retrieval_generation:
                     retrieval_generation = generation
                     if self._provider_reindex_eligible(item):
@@ -654,17 +659,20 @@ class Store:
                     ):
                         native_values = (None, None, None, None)
                         native_reset += 1
-                self.conn.execute(
-                    """UPDATE memories SET retrieval_text=?, translation_hash=?,
-                    translation_version=?, translation_status=?, retrieval_updated_at=?,
-                    retrieval_generation=?, native_index_version=?, native_index_status=?,
-                    native_indexed_at=?, native_index_error=?, native_generation=?
-                    WHERE id=?""",
-                    (
-                        *retrieval_values, retrieval_generation, *native_values,
-                        native_generation, row["id"],
-                    ),
+                next_values = (
+                    *retrieval_values, retrieval_generation, *native_values,
+                    native_generation,
                 )
+                if next_values != current_values:
+                    self.conn.execute(
+                        """UPDATE memories SET retrieval_text=?, translation_hash=?,
+                        translation_version=?, translation_status=?, retrieval_updated_at=?,
+                        retrieval_generation=?, native_index_version=?, native_index_status=?,
+                        native_indexed_at=?, native_index_error=?, native_generation=?
+                        WHERE id=?""",
+                        (*next_values, row["id"]),
+                    )
+                    updated += 1
             scanned = len(rows)
             next_cursor = int(rows[-1]["id"]) if rows else row_cursor
             has_more = self.conn.execute(
@@ -685,13 +693,20 @@ class Store:
         return {
             "applied": applied,
             "scanned": scanned,
+            "updated": updated,
             "retrieval_reset": retrieval_reset,
             "native_reset": native_reset,
         }
 
     def drain_reindex_controls(self, batch_size: int = 500) -> dict[str, int]:
         """Drain controls using bounded transactions; intended for restore only."""
-        totals = {"applied": 0, "scanned": 0, "retrieval_reset": 0, "native_reset": 0}
+        totals = {
+            "applied": 0,
+            "scanned": 0,
+            "updated": 0,
+            "retrieval_reset": 0,
+            "native_reset": 0,
+        }
         while True:
             result = self.apply_pending_reindex_controls(batch_size)
             for name in totals:
@@ -699,12 +714,33 @@ class Store:
             if not result["scanned"] and not result["applied"]:
                 return totals
 
-    def reset_reindex_control_cursors(self) -> None:
-        """Restart every control after a complete unordered Hub restore."""
+    def compact_reindex_controls(self, *, replay: bool = False) -> dict[str, int]:
+        """Keep only the latest retrieval effect and the latest all effect."""
         with self.lock, self.conn:
-            self.conn.execute(
-                "UPDATE reindex_controls SET row_cursor=0, applied_at=NULL"
-            )
+            latest = self.conn.execute(
+                """SELECT generation, scope FROM reindex_controls
+                ORDER BY generation DESC LIMIT 1"""
+            ).fetchone()
+            if latest is None:
+                return {"kept": 0, "deleted": 0}
+            keep = {int(latest["generation"])}
+            if str(latest["scope"]) != "all":
+                latest_all = self.conn.execute(
+                    """SELECT generation FROM reindex_controls WHERE scope='all'
+                    ORDER BY generation DESC LIMIT 1"""
+                ).fetchone()
+                if latest_all is not None:
+                    keep.add(int(latest_all["generation"]))
+            placeholders = ",".join("?" for _ in keep)
+            deleted = self.conn.execute(
+                f"DELETE FROM reindex_controls WHERE generation NOT IN ({placeholders})",
+                tuple(sorted(keep)),
+            ).rowcount
+            if replay:
+                self.conn.execute(
+                    "UPDATE reindex_controls SET row_cursor=0, applied_at=NULL"
+                )
+            return {"kept": len(keep), "deleted": deleted}
 
     def canonical_index_candidates(self, limit: int) -> list[dict[str, Any]]:
         """Return final non-session retrieval shadows for native reconciliation."""
@@ -1201,7 +1237,7 @@ class SnapshotSync:
                 # A complete Hub restore can replay an old generation-zero
                 # revision into an id below a partially persisted row cursor.
                 # Rewind only here; ordinary local restarts keep their cursor.
-                self.store.reset_reindex_control_cursors()
+                self.store.compact_reindex_controls(replay=True)
                 self.store.drain_reindex_controls(self.restore_batch)
                 self.restored = True
                 return restored
@@ -1217,6 +1253,7 @@ class SnapshotSync:
             return 0
         try:
             restored = self.store.restore(local, apply_controls=False)
+            self.store.compact_reindex_controls()
             self.store.drain_reindex_controls(self.restore_batch)
             self.restored = True
             return restored
@@ -1671,6 +1708,7 @@ def queue_reindex(app: Any, scope: str) -> dict[str, Any]:
                 "error": str(sync.get("reason") or "durability_pending"),
             }
         app.store.record_reindex_control(control)
+        app.store.compact_reindex_controls()
         wake = getattr(app, "reindex_wake", None)
         if wake is not None:
             wake.set()
@@ -1773,6 +1811,7 @@ class App:
                 self.reconcile_wake.set()
             if result["scanned"] or result["applied"]:
                 continue
+            self.store.compact_reindex_controls()
             self.reindex_wake.wait(self.reconcile_interval)
             self.reindex_wake.clear()
 

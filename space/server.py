@@ -81,13 +81,16 @@ def _warm_native_memory() -> None:
 
 def request_warm(*, force: bool = False) -> dict[str, object]:
     """Start one background refresh, optionally replacing an old remote worker."""
-    if force:
-        close_native_worker()
     with _WARM_STATE_LOCK:
         if _WARM_STATE.get("state") == "warming":
             return dict(_WARM_STATE)
         _WARM_STATE.update(state="not_started", started_at=None, finished_at=None)
-    threading.Thread(target=_warm_native_memory, name="funes-native-warm", daemon=True).start()
+    def refresh() -> None:
+        if force:
+            close_native_worker()
+        _warm_native_memory()
+
+    threading.Thread(target=refresh, name="funes-native-warm", daemon=True).start()
     return warm_state()
 
 # The default Funes embedding model is English-oriented.  Keep this small,

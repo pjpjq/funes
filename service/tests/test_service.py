@@ -10,7 +10,7 @@ from http.client import HTTPConnection
 from pathlib import Path
 from http.server import ThreadingHTTPServer
 
-from service.server import QUERY_PROMPT_VERSION, QUERY_RETRIEVAL_PROMPT, RETRIEVAL_PROMPT, App, Store, Translator, make_handler, persist_translation_documents
+from service.server import QUERY_PROMPT_VERSION, QUERY_RETRIEVAL_PROMPT, RETRIEVAL_PROMPT, App, Store, Translator, make_handler, persist_translation_documents, prepare_ingest_documents
 
 
 class ServiceTests(unittest.TestCase):
@@ -47,6 +47,29 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(Translator(store).max_per_ingest, 0)
         finally:
             store.close()
+
+    def test_prepare_ingest_reads_reindex_generation_once_per_batch(self):
+        app = App()
+        try:
+            with mock.patch.object(
+                app.store,
+                "latest_reindex_generation",
+                wraps=app.store.latest_reindex_generation,
+            ) as latest:
+                prepared = prepare_ingest_documents(
+                    app,
+                    [
+                        {"source_identity": "batch-one", "source_type": "session", "raw_text": "one"},
+                        {"source_identity": "batch-two", "source_type": "session", "raw_text": "two"},
+                    ],
+                )
+            self.assertEqual(latest.call_count, 1)
+            self.assertEqual(
+                {item["retrieval_generation"] for item in prepared},
+                {app.store.latest_reindex_generation()},
+            )
+        finally:
+            app.close()
 
     def test_same_revision_updates_only_derived_fields_in_place(self):
         store = Store(self.tmp.name)

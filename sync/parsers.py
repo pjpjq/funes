@@ -308,9 +308,23 @@ def _parse_claude_native(source: Source, start: int = 0) -> list[Chunk]:
 
 def _parse_pi_native(source: Source, start: int = 0) -> list[Chunk]:
     out: list[Chunk] = []
-    session = Path(source.path).stem
+    path = Path(source.path)
+    # Append scans must retain the session envelope from the beginning of the
+    # file; otherwise the fallback stem becomes a new identity for every tail.
+    prefix = _read_lines(path, 0)
+    session = path.stem
     worktree = ""
-    for ordinal, line in enumerate(_read_lines(Path(source.path), start), start if start else 0):
+    for line in prefix[:256]:
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        if obj.get("type") == "session":
+            session = str(obj.get("id") or obj.get("sessionId") or session)
+            worktree = str(obj.get("cwd") or "")
+            break
+    lines = _read_lines(path, start) if start else prefix
+    for ordinal, line in enumerate(lines, start if start else 0):
         try:
             obj = json.loads(line)
         except Exception:

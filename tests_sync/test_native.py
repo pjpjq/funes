@@ -34,6 +34,26 @@ def test_same_session_converges_across_devices(tmp_path):
     assert a.record_id == b.record_id
 
 
+def test_pi_append_keeps_native_session_identity(tmp_path):
+    path = tmp_path / "pi-session.jsonl"
+    path.write_text(
+        json.dumps({"type": "session", "id": "pi-real-session", "cwd": "/repo"})
+        + "\n"
+        + json.dumps({"type": "message", "id": "m1", "message": {"role": "user", "content": "first"}})
+        + "\n",
+        encoding="utf-8",
+    )
+    source = Source("pi:~/.pi/agent/sessions/pi-session.jsonl", "pi", path, "dev-a")
+    first = parse_file(source)
+    offset = path.stat().st_size
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"type": "message", "id": "m2", "message": {"role": "assistant", "content": "second"}}) + "\n")
+    appended = parse_file(source, offset)
+    assert first[0].session_id == "pi-real-session"
+    assert appended[0].session_id == "pi-real-session"
+    assert first[0].record_id != appended[0].record_id
+
+
 def test_memory_update_is_one_record_and_queue_is_idempotent(tmp_path):
     path = tmp_path / "MEMORY.md"
     path.write_text("# decision\n保留 raw_text\n", encoding="utf-8")

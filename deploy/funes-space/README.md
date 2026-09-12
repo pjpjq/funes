@@ -11,9 +11,13 @@ This Docker Space exposes a thin HTTP/MCP-compatible facade over the native
 truth: Lance vector search, BM25, reranking, recency, neighbor expansion, and
 the existing TruffleHog fail-closed push gate.
 
-- public `GET /health` and `GET /ready`;
-- bearer-authenticated `POST /ingest`, `/search`, `/recall`, `/get`, `/reindex`, `/sync`;
-- bearer-authenticated `GET /sources` and `GET /sync/status`.
+- `GET /health` and `GET /ready` (a private Space also needs the HF bearer at the
+  front door; `/ready` additionally checks the application bearer);
+- bearer-authenticated `POST /ingest`, `/search`, `/recall`, and `/get`.
+
+Source discovery, backfill, reindex, and sync status are local-daemon/CLI
+operations (`funes sync status`, `funes sources`, `funes reindex`); the Space
+does not pretend to access the Mac filesystem.
 
 The raw source text remains the durable source of truth. Set `FUNES_MEMORY` to a private
 Funes HF dataset (`owner/name` or `hf://datasets/...`) and `HF_TOKEN` to use native

@@ -8,6 +8,8 @@ corresponding environment variables are configured.
 from __future__ import annotations
 
 import hashlib
+import gzip
+import io
 import json
 import os
 import re
@@ -16,6 +18,7 @@ import shutil
 import subprocess
 import threading
 import time
+import uuid
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
@@ -146,8 +149,9 @@ class Store:
                 source_version = str(doc.get("source_version", metadata.get("source_version", "")))
                 content_hash = hashlib.sha256(raw.encode("utf-8")).hexdigest()
                 now = utc_now()
+                incoming_updated = doc.get("updated_at", metadata.get("updated_at")) or now
                 row = self.conn.execute(
-                    "SELECT id, content_hash, source_version FROM memories WHERE source_identity=?",
+                    "SELECT id, content_hash, source_version, updated_at FROM memories WHERE source_identity=?",
                     (source_identity,),
                 ).fetchone()
                 values = {k: doc.get(k, metadata.get(k)) for k in FIELDS if k not in ("content_hash", "ingested_at", "updated_at")}
@@ -155,6 +159,12 @@ class Store:
                 if row and row["content_hash"] == content_hash and row["source_version"] == source_version:
                     deduped += 1
                     results.append({"id": row["id"], "status": "deduped", "source_identity": source_identity})
+                    continue
+                if row and self._older(incoming_updated, row["updated_at"]):
+                    # Delta files can arrive out of order after a retry.  Never
+                    # let an older local version roll a durable source back.
+                    deduped += 1
+                    results.append({"id": row["id"], "status": "stale", "source_identity": source_identity})
                     continue
                 if row:
                     self.conn.execute(
@@ -166,7 +176,7 @@ class Store:
                          values.get("source_agent"), values.get("source_type"), values.get("device_id"),
                          values.get("project"), values.get("repo"), values.get("worktree"), values.get("session_id"),
                          values.get("message_id"), values.get("role"), values.get("timestamp"), values.get("source_path"),
-                         content_hash, now, values.get("content_type"), values["source_missing"], values.get("agent_type"),
+                         content_hash, incoming_updated, values.get("content_type"), values["source_missing"], values.get("agent_type"),
                          values.get("parent_session_id"), values.get("agent_id"), values.get("translation_hash"), values.get("translation_version"), values.get("translation_status"), row["id"]),
                     )
                     updated += 1
@@ -180,13 +190,25 @@ class Store:
                         (source_identity, source_version, raw, retrieval, json.dumps(metadata, ensure_ascii=False),
                          values.get("source_agent"), values.get("source_type"), values.get("device_id"), values.get("project"),
                          values.get("repo"), values.get("worktree"), values.get("session_id"), values.get("message_id"),
-                         values.get("role"), values.get("timestamp"), values.get("source_path"), content_hash, now, now,
+                         values.get("role"), values.get("timestamp"), values.get("source_path"), content_hash, values.get("ingested_at") or now, incoming_updated,
                          values.get("content_type"), values["source_missing"], values.get("agent_type"),
                          values.get("parent_session_id"), values.get("agent_id"), values.get("translation_hash"), values.get("translation_version"), values.get("translation_status")),
                     )
                     created += 1
                     results.append({"id": cur.lastrowid, "status": "created", "source_identity": source_identity})
         return {"created": created, "updated": updated, "deduped": deduped, "items": results}
+
+    @staticmethod
+    def _older(candidate: Any, current: Any) -> bool:
+        if not candidate or not current:
+            return False
+        def key(value: Any):
+            text = str(value)
+            try:
+                return (0, float(text))
+            except ValueError:
+                return (1, text)
+        return key(candidate) < key(current)
 
     @staticmethod
     def _identity(doc: dict[str, Any], metadata: dict[str, Any], raw: str) -> str:
@@ -303,18 +325,48 @@ class Store:
                     d = self._row(row)
                     f.write(json.dumps(d, ensure_ascii=False) + "\n")
 
+    def iter_documents(self, batch_size: int = 500):
+        """Yield durable rows in bounded batches for snapshot/delta transport."""
+        batch: list[dict[str, Any]] = []
+        with self.lock:
+            cursor = self.conn.execute("SELECT * FROM memories ORDER BY id")
+            for row in cursor:
+                batch.append(self._row(row))
+                if len(batch) >= batch_size:
+                    yield batch
+                    batch = []
+        if batch:
+            yield batch
+
+    def restore_documents(self, documents: Any, batch_size: int = 500) -> int:
+        """Restore a stream without materialising a multi-gigabyte snapshot."""
+        total = 0
+        batch: list[dict[str, Any]] = []
+        for item in documents:
+            if not isinstance(item, dict):
+                continue
+            item = dict(item)
+            item["metadata"] = item.pop("metadata", item.pop("metadata_json", {}))
+            batch.append(item)
+            if len(batch) >= batch_size:
+                result = self.ingest(batch)
+                total += result["created"] + result["updated"]
+                batch = []
+        if batch:
+            result = self.ingest(batch)
+            total += result["created"] + result["updated"]
+        return total
+
     def restore(self, path: Path) -> int:
         if not path.exists():
             return 0
-        docs = []
-        with path.open(encoding="utf-8") as f:
-            for line in f:
-                if line.strip():
-                    d = json.loads(line)
-                    d["metadata"] = d.pop("metadata", {})
-                    docs.append(d)
-        result = self.ingest(docs)
-        return result["created"] + result["updated"]
+        opener = gzip.open if path.suffix == ".gz" else open
+        def rows():
+            with opener(path, "rt", encoding="utf-8") as f:
+                for line in f:
+                    if line.strip():
+                        yield json.loads(line)
+        return self.restore_documents(rows())
 
 
 class Translator:
@@ -402,12 +454,16 @@ class SnapshotSync:
         # Without this lock, concurrent /sync requests can upload an older
         # snapshot after a newer one and roll the durable dataset backwards.
         self.upload_lock = threading.Lock()
-        self.repo = os.getenv("FUNES_STORAGE_REPO", "")
+        self.repo = os.getenv("FUNES_STORAGE_REPO") or os.getenv("FUNES_MEMORY", "")
         self.token = os.getenv("HF_TOKEN", "")
         self.filename = os.getenv("FUNES_SNAPSHOT_FILE", "funes-snapshot.jsonl")
+        self.prefix = os.getenv("FUNES_SNAPSHOT_PREFIX", "funes-snapshot-")
+        self.delta_prefix = os.getenv("FUNES_DELTA_PREFIX", "funes-delta-")
+        self.restore_batch = max(50, int(os.getenv("FUNES_RESTORE_BATCH", "500")))
         self.restore_failed = False
         self.restore_error = None
         self.restored = False
+        self.restoring = False
 
     @staticmethod
     def _truth(name: str, default: bool = False) -> bool:
@@ -424,12 +480,49 @@ class SnapshotSync:
     def snapshot_path(self) -> Path:
         return self.store.data_dir / self.filename
 
+    def _repo_files(self) -> list[str]:
+        """List snapshot and delta objects without exposing repository contents."""
+        from huggingface_hub import HfApi
+        api = HfApi(token=self.token)
+        files = []
+        for item in api.list_repo_tree(self.repo, repo_type="dataset", recursive=True, token=self.token):
+            name = getattr(item, "path", "")
+            if name == self.filename or name.startswith(self.prefix) or name.startswith(self.delta_prefix):
+                if name.endswith((".jsonl", ".jsonl.gz")):
+                    files.append(name)
+        snapshots = sorted(name for name in files if name == self.filename or name.startswith(self.prefix))
+        deltas = sorted(name for name in files if name.startswith(self.delta_prefix))
+        return snapshots + deltas
+
+    def _restore_file(self, filename: str) -> int:
+        from huggingface_hub import hf_hub_download
+        downloaded = hf_hub_download(
+            repo_id=self.repo,
+            repo_type="dataset",
+            filename=filename,
+            token=self.token,
+            local_dir=str(self.store.data_dir / "remote"),
+        )
+        return self.store.restore_documents(self._iter_file(Path(downloaded)), self.restore_batch)
+
+    @staticmethod
+    def _iter_file(path: Path):
+        opener = gzip.open if path.suffix == ".gz" else open
+        with opener(path, "rt", encoding="utf-8") as stream:
+            for line in stream:
+                if line.strip():
+                    yield json.loads(line)
+
     def restore(self) -> int:
         if self.repo and self.token:
             try:
-                from huggingface_hub import hf_hub_download
-                downloaded = hf_hub_download(repo_id=self.repo, repo_type="dataset", filename=self.filename, token=self.token, local_dir=str(self.store.data_dir))
-                restored = self.store.restore(Path(downloaded))
+                files = self._repo_files()
+                if not files:
+                    # Backwards-compatible single-file snapshot lookup.
+                    files = [self.filename]
+                restored = 0
+                for filename in files:
+                    restored += self._restore_file(filename)
                 self.restored = True
                 return restored
             except Exception as exc:  # optional recovery must never stop serving
@@ -460,7 +553,7 @@ class SnapshotSync:
             return False, "secret_scanner_unavailable"
         try:
             result = subprocess.run(
-                [binary, "filesystem", str(path.parent), "--json", "--no-verification",
+                [binary, "filesystem", str(path), "--json", "--no-verification",
                  "--no-update", "--fail", "--fail-on-scan-errors",
                  "--results=verified,unknown,unverified"],
                 stdout=subprocess.DEVNULL,
@@ -472,12 +565,30 @@ class SnapshotSync:
             return False, "secret_scan_error"
         return (result.returncode == 0), ("clean" if result.returncode == 0 else "secret_detected")
 
-    def upload(self) -> dict[str, Any]:
+    def _write_jsonl_gzip(self, docs: list[dict[str, Any]], path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with gzip.open(path, "wt", encoding="utf-8", compresslevel=6) as stream:
+            for doc in docs:
+                stream.write(json.dumps(doc, ensure_ascii=False, separators=(",", ":")))
+                stream.write("\n")
+
+    def upload(self, docs: list[dict[str, Any]] | None = None) -> dict[str, Any]:
         with self.upload_lock:
             if self.restore_failed:
                 return {"uploaded": False, "durable": False, "reason": "restore_failed"}
-            path = self.snapshot_path()
-            self.store.snapshot(path)
+            # Normal ingest uses an immutable, content-addressed delta.  This
+            # avoids rewriting a multi-gigabyte snapshot for every new turn and
+            # makes retries idempotent.  `/sync` without documents still emits a
+            # compact full snapshot for operators.
+            if docs is not None:
+                digest = hashlib.sha256(json.dumps(docs, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:24]
+                # Timestamp gives restart restore a deterministic causal order;
+                # the digest suffix keeps retries identifiable in diagnostics.
+                path = self.store.data_dir / f"{self.delta_prefix}{time.time_ns()}-{digest}.jsonl.gz"
+                self._write_jsonl_gzip(docs, path)
+            else:
+                path = self.snapshot_path()
+                self.store.snapshot(path)
             if not self.repo or not self.token:
                 self.store.set_sync(last_sync=utc_now(), snapshot_path=str(path), last_error=None)
                 if self._truth("FUNES_REQUIRE_DURABLE_ACK"):
@@ -489,7 +600,10 @@ class SnapshotSync:
                 return {"uploaded": False, "durable": False, "path": str(path), "reason": gate_reason}
             try:
                 from huggingface_hub import HfApi
-                HfApi(token=self.token).upload_file(path_or_fileobj=str(path), path_in_repo=self.filename, repo_id=self.repo, repo_type="dataset", commit_message="funes snapshot")
+                target = path.name if docs is not None else self.filename
+                HfApi(token=self.token).upload_file(path_or_fileobj=str(path), path_in_repo=target, repo_id=self.repo, repo_type="dataset", commit_message="funes durable memory delta" if docs is not None else "funes snapshot")
+                if docs is not None:
+                    path.unlink(missing_ok=True)
                 self.store.set_sync(last_sync=utc_now(), snapshot_path=str(path), last_error=None)
                 return {"uploaded": True, "durable": True, "path": str(path)}
             except Exception as exc:
@@ -505,10 +619,24 @@ class App:
         self.store = Store(os.getenv("FUNES_DATA_DIR", "/tmp/funes-data"))
         self.translator = Translator(self.store)
         self.syncer = SnapshotSync(self.store)
-        self.restore_result = self.syncer.restore()
-        # FTS5 external-content tables need an explicit rebuild after restoring
-        # rows from a JSONL snapshot (the insert triggers only cover new writes).
-        self.store.reindex()
+        self.restore_result = 0
+        self.restore_done = threading.Event()
+        if os.getenv("FUNES_LAZY_RESTORE", "false").lower() in {"1", "true", "yes", "on"}:
+            self.syncer.restoring = True
+            threading.Thread(target=self._restore_background, name="funes-restore", daemon=True).start()
+        else:
+            self._restore_background()
+
+    def _restore_background(self) -> None:
+        try:
+            self.restore_result = self.syncer.restore()
+            if not self.syncer.restore_failed:
+                # FTS5 external-content tables need an explicit rebuild after
+                # restoring rows from a JSONL snapshot.
+                self.store.reindex()
+        finally:
+            self.syncer.restoring = False
+            self.restore_done.set()
 
     def close(self):
         self.store.close()
@@ -538,7 +666,7 @@ def make_handler(app: App):
             if not token:
                 self._json(503, {"error": "auth_not_configured"})
                 return False
-            supplied = self.headers.get("Authorization", "")
+            supplied = self.headers.get("X-Funes-Authorization", "") or self.headers.get("Authorization", "")
             if supplied != "Bearer " + token:
                 self._json(401, {"error": "unauthorized"})
                 return False
@@ -569,6 +697,8 @@ def make_handler(app: App):
                 return self._json(200, {"status": "ok", "service": "funes"})
             if route == "/ready":
                 try:
+                    if app.syncer.restoring:
+                        return self._json(503, {"status": "restoring"})
                     if app.syncer.restore_failed:
                         return self._json(503, {"status": "not_ready", "error": "restore_failed"})
                     count = app.store.count()
@@ -594,8 +724,8 @@ def make_handler(app: App):
             try:
                 body = self._body()
                 if self.path == "/ingest":
-                    if app.syncer.restore_failed:
-                        return self._json(503, {"error": "restore_failed", "durable": False})
+                    if app.syncer.restoring or app.syncer.restore_failed:
+                        return self._json(503, {"error": "restore_in_progress" if app.syncer.restoring else "restore_failed", "durable": False})
                     docs = body.get("documents", body.get("records", body.get("items")))
                     if docs is None:
                         docs = [body]
@@ -621,11 +751,13 @@ def make_handler(app: App):
                     # A remote caller must not receive an ACK that can be lost
                     # between SQLite commit and HF persistence.  The upload is
                     # idempotent; retrying the same source identities is safe.
-                    result["sync"] = app.syncer.upload()
+                    result["sync"] = app.syncer.upload(prepared)
                     if not result["sync"].get("durable"):
                         return self._json(503, {"error": "durability_pending", **result})
                     return self._json(200, result)
                 if self.path in ("/search", "/recall"):
+                    if app.syncer.restoring:
+                        return self._json(503, {"error": "restore_in_progress", "results": []})
                     query = normalize_text(str(body.get("query", body.get("q", ""))))
                     if not query:
                         raise ValueError("query is required")

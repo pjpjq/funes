@@ -49,7 +49,10 @@ def render_plist(python=None):
     python=python or os.environ.get("PYTHON", sys.executable)
     root=Path(__file__).resolve().parents[1]
     launcher=root / "bin" / "funes-sync"
-    env={"PYTHONPATH":str(root)}
+    # launchd does not guarantee that HOME/USER are inherited for a GUI
+    # LaunchAgent.  The launcher uses both values when resolving the login
+    # Keychain, so make the lookup deterministic without persisting secrets.
+    env={"PYTHONPATH":str(root), "HOME":str(Path.home()), "USER":os.environ.get("USER") or str(os.getuid())}
     # The launcher loads FUNES_API_TOKEN from macOS Keychain at runtime; never
     # persist the bearer token in a world-readable plist.
     for key in (

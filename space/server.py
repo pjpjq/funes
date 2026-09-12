@@ -424,6 +424,7 @@ def canonical_source_version(item: dict) -> str:
         str(item.get("translation_version", "")),
         retrieval_hash,
         "1" if item.get("source_missing") else "0",
+        str(int(item.get("native_generation") or 0)),
     ]
     encoded = json.dumps(parts, ensure_ascii=False, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()

@@ -199,6 +199,7 @@ class Store:
                     generation INTEGER PRIMARY KEY,
                     scope TEXT NOT NULL,
                     created_at TEXT NOT NULL,
+                    row_cursor INTEGER NOT NULL DEFAULT 0,
                     applied_at TEXT
                 );
                 """
@@ -227,6 +228,14 @@ class Store:
             for name in ("translation_hash", "translation_version", "translation_status"):
                 if name not in cache_columns:
                     self.conn.execute(f"ALTER TABLE translation_cache ADD COLUMN {name} TEXT")
+            control_columns = {
+                row[1] for row in self.conn.execute("PRAGMA table_info(reindex_controls)")
+            }
+            if "row_cursor" not in control_columns:
+                self.conn.execute(
+                    """ALTER TABLE reindex_controls ADD COLUMN row_cursor
+                    INTEGER NOT NULL DEFAULT 0"""
+                )
 
     def close(self) -> None:
         with self.lock:
@@ -557,7 +566,9 @@ class Store:
             "created_at": utc_now(),
         }
 
-    def record_reindex_control(self, control: dict[str, Any]) -> bool:
+    def record_reindex_control(
+        self, control: dict[str, Any], *, replay_applied: bool = False
+    ) -> bool:
         scope = str(control.get("scope", ""))
         generation = int(control.get("generation", 0))
         created_at = str(control.get("created_at") or utc_now())
@@ -566,24 +577,28 @@ class Store:
         with self.lock, self.conn:
             cursor = self.conn.execute(
                 """INSERT OR IGNORE INTO reindex_controls(
-                generation, scope, created_at, applied_at
-                ) VALUES(?,?,?,NULL)""",
+                generation, scope, created_at, row_cursor, applied_at
+                ) VALUES(?,?,?,0,NULL)""",
                 (generation, scope, created_at),
             )
+            if not cursor.rowcount and replay_applied:
+                # Remote restore may add legacy deltas after a control that was
+                # already completed locally. Replay only completed controls;
+                # an interrupted control keeps its durable row cursor.
+                self.conn.execute(
+                    """UPDATE reindex_controls SET row_cursor=0, applied_at=NULL
+                    WHERE generation=? AND applied_at IS NOT NULL""",
+                    (generation,),
+                )
             return cursor.rowcount == 1
 
     @staticmethod
     def _provider_reindex_eligible(item: dict[str, Any]) -> bool:
         source_type = str(item.get("source_type") or "").lower()
         content_type = str(item.get("content_type") or "").lower()
-        status = str(item.get("translation_status") or "")
         return (
             source_type not in NATIVE_SESSION_TYPES
             and content_type not in LOW_VALUE_CONTENT_TYPES
-            and status not in {
-                "skipped_non_cjk", "skipped_raw_mode", "skipped_native_session",
-                "skipped_low_value",
-            }
         )
 
     @staticmethod
@@ -594,77 +609,106 @@ class Store:
             not in LOW_VALUE_CONTENT_TYPES
         )
 
-    def apply_pending_reindex_controls(
-        self, limit: int = 1, *, replay: bool = False
-    ) -> dict[str, int]:
-        """Apply a bounded control batch without changing raw source truth."""
-        applied = retrieval_reset = native_reset = 0
+    def apply_pending_reindex_controls(self, batch_size: int = 500) -> dict[str, int]:
+        """Apply one restart-safe row batch without changing raw source truth."""
+        applied = retrieval_reset = native_reset = scanned = 0
         with self.lock, self.conn:
-            where = "" if replay else "WHERE applied_at IS NULL"
-            controls = self.conn.execute(
-                f"""SELECT generation, scope FROM reindex_controls
-                {where} ORDER BY generation LIMIT ?""",
-                (max(1, int(limit)),),
+            control = self.conn.execute(
+                """SELECT generation, scope, row_cursor FROM reindex_controls
+                WHERE applied_at IS NULL ORDER BY generation LIMIT 1"""
+            ).fetchone()
+            if control is None:
+                return {
+                    "applied": 0,
+                    "scanned": 0,
+                    "retrieval_reset": 0,
+                    "native_reset": 0,
+                }
+            generation = int(control["generation"])
+            scope = str(control["scope"])
+            row_cursor = int(control["row_cursor"] or 0)
+            rows = self.conn.execute(
+                "SELECT * FROM memories WHERE id>? ORDER BY id LIMIT ?",
+                (row_cursor, max(1, int(batch_size))),
             ).fetchall()
-            for control in controls:
-                generation = int(control["generation"])
-                scope = str(control["scope"])
-                rows = self.conn.execute("SELECT * FROM memories ORDER BY id").fetchall()
-                for row in rows:
-                    item = dict(row)
-                    retrieval_generation = int(item.get("retrieval_generation") or 0)
-                    native_generation = int(item.get("native_generation") or 0)
-                    retrieval_values = (
-                        item.get("retrieval_text"), item.get("translation_hash"),
-                        item.get("translation_version"), item.get("translation_status"),
-                        item.get("retrieval_updated_at"),
-                    )
-                    native_values = (
-                        item.get("native_index_version"), item.get("native_index_status"),
-                        item.get("native_indexed_at"), item.get("native_index_error"),
-                    )
-                    if generation > retrieval_generation:
-                        retrieval_generation = generation
-                        if self._provider_reindex_eligible(item):
-                            retrieval_values = (
-                                item["raw_text"], None, PROMPT_VERSION,
-                                "pending_provider", None,
-                            )
-                            retrieval_reset += 1
-                            if generation > native_generation:
-                                native_generation = generation
-                                if item.get("native_index_status") != "waiting_durability":
-                                    native_values = (None, None, None, None)
-                                    native_reset += 1
-                    if scope == "all" and generation > native_generation:
-                        native_generation = generation
-                        if (
-                            self._canonical_reindex_eligible(item)
-                            and item.get("native_index_status") != "waiting_durability"
-                        ):
-                            native_values = (None, None, None, None)
-                            native_reset += 1
-                    self.conn.execute(
-                        """UPDATE memories SET retrieval_text=?, translation_hash=?,
-                        translation_version=?, translation_status=?, retrieval_updated_at=?,
-                        retrieval_generation=?, native_index_version=?, native_index_status=?,
-                        native_indexed_at=?, native_index_error=?, native_generation=?
-                        WHERE id=?""",
-                        (
-                            *retrieval_values, retrieval_generation, *native_values,
-                            native_generation, row["id"],
-                        ),
-                    )
+            for row in rows:
+                item = dict(row)
+                retrieval_generation = int(item.get("retrieval_generation") or 0)
+                native_generation = int(item.get("native_generation") or 0)
+                retrieval_values = (
+                    item.get("retrieval_text"), item.get("translation_hash"),
+                    item.get("translation_version"), item.get("translation_status"),
+                    item.get("retrieval_updated_at"),
+                )
+                native_values = (
+                    item.get("native_index_version"), item.get("native_index_status"),
+                    item.get("native_indexed_at"), item.get("native_index_error"),
+                )
+                if generation > retrieval_generation:
+                    retrieval_generation = generation
+                    if self._provider_reindex_eligible(item):
+                        retrieval_values = (
+                            item["raw_text"], None, PROMPT_VERSION,
+                            "pending_provider", None,
+                        )
+                        retrieval_reset += 1
+                        if generation > native_generation:
+                            native_generation = generation
+                            if item.get("native_index_status") != "waiting_durability":
+                                native_values = (None, None, None, None)
+                                native_reset += 1
+                if scope == "all" and generation > native_generation:
+                    native_generation = generation
+                    if (
+                        self._canonical_reindex_eligible(item)
+                        and item.get("native_index_status") != "waiting_durability"
+                    ):
+                        native_values = (None, None, None, None)
+                        native_reset += 1
                 self.conn.execute(
-                    "UPDATE reindex_controls SET applied_at=? WHERE generation=?",
-                    (utc_now(), generation),
+                    """UPDATE memories SET retrieval_text=?, translation_hash=?,
+                    translation_version=?, translation_status=?, retrieval_updated_at=?,
+                    retrieval_generation=?, native_index_version=?, native_index_status=?,
+                    native_indexed_at=?, native_index_error=?, native_generation=?
+                    WHERE id=?""",
+                    (
+                        *retrieval_values, retrieval_generation, *native_values,
+                        native_generation, row["id"],
+                    ),
+                )
+            scanned = len(rows)
+            next_cursor = int(rows[-1]["id"]) if rows else row_cursor
+            has_more = self.conn.execute(
+                "SELECT 1 FROM memories WHERE id>? LIMIT 1", (next_cursor,)
+            ).fetchone()
+            if has_more is None:
+                self.conn.execute(
+                    """UPDATE reindex_controls SET row_cursor=?, applied_at=?
+                    WHERE generation=?""",
+                    (next_cursor, utc_now(), generation),
                 )
                 applied += 1
+            else:
+                self.conn.execute(
+                    "UPDATE reindex_controls SET row_cursor=? WHERE generation=?",
+                    (next_cursor, generation),
+                )
         return {
             "applied": applied,
+            "scanned": scanned,
             "retrieval_reset": retrieval_reset,
             "native_reset": native_reset,
         }
+
+    def drain_reindex_controls(self, batch_size: int = 500) -> dict[str, int]:
+        """Drain controls using bounded transactions; intended for restore only."""
+        totals = {"applied": 0, "scanned": 0, "retrieval_reset": 0, "native_reset": 0}
+        while True:
+            result = self.apply_pending_reindex_controls(batch_size)
+            for name in totals:
+                totals[name] += result[name]
+            if not result["scanned"] and not result["applied"]:
+                return totals
 
     def canonical_index_candidates(self, limit: int) -> list[dict[str, Any]]:
         """Return final non-session retrieval shadows for native reconciliation."""
@@ -843,7 +887,9 @@ class Store:
         if batch:
             yield batch
 
-    def restore_documents(self, documents: Any, batch_size: int = 500) -> int:
+    def restore_documents(
+        self, documents: Any, batch_size: int = 500, *, apply_controls: bool = True
+    ) -> int:
         """Restore a stream without materialising a multi-gigabyte snapshot."""
         total = 0
         batch: list[dict[str, Any]] = []
@@ -857,7 +903,7 @@ class Store:
                     result = self.ingest(batch)
                     total += result["created"] + result["updated"]
                     batch = []
-                self.record_reindex_control(item)
+                self.record_reindex_control(item, replay_applied=not apply_controls)
                 continue
             if record_type == "translation_cache":
                 query = str(item.get("query", ""))
@@ -882,11 +928,11 @@ class Store:
         if batch:
             result = self.ingest(batch)
             total += result["created"] + result["updated"]
-        controls = max(1, self.latest_reindex_generation())
-        self.apply_pending_reindex_controls(controls, replay=True)
+        if apply_controls:
+            self.drain_reindex_controls(batch_size)
         return total
 
-    def restore(self, path: Path) -> int:
+    def restore(self, path: Path, *, apply_controls: bool = True) -> int:
         if not path.exists():
             return 0
         opener = gzip.open if path.name.endswith(".gz") else open
@@ -895,7 +941,7 @@ class Store:
                 for line in f:
                     if line.strip():
                         yield json.loads(line)
-        return self.restore_documents(rows())
+        return self.restore_documents(rows(), apply_controls=apply_controls)
 
 
 class Translator:
@@ -1128,11 +1174,15 @@ class SnapshotSync:
         if not filename.endswith(".enc"):
             if not self._truth("FUNES_ALLOW_PLAINTEXT_SOURCE_RESTORE"):
                 raise RuntimeError("plaintext source snapshot restore is disabled")
-            return self.store.restore_documents(self._iter_file(encrypted), self.restore_batch)
+            return self.store.restore_documents(
+                self._iter_file(encrypted), self.restore_batch, apply_controls=False
+            )
         with tempfile.TemporaryDirectory(prefix="funes-source-restore-") as directory:
             plaintext = Path(directory) / Path(filename).name.removesuffix(".enc")
             self._decrypt_file(encrypted, plaintext)
-            return self.store.restore_documents(self._iter_file(plaintext), self.restore_batch)
+            return self.store.restore_documents(
+                self._iter_file(plaintext), self.restore_batch, apply_controls=False
+            )
 
     @staticmethod
     def _iter_file(path: Path):
@@ -1152,6 +1202,7 @@ class SnapshotSync:
                 restored = 0
                 for filename in files:
                     restored += self._restore_file(filename)
+                self.store.drain_reindex_controls(self.restore_batch)
                 self.restored = True
                 return restored
             except Exception as exc:  # optional recovery must never stop serving
@@ -1165,7 +1216,8 @@ class SnapshotSync:
             self.restored = True
             return 0
         try:
-            restored = self.store.restore(local)
+            restored = self.store.restore(local, apply_controls=False)
+            self.store.drain_reindex_controls(self.restore_batch)
             self.restored = True
             return restored
         except Exception as exc:
@@ -1648,6 +1700,9 @@ class App:
         self.reindex_stop = threading.Event()
         self.reindex_wake = threading.Event()
         self.reindex_lock = threading.Lock()
+        self.reindex_batch_size = max(
+            1, int(os.getenv("FUNES_REINDEX_BATCH_SIZE", "500"))
+        )
         self.translation_lock = threading.Lock()
         self.reconcile_interval = max(0.01, float(os.getenv("TRANSLATION_RECONCILE_INTERVAL", "300")))
         self.restore_thread = None
@@ -1711,9 +1766,12 @@ class App:
     def _reindex_background(self) -> None:
         self.restore_done.wait()
         while not self.reindex_stop.is_set():
-            result = self.store.apply_pending_reindex_controls(1)
+            result = self.store.apply_pending_reindex_controls(
+                getattr(self, "reindex_batch_size", 500)
+            )
             if result["applied"]:
                 self.reconcile_wake.set()
+            if result["scanned"] or result["applied"]:
                 continue
             self.reindex_wake.wait(self.reconcile_interval)
             self.reindex_wake.clear()

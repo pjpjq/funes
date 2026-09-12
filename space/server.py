@@ -36,6 +36,44 @@ PROMPT_VERSION = "funes-retrieval-v1"
 LANGUAGE_MODE = os.getenv("FUNES_RETRIEVAL_LANGUAGE_MODE", "auto").lower()
 INDEX_LOCK = threading.Lock()
 
+# A remote Lance memory can take longer than the Space ingress timeout to open
+# on the first recall (model + snapshot + ANN/FTS handles).  Warm it in the
+# background at process start so the public search path is hot before an agent
+# asks its first question.  Keep only coarse state here: never expose child
+# stderr or query/source text in the readiness response.
+_WARM_STATE_LOCK = threading.Lock()
+_WARM_STATE = {
+    "state": "not_started",
+    "started_at": None,
+    "finished_at": None,
+}
+
+
+def warm_state() -> dict[str, object]:
+    with _WARM_STATE_LOCK:
+        return dict(_WARM_STATE)
+
+
+def _warm_native_memory() -> None:
+    started = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    with _WARM_STATE_LOCK:
+        _WARM_STATE.update(state="warming", started_at=started, finished_at=None)
+    try:
+        # A minimal recall initializes the same remote dataset, embedding model,
+        # text index, and reranker used by real requests.  It is intentionally
+        # run outside the HTTP request lifecycle.
+        with INDEX_LOCK:
+            native_worker().recall("memory", k=1, candidates=1, half_life=0, neighbors=0)
+    except Exception:
+        # Readiness remains useful when a provider/HF endpoint is temporarily
+        # unavailable; the next request will retry through the normal worker
+        # recovery path.  Do not retain or emit exception text.
+        state = "error"
+    else:
+        state = "ready"
+    with _WARM_STATE_LOCK:
+        _WARM_STATE.update(state=state, finished_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+
 # The default Funes embedding model is English-oriented.  Keep this small,
 # deterministic fallback for installations without a translation provider so
 # Chinese queries do not enter the slow CJK tokenizer path.  Technical names
@@ -533,7 +571,16 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(503, {"ok": False, "error": "FUNES_MEMORY is not configured"})
                 return
             code, out, err = run("status", REMOTE, timeout=30)
-            self.send_json(200 if code == 0 else 503, {"ok": code == 0, "remote": REMOTE, "status": out[-2000:], "error": err[-500:]})
+            self.send_json(
+                200 if code == 0 else 503,
+                {
+                    "ok": code == 0,
+                    "remote": REMOTE,
+                    "status": out[-2000:],
+                    "error": err[-500:],
+                    "native_warm": warm_state(),
+                },
+            )
             return
         self.send_json(404, {"error": "not found"})
 
@@ -665,6 +712,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def serve(host: str = "0.0.0.0", port: int = PORT) -> None:
     (HOME / "sources").mkdir(parents=True, exist_ok=True)
+    threading.Thread(target=_warm_native_memory, name="funes-native-warm", daemon=True).start()
     ThreadingHTTPServer((host, port), Handler).serve_forever()
 
 

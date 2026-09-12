@@ -21,8 +21,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from service.server import App as SourceApp
-from service.server import PROMPT_VERSION as SOURCE_PROMPT_VERSION
-from service.server import normalize_text as normalize_source_text
+from service.server import ingest_documents as persist_source_ingest
+from service.server import prepare_ingest_documents as prepare_source_ingest_documents
 
 
 FUNES_BIN = os.getenv("FUNES_BIN", "/usr/local/bin/funes")
@@ -66,6 +66,7 @@ def source_app():
         if SOURCE_APP is None:
             os.environ.setdefault("FUNES_DATA_DIR", str(HOME / "source-store"))
             os.environ.setdefault("FUNES_LAZY_RESTORE", "true")
+            os.environ.setdefault("FUNES_REQUIRE_DURABLE_ACK", "true")
             SOURCE_APP = SourceApp()
     return SOURCE_APP
 
@@ -100,71 +101,8 @@ def close_source_app() -> None:
 
 
 def prepare_source_documents(app, docs: list[dict]) -> list[dict]:
-    """Add retrieval shadows without translating an already-cached good revision again."""
-    prepared = []
-    pending_indexes = []
-    pending_raws = []
-    for index, doc in enumerate(docs):
-        item = dict(doc)
-        raw = str(item.get("raw_text", item.get("text", "")))
-        source_type = str(item.get("source_type", item.get("kind", ""))).lower()
-        content_type = str(item.get("content_type", "")).lower()
-        native_session = source_type in {
-            "session",
-            "codex",
-            "codex_session",
-            "pi",
-            "pi_session",
-            "claude",
-            "claude_session",
-        }
-        low_value = content_type in {
-            "tool_call",
-            "tool_result",
-            "shell_output",
-            "progress",
-        }
-        if (native_session or low_value) and not item.get("retrieval_text"):
-            item["retrieval_text"] = normalize_source_text(raw)
-            item.setdefault(
-                "translation_hash",
-                hashlib.sha256((raw + app.translator.model + SOURCE_PROMPT_VERSION).encode("utf-8")).hexdigest(),
-            )
-            item.setdefault("translation_version", SOURCE_PROMPT_VERSION)
-            item.setdefault(
-                "translation_status",
-                "skipped_native_session" if native_session else "skipped_low_value",
-            )
-        identity = str(item.get("source_identity", ""))
-        existing = app.store.get(identity) if identity else None
-        same_content = bool(
-            existing
-            and existing.get("content_hash") == hashlib.sha256(raw.encode("utf-8")).hexdigest()
-            and existing.get("translation_status") in {
-                "ok",
-                "skipped_non_cjk",
-                "skipped_raw_mode",
-                "skipped_native_session",
-                "skipped_low_value",
-            }
-        )
-        if same_content and not item.get("retrieval_text"):
-            item["retrieval_text"] = existing.get("retrieval_text") or raw
-            for name in ("translation_hash", "translation_version", "translation_status"):
-                if existing.get(name) is not None:
-                    item.setdefault(name, existing[name])
-        elif not item.get("retrieval_text"):
-            pending_indexes.append(index)
-            pending_raws.append(raw)
-        prepared.append(item)
-    if pending_raws:
-        for index, derived in zip(pending_indexes, app.translator.normalize_many(pending_raws)):
-            shadow, translation_hash, translation_version, translation_status = derived
-            prepared[index]["retrieval_text"] = shadow
-            prepared[index].setdefault("translation_hash", translation_hash)
-            prepared[index].setdefault("translation_version", translation_version)
-            prepared[index].setdefault("translation_status", translation_status)
-    return prepared
+    """Build the durable raw-first representation without provider I/O."""
+    return prepare_source_ingest_documents(app, docs)
 
 
 def ingest_source_documents(docs: list[dict]) -> tuple[int, dict, list[dict]] | None:
@@ -174,19 +112,10 @@ def ingest_source_documents(docs: list[dict]) -> tuple[int, dict, list[dict]] | 
     if app.syncer.restoring or app.syncer.restore_failed:
         error = "restore_in_progress" if app.syncer.restoring else "restore_failed"
         return 503, {"ok": False, "durable": False, "error": error}, []
-    prepared = prepare_source_documents(app, docs)
-    result = app.store.ingest(prepared)
+    result = persist_source_ingest(app, docs)
     identities = [str(item.get("source_identity", "")) for item in result["items"]]
     canonical = app.store.get_many(identities)
-    durable = app.syncer.upload(canonical)
-    result.update(
-        ok=bool(durable.get("durable")),
-        durable=bool(durable.get("durable")),
-        accepted=result["created"] + result["updated"] + result["deduped"],
-        sync=durable,
-    )
-    if not result["durable"]:
-        result["error"] = "durability_pending"
+    result["ok"] = bool(result["durable"])
     return (200 if result["durable"] else 503), result, canonical
 
 

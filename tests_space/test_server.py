@@ -1,5 +1,6 @@
 import json
 import threading
+import time
 from collections import deque
 from http.client import HTTPConnection
 from http.server import ThreadingHTTPServer
@@ -9,6 +10,7 @@ from types import SimpleNamespace
 import pytest
 
 import space.server as bridge
+from service.server import persist_translation_documents
 from service.server import Store as SourceStore
 
 
@@ -514,6 +516,10 @@ def test_ingest_preserves_source_metadata_and_timestamp(monkeypatch, tmp_path):
 
 class _SourceTranslator:
     model = "test-model"
+    max_per_ingest = 16
+
+    def pending_document(self, raw):
+        return raw, "translation-hash", "translation-version", "pending_provider"
 
     def normalize_many(self, raws):
         return [
@@ -634,7 +640,9 @@ def test_source_sidecar_updates_in_place_and_returns_only_raw_text(monkeypatch, 
     assert status == status2 == search_status == get_status == 200
     assert first["created"] == 1
     assert second["updated"] == 1
-    assert len(app.syncer.uploads) == 2
+    assert len(app.syncer.uploads) == 4
+    assert app.syncer.uploads[0][0]["translation_status"] == "pending_provider"
+    assert app.syncer.uploads[1][0]["translation_status"] == "ok"
     assert app.syncer.uploads[-1][0]["raw_text"] == "新的中文正文"
     assert found["results"][0]["raw_text"] == "新的中文正文"
     assert "retrieval_text" not in found["results"][0]
@@ -663,3 +671,138 @@ def test_source_sidecar_does_not_ack_before_encrypted_durability(monkeypatch, tm
     assert status == 503
     assert body["durable"] is False
     assert body["error"] == "durability_pending"
+
+
+def test_ingest_limits_synchronous_provider_work_and_persists_all_raw_first(tmp_path):
+    class LimitedTranslator:
+        model = "test-model"
+        max_per_ingest = 2
+
+        def __init__(self):
+            self.calls = []
+
+        def pending_document(self, raw):
+            return raw, "pending-hash", "translation-version", "pending_provider"
+
+        def normalize_many(self, raws):
+            self.calls.extend(raws)
+            return [
+                (f"{raw} english-shadow", "translated-hash", "translation-version", "ok")
+                for raw in raws
+            ]
+
+    translator = LimitedTranslator()
+    app = SimpleNamespace(
+        store=SourceStore(str(tmp_path / "limited-store")),
+        translator=translator,
+        syncer=_SourceSyncer(),
+    )
+    docs = [
+        {"source_identity": f"doc-{index}", "raw_text": f"中文正文 {index}"}
+        for index in range(5)
+    ]
+    try:
+        result = bridge.persist_source_ingest(app, docs)
+        stored = [app.store.get(f"doc-{index}") for index in range(5)]
+    finally:
+        app.store.close()
+    assert result["durable"] is True
+    assert result["translation"]["attempted"] == 2
+    assert translator.calls == ["中文正文 0", "中文正文 1"]
+    assert len(app.syncer.uploads[0]) == 5
+    assert {item["translation_status"] for item in app.syncer.uploads[0]} == {"pending_provider"}
+    assert [item["translation_status"] for item in stored] == [
+        "ok",
+        "ok",
+        "pending_provider",
+        "pending_provider",
+        "pending_provider",
+    ]
+
+
+def test_pending_translation_survives_restore_and_reconciles_in_place(tmp_path):
+    source = SourceStore(str(tmp_path / "before-restart"))
+    source.ingest(
+        [{
+            "source_identity": "restart-doc",
+            "source_version": "v1",
+            "raw_text": "重启后恢复",
+            "retrieval_text": "重启后恢复",
+            "translation_hash": "pending-hash",
+            "translation_version": "translation-version",
+            "translation_status": "pending_provider",
+        }]
+    )
+    snapshot = tmp_path / "restart.jsonl.gz"
+    source.snapshot(snapshot)
+    source.close()
+
+    restored = SourceStore(str(tmp_path / "after-restart"))
+    restored.restore(snapshot)
+
+    class SuccessfulTranslator(_SourceTranslator):
+        batch_size = 1
+        concurrency = 1
+
+    app = bridge.SourceApp.__new__(bridge.SourceApp)
+    app.store = restored
+    app.translator = SuccessfulTranslator()
+    app.syncer = _SourceSyncer()
+    app.restore_done = threading.Event()
+    app.restore_done.set()
+    app.reconcile_stop = threading.Event()
+    app.reconcile_interval = 0.01
+    app.translation_lock = threading.Lock()
+    app.restore_thread = None
+    app.reconcile_thread = threading.Thread(target=app._reconcile_background, daemon=True)
+    app.reconcile_thread.start()
+    try:
+        deadline = time.monotonic() + 1
+        item = restored.get("restart-doc")
+        while item["translation_status"] != "ok" and time.monotonic() < deadline:
+            time.sleep(0.01)
+            item = restored.get("restart-doc")
+    finally:
+        app.close()
+    assert item["raw_text"] == "重启后恢复"
+    assert item["retrieval_text"] == "english retrieval needle"
+    assert item["translation_status"] == "ok"
+
+
+def test_provider_failure_stays_pending_and_later_retry_succeeds(tmp_path):
+    class RetryTranslator(_SourceTranslator):
+        max_per_ingest = 0
+
+        def __init__(self):
+            self.fail = True
+
+        def normalize_many(self, raws):
+            if self.fail:
+                raise RuntimeError("provider unavailable")
+            return super().normalize_many(raws)
+
+    translator = RetryTranslator()
+    app = SimpleNamespace(
+        store=SourceStore(str(tmp_path / "retry-store")),
+        translator=translator,
+        syncer=_SourceSyncer(),
+    )
+    try:
+        bridge.persist_source_ingest(
+            app,
+            [{"source_identity": "retry-doc", "raw_text": "失败后重试"}],
+        )
+        pending = app.store.pending_translations(1)
+        first = persist_translation_documents(app, pending)
+        translator.fail = False
+        second = persist_translation_documents(
+            app,
+            app.store.pending_translations(1),
+        )
+        item = app.store.get("retry-doc")
+    finally:
+        app.store.close()
+    assert first["updated"] == 0
+    assert second["updated"] == 1
+    assert item["raw_text"] == "失败后重试"
+    assert item["translation_status"] == "ok"

@@ -23,5 +23,7 @@ def test_store_dedupe_queue(tmp_path):
     from sync.discovery import Source
     src=Source('pi:~/x','pi',p,'d'); chunks=parse_file(src); assert s.upsert_chunks(chunks)==1; assert s.upsert_chunks(chunks)==1; assert s.stats()['pending']==1; s.ack([chunks[0].record_id]); assert s.stats()['pending']==0
 
-def test_launchagent():
+def test_launchagent(monkeypatch):
+    monkeypatch.setenv("FUNES_API_TOKEN", "redacted-test-token")
     d=render_plist('/usr/bin/python3'); assert d['Label']=='com.funes.sync'; assert d['RunAtLoad']
+    assert "FUNES_API_TOKEN" not in d["EnvironmentVariables"]

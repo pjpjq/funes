@@ -12,7 +12,7 @@ class Config:
     home: Path
     state_dir: Path
     config_path: Path
-    remote_url: str = "http://127.0.0.1:8080"
+    remote_url: str = "http://127.0.0.1:7860"
     interval: int = 300
     batch_size: int = 50
     concurrency: int = 2
@@ -47,7 +47,7 @@ class Config:
             section = data
         truth=lambda v: str(v).lower() not in ("0", "false", "no", "off")
         return cls(home, Path(os.environ.get("FUNES_STATE_DIR", home / ".local/share/funes-sync")).expanduser(), cfg,
-                   os.environ.get("FUNES_REMOTE_URL", remote.get("url", section.get("remote_url", "http://127.0.0.1:8080"))),
+                   os.environ.get("FUNES_REMOTE_URL", remote.get("url", section.get("remote_url", "http://127.0.0.1:7860"))),
                    int(os.environ.get("FUNES_SYNC_INTERVAL", section.get("interval", 300))),
                    int(os.environ.get("FUNES_SYNC_BATCH", section.get("batch_size", 50))),
                    int(os.environ.get("FUNES_SYNC_CONCURRENCY", section.get("concurrency", 2))),

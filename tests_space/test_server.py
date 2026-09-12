@@ -103,35 +103,19 @@ def test_mixed_english_query_is_left_unchanged(monkeypatch):
     assert bridge.query_text(query) == query
 
 
-def test_translation_provider_accepts_base_url_with_or_without_v1(monkeypatch):
-    seen = []
-
-    class Response:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_):
-            return False
-
-        def read(self):
-            return b'{"choices":[{"message":{"content":"context loss CPA"}}]}'
-
-    def fake_urlopen(request, timeout):
-        seen.append(request.full_url)
-        return Response()
-
+def test_query_text_is_deterministic_and_never_calls_provider(monkeypatch):
     monkeypatch.setattr(bridge, "LANGUAGE_MODE", "translate")
     monkeypatch.setenv("TRANSLATION_API_KEY", "test-key")
     monkeypatch.setenv("TRANSLATION_MODEL", "test-model")
-    monkeypatch.setattr(bridge.urllib.request, "urlopen", fake_urlopen)
-    monkeypatch.setenv("TRANSLATION_BASE_URL", "https://provider.example/v1")
-    assert bridge.query_text("中文 CPA 问题").startswith("context loss CPA")
     monkeypatch.setenv("TRANSLATION_BASE_URL", "https://provider.example")
-    assert bridge.query_text("中文 CPA 问题").startswith("context loss CPA")
-    assert seen == [
-        "https://provider.example/v1/chat/completions",
-        "https://provider.example/v1/chat/completions",
-    ]
+    monkeypatch.setattr(
+        bridge.urllib.request,
+        "urlopen",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("deterministic fallback must not call the provider")
+        ),
+    )
+    assert bridge.query_text("中文 CPA 问题") == "CPA"
 
 
 def test_native_mcp_worker_reuses_child_and_passes_hf_environment(monkeypatch, tmp_path):
@@ -539,7 +523,7 @@ class _SourceTranslator:
             for _raw in raws
         ]
 
-    def rewrite(self, query):
+    def rewrite_query(self, query):
         return query
 
 
@@ -1102,7 +1086,13 @@ def test_restart_restores_pending_canonical_and_indexes_it(monkeypatch, tmp_path
 
 def test_native_rank_maps_canonical_to_raw_and_forwards_facets(monkeypatch, tmp_path):
     app = _source_app(tmp_path)
-    app.translator.rewrite = lambda _query: "PROVIDER REWRITE"
+    provider_calls = []
+
+    def rewrite_query(query):
+        provider_calls.append(query)
+        return "PROVIDER REWRITE"
+
+    app.translator.rewrite_query = rewrite_query
     _canonical_source(
         app.store,
         "canonical id",
@@ -1158,10 +1148,145 @@ def test_native_rank_maps_canonical_to_raw_and_forwards_facets(monkeypatch, tmp_
     assert body["results"][0]["raw_text"] == "原始 sidecar 正文"
     assert "retrieval_text" not in body["results"][0]
     assert "CANONICAL ENGLISH SHADOW" not in body["results_text"]
+    assert provider_calls == ["english retrieval"]
     assert calls[0][0] == "PROVIDER REWRITE"
     assert calls[0][1]["source_agent"] == "codex"
     assert calls[0][1]["source_type"] == "memory"
     assert calls[0][1]["source_missing"] is False
+
+
+def test_sidecar_search_rrf_queries_raw_and_rewrite_with_filters(monkeypatch):
+    calls = []
+
+    class Translator:
+        def rewrite_query(self, query):
+            calls.append(("rewrite", query))
+            return "provider query"
+
+    class Store:
+        def search(self, query, limit, filters):
+            calls.append(("search", query, limit, filters))
+            if query == "raw query":
+                return [
+                    {"source_identity": "raw-only", "raw_text": "raw BM25", "retrieval_text": "shadow"},
+                    {"source_identity": "both", "raw_text": "both raw", "retrieval_text": "shadow"},
+                ]
+            return [
+                {"source_identity": "provider-only", "raw_text": "provider raw", "retrieval_text": "shadow"},
+                {"source_identity": "both", "raw_text": "both raw", "retrieval_text": "shadow"},
+            ]
+
+    app = SimpleNamespace(
+        translator=Translator(),
+        store=Store(),
+        syncer=SimpleNamespace(restoring=False, restore_failed=False),
+    )
+    filters = {"project": "demo", "role": "user"}
+    monkeypatch.setattr(bridge, "SOURCE_APP", app)
+    rewritten, results = bridge.search_source_documents("raw query", 3, filters)
+    assert rewritten == "provider query"
+    assert [item["source_identity"] for item in results] == [
+        "both",
+        "raw-only",
+        "provider-only",
+    ]
+    assert all("retrieval_text" not in item for item in results)
+    assert calls == [
+        ("rewrite", "raw query"),
+        ("search", "raw query", 9, filters),
+        ("search", "provider query", 9, filters),
+    ]
+
+
+def test_http_rrf_promotes_dual_hit_and_keeps_sidecar_raw(monkeypatch, tmp_path):
+    app = _source_app(tmp_path)
+    for identity, raw in (
+        ("both", "dual raw"),
+        ("native-only", "native raw"),
+    ):
+        _canonical_source(app.store, identity, raw=raw, retrieval="ENGLISH SHADOW")
+    source_rankings = [
+        [
+            {"source_identity": "sidecar-only", "raw_text": "raw BM25"},
+            {"source_identity": "both", "raw_text": "triple raw"},
+        ],
+        [
+            {"source_identity": "provider-only", "raw_text": "provider raw"},
+            {"source_identity": "both", "raw_text": "triple raw"},
+        ],
+    ]
+    monkeypatch.setattr(bridge, "SOURCE_APP", app)
+    monkeypatch.setattr(bridge, "TOKEN", "test-token")
+    monkeypatch.setattr(
+        bridge,
+        "search_source_rankings",
+        lambda query, limit, filters: ("provider query", source_rankings),
+    )
+    monkeypatch.setattr(
+        bridge,
+        "recall",
+        lambda *_args, **_kwargs: "\n".join(
+            (
+                "native\n  → get native-only --from 0 --to 0",
+                "dual\n  → get both --from 0 --to 0",
+            )
+        ),
+    )
+    server = ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        status, body = _post(server, "/search", {"query": "raw query", "limit": 3})
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+        app.store.close()
+    assert status == 200
+    assert [item["source_identity"] for item in body["results"]] == [
+        "both",
+        "sidecar-only",
+        "provider-only",
+    ]
+    assert body["results_text"] == "triple raw\n\nraw BM25\n\nprovider raw"
+    assert "ENGLISH SHADOW" not in json.dumps(body["results"], ensure_ascii=False)
+
+
+def test_http_caps_cjk_native_candidates_after_query_tuning(monkeypatch, tmp_path):
+    app = _source_app(tmp_path)
+    calls = []
+    monkeypatch.setattr(bridge, "SOURCE_APP", app)
+    monkeypatch.setattr(bridge, "TOKEN", "test-token")
+    monkeypatch.setattr(bridge, "LANGUAGE_MODE", "auto")
+    monkeypatch.setattr(bridge, "HTTP_MAX_CANDIDATES", 12)
+    monkeypatch.setattr(
+        bridge,
+        "search_source_rankings",
+        lambda query, limit, filters: ("CPA previous_response_id context loss", []),
+    )
+
+    def fake_recall(query, **kwargs):
+        calls.append((query, kwargs))
+        return ""
+
+    monkeypatch.setattr(bridge, "recall", fake_recall)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        status, _body = _post(
+            server,
+            "/search",
+            {"query": "CPA previous_response_id 为什么丢上下文？", "limit": 10},
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+        app.store.close()
+    assert status == 200
+    assert calls[0][0] == "CPA previous_response_id context loss"
+    assert calls[0][1]["candidates"] == 12
 
 
 def test_missing_canonical_reference_never_falls_back_to_native_get(monkeypatch, tmp_path):

@@ -4,6 +4,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 const base = (process.env.FUNES_REMOTE_URL || "").replace(/\/+$/, "");
 const token = process.env.FUNES_API_TOKEN || "";
+const hubToken = process.env.FUNES_HF_TOKEN || process.env.HF_TOKEN || "";
 
 // Keep automatic recall useful without adding latency to every self-contained
 // prompt.  Explicit memory language and historical/project-decision cues opt in;
@@ -16,9 +17,16 @@ function shouldRecall(prompt: string): boolean {
 async function call(path: string, body: Record<string, unknown>) {
   if (!base || !token) return null;
   try {
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (hubToken) {
+      headers.Authorization = `Bearer ${hubToken}`;
+      headers["X-Funes-Authorization"] = `Bearer ${token}`;
+    } else {
+      headers.Authorization = `Bearer ${token}`;
+    }
     const response = await fetch(`${base}${path}`, {
       method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+      headers,
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(20_000),
     });

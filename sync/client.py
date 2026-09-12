@@ -16,7 +16,12 @@ class SyncClient:
         token=os.environ.get("FUNES_API_TOKEN")
         if not token:
             raise RuntimeError("FUNES_API_TOKEN is not configured")
-        headers["Authorization"]="Bearer "+token
+        hub_token = os.environ.get("FUNES_HF_TOKEN") or os.environ.get("HF_TOKEN")
+        if hub_token:
+            headers["Authorization"] = "Bearer " + hub_token
+            headers["X-Funes-Authorization"] = "Bearer " + token
+        else:
+            headers["Authorization"] = "Bearer " + token
         last = None
         for attempt in range(4):
             req=request.Request(url,data=body,headers=headers,method="POST")
@@ -55,7 +60,14 @@ class SyncClient:
         token = os.environ.get("FUNES_API_TOKEN")
         if not token:
             raise RuntimeError("FUNES_API_TOKEN is not configured")
-        req=request.Request(self.config.remote_url.rstrip("/")+"/sync",data=b"{}",headers={"Content-Type":"application/json","Authorization":"Bearer "+token},method="POST")
+        headers={"Content-Type":"application/json"}
+        hub_token=os.environ.get("FUNES_HF_TOKEN") or os.environ.get("HF_TOKEN")
+        if hub_token:
+            headers["Authorization"]="Bearer "+hub_token
+            headers["X-Funes-Authorization"]="Bearer "+token
+        else:
+            headers["Authorization"]="Bearer "+token
+        req=request.Request(self.config.remote_url.rstrip("/")+"/sync",data=b"{}",headers=headers,method="POST")
         with request.urlopen(req,timeout=120) as r:
             raw=r.read(); result=json.loads(raw) if raw else {}
             if result.get("durable") is not True:

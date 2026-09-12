@@ -7,4 +7,8 @@ if [ -z "${FUNES_API_TOKEN:-}" ] && command -v security >/dev/null 2>&1; then
   FUNES_API_TOKEN="$(security find-generic-password -a "${USER:-$(id -un)}" -s funes-api-token -w 2>/dev/null || true)"
   if [ -n "$FUNES_API_TOKEN" ]; then export FUNES_API_TOKEN; fi
 fi
+if [ -z "${FUNES_HF_TOKEN:-}" ] && command -v security >/dev/null 2>&1; then
+  FUNES_HF_TOKEN="$(security find-generic-password -a "${USER:-$(id -un)}" -s funes-hf-token -w 2>/dev/null || true)"
+  if [ -n "$FUNES_HF_TOKEN" ]; then export FUNES_HF_TOKEN; fi
+fi
 exec "${PYTHON:-python3}" -m sync "$@"

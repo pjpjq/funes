@@ -6,6 +6,11 @@ active/archived）、Claude Code、pi 的会话，以及 Codex/Claude/pi 和仓�
 `funes push` 完成；这会保留 Lance vector/BM25/rerank/recency/neighbors 和 TruffleHog gate。
 兼容 HTTP 服务只用于迁移/测试，不替代 Funes 检索引擎。
 
+当 `FUNES_MEMORY_ONLY=1` 用于让轻量 HTTP 队列只处理持久记忆文件时，历史 session 由
+`deploy/funes-sync/native-backfill.sh` 调用官方原生 parser/index/push。它完成首次回填后不会退出，
+而是按 `FUNES_NATIVE_BACKFILL_RECONCILE_INTERVAL`（默认 300 秒）继续扫描 Codex、Pi、Claude
+的新建/追加 session；这样 memory-only daemon 不会留下未来 session 的接管空档。
+
 ## 快速使用
 
 ```sh

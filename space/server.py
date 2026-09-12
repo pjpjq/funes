@@ -71,6 +71,12 @@ def run(*args: str, timeout: int = 180) -> tuple[int, str, str]:
 
 
 def auth_ok(handler: BaseHTTPRequestHandler) -> bool:
+    supplied = handler.headers.get("X-Funes-Authorization", "") or handler.headers.get("X-Funes-Token", "")
+    if supplied:
+        return bool(TOKEN) and supplied == "Bearer " + TOKEN
+    # Public Spaces and local tests can use the normal Authorization header.
+    # Private Spaces reserve that header for the Hub token and use the explicit
+    # application header above.
     return bool(TOKEN) and handler.headers.get("Authorization", "") == "Bearer " + TOKEN
 
 

@@ -64,7 +64,7 @@ class Config:
                    os.environ.get("FUNES_RETRIEVAL_LANGUAGE_MODE", retrieval.get("language_mode", section.get("retrieval_language_mode", "auto"))),
                    os.environ.get("FUNES_MEMORY", remote.get("memory", "")),
                    truth(os.environ.get("FUNES_NATIVE_PRIMARY", section.get("native_primary", False))),
-                   os.environ.get("FUNES_BIN", ""),
+                   os.environ.get("FUNES_BIN", section.get("native_bin", "")),
                    truth(os.environ.get("FUNES_MEMORY_ONLY", section.get("memory_only", False))))
     def ensure(self):
         self.state_dir.mkdir(parents=True, exist_ok=True)

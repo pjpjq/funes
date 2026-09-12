@@ -170,7 +170,7 @@ def _stable_identity(source: Source, session: str, message: str, ordinal: int) -
 
 def _chunk(source: Source, *, ordinal: int, session: str, message: str, role: str,
            text: str, raw: str, timestamp: str = "", content_type: str = "assistant_message",
-           metadata: dict[str, Any] | None = None, parent_session: str = "", agent_id: str = "") -> Chunk | None:
+           metadata: dict[str, Any] | None = None, parent_session: str = "", agent_id: str = "", worktree: str = "") -> Chunk | None:
     if not text.strip():
         return None
     meta = dict(metadata or {})
@@ -198,6 +198,7 @@ def _chunk(source: Source, *, ordinal: int, session: str, message: str, role: st
         source_type=source.source_type,
         content_type=content_type,
         project=source.project,
+        worktree=worktree,
         agent_type="subagent" if agent_id or "subagent" in str(source.path) or "agent-" in str(source.path) else "main",
         device_id=source.device_id,
     )
@@ -222,6 +223,7 @@ def _parse_codex_native(source: Source, start: int = 0) -> list[Chunk]:
     all_lines = _read_lines(path, 0 if not start else 0)
     session = path.stem
     parent = ""
+    worktree = ""
     for line in all_lines[:256]:
         try:
             obj = json.loads(line)
@@ -231,6 +233,7 @@ def _parse_codex_native(source: Source, start: int = 0) -> list[Chunk]:
             payload = obj.get("payload") or {}
             session = str(payload.get("id") or payload.get("session_id") or session)
             parent = str(payload.get("parent_thread_id") or "")
+            worktree = str(payload.get("cwd") or "")
             break
     lines = _read_lines(path, start) if start else all_lines
     # `start` is a byte cursor, not a line number; use the source offset only as a
@@ -270,7 +273,7 @@ def _parse_codex_native(source: Source, start: int = 0) -> list[Chunk]:
         chunk = _chunk(source, ordinal=ordinal, session=session, message=message, role=role,
                        text=text, raw=line, timestamp=str(obj.get("timestamp") or ""),
                        content_type=ctype, parent_session=parent, agent_id=agent_id,
-                       metadata={"record_type": typ, "tool_name": payload.get("name")})
+                       metadata={"record_type": typ, "tool_name": payload.get("name")}, worktree=worktree)
         if chunk:
             out.append(chunk)
     return out
@@ -296,7 +299,8 @@ def _parse_claude_native(source: Source, start: int = 0) -> list[Chunk]:
                        raw=line, timestamp=str(obj.get("timestamp") or ""), content_type=ctype,
                        parent_session=str(obj.get("parentUuid") or ""),
                        agent_id=str(obj.get("agentId") or ""),
-                       metadata={"is_sidechain": bool(obj.get("isSidechain")), "git_branch": obj.get("gitBranch")})
+                       metadata={"is_sidechain": bool(obj.get("isSidechain")), "git_branch": obj.get("gitBranch")},
+                       worktree=str(obj.get("cwd") or ""))
         if chunk:
             out.append(chunk)
     return out
@@ -305,6 +309,7 @@ def _parse_claude_native(source: Source, start: int = 0) -> list[Chunk]:
 def _parse_pi_native(source: Source, start: int = 0) -> list[Chunk]:
     out: list[Chunk] = []
     session = Path(source.path).stem
+    worktree = ""
     for ordinal, line in enumerate(_read_lines(Path(source.path), start), start if start else 0):
         try:
             obj = json.loads(line)
@@ -312,6 +317,7 @@ def _parse_pi_native(source: Source, start: int = 0) -> list[Chunk]:
             continue
         if obj.get("type") == "session":
             session = str(obj.get("id") or obj.get("sessionId") or session)
+            worktree = str(obj.get("cwd") or "")
             continue
         if obj.get("type") != "message":
             continue
@@ -325,7 +331,7 @@ def _parse_pi_native(source: Source, start: int = 0) -> list[Chunk]:
         chunk = _chunk(source, ordinal=ordinal, session=session, message=mid, role=role, text=text,
                        raw=line, timestamp=str(obj.get("timestamp") or ""), content_type=ctype,
                        parent_session=str(obj.get("parentId") or ""),
-                       metadata={"tool_name": msg.get("toolName")})
+                       metadata={"tool_name": msg.get("toolName")}, worktree=worktree)
         if chunk:
             out.append(chunk)
     return out

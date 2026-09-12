@@ -64,8 +64,7 @@ provider-quality claim. Full rows are in `docs/chinese-retrieval-e2e-results.jso
 | native Funes, deterministic English shadow query | 0.65 | 0.90 | 0.95 | 0.226 |
 
 The result is intentionally not presented as “shadow always wins”: it improves Recall@5 on this
-fixture but lowers Recall@1. A provider-backed Chinese translation comparison remains a follow-up
-when `TRANSLATION_BASE_URL`, `TRANSLATION_API_KEY`, and `TRANSLATION_MODEL` are configured.
+fixture but lowers Recall@1. The provider-backed comparison below is the authoritative follow-up.
 
 ## Provider-backed native runner
 
@@ -77,17 +76,19 @@ same 60 memories and 20 queries through the OpenAI-compatible
 `funes ingest-docs <jsonl> --memory <local-path>`:
 
 1. **Before:** canonical `retrieval_text` is the raw Chinese fixture text; queries are raw Chinese.
-2. **After:** canonical `retrieval_text` is only the provider-generated English shadow; queries use
-   provider-generated shadows.
+2. **After:** canonical `retrieval_text` is only the document-prompt English shadow; queries use the
+   query-specific prompt and fall back to the raw query when entity, number, or length validation
+   rejects the provider output.
 
 Every canonical row includes `source_identity`, `source_version`, `retrieval_text`, `content_hash`,
 `updated_at`, and `metadata`. Neither arm emits a synthetic transcript or a `raw_text` sidecar, so
 the After native index never contains the raw Chinese document text. Each arm has its own temporary
 `FUNES_HOME` and explicit local memory path; recall serves that exact path. Both arms request `k=5`,
 `candidates=12`, `neighbors=0`, and `half_life=0` for the same 20 queries from one warm MCP process
-per memory. The output records Recall@1/@3/@5, per-query ranks, provider outputs, model, endpoint,
-prompt hash, backend, and latency in `docs/chinese-retrieval-provider-results.json`; it never records
-the credential. Run the offline invariant check first, then the real comparison:
+per memory. The output records Recall@1/@3/@5, per-query ranks, raw/effective provider outputs,
+model, endpoint, both prompt versions and hashes, backend, and latency in
+`docs/chinese-retrieval-provider-results.json`; it never records the credential. Run the offline
+invariant check first, then the real comparison:
 
 ```bash
 python3 scripts/benchmark_chinese_retrieval_provider.py --self-check
@@ -100,12 +101,18 @@ no more provider calls. `--provider-only` explicitly stops at that checkpoint.
 
 ### Execution evidence (2026-09-13)
 
-The HF Router probe returned HTTP 200, and the full provider stage completed all 44 unique inputs
-(60 memories contain repeated distractors). Native indexing then exited 1 before either arm could be
-measured because the active `target/release/funes` was an ONNX-only build and downloading
-`onnx/model.onnx` failed with `connection reset by peer (os error 54)`. That attempt predated the
-checkpoint fix, so its generated text could not be recovered. A cached default-BLAS binary was
-independently verified with a one-memory native index (`exit 0`). **No provider-backed Recall@k is
-currently available or claimed from the failed run.** The runner now preserves provider output
-across exactly this failure; a successful canonical-ingestion run is still required before reporting
-provider Recall@k.
+The full v2 run completed 24 distinct document normalizations, 20 query rewrites, both canonical
+indexes, and all 40 native recall calls. One query rewrite changed the technical entity `Mac` to
+`mac`; validation rejected it and used the original Chinese query. The recorded credential scan is
+clean (`credential_value_recorded=false`, and no configured token value occurs in the JSON).
+
+| mode | Recall@1 | Recall@3 | Recall@5 | index seconds | mean query seconds |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| raw Chinese | 0.75 | 0.90 | 0.90 | 1.817 | 0.272 |
+| English retrieval shadow | 0.70 | 0.90 | 0.90 | 1.469 | 0.256 |
+| delta (shadow - raw) | -0.05 | 0.00 | 0.00 | -0.348 | -0.016 |
+
+The English-only arm ties raw Chinese at Recall@3 and Recall@5 but remains 0.05 lower at Recall@1;
+therefore this result does not support a blanket claim that translation improves retrieval. The
+deployed HTTP service mitigates that limitation by fusing raw-query, rewritten-query, and native
+rankings with RRF, while this controlled benchmark intentionally isolates the two representations.

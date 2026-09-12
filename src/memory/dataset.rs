@@ -134,15 +134,31 @@ pub async fn scan_rows(
     Ok(batches)
 }
 
-/// Best-effort: build the FTS index on `text` and the IVF_PQ index on `vector`. A small corpus
-/// can't train IVF (lance needs ~256 rows) — that's fine, recall falls back to brute force.
+const VECTOR_INDEX_MIN_ROWS: usize = 256;
+const TEXT_INDEX_NAME: &str = "text_idx";
+const VECTOR_INDEX_NAME: &str = "vector_idx";
+
+/// Build the FTS index on `text` and, once it has enough rows to train, the IVF_PQ index on
+/// `vector`. A small corpus falls back to brute-force vector recall until it reaches Lance's
+/// training minimum.
 ///
 /// `on_phase` is called with a human label before each index is built, so a caller can report
 /// progress around these opaque (no incremental hook), potentially slow Lance calls. Pass `|_| {}`
 /// to stay silent.
 pub async fn build_indexes(ds: &mut Dataset, on_phase: impl Fn(&str)) {
+    if let Err(error) = build_indexes_checked(ds, on_phase).await {
+        eprintln!("funes: index creation failed — {error:#}");
+    }
+}
+
+/// Checked variant for callers, such as local indexing, that can return an index failure to the
+/// invoking user instead of only reporting it on stderr.
+pub(crate) async fn build_indexes_checked(
+    ds: &mut Dataset,
+    on_phase: impl Fn(&str),
+) -> Result<()> {
     on_phase("text search index");
-    let _ = ds
+    ds
         .create_index(
             &["text"],
             IndexType::Inverted,
@@ -150,13 +166,56 @@ pub async fn build_indexes(ds: &mut Dataset, on_phase: impl Fn(&str)) {
             &InvertedIndexParams::default(),
             true,
         )
-        .await;
-    if let Some(params) = ivf_pq_params(ds) {
+        .await
+        .context("creating text search index")?;
+    if vector_index_required(ds).await? {
+        let params = ivf_pq_params(ds).expect("required vector index has a vector column");
         on_phase("vector index");
-        let _ = ds
+        ds
             .create_index(&["vector"], IndexType::Vector, None, &params, true)
-            .await;
+            .await
+            .context("creating vector index")?;
     }
+    Ok(())
+}
+
+/// Whether a no-new-chunk indexing pass must rebuild its indexes. This closes the crash window
+/// after an append: the source state may already say every chunk is stored, while the interrupted
+/// finalization left an absent FTS/IVF index or a delta with unindexed rows behind.
+pub(crate) async fn indexes_need_rebuild(ds: &Dataset) -> Result<bool> {
+    let rows = ds.count_rows(None).await.context("counting rows for index health")?;
+    if rows == 0 {
+        return Ok(false);
+    }
+    let indexes = ds.load_indices().await.context("listing indexes for index health")?;
+    let required = if vector_index_required(ds).await? {
+        [TEXT_INDEX_NAME, VECTOR_INDEX_NAME].as_slice()
+    } else {
+        [TEXT_INDEX_NAME].as_slice()
+    };
+    for name in required {
+        if !indexes.iter().any(|index| index.name == *name) {
+            return Ok(true);
+        }
+        let statistics = ds
+            .index_statistics(name)
+            .await
+            .with_context(|| format!("reading index health for {name}"))?;
+        let unindexed = serde_json::from_str::<serde_json::Value>(&statistics)
+            .with_context(|| format!("parsing index health for {name}"))?
+            .get("num_unindexed_rows")
+            .and_then(serde_json::Value::as_u64)
+            .context("index health omitted num_unindexed_rows")?;
+        if unindexed > 0 {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+async fn vector_index_required(ds: &Dataset) -> Result<bool> {
+    let rows = ds.count_rows(None).await.context("counting rows for vector index")?;
+    Ok(ivf_pq_params(ds).is_some() && rows >= VECTOR_INDEX_MIN_ROWS)
 }
 
 /// IVF_PQ parameters sized from the `vector` column's dimension (matching lancedb's defaults).
@@ -338,6 +397,20 @@ pub(crate) fn build_batch_for_schema(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow_array::RecordBatchIterator;
+    use lance::dataset::WriteParams;
+
+    fn text_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![Field::new("text", DataType::Utf8, false)]))
+    }
+
+    fn text_batch(texts: &[&str]) -> RecordBatch {
+        RecordBatch::try_new(
+            text_schema(),
+            vec![Arc::new(StringArray::from(texts.to_vec()))],
+        )
+        .unwrap()
+    }
 
     #[test]
     fn schema_column_order_is_load_bearing() {
@@ -378,5 +451,38 @@ mod tests {
                 "metadata_json",
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn interrupted_index_finalization_is_repaired_without_new_source_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().join("chunks.lance");
+        let first = text_batch(&["already stored source row"]);
+        let mut ds = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(first)].into_iter(), text_schema()),
+            uri.to_str().unwrap(),
+            Some(WriteParams::default()),
+        )
+        .await
+        .unwrap();
+
+        // This is the state after append + persisted source state, then a crash before finalize:
+        // the retry will find no new source chunks, but FTS is still absent.
+        assert!(indexes_need_rebuild(&ds).await.unwrap());
+        build_indexes_checked(&mut ds, |_| {}).await.unwrap();
+        assert!(!indexes_need_rebuild(&ds).await.unwrap());
+
+        // An append after an existing FTS leaves an index delta. A no-new-source retry must also
+        // detect that debt and fold the stored row into a rebuilt index.
+        let appended = text_batch(&["stored while finalization was interrupted"]);
+        ds.append(
+            RecordBatchIterator::new(vec![Ok(appended)].into_iter(), text_schema()),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(indexes_need_rebuild(&ds).await.unwrap());
+        build_indexes_checked(&mut ds, |_| {}).await.unwrap();
+        assert!(!indexes_need_rebuild(&ds).await.unwrap());
     }
 }

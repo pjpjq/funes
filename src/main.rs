@@ -262,6 +262,15 @@ enum Cmd {
         #[arg(value_name = "AGENT")]
         agent: String,
     },
+    /// Run the unified local Codex/Pi/Claude sync daemon (`funes-sync`).
+    Sync {
+        #[command(subcommand)]
+        command: SyncCommand,
+    },
+    /// Diagnose the unified sync bridge without printing credentials.
+    Doctor,
+    /// List discovered Codex/Pi/Claude sessions and memory files.
+    Sources,
 }
 
 // The `[MEMORY]` positional of `add`; the user-facing help comes from the field doc below.
@@ -271,6 +280,22 @@ struct AddMemory {
     /// `local`. Omitted, the agent takes the memory the host is bound to.
     #[arg(value_name = "MEMORY")]
     memory: Option<String>,
+}
+
+#[derive(Subcommand)]
+enum SyncCommand {
+    Status,
+    Sources,
+    Doctor,
+    Backfill,
+    Run,
+    Install,
+    Uninstall,
+    Start,
+    Stop,
+    Restart,
+    Logs,
+    Mcp,
 }
 
 // Flattened into every ask agent so they share the question positional and the read `--memory`
@@ -490,6 +515,36 @@ async fn run() -> Result<()> {
         Cmd::Bind { memory } => bind::run(&memory).await,
         Cmd::Add { agent, memory, from } => add::run(&agent, memory.memory.as_deref(), from.as_deref()).await,
         Cmd::Remove { agent } => add::remove(&agent).await,
+        Cmd::Sync { command } => run_sync_command(command),
+        Cmd::Doctor => run_sync_command(SyncCommand::Doctor),
+        Cmd::Sources => run_sync_command(SyncCommand::Sources),
+    }
+}
+
+/// Delegate the long-lived bridge to the separately testable Python package.  Keeping
+/// discovery/queue state out of the Rust Lance process means a Space restart or a
+/// client upgrade cannot strand a pending upload.
+fn run_sync_command(command: SyncCommand) -> Result<()> {
+    let name = match command {
+        SyncCommand::Status => "status",
+        SyncCommand::Sources => "sources",
+        SyncCommand::Doctor => "doctor",
+        SyncCommand::Backfill => "backfill",
+        SyncCommand::Run => "run",
+        SyncCommand::Install => "install",
+        SyncCommand::Uninstall => "uninstall",
+        SyncCommand::Start => "start",
+        SyncCommand::Stop => "stop",
+        SyncCommand::Restart => "restart",
+        SyncCommand::Logs => "logs",
+        SyncCommand::Mcp => "mcp",
+    };
+    let mut child = std::process::Command::new(std::env::var("FUNES_SYNC_BIN").unwrap_or_else(|_| "funes-sync".into()));
+    let status = child.arg(name).status().context("running funes-sync (set FUNES_SYNC_BIN to its absolute path)")?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(anyhow!("funes-sync exited with {:?}", status.code()))
     }
 }
 

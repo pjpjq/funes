@@ -1,10 +1,9 @@
 # Funes HTTP compatibility service
 
-`service/server.py` remains a standard-library compatibility implementation for
-local tests and migrations. It is **not** the production retrieval engine. The
-Space/Docker entry point is `space/server.py`, a thin bridge over native Funes.
-Native Funes owns Lance vector search, BM25, reranking, recency, neighbors and
-the TruffleHog push gate.
+`service/server.py` provides the source-of-truth sidecar used by the production
+Space and remains independently usable for local tests and migrations. The
+Space/Docker entry point is `space/server.py`; native Funes still owns Lance vector
+search, BM25, reranking, recency and neighbors.
 
 ## API
 
@@ -16,7 +15,10 @@ Set `FUNES_AUTH_TOKEN` in local compatibility deployments. Ingest documents with
 `raw_text` and optional identity/version/metadata fields. Responses include
 `raw_text`; logs never include authorization or document bodies.
 
-For production use `FUNES_MEMORY` with the native bridge and `HF_TOKEN`; the HF
-Hub Lance dataset is the durable source of truth.
+For production, configure `FUNES_STORAGE_REPO`, `HF_TOKEN`, and
+`FUNES_STORAGE_KEY`. Snapshot and delta objects are compressed then encrypted with
+streaming AES-256-GCM before upload. Plain `raw_text` never enters the Hub repo;
+restore fails closed when the key is absent or authentication fails. `FUNES_MEMORY`
+remains the separately rebuildable native retrieval index.
 
 Chinese queries use the optional OpenAI-compatible translation endpoint configured by `TRANSLATION_BASE_URL`, `TRANSLATION_API_KEY`, and `TRANSLATION_MODEL`. Failed translation falls back to the original query.

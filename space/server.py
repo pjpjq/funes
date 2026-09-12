@@ -761,10 +761,17 @@ class Handler(BaseHTTPRequestHandler):
                             if code != 0:
                                 self.send_json(503, {"ok": False, "durable": False, "session_ids": session_ids, "error": "native_index_failed"})
                                 return
-                        code, pout, perr = run("push", REMOTE, "--yes", "--force-reindex", timeout=INGEST_PUSH_TIMEOUT)
+                        # Keep the durable chunk push incremental.  Forcing a
+                        # full remote reindex for every tiny memory-file batch
+                        # repeatedly invalidates the read worker; native Funes
+                        # can search newly-pushed deltas until its normal index
+                        # threshold is reached.
+                        code, pout, perr = run("push", REMOTE, "--yes", timeout=INGEST_PUSH_TIMEOUT)
                     outputs.append(pout)
                     errors.append(perr)
                     durable = code == 0
+                    if durable:
+                        request_warm(force=True)
                     self.send_json(200 if durable else 503, {"ok": durable, "durable": durable, "accepted": len(docs) if durable else 0, "session_ids": session_ids, "output": "".join(outputs)[-3000:] if durable else "", "error": "" if durable else "native_push_failed"})
                 finally:
                     shutil.rmtree(source, ignore_errors=True)

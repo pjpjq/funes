@@ -1,4 +1,5 @@
 from __future__ import annotations
+import gzip
 import json, os, subprocess, sys, time
 from urllib import request, error
 from .config import Config
@@ -60,6 +61,16 @@ class SyncClient:
         # implementation.
         body=json.dumps({"device_id":self.config.device_id,"documents":records}, ensure_ascii=False).encode()
         headers=self._auth_headers(json_content=True)
+        gzip_enabled = os.environ.get("FUNES_HTTP_GZIP", "true").strip().lower() not in {"0", "false", "no", "off"}
+        try:
+            gzip_min_bytes = max(0, int(os.environ.get("FUNES_HTTP_GZIP_MIN_BYTES", "8192")))
+        except ValueError:
+            gzip_min_bytes = 8192
+        if gzip_enabled and len(body) >= gzip_min_bytes:
+            compressed = gzip.compress(body, mtime=0)
+            if len(compressed) < len(body):
+                body = compressed
+                headers["Content-Encoding"] = "gzip"
         timeout = float(os.environ.get("FUNES_REMOTE_TIMEOUT", "900"))
         last = None
         for attempt in range(4):

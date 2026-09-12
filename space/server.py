@@ -7,6 +7,8 @@ container's /data/.funes directory is only a warm cache and may be recreated.
 import hashlib
 import atexit
 import base64
+import gzip
+import io
 import json
 import os
 import re
@@ -18,6 +20,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -1180,11 +1183,33 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def body(self) -> dict:
-        n = int(self.headers.get("Content-Length", "0"))
-        max_bytes = int(os.getenv("FUNES_MAX_BODY_BYTES", "64000000"))
-        if n > max_bytes:
+        try:
+            max_bytes = max(1, int(os.getenv("FUNES_MAX_BODY_BYTES", "64000000")))
+            n = int(self.headers.get("Content-Length", "0"))
+        except ValueError as exc:
+            raise ValueError("invalid Content-Length") from exc
+        if n < 0 or n > max_bytes:
             raise ValueError("request too large")
-        return json.loads(self.rfile.read(n) or b"{}")
+        raw = self.rfile.read(n)
+        if len(raw) != n:
+            raise ValueError("truncated request body")
+        encoding = self.headers.get("Content-Encoding", "identity").strip().lower()
+        if encoding in ("", "identity"):
+            decoded = raw
+        elif encoding == "gzip":
+            try:
+                with gzip.GzipFile(fileobj=io.BytesIO(raw), mode="rb") as stream:
+                    decoded = stream.read(max_bytes + 1)
+            except (EOFError, OSError, zlib.error) as exc:
+                raise ValueError("invalid gzip request body") from exc
+        else:
+            raise ValueError("unsupported Content-Encoding")
+        if len(decoded) > max_bytes:
+            raise ValueError("request too large")
+        obj = json.loads(decoded or b"{}")
+        if not isinstance(obj, dict):
+            raise ValueError("JSON object required")
+        return obj
 
     def do_GET(self) -> None:
         if self.path == "/health":
@@ -1529,7 +1554,9 @@ class Handler(BaseHTTPRequestHandler):
                     shutil.rmtree(source, ignore_errors=True)
                 return
             self.send_json(404, {"error": "not found"})
-        except (ValueError, OSError, subprocess.SubprocessError) as exc:
+        except ValueError as exc:
+            self.send_json(400, {"error": str(exc)})
+        except (OSError, subprocess.SubprocessError) as exc:
             self.send_json(500, {"error": str(exc)})
 
 

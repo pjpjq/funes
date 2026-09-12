@@ -1,3 +1,4 @@
+import gzip
 import json
 import threading
 import time
@@ -668,6 +669,58 @@ def _post(server, path, payload):
     body = json.loads(response.read())
     conn.close()
     return response.status, body
+
+
+def _post_bytes(server, path, body, headers=None):
+    conn = HTTPConnection(*server.server_address)
+    request_headers = {"Authorization": "Bearer test-token", "Content-Type": "application/json"}
+    request_headers.update(headers or {})
+    conn.request("POST", path, body, request_headers)
+    response = conn.getresponse()
+    payload = json.loads(response.read())
+    conn.close()
+    return response.status, payload
+
+
+def test_http_gzip_ingest_rejects_invalid_and_oversized_payloads(monkeypatch, tmp_path):
+    app = _source_app(tmp_path)
+    monkeypatch.setattr(bridge, "SOURCE_APP", app)
+    monkeypatch.setattr(bridge, "TOKEN", "test-token")
+    server = ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        valid = gzip.compress(json.dumps({"documents": [{"source_identity": "gzip-valid", "raw_text": "compressed"}]}).encode())
+        status, result = _post_bytes(server, "/ingest", valid, {"Content-Encoding": "gzip"})
+        assert status == 200
+        assert result["created"] == 1
+        assert app.store.get("gzip-valid") is not None
+
+        status, result = _post_bytes(server, "/ingest", b"not-a-gzip-stream", {"Content-Encoding": "gzip"})
+        assert status == 400
+        assert result["error"] == "invalid gzip request body"
+        status, result = _post_bytes(server, "/ingest", valid[:-1], {"Content-Encoding": "gzip"})
+        assert status == 400
+        assert result["error"] == "invalid gzip request body"
+        corrupt_deflate = bytes.fromhex("1f8b0800000000000003ffff0000000000000000")
+        status, result = _post_bytes(server, "/ingest", corrupt_deflate, {"Content-Encoding": "gzip"})
+        assert status == 400
+        assert result["error"] == "invalid gzip request body"
+        status, result = _post_bytes(server, "/ingest", valid, {"Content-Encoding": "br"})
+        assert status == 400
+        assert result["error"] == "unsupported Content-Encoding"
+
+        monkeypatch.setenv("FUNES_MAX_BODY_BYTES", "128")
+        oversized = gzip.compress(json.dumps({"documents": [{"source_identity": "gzip-oversized", "raw_text": "x" * 1024}]}).encode())
+        status, result = _post_bytes(server, "/ingest", oversized, {"Content-Encoding": "gzip"})
+        assert status == 400
+        assert result["error"] == "request too large"
+        assert app.store.get("gzip-oversized") is None
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+        app.store.close()
 
 
 def test_reindex_queues_durable_control_without_native_or_provider_work(monkeypatch, tmp_path):

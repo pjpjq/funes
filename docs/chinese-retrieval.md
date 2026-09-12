@@ -66,3 +66,46 @@ provider-quality claim. Full rows are in `docs/chinese-retrieval-e2e-results.jso
 The result is intentionally not presented as “shadow always wins”: it improves Recall@5 on this
 fixture but lowers Recall@1. A provider-backed Chinese translation comparison remains a follow-up
 when `TRANSLATION_BASE_URL`, `TRANSLATION_API_KEY`, and `TRANSLATION_MODEL` are configured.
+
+## Provider-backed native runner
+
+`scripts/benchmark_chinese_retrieval_provider.py` closes the provider/E2E gap without changing a
+real memory. It reads the provider credential only from an environment variable, normalizes the
+same 60 memories and 20 queries through the OpenAI-compatible
+`https://router.huggingface.co/v1/chat/completions` endpoint with
+`Qwen/Qwen3-4B-Instruct-2507`, and builds two isolated temporary native Funes memories through
+`funes ingest-docs <jsonl> --memory <local-path>`:
+
+1. **Before:** canonical `retrieval_text` is the raw Chinese fixture text; queries are raw Chinese.
+2. **After:** canonical `retrieval_text` is only the provider-generated English shadow; queries use
+   provider-generated shadows.
+
+Every canonical row includes `source_identity`, `source_version`, `retrieval_text`, `content_hash`,
+`updated_at`, and `metadata`. Neither arm emits a synthetic transcript or a `raw_text` sidecar, so
+the After native index never contains the raw Chinese document text. Each arm has its own temporary
+`FUNES_HOME` and explicit local memory path; recall serves that exact path. Both arms request `k=5`,
+`candidates=12`, `neighbors=0`, and `half_life=0` for the same 20 queries from one warm MCP process
+per memory. The output records Recall@1/@3/@5, per-query ranks, provider outputs, model, endpoint,
+prompt hash, backend, and latency in `docs/chinese-retrieval-provider-results.json`; it never records
+the credential. Run the offline invariant check first, then the real comparison:
+
+```bash
+python3 scripts/benchmark_chinese_retrieval_provider.py --self-check
+python3 scripts/benchmark_chinese_retrieval_provider.py --token-env HF_TOKEN
+```
+
+Provider outputs are atomically checkpointed to the result path **before** canonical ingestion. If
+the ingestion/model network path fails, rerunning the same command reuses that checkpoint and makes
+no more provider calls. `--provider-only` explicitly stops at that checkpoint.
+
+### Execution evidence (2026-09-13)
+
+The HF Router probe returned HTTP 200, and the full provider stage completed all 44 unique inputs
+(60 memories contain repeated distractors). Native indexing then exited 1 before either arm could be
+measured because the active `target/release/funes` was an ONNX-only build and downloading
+`onnx/model.onnx` failed with `connection reset by peer (os error 54)`. That attempt predated the
+checkpoint fix, so its generated text could not be recovered. A cached default-BLAS binary was
+independently verified with a one-memory native index (`exit 0`). **No provider-backed Recall@k is
+currently available or claimed from the failed run.** The runner now preserves provider output
+across exactly this failure; a successful canonical-ingestion run is still required before reporting
+provider Recall@k.

@@ -1,3 +1,4 @@
+import gzip
 import json
 import os
 import tempfile
@@ -15,10 +16,10 @@ from service.server import QUERY_PROMPT_VERSION, QUERY_RETRIEVAL_PROMPT, RETRIEV
 class ServiceTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.old = {k: os.environ.get(k) for k in ("FUNES_DATA_DIR", "FUNES_AUTH_TOKEN", "FUNES_API_TOKEN", "FUNES_STORAGE_KEY", "FUNES_STORAGE_REPO", "FUNES_SNAPSHOT_FILE", "HF_TOKEN", "FUNES_REQUIRE_DURABLE_ACK", "FUNES_ALLOW_EMPTY_REMOTE", "TRANSLATION_BASE_URL", "TRANSLATION_API_KEY", "TRANSLATION_MODEL", "TRANSLATION_MAX_PER_INGEST", "TRANSLATION_QUERY_MAX_TOKENS", "TRANSLATION_RECONCILE_INTERVAL", "RETURN_RETRIEVAL_TEXT")}
+        self.old = {k: os.environ.get(k) for k in ("FUNES_DATA_DIR", "FUNES_AUTH_TOKEN", "FUNES_API_TOKEN", "FUNES_STORAGE_KEY", "FUNES_STORAGE_REPO", "FUNES_SNAPSHOT_FILE", "HF_TOKEN", "FUNES_REQUIRE_DURABLE_ACK", "FUNES_ALLOW_EMPTY_REMOTE", "FUNES_MAX_BODY_BYTES", "TRANSLATION_BASE_URL", "TRANSLATION_API_KEY", "TRANSLATION_MODEL", "TRANSLATION_MAX_PER_INGEST", "TRANSLATION_QUERY_MAX_TOKENS", "TRANSLATION_RECONCILE_INTERVAL", "RETURN_RETRIEVAL_TEXT")}
         os.environ["FUNES_DATA_DIR"] = self.tmp.name
         os.environ["FUNES_AUTH_TOKEN"] = "test-token"
-        for k in ("FUNES_API_TOKEN", "FUNES_STORAGE_KEY", "FUNES_STORAGE_REPO", "FUNES_SNAPSHOT_FILE", "HF_TOKEN", "FUNES_REQUIRE_DURABLE_ACK", "FUNES_ALLOW_EMPTY_REMOTE", "TRANSLATION_BASE_URL", "TRANSLATION_API_KEY", "TRANSLATION_MODEL", "TRANSLATION_MAX_PER_INGEST", "TRANSLATION_QUERY_MAX_TOKENS", "TRANSLATION_RECONCILE_INTERVAL", "RETURN_RETRIEVAL_TEXT"):
+        for k in ("FUNES_API_TOKEN", "FUNES_STORAGE_KEY", "FUNES_STORAGE_REPO", "FUNES_SNAPSHOT_FILE", "HF_TOKEN", "FUNES_REQUIRE_DURABLE_ACK", "FUNES_ALLOW_EMPTY_REMOTE", "FUNES_MAX_BODY_BYTES", "TRANSLATION_BASE_URL", "TRANSLATION_API_KEY", "TRANSLATION_MODEL", "TRANSLATION_MAX_PER_INGEST", "TRANSLATION_QUERY_MAX_TOKENS", "TRANSLATION_RECONCILE_INTERVAL", "RETURN_RETRIEVAL_TEXT"):
             os.environ.pop(k, None)
 
     def tearDown(self):
@@ -206,6 +207,47 @@ class ServiceTests(unittest.TestCase):
         data = json.loads(response.read())
         conn.close()
         return response.status, data
+
+    def _request_bytes(self, server, body, headers=None):
+        conn = HTTPConnection(*server.server_address)
+        request_headers = {"Authorization": "Bearer test-token", "Content-Type": "application/json"}
+        request_headers.update(headers or {})
+        conn.request("POST", "/ingest", body, request_headers)
+        response = conn.getresponse()
+        data = json.loads(response.read())
+        conn.close()
+        return response.status, data
+
+    def test_gzip_ingest_rejects_invalid_and_oversized_payloads(self):
+        server = self._server()
+        valid = gzip.compress(json.dumps({"documents": [{"source_identity": "gzip-valid", "raw_text": "compressed"}]}).encode())
+        status, result = self._request_bytes(server, valid, {"Content-Encoding": "gzip"})
+        self.assertEqual(status, 200)
+        self.assertEqual(result["created"], 1)
+
+        status, result = self._request_bytes(server, b"not-a-gzip-stream", {"Content-Encoding": "gzip"})
+        self.assertEqual(status, 400)
+        self.assertEqual(result["error"], "invalid gzip request body")
+        status, result = self._request_bytes(server, valid[:-1], {"Content-Encoding": "gzip"})
+        self.assertEqual(status, 400)
+        self.assertEqual(result["error"], "invalid gzip request body")
+        corrupt_deflate = bytes.fromhex("1f8b0800000000000003ffff0000000000000000")
+        status, result = self._request_bytes(server, corrupt_deflate, {"Content-Encoding": "gzip"})
+        self.assertEqual(status, 400)
+        self.assertEqual(result["error"], "invalid gzip request body")
+        status, result = self._request_bytes(server, valid, {"Content-Encoding": "br"})
+        self.assertEqual(status, 400)
+        self.assertEqual(result["error"], "unsupported Content-Encoding")
+        status, _ = self._request(server, "POST", "/get", {"id": "gzip-invalid"})
+        self.assertEqual(status, 404)
+
+        os.environ["FUNES_MAX_BODY_BYTES"] = "128"
+        oversized = gzip.compress(json.dumps({"documents": [{"source_identity": "gzip-oversized", "raw_text": "x" * 1024}]}).encode())
+        status, result = self._request_bytes(server, oversized, {"Content-Encoding": "gzip"})
+        self.assertEqual(status, 400)
+        self.assertEqual(result["error"], "request too large")
+        status, _ = self._request(server, "POST", "/get", {"id": "gzip-oversized"})
+        self.assertEqual(status, 404)
 
     def test_auth_search_get(self):
         server = self._server()

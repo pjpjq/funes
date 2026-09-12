@@ -1,3 +1,4 @@
+import gzip
 import json
 from types import SimpleNamespace
 
@@ -92,6 +93,46 @@ def test_sync_methods_use_keychain_credentials_when_environment_is_empty(tmp_pat
         assert headers["authorization"] == "Bearer hf-keychain-value"
         assert headers["x-funes-authorization"] == "Bearer api-keychain-value"
     assert json.loads(requests[-1].data) == {"scope": "all"}
+
+
+def test_ingest_gzips_large_payload_and_can_be_disabled(tmp_path, monkeypatch):
+    monkeypatch.setenv("FUNES_API_TOKEN", "api-environment-value")
+    monkeypatch.setattr(client_module, "_keychain_token", lambda _service: "")
+    requests = []
+
+    class Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+        def read(self):
+            return b'{"durable":true,"accepted":1}'
+
+    def urlopen(req, **_kwargs):
+        requests.append(req)
+        return Response()
+
+    monkeypatch.setattr(client_module, "open_no_redirect", urlopen)
+    records = [{"source_identity": "large", "raw_text": "repeated memory text " * 2048}]
+    client = SyncClient(cfg(tmp_path))
+
+    assert client.ingest(records)["accepted"] == 1
+    compressed = requests[-1]
+    compressed_headers = {key.lower(): value for key, value in compressed.header_items()}
+    original = json.dumps({"device_id": client.config.device_id, "documents": records}, ensure_ascii=False).encode()
+    assert compressed_headers["content-encoding"] == "gzip"
+    assert gzip.decompress(compressed.data) == original
+    assert len(compressed.data) < len(original) // 10
+
+    monkeypatch.setenv("FUNES_HTTP_GZIP", "false")
+    assert client.ingest(records)["accepted"] == 1
+    disabled_headers = {key.lower(): value for key, value in requests[-1].header_items()}
+    assert "content-encoding" not in disabled_headers
+    assert requests[-1].data == original
 
 
 @pytest.mark.parametrize("status", [200, 201])

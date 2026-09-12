@@ -23,6 +23,7 @@ import time
 import uuid
 import urllib.error
 import urllib.request
+import zlib
 from collections import Counter
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -1866,10 +1867,30 @@ def make_handler(app: App):
             return True
 
         def _body(self) -> dict[str, Any]:
-            length = int(self.headers.get("Content-Length", "0"))
-            if length > 20_000_000:
+            try:
+                max_bytes = max(1, int(os.getenv("FUNES_MAX_BODY_BYTES", "20000000")))
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError as exc:
+                raise ValueError("invalid Content-Length") from exc
+            if length < 0 or length > max_bytes:
                 raise ValueError("request too large")
-            data = json.loads(self.rfile.read(length) or b"{}")
+            raw = self.rfile.read(length)
+            if len(raw) != length:
+                raise ValueError("truncated request body")
+            encoding = self.headers.get("Content-Encoding", "identity").strip().lower()
+            if encoding in ("", "identity"):
+                decoded = raw
+            elif encoding == "gzip":
+                try:
+                    with gzip.GzipFile(fileobj=io.BytesIO(raw), mode="rb") as stream:
+                        decoded = stream.read(max_bytes + 1)
+                except (EOFError, OSError, zlib.error) as exc:
+                    raise ValueError("invalid gzip request body") from exc
+            else:
+                raise ValueError("unsupported Content-Encoding")
+            if len(decoded) > max_bytes:
+                raise ValueError("request too large")
+            data = json.loads(decoded or b"{}")
             if not isinstance(data, dict):
                 raise ValueError("JSON object required")
             return data

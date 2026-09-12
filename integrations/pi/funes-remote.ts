@@ -16,10 +16,145 @@ function keychain(service: string): string {
 
 const token = process.env.FUNES_API_TOKEN || keychain("funes-api-token");
 const hubToken = process.env.FUNES_HF_TOKEN || process.env.HF_TOKEN || keychain("funes-hf-token");
+
+function envNumber(name: string): number | undefined {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === "") return undefined;
+  const value = Number(raw);
+  return Number.isFinite(value) ? value : undefined;
+}
+
+function bounded(value: number | undefined, fallback: number, minimum: number, maximum: number): number {
+  return Math.min(maximum, Math.max(minimum, value ?? fallback));
+}
+
+// Keep one deadline across readiness checks, network attempts, and backoff. The
+// *_MS spelling was used by an earlier release; prefer it when present while
+// also accepting the seconds-based names shared with the other integrations.
 const remoteTimeoutMs = (() => {
-  const value = Number(process.env.FUNES_REMOTE_TIMEOUT_MS || "90000");
-  return Number.isFinite(value) && value >= 5000 && value <= 180000 ? value : 90000;
+  const milliseconds = envNumber("FUNES_REMOTE_TIMEOUT_MS");
+  if (milliseconds !== undefined) return bounded(milliseconds, 180_000, 5_000, 300_000);
+  return bounded((envNumber("FUNES_REMOTE_TIMEOUT") ?? 180) * 1_000, 180_000, 5_000, 300_000);
 })();
+const remoteAttempts = Math.floor(bounded(envNumber("FUNES_REMOTE_ATTEMPTS"), 3, 1, 5));
+const remoteAttemptTimeoutMs = bounded(
+  (envNumber("FUNES_REMOTE_ATTEMPT_TIMEOUT_MS") ?? (envNumber("FUNES_REMOTE_ATTEMPT_TIMEOUT") ?? 50) * 1_000),
+  50_000,
+  1_000,
+  55_000,
+);
+const remoteReadyTimeoutMs = bounded((envNumber("FUNES_REMOTE_READY_TIMEOUT") ?? 8) * 1_000, 8_000, 1_000, 15_000);
+const remoteReadyPolls = Math.floor(bounded(envNumber("FUNES_REMOTE_READY_POLLS"), 8, 1, 30));
+
+type FetchResult = Awaited<ReturnType<typeof fetch>>;
+
+class RequestTimeoutError extends Error {
+  constructor() {
+    super("funes remote request timed out");
+    this.name = "RequestTimeoutError";
+  }
+}
+
+function now(): number {
+  return Date.now();
+}
+
+async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<FetchResult> {
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const request = fetch(url, { ...init, signal: controller.signal });
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      controller.abort();
+      reject(new RequestTimeoutError());
+    }, Math.max(1, timeoutMs));
+  });
+  try {
+    return await Promise.race([request, timeout]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+function statusOf(response: FetchResult): number {
+  const status = Number(response.status);
+  if (Number.isFinite(status) && status > 0) return status;
+  return response.ok ? 200 : 500;
+}
+
+function isSuccess(response: FetchResult): boolean {
+  const status = statusOf(response);
+  return response.ok || (status >= 200 && status < 300);
+}
+
+function isRetryableStatus(status: number): boolean {
+  // 408/425 are transport-window responses rather than authentication or
+  // malformed-request failures; keep the other 4xx statuses terminal.
+  return status === 408 || status === 425 || status === 429 || status >= 500;
+}
+
+function retryDelay(response: FetchResult | undefined, attempt: number): number {
+  const exponential = Math.min(8_000, 1_000 * 2 ** attempt);
+  const retryAfter = response?.headers?.get("retry-after");
+  if (!retryAfter) return exponential;
+  const seconds = Number(retryAfter);
+  if (Number.isFinite(seconds) && seconds >= 0) return Math.min(8_000, seconds * 1_000);
+  const date = Date.parse(retryAfter);
+  if (Number.isFinite(date)) return Math.min(8_000, Math.max(0, date - now()));
+  return exponential;
+}
+
+async function sleepUntil(ms: number, deadline: number): Promise<boolean> {
+  const remaining = deadline - now();
+  if (remaining <= 0) return false;
+  const delay = Math.min(Math.max(0, ms), Math.max(0, remaining));
+  if (delay <= 0) return true;
+  await new Promise<void>((resolve) => setTimeout(resolve, delay));
+  return now() < deadline;
+}
+
+type ReadyState = "ready" | "warming" | "transient" | "unknown" | "permanent";
+
+async function probeReady(headers: Record<string, string>, timeoutMs: number): Promise<ReadyState> {
+  try {
+    const response = await fetchWithTimeout(`${base}/ready`, { method: "GET", headers }, timeoutMs);
+    const status = statusOf(response);
+    if (!isSuccess(response)) return isRetryableStatus(status) ? "transient" : "permanent";
+    if (status === 204) return "ready";
+    let value: unknown;
+    try {
+      value = await response.json();
+    } catch {
+      return "unknown";
+    }
+    if (!value || typeof value !== "object") return "ready";
+    const payload = value as Record<string, unknown>;
+    const warm = payload.native_warm;
+    const warmState = warm && typeof warm === "object" ? String((warm as Record<string, unknown>).state || "") : "";
+    if (warmState === "warming" || payload.status === "warming") return "warming";
+    if (payload.ok === false) return "warming";
+    return "ready";
+  } catch {
+    // An unreachable readiness endpoint should not add fourteen seconds of
+    // polling before the normal POST retry loop gets a chance to recover.
+    return "unknown";
+  }
+}
+
+async function waitUntilReady(headers: Record<string, string>, deadline: number): Promise<ReadyState> {
+  let state: ReadyState = "transient";
+  for (let poll = 0; poll < remoteReadyPolls; poll += 1) {
+    const remaining = deadline - now();
+    if (remaining <= 0) break;
+    state = await probeReady(headers, Math.min(remoteReadyTimeoutMs, remaining));
+    if (state === "ready" || state === "unknown" || state === "permanent") return state;
+    if (poll + 1 >= remoteReadyPolls) break;
+    // A warming response is expected during a cold Space start. Keep the poll
+    // interval short, but let the shared deadline stop it deterministically.
+    if (!(await sleepUntil(2_000, deadline))) break;
+  }
+  return state;
+}
 
 // Keep automatic recall useful without adding latency to every self-contained
 // prompt.  Explicit memory language and historical/project-decision cues opt in;
@@ -31,22 +166,70 @@ function shouldRecall(prompt: string): boolean {
 
 async function call(path: string, body: Record<string, unknown>) {
   if (!base || !token) return null;
+  let encodedBody: string;
   try {
-    const headers: Record<string, string> = { "Content-Type": "application/json" };
-    if (hubToken) {
-      headers.Authorization = `Bearer ${hubToken}`;
-      headers["X-Funes-Authorization"] = `Bearer ${token}`;
-    } else {
-      headers.Authorization = `Bearer ${token}`;
+    encodedBody = JSON.stringify(body);
+  } catch {
+    return null;
+  }
+
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (hubToken) {
+    headers.Authorization = `Bearer ${hubToken}`;
+    headers["X-Funes-Authorization"] = `Bearer ${token}`;
+  } else {
+    headers.Authorization = `Bearer ${token}`;
+  }
+
+  const deadline = now() + remoteTimeoutMs;
+  if (path === "/search" || path === "/recall") {
+    const ready = await waitUntilReady(headers, deadline);
+    // A permanent readiness response (most commonly 401/403) must not be
+    // followed by a duplicate POST. A still-warming service can be queried if
+    // the bounded poll count was reached before the overall deadline.
+    if (ready === "permanent" || (ready === "warming" && now() >= deadline)) return null;
+  }
+
+  let lastResponse: FetchResult | undefined;
+  for (let attempt = 0; attempt < remoteAttempts; attempt += 1) {
+    const remaining = deadline - now();
+    if (remaining <= 0) break;
+    lastResponse = undefined;
+    try {
+      const response = await fetchWithTimeout(
+        `${base}${path}`,
+        {
+          method: "POST",
+          headers,
+          body: encodedBody,
+        },
+        Math.min(remoteAttemptTimeoutMs, remaining),
+      );
+      const status = statusOf(response);
+      if (isSuccess(response)) {
+        try {
+          return await response.json();
+        } catch {
+          // A truncated/invalid JSON body is transient; let the bounded retry
+          // loop recover without changing the response shape for valid calls.
+        }
+      } else {
+        // Never retry authentication or other caller errors.  Only provider /
+        // gateway failures and explicit rate limits are transient here.
+        if (!isRetryableStatus(status)) return null;
+        lastResponse = response;
+      }
+    } catch {
+      // Fetch failures include connection resets and per-attempt timeouts; all
+      // are bounded by the shared deadline and safe to retry.
     }
-    const response = await fetch(`${base}${path}`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(remoteTimeoutMs),
-    });
-    return response.ok ? await response.json() : null;
-  } catch { return null; }
+
+    if (attempt + 1 >= remoteAttempts) break;
+    const remainingAfterAttempt = deadline - now();
+    if (remainingAfterAttempt <= 0) break;
+    if (!(await sleepUntil(retryDelay(lastResponse, attempt), deadline))) break;
+  }
+  return null;
 }
 
 export default function funesRemote(pi: ExtensionAPI) {

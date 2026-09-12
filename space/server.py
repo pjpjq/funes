@@ -33,12 +33,20 @@ MCP_PROTOCOL_VERSION = "2024-11-05"
 MCP_TIMEOUT = float(os.getenv("FUNES_MCP_TIMEOUT", "180"))
 MCP_HANDSHAKE_TIMEOUT = float(os.getenv("FUNES_MCP_HANDSHAKE_TIMEOUT", "10"))
 try:
+    RECALL_LOCK_TIMEOUT = min(55.0, max(0.1, float(os.getenv("FUNES_RECALL_LOCK_TIMEOUT", "2"))))
+except ValueError:
+    RECALL_LOCK_TIMEOUT = 2.0
+try:
     HTTP_MAX_CANDIDATES = max(1, int(os.getenv("FUNES_HTTP_MAX_CANDIDATES", "12")))
 except ValueError:
     HTTP_MAX_CANDIDATES = 12
 PROMPT_VERSION = "funes-retrieval-v1"
 LANGUAGE_MODE = os.getenv("FUNES_RETRIEVAL_LANGUAGE_MODE", "auto").lower()
 INDEX_LOCK = threading.Lock()
+# Writes use the native memory lock inside the `funes` process.  Keep their
+# Python-level serialization separate from reads so a background ingest/push
+# cannot make an HTTP recall wait for the full upload duration.
+WRITE_LOCK = threading.Lock()
 
 # A remote Lance memory can take longer than the Space ingress timeout to open
 # on the first recall (model + snapshot + ANN/FTS handles).  Warm it in the
@@ -243,6 +251,10 @@ def run(*args: str, timeout: int = 180) -> tuple[int, str, str]:
 
 class NativeMcpError(subprocess.SubprocessError):
     """A native MCP failure without carrying process output into logs or HTTP responses."""
+
+
+class NativeMcpBusyError(NativeMcpError):
+    """The single native read worker is occupied; callers should retry shortly."""
 
 
 class NativeMcpWorker:
@@ -583,13 +595,21 @@ atexit.register(close_native_worker)
 
 
 def recall(query: str, **kwargs) -> str:
-    with INDEX_LOCK:
+    if not INDEX_LOCK.acquire(timeout=RECALL_LOCK_TIMEOUT):
+        raise NativeMcpBusyError("native MCP busy")
+    try:
         return native_worker().recall(query, **kwargs)
+    finally:
+        INDEX_LOCK.release()
 
 
 def get(session_id: str, **kwargs) -> str:
-    with INDEX_LOCK:
+    if not INDEX_LOCK.acquire(timeout=RECALL_LOCK_TIMEOUT):
+        raise NativeMcpBusyError("native MCP busy")
+    try:
         return native_worker().get(session_id, **kwargs)
+    finally:
+        INDEX_LOCK.release()
 
 
 def auth_ok(handler: BaseHTTPRequestHandler) -> bool:
@@ -705,6 +725,9 @@ class Handler(BaseHTTPRequestHandler):
                     tuning.setdefault("neighbors", 0)
                     tuning.setdefault("half_life", 0)
                     out = recall(query, k=limit, **tuning)
+                except NativeMcpBusyError:
+                    self.send_json(429, {"ok": False, "query": raw_query, "retrieval_query": query, "results": [], "results_text": "", "error": "native_mcp_busy", "retry_after": 3})
+                    return
                 except NativeMcpError:
                     self.send_json(503, {"ok": False, "query": raw_query, "retrieval_query": query, "results": [], "results_text": "", "error": "native_mcp_unavailable"})
                     return
@@ -718,6 +741,9 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 try:
                     out = get(sid, from_=obj.get("from"), to=obj.get("to"))
+                except NativeMcpBusyError:
+                    self.send_json(429, {"ok": False, "result": "", "error": "native_mcp_busy", "retry_after": 3})
+                    return
                 except NativeMcpError:
                     self.send_json(503, {"ok": False, "result": "", "error": "native_mcp_unavailable"})
                     return
@@ -774,11 +800,10 @@ class Handler(BaseHTTPRequestHandler):
                         (harness_dir / f"{index:08d}-{hashlib.sha256(sid.encode()).hexdigest()[:16]}.jsonl").write_text(json.dumps(line, ensure_ascii=False) + "\n" + json.dumps(msg, ensure_ascii=False) + "\n", encoding="utf-8")
                     outputs = []
                     errors = []
-                    with INDEX_LOCK:
-                        # The long-lived MCP process keeps its own model/index handles.  Stop it
-                        # before replacing the local cache so the next read observes the freshly
-                        # pushed snapshot instead of a pre-ingest view.
-                        close_native_worker()
+                    with WRITE_LOCK:
+                        # The long-lived MCP process keeps its own model/index handles; leave it
+                        # alive while Lance appends. Readers use consistent snapshots and can
+                        # continue serving the previous remote head while this durable write runs.
                         for harness in sorted(harnesses):
                             code, out, err = run("index", str(source / harness), "--harness", harness, "--yes", timeout=INGEST_INDEX_TIMEOUT)
                             outputs.append(out)

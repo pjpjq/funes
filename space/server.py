@@ -133,7 +133,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not query:
                     self.send_json(400, {"error": "query is required"})
                     return
-                args = ["recall", query, "--k", str(min(int(obj.get("k", 8)), 50))]
+                args = ["recall", query, "--k", str(min(int(obj.get("limit", obj.get("k", 8))), 50))]
                 if REMOTE:
                     args += ["--memory", REMOTE]
                 for name in ("harness", "repo"):
@@ -194,8 +194,17 @@ class Handler(BaseHTTPRequestHandler):
                         harnesses.add(harness)
                         session_ids.append(sid)
                         metadata = {k: doc[k] for k in ("source_identity", "source_type", "project", "repo", "worktree", "message_id", "content_type") if doc.get(k) is not None}
-                        line = {"type": "session_meta", "timestamp": now, "payload": {"id": sid, "cwd": str(doc.get("worktree", doc.get("project", "remote"))), "metadata": metadata}}
-                        msg = {"type": "response_item", "timestamp": now, "payload": {"type": "message", "role": str(doc.get("role", "user")), "content": [{"type": "input_text", "text": raw}]}}
+                        cwd = str(doc.get("worktree", doc.get("project", "remote")))
+                        role = str(doc.get("role", "user"))
+                        if harness == "pi":
+                            line = {"type": "session", "id": sid, "cwd": cwd, "timestamp": now, "metadata": metadata}
+                            msg = {"type": "message", "id": str(doc.get("message_id") or hashlib.sha256((sid + raw).encode()).hexdigest()[:24]), "timestamp": now, "message": {"role": role, "content": [{"type": "text", "text": raw}]}}
+                        elif harness == "claude":
+                            line = {"type": role if role in {"user", "assistant"} else "user", "uuid": str(doc.get("message_id") or hashlib.sha256((sid + raw).encode()).hexdigest()[:24]), "timestamp": now, "cwd": cwd, "metadata": metadata}
+                            msg = {"type": line["type"], "uuid": line["uuid"], "timestamp": now, "cwd": cwd, "message": {"role": role, "content": [{"type": "text", "text": raw}]}}
+                        else:
+                            line = {"type": "session_meta", "timestamp": now, "payload": {"id": sid, "cwd": cwd, "metadata": metadata}}
+                            msg = {"type": "response_item", "timestamp": now, "payload": {"type": "message", "role": role, "content": [{"type": "input_text", "text": raw}]}}
                         # Keep each harness in its own directory.  A Pi/Claude
                         # parser must never rescan a Codex envelope from the
                         # same batch.

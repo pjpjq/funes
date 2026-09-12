@@ -13,10 +13,12 @@ def persist_keychain_token() -> bool:
     if not token or not security:
         return False
     account = os.environ.get("USER") or str(os.getuid())
-    # `security` has no stdin password mode; the value is passed only to this
-    # short-lived process and is never written to a file or logged.
+    # Supplying `-w <value>` exposes the secret in process arguments.  The
+    # macOS security CLI prompts twice when `-w` is the final option, so feed
+    # both prompts over stdin instead.
     saved = subprocess.run(
-        [security, "add-generic-password", "-U", "-a", account, "-s", KEYCHAIN_SERVICE, "-w", token],
+        [security, "add-generic-password", "-U", "-a", account, "-s", KEYCHAIN_SERVICE, "-w"],
+        input=f"{token}\n{token}\n", encoding="utf-8",
         check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
     if saved.returncode != 0:
@@ -32,12 +34,12 @@ def persist_keychain_token() -> bool:
 def persist_keychain_credentials() -> None:
     """Persist configured API and Hub tokens; neither is written to the plist."""
     persist_keychain_token()
-    hub = os.environ.get("FUNES_HF_TOKEN")
+    hub = os.environ.get("FUNES_HF_TOKEN") or os.environ.get("HF_TOKEN")
     security = shutil.which("security")
     if not hub or not security:
         return
     account = os.environ.get("USER") or str(os.getuid())
-    saved = subprocess.run([security, "add-generic-password", "-U", "-a", account, "-s", HF_KEYCHAIN_SERVICE, "-w", hub], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    saved = subprocess.run([security, "add-generic-password", "-U", "-a", account, "-s", HF_KEYCHAIN_SERVICE, "-w"], input=f"{hub}\n{hub}\n", encoding="utf-8", check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     if saved.returncode != 0:
         raise RuntimeError("unable to store FUNES_HF_TOKEN in macOS Keychain")
     check = subprocess.run([security, "find-generic-password", "-a", account, "-s", HF_KEYCHAIN_SERVICE, "-w"], check=False, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
@@ -50,7 +52,13 @@ def render_plist(python=None):
     env={"PYTHONPATH":str(root)}
     # The launcher loads FUNES_API_TOKEN from macOS Keychain at runtime; never
     # persist the bearer token in a world-readable plist.
-    for key in ("FUNES_REMOTE_URL", "FUNES_MEMORY_ONLY", "FUNES_STATE_DIR"):
+    for key in (
+        "FUNES_REMOTE_URL",
+        "FUNES_MEMORY_ONLY",
+        "FUNES_STATE_DIR",
+        "FUNES_SYNC_BATCH",
+        "FUNES_REMOTE_TIMEOUT",
+    ):
         value=os.environ.get(key)
         if value:
             env[key]=value
@@ -67,6 +75,7 @@ def install(home=None):
     # This file is owned by us; never overwrite unrelated launch agents.
     persist_keychain_credentials()
     with p.open("wb") as f: plistlib.dump(render_plist(),f)
+    p.chmod(0o600)
     try:
         uid=str(os.getuid())
         subprocess.run(["launchctl","bootstrap",f"gui/{uid}",str(p)],check=False,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)

@@ -926,6 +926,27 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(result["reason"], "HF storage not configured")
         store.close()
 
+    def test_existing_content_addressed_delta_is_durable_without_reupload(self):
+        from service.server import SnapshotSync
+        store = Store(self.tmp.name)
+        store.ingest([{"source_identity": "remote", "raw_text": "already durable"}])
+        os.environ.update(
+            FUNES_STORAGE_REPO="owner/private",
+            FUNES_STORAGE_KEY="test-storage-key",
+            HF_TOKEN="hf-test",
+        )
+        api = mock.Mock()
+        api.file_exists.return_value = True
+        module = mock.Mock(HfApi=mock.Mock(return_value=api))
+        syncer = SnapshotSync(store)
+        with mock.patch.dict("sys.modules", {"huggingface_hub": module}):
+            result = syncer.upload(store.get_many(["remote"]))
+        self.assertTrue(result["durable"])
+        self.assertTrue(result["already_uploaded"])
+        api.upload_file.assert_not_called()
+        self.assertFalse(list(Path(self.tmp.name).glob("funes-delta-*.jsonl.gz")))
+        store.close()
+
     def test_encrypted_source_snapshot_roundtrip_hides_plaintext(self):
         from service.server import SnapshotSync
         store = Store(self.tmp.name)

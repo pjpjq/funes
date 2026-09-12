@@ -1440,6 +1440,31 @@ class SnapshotSync:
                 if self.repo or self._truth("FUNES_REQUIRE_DURABLE_ACK"):
                     return {"uploaded": False, "durable": False, "path": str(path), "reason": "HF storage not configured"}
                 return {"uploaded": False, "durable": True, "path": str(path), "reason": "local durable store"}
+            target = (path.name if docs is not None else self.filename) + ".enc"
+            api = None
+            if docs is not None:
+                try:
+                    from huggingface_hub import HfApi
+                    api = HfApi(token=self.token)
+                    if api.file_exists(
+                        repo_id=self.repo,
+                        filename=target,
+                        repo_type="dataset",
+                        token=self.token,
+                    ):
+                        path.unlink(missing_ok=True)
+                        self.store.set_sync(last_sync=utc_now(), snapshot_path=str(path), last_error=None)
+                        return {
+                            "uploaded": False,
+                            "durable": True,
+                            "path": str(path),
+                            "already_uploaded": True,
+                        }
+                except Exception:
+                    # Existence probing is only an idempotency optimization. A
+                    # transient read failure must not prevent the authoritative
+                    # upload attempt below.
+                    api = None
             try:
                 encrypted = path.with_name(path.name + ".enc")
                 self._encrypt_file(path, encrypted)
@@ -1448,9 +1473,10 @@ class SnapshotSync:
                 self.store.set_sync(last_error=reason, snapshot_path=str(path))
                 return {"uploaded": False, "durable": False, "path": str(path), "reason": reason}
             try:
-                from huggingface_hub import HfApi
-                target = (path.name if docs is not None else self.filename) + ".enc"
-                HfApi(token=self.token).upload_file(path_or_fileobj=str(encrypted), path_in_repo=target, repo_id=self.repo, repo_type="dataset", commit_message="funes encrypted source delta" if docs is not None else "funes encrypted source snapshot")
+                if api is None:
+                    from huggingface_hub import HfApi
+                    api = HfApi(token=self.token)
+                api.upload_file(path_or_fileobj=str(encrypted), path_in_repo=target, repo_id=self.repo, repo_type="dataset", commit_message="funes encrypted source delta" if docs is not None else "funes encrypted source snapshot")
                 if docs is not None:
                     path.unlink(missing_ok=True)
                 encrypted.unlink(missing_ok=True)

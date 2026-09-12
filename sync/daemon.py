@@ -80,8 +80,17 @@ class SyncDaemon:
             roots.add(project)
         for root in roots:
             if root.exists():
-                observer.schedule(Handler(), str(root), recursive=True)
-        observer.start()
+                try:
+                    observer.schedule(Handler(), str(root), recursive=True)
+                except OSError as exc:
+                    log.warning("watcher unavailable for %s: %s", root, type(exc).__name__)
+        try:
+            observer.start()
+        except OSError as exc:
+            log.warning("watcher unavailable; continuing with reconciliation polling: %s", type(exc).__name__)
+            observer.stop()
+            observer.join(timeout=5)
+            return
         self._observer = observer
 
     def _stop_watcher(self) -> None:

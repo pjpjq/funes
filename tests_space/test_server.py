@@ -173,6 +173,103 @@ def test_native_mcp_worker_restarts_after_eof(monkeypatch, tmp_path):
     assert processes[0].terminated is True
 
 
+def test_native_mcp_timeout_is_not_retried_with_a_second_full_budget(monkeypatch, tmp_path):
+    worker = bridge.NativeMcpWorker(
+        "fake-funes", "owner/memory", tmp_path, timeout=180, handshake_timeout=10
+    )
+    request_timeouts = []
+    monkeypatch.setattr(worker, "_ensure_started_locked", lambda _deadline=None: None)
+
+    def timeout_request(_method, _params, timeout):
+        request_timeouts.append(timeout)
+        raise bridge.NativeMcpTimeoutError("timed out")
+
+    monkeypatch.setattr(worker, "_request_locked", timeout_request)
+    monkeypatch.setattr(worker, "_stop_locked", lambda *_args: None)
+    with pytest.raises(bridge.NativeMcpTimeoutError):
+        worker.recall("slow query", timeout=12)
+    assert len(request_timeouts) == 1
+    assert 0 < request_timeouts[0] <= 12
+
+
+def test_native_lock_wait_is_deducted_from_call_budget(monkeypatch):
+    clock = [100.0]
+    acquired = []
+    released = []
+
+    class Lock:
+        def acquire(self, timeout):
+            acquired.append(timeout)
+            clock[0] += 0.04
+            return True
+
+        def release(self):
+            released.append(True)
+
+    remaining = []
+    monkeypatch.setattr(bridge, "INDEX_LOCK", Lock())
+    monkeypatch.setattr(bridge, "RECALL_LOCK_TIMEOUT", 2.0)
+    monkeypatch.setattr(bridge.time, "monotonic", lambda: clock[0])
+    bridge._locked_native_call(lambda timeout: remaining.append(timeout), 0.05)
+    assert 0 < acquired[0] <= 0.05
+    assert 0 < remaining[0] <= 0.011
+    assert released == [True]
+
+
+def test_timeout_cleanup_kills_without_synchronous_wait(monkeypatch, tmp_path):
+    waits = []
+
+    class Process:
+        stdin = None
+        stdout = None
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            return None
+
+        def kill(self):
+            return None
+
+        def wait(self, timeout=None):
+            waits.append(timeout)
+            return -9
+
+    class Thread:
+        def __init__(self, *, target, args, **_kwargs):
+            self.target = target
+            self.args = args
+
+        def start(self):
+            self.target(*self.args)
+
+    worker = bridge.NativeMcpWorker("fake-funes", "owner/memory", tmp_path)
+    worker._process = Process()
+    monkeypatch.setattr(bridge.threading, "Thread", Thread)
+    worker._stop_locked(deadline=100.0)
+    assert waits == [None]
+
+
+def test_materialize_native_session_uses_remaining_deadline(monkeypatch):
+    calls = []
+    app = SimpleNamespace(store=SimpleNamespace(get=lambda _identity: None))
+    monkeypatch.setattr(bridge.time, "monotonic", lambda: 100.0)
+    monkeypatch.setattr(
+        bridge,
+        "get",
+        lambda identity, **kwargs: calls.append((identity, kwargs)) or "raw session",
+    )
+    results = bridge.materialize_native_results(
+        "hit\n  → get session-1 --from 0 --to 0",
+        app,
+        1,
+        deadline=112.0,
+    )
+    assert results[0]["raw_text"] == "raw session"
+    assert calls == [("session-1", {"timeout": 12.0})]
+
+
 def test_request_warm_reserves_state_before_start(monkeypatch):
     starts = []
 
@@ -286,8 +383,12 @@ def test_search_and_get_use_native_worker_and_keep_raw_query(monkeypatch):
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)
-    assert calls[1] == ("get", "session-1", {})
-    assert calls[2] == ("get", "session-1", {"from_": 2, "to": None})
+    assert calls[1][0:2] == ("get", "session-1")
+    assert 0 < calls[1][2]["timeout"] <= bridge.HTTP_NATIVE_TIMEOUT
+    assert calls[2][0:2] == ("get", "session-1")
+    assert calls[2][2]["from_"] == 2
+    assert calls[2][2]["to"] is None
+    assert 0 < calls[2][2]["timeout"] <= bridge.HTTP_NATIVE_TIMEOUT
 
 
 def _request(server, payload, token="test-token"):
@@ -1252,6 +1353,84 @@ def test_http_rrf_promotes_dual_hit_and_keeps_sidecar_raw(monkeypatch, tmp_path)
     assert "ENGLISH SHADOW" not in json.dumps(body["results"], ensure_ascii=False)
 
 
+@pytest.mark.parametrize(
+    ("native_error", "degraded"),
+    (
+        (bridge.NativeMcpError("timed out"), "native_mcp_unavailable"),
+        (bridge.NativeMcpBusyError("busy"), "native_mcp_busy"),
+    ),
+)
+def test_http_native_failure_returns_raw_sidecar_results(
+    monkeypatch, tmp_path, native_error, degraded
+):
+    app = _source_app(tmp_path)
+    source_rankings = [[{"source_identity": "sidecar", "raw_text": "原始 sidecar 结果"}]]
+    monkeypatch.setattr(bridge, "SOURCE_APP", app)
+    monkeypatch.setattr(bridge, "TOKEN", "test-token")
+    monkeypatch.setattr(
+        bridge,
+        "search_source_rankings",
+        lambda query, limit, filters: ("provider query", source_rankings),
+    )
+    monkeypatch.setattr(
+        bridge,
+        "recall",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(native_error),
+    )
+    server = ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        status, body = _post(server, "/search", {"query": "raw query", "limit": 3})
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+        app.store.close()
+    assert status == 200
+    assert body["retrieval_degraded"] == degraded
+    assert body["results_text"] == "原始 sidecar 结果"
+    assert body["results"] == source_rankings[0]
+
+
+@pytest.mark.parametrize(
+    ("native_error", "expected_status", "expected_error"),
+    (
+        (bridge.NativeMcpError("failed"), 503, "native_mcp_unavailable"),
+        (bridge.NativeMcpBusyError("busy"), 429, "native_mcp_busy"),
+    ),
+)
+def test_http_native_failure_without_sidecar_stays_retryable(
+    monkeypatch, tmp_path, native_error, expected_status, expected_error
+):
+    app = _source_app(tmp_path)
+    monkeypatch.setattr(bridge, "SOURCE_APP", app)
+    monkeypatch.setattr(bridge, "TOKEN", "test-token")
+    monkeypatch.setattr(
+        bridge,
+        "search_source_rankings",
+        lambda query, limit, filters: ("provider query", []),
+    )
+    monkeypatch.setattr(
+        bridge,
+        "recall",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(native_error),
+    )
+    server = ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        status, body = _post(server, "/search", {"query": "private query", "limit": 3})
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+        app.store.close()
+    assert status == expected_status
+    assert body["error"] == expected_error
+    assert "private query" not in json.dumps(body)
+
+
 def test_http_caps_cjk_native_candidates_after_query_tuning(monkeypatch, tmp_path):
     app = _source_app(tmp_path)
     calls = []
@@ -1287,6 +1466,7 @@ def test_http_caps_cjk_native_candidates_after_query_tuning(monkeypatch, tmp_pat
     assert status == 200
     assert calls[0][0] == "CPA previous_response_id context loss"
     assert calls[0][1]["candidates"] == 12
+    assert 0 < calls[0][1]["timeout"] <= bridge.HTTP_NATIVE_TIMEOUT
 
 
 def test_missing_canonical_reference_never_falls_back_to_native_get(monkeypatch, tmp_path):

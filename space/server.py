@@ -50,6 +50,10 @@ try:
     HTTP_MAX_CANDIDATES = max(1, int(os.getenv("FUNES_HTTP_MAX_CANDIDATES", "12")))
 except ValueError:
     HTTP_MAX_CANDIDATES = 12
+try:
+    HTTP_NATIVE_TIMEOUT = min(50.0, max(0.1, float(os.getenv("FUNES_HTTP_NATIVE_TIMEOUT", "12"))))
+except ValueError:
+    HTTP_NATIVE_TIMEOUT = 12.0
 PROMPT_VERSION = "funes-retrieval-v1"
 LANGUAGE_MODE = os.getenv("FUNES_RETRIEVAL_LANGUAGE_MODE", "auto").lower()
 INDEX_LOCK = threading.Lock()
@@ -636,7 +640,13 @@ def _public_source_item(item: dict) -> dict:
     return public
 
 
-def materialize_native_results(output: str, app, limit: int) -> list[dict]:
+def materialize_native_results(
+    output: str,
+    app,
+    limit: int,
+    *,
+    deadline: float | None = None,
+) -> list[dict]:
     """Resolve native rank coordinates to raw sidecar documents or sessions."""
     results = []
     for identity in native_result_ids(output)[:limit]:
@@ -653,7 +663,10 @@ def materialize_native_results(output: str, app, limit: int) -> list[dict]:
             # A canonical native reference without its encrypted sidecar raw is
             # unsafe to render: native get would expose retrieval_text.
             continue
-        session = get(identity)
+        remaining = None if deadline is None else deadline - time.monotonic()
+        if remaining is not None and remaining <= 0:
+            raise NativeMcpTimeoutError("native MCP request timed out")
+        session = get(identity, timeout=remaining)
         results.append(
             {
                 "raw_text": session,
@@ -671,6 +684,10 @@ class NativeMcpError(subprocess.SubprocessError):
 
 class NativeMcpBusyError(NativeMcpError):
     """The single native read worker is occupied; callers should retry shortly."""
+
+
+class NativeMcpTimeoutError(NativeMcpError):
+    """A native request exhausted its complete caller-owned time budget."""
 
 
 class NativeMcpWorker:
@@ -726,7 +743,14 @@ class NativeMcpWorker:
         except (OSError, ValueError):
             pass
 
-    def _stop_locked(self) -> None:
+    @staticmethod
+    def _reap_process(process) -> None:
+        try:
+            process.wait()
+        except (OSError, AttributeError, TypeError):
+            pass
+
+    def _stop_locked(self, deadline: float | None = None) -> None:
         process = self._process
         self._process = None
         if process is None:
@@ -736,21 +760,33 @@ class NativeMcpWorker:
                 process.terminate()
             except (OSError, AttributeError):
                 pass
-            try:
-                process.wait(timeout=0.5)
-            except (OSError, subprocess.TimeoutExpired, AttributeError, TypeError):
+            if deadline is not None:
                 try:
                     process.kill()
                 except (OSError, AttributeError):
                     pass
+                threading.Thread(
+                    target=self._reap_process,
+                    args=(process,),
+                    name="funes-native-mcp-reap",
+                    daemon=True,
+                ).start()
+            else:
                 try:
                     process.wait(timeout=0.5)
                 except (OSError, subprocess.TimeoutExpired, AttributeError, TypeError):
-                    pass
+                    try:
+                        process.kill()
+                    except (OSError, AttributeError):
+                        pass
+                    try:
+                        process.wait(timeout=0.5)
+                    except (OSError, subprocess.TimeoutExpired, AttributeError, TypeError):
+                        pass
         self._close_stream(getattr(process, "stdin", None))
         self._close_stream(getattr(process, "stdout", None))
 
-    def _start_locked(self) -> None:
+    def _start_locked(self, deadline: float | None = None) -> None:
         args = [self.binary, "mcp"]
         if self.remote:
             args.append(self.remote)
@@ -771,6 +807,12 @@ class NativeMcpWorker:
         # restarted worker interoperable with strict fake/native servers.
         self._next_id = 1
         try:
+            handshake_timeout = self.handshake_timeout
+            if deadline is not None:
+                handshake_timeout = min(
+                    handshake_timeout,
+                    max(0.001, deadline - time.monotonic()),
+                )
             self._request_locked(
                 "initialize",
                 {
@@ -778,18 +820,18 @@ class NativeMcpWorker:
                     "capabilities": {},
                     "clientInfo": {"name": "funes-space-bridge", "version": "1"},
                 },
-                self.handshake_timeout,
+                handshake_timeout,
             )
             self._send_locked({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}})
         except NativeMcpError:
-            self._stop_locked()
+            self._stop_locked(deadline)
             raise
 
-    def _ensure_started_locked(self) -> None:
+    def _ensure_started_locked(self, deadline: float | None = None) -> None:
         if self._process is not None and self._alive(self._process):
             return
         self._stop_locked()
-        self._start_locked()
+        self._start_locked(deadline)
 
     def _send_locked(self, message: dict) -> None:
         process = self._process
@@ -810,7 +852,7 @@ class NativeMcpWorker:
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise NativeMcpError("native MCP request timed out")
+                raise NativeMcpTimeoutError("native MCP request timed out")
             try:
                 fd = stream.fileno()
             except (AttributeError, OSError, ValueError):
@@ -823,7 +865,7 @@ class NativeMcpWorker:
                 except (OSError, ValueError):
                     readable = True
             if not readable:
-                raise NativeMcpError("native MCP request timed out")
+                raise NativeMcpTimeoutError("native MCP request timed out")
             try:
                 line = stream.readline()
             except (OSError, ValueError) as exc:
@@ -863,15 +905,23 @@ class NativeMcpWorker:
         # A read-only recall/get can safely be retried once after a dead child;
         # the retry also covers a child that exits during initialization.
         last_error = None
+        total_timeout = self.timeout if timeout is None else max(0.001, float(timeout))
+        deadline = time.monotonic() + total_timeout
         with self._lock:
             for attempt in range(2):
                 try:
-                    self._ensure_started_locked()
-                    return self._request_locked(method, params, self.timeout if timeout is None else timeout)
+                    self._ensure_started_locked(deadline)
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise NativeMcpTimeoutError("native MCP request timed out")
+                    return self._request_locked(method, params, remaining)
+                except NativeMcpTimeoutError:
+                    self._stop_locked(deadline)
+                    raise
                 except NativeMcpError as exc:
                     last_error = exc
-                    self._stop_locked()
-                    if attempt == 0:
+                    self._stop_locked(deadline)
+                    if attempt == 0 and time.monotonic() < deadline:
                         continue
                     raise
         raise last_error or NativeMcpError("native MCP request failed")
@@ -908,6 +958,7 @@ class NativeMcpWorker:
         neighbors: int | None = None,
         block_type: str | None = None,
         harness: str | None = None,
+        timeout: float | None = None,
         **extra,
     ) -> str:
         arguments = {"query": str(query), "k": int(k)}
@@ -924,9 +975,17 @@ class NativeMcpWorker:
         # rmcp/serde ignores unknown optional fields while native recall still
         # receives the same query and bounded tuning values.
         arguments.update({name: value for name, value in extra.items() if value is not None})
-        return self.call_tool("recall", arguments)
+        return self.call_tool("recall", arguments, timeout=timeout)
 
-    def get(self, session_id: str, *, from_: int | None = None, to: int | None = None, **extra) -> str:
+    def get(
+        self,
+        session_id: str,
+        *,
+        from_: int | None = None,
+        to: int | None = None,
+        timeout: float | None = None,
+        **extra,
+    ) -> str:
         if from_ is None and "from" in extra:
             from_ = extra.pop("from")
         arguments = {"session_id": str(session_id)}
@@ -935,7 +994,7 @@ class NativeMcpWorker:
         if to is not None:
             arguments["to"] = to
         arguments.update({name: value for name, value in extra.items() if value is not None})
-        return self.call_tool("get", arguments)
+        return self.call_tool("get", arguments, timeout=timeout)
 
 
 MCP_WORKER = None
@@ -1011,22 +1070,43 @@ atexit.register(close_native_worker)
 atexit.register(close_source_app)
 
 
-def recall(query: str, **kwargs) -> str:
-    if not INDEX_LOCK.acquire(timeout=RECALL_LOCK_TIMEOUT):
+def _locked_native_call(invoke, timeout: float | None):
+    deadline = None
+    lock_timeout = RECALL_LOCK_TIMEOUT
+    if timeout is not None:
+        deadline = time.monotonic() + max(0.001, float(timeout))
+        lock_timeout = min(lock_timeout, max(0.001, deadline - time.monotonic()))
+    if not INDEX_LOCK.acquire(timeout=lock_timeout):
         raise NativeMcpBusyError("native MCP busy")
     try:
-        return native_worker().recall(query, **kwargs)
+        remaining = None if deadline is None else deadline - time.monotonic()
+        if remaining is not None and remaining <= 0:
+            raise NativeMcpTimeoutError("native MCP request timed out")
+        return invoke(remaining)
     finally:
         INDEX_LOCK.release()
 
 
-def get(session_id: str, **kwargs) -> str:
-    if not INDEX_LOCK.acquire(timeout=RECALL_LOCK_TIMEOUT):
-        raise NativeMcpBusyError("native MCP busy")
-    try:
-        return native_worker().get(session_id, **kwargs)
-    finally:
-        INDEX_LOCK.release()
+def recall(query: str, *, timeout: float | None = None, **kwargs) -> str:
+    return _locked_native_call(
+        lambda remaining: native_worker().recall(
+            query,
+            timeout=remaining,
+            **kwargs,
+        ),
+        timeout,
+    )
+
+
+def get(session_id: str, *, timeout: float | None = None, **kwargs) -> str:
+    return _locked_native_call(
+        lambda remaining: native_worker().get(
+            session_id,
+            timeout=remaining,
+            **kwargs,
+        ),
+        timeout,
+    )
 
 
 def auth_ok(handler: BaseHTTPRequestHandler) -> bool:
@@ -1192,6 +1272,7 @@ class Handler(BaseHTTPRequestHandler):
                         tuning[name] = filters[name]
                 # Date/role filtering remains authoritative in the sidecar.
                 native_allowed = not any(key in filters for key in ("role", "since", "until"))
+                native_deadline = time.monotonic() + HTTP_NATIVE_TIMEOUT
                 try:
                     # The native CLI defaults to 30 fused candidates, recency
                     # weighting, and neighbor expansion. Those defaults are
@@ -1203,21 +1284,50 @@ class Handler(BaseHTTPRequestHandler):
                     tuning["candidates"] = min(HTTP_MAX_CANDIDATES, requested_candidates)
                     tuning.setdefault("neighbors", 0)
                     tuning.setdefault("half_life", 0)
-                    out = recall(query, k=limit, **tuning) if native_allowed else ""
-                    results = materialize_native_results(out, app, limit) if out else []
+                    out = (
+                        recall(
+                            query,
+                            k=limit,
+                            timeout=max(0.001, native_deadline - time.monotonic()),
+                            **tuning,
+                        )
+                        if native_allowed
+                        else ""
+                    )
+                    results = (
+                        materialize_native_results(
+                            out,
+                            app,
+                            limit,
+                            deadline=native_deadline,
+                        )
+                        if out
+                        else []
+                    )
                 except NativeMcpBusyError:
-                    self.send_json(429, {"ok": False, "results": [], "results_text": "", "error": "native_mcp_busy", "retry_after": 3}, {"Retry-After": "3"})
-                    return
+                    if not any(source_rankings):
+                        self.send_json(429, {"ok": False, "results": [], "results_text": "", "error": "native_mcp_busy", "retry_after": 3}, {"Retry-After": "3"})
+                        return
+                    results = []
+                    retrieval_degraded = "native_mcp_busy"
                 except NativeMcpError:
-                    self.send_json(503, {"ok": False, "results": [], "results_text": "", "error": "native_mcp_unavailable"})
-                    return
+                    if not any(source_rankings):
+                        self.send_json(503, {"ok": False, "results": [], "results_text": "", "error": "native_mcp_unavailable"})
+                        return
+                    results = []
+                    retrieval_degraded = "native_mcp_unavailable"
+                else:
+                    retrieval_degraded = ""
                 results = stable_rrf([*source_rankings, results], limit)
                 results_text = "\n\n".join(
                     str(item.get("raw_text", ""))
                     for item in results
                     if item.get("raw_text")
                 )
-                self.send_json(200, {"ok": True, "query": raw_query, "retrieval_query": source_query if source_query != raw_query else query, "results": results, "results_text": results_text, "error": ""})
+                response = {"ok": True, "query": raw_query, "retrieval_query": source_query if source_query != raw_query else query, "results": results, "results_text": results_text, "error": ""}
+                if retrieval_degraded:
+                    response["retrieval_degraded"] = retrieval_degraded
+                self.send_json(200, response)
                 return
             if self.path == "/get":
                 sid = str(obj.get("source_identity", obj.get("id", obj.get("session_id", "")))).strip()
@@ -1236,7 +1346,12 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json(404, {"ok": False, "result": "", "error": "not_found"})
                     return
                 try:
-                    out = get(sid, from_=obj.get("from"), to=obj.get("to"))
+                    out = get(
+                        sid,
+                        from_=obj.get("from"),
+                        to=obj.get("to"),
+                        timeout=HTTP_NATIVE_TIMEOUT,
+                    )
                 except NativeMcpBusyError:
                     self.send_json(429, {"ok": False, "result": "", "error": "native_mcp_busy", "retry_after": 3}, {"Retry-After": "3"})
                     return

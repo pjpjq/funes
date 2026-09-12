@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
-"""Small, deterministic retrieval benchmark for the unified service.
+"""Synthetic retrieval proxy plus an explicit real-E2E benchmark scaffold.
 
-This intentionally uses the service's ASCII-token scoring path as a repeatable
-offline proxy.  It does not pretend to be a BGE embedding score when no
-translation provider/model is configured; the report records that boundary.
+The default run uses a checked-in fixture and ASCII-token overlap only. It is not
+a Funes, Lance, FTS, or BGE benchmark. A real command can be supplied with
+``--e2e-command``; its output is recorded separately and is never substituted
+for the synthetic fixture metrics.
 """
 from __future__ import annotations
 
+import argparse
 import json
 import re
+import shlex
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -125,19 +129,67 @@ def evaluate(memories: list[Memory], queries: list[Query], shadow: bool) -> dict
     return out
 
 
-def main() -> None:
+def _e2e_scaffold(command: str | None) -> dict[str, object]:
+    """Run an explicitly supplied E2E command, without inventing a backend result."""
+    scaffold: dict[str, object] = {
+        "status": "not_run",
+        "kind": "real_funes_e2e_scaffold",
+        "not_comparable_to_synthetic_proxy": True,
+        "required": [
+            "a real funes binary and local memory",
+            "the same fixture indexed through funes",
+            "a configured embedding/retrieval backend",
+        ],
+        "command_template": "python3 scripts/benchmark_chinese_retrieval.py --e2e-command '<command>'",
+    }
+    if not command:
+        return scaffold
+    try:
+        argv = shlex.split(command)
+        if not argv:
+            raise ValueError("empty --e2e-command")
+        completed = subprocess.run(argv, check=False, capture_output=True, text=True)
+    except (OSError, ValueError) as exc:
+        scaffold.update({"status": "error", "error": str(exc), "command": command})
+        return scaffold
+    scaffold.update({
+        "status": "completed" if completed.returncode == 0 else "failed",
+        "command": command,
+        "returncode": completed.returncode,
+        "stdout": completed.stdout[-4000:],
+        "stderr": completed.stderr[-4000:],
+    })
+    return scaffold
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--e2e-command",
+        help="optional real Funes benchmark command; output is recorded separately and never changes proxy metrics",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        help="write JSON here instead of docs/chinese-retrieval-results.json",
+    )
+    args = parser.parse_args(argv)
     memories = _memories()
     queries = _queries(memories)
     result = {
         "memories": len(memories),
         "queries": len(queries),
-        "method": "ASCII-token overlap proxy for the deployed FTS path; not a fabricated BGE score",
-        "before_raw_chinese_to_bge_en_proxy": evaluate(memories, queries, shadow=False),
-        "after_english_retrieval_shadow_proxy": evaluate(memories, queries, shadow=True),
+        "benchmark_kind": "synthetic_ascii_token_overlap_v1",
+        "not_a_real_funes_or_bge_benchmark": True,
+        "method": "ASCII-token overlap over a checked-in synthetic fixture; no Funes/Lance/FTS/BGE backend is invoked",
+        "synthetic_raw_chinese_ascii_token_proxy": evaluate(memories, queries, shadow=False),
+        "synthetic_english_shadow_ascii_token_proxy": evaluate(memories, queries, shadow=True),
+        "e2e": _e2e_scaffold(args.e2e_command),
     }
-    print(json.dumps(result, ensure_ascii=False, indent=2))
-    out = Path(__file__).resolve().parents[1] / "docs" / "chinese-retrieval-results.json"
-    out.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    rendered = json.dumps(result, ensure_ascii=False, indent=2)
+    print(rendered)
+    out = args.output or Path(__file__).resolve().parents[1] / "docs" / "chinese-retrieval-results.json"
+    out.write_text(rendered + "\n", encoding="utf-8")
 
 
 if __name__ == "__main__":

@@ -151,18 +151,32 @@ API-latency sample. The response model is validated against the requested model,
 the validated backend/model profile and observed embedding dimension. Five target memories share
 duplicate distractor text with other IDs, so the stable tie-break is part of the fixture definition.
 
-### Voyage result placeholder (not run)
+### Voyage results (recorded 2026-09-13)
 
-No paid Voyage request was made while adding this runner. Replace the dashes only from the
-sanitized JSON produced by a completed `--live-voyage` run.
+The paid Voyage native REST run completed at `2026-09-13T14:40:59.442740+00:00` against the same
+60-memory/20-query fixture. Each arm's document and query embeddings were fully cached before its
+20 measured queries.
 
 | arm | Recall@1 | Recall@3 | Recall@5 | MRR | p50 ms | p95 ms | max ms | status |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| `voyage-4-lite` | — | — | — | — | — | — | — | not run |
-| `voyage-4` | — | — | — | — | — | — | — | not run |
-| `voyage-4` document + `voyage-4-lite` query | — | — | — | — | — | — | — | not run |
-| `voyage-code-4` | — | — | — | — | — | — | — | not run |
-| `voyage-4-lite` + `rerank-3-lite` | — | — | — | — | — | — | — | not run |
+| `voyage-4-lite` | 0.95 | 1.00 | 1.00 | 0.975 | 5.690 | 5.806 | 5.843 | completed |
+| `voyage-4` | 0.95 | 1.00 | 1.00 | 0.975 | 5.687 | 5.855 | 5.951 | completed |
+| `voyage-4` document + `voyage-4-lite` query | 1.00 | 1.00 | 1.00 | 1.000 | 5.284 | 5.337 | 5.730 | completed |
+| `voyage-code-4` | 0.85 | 1.00 | 1.00 | 0.925 | 5.276 | 5.358 | 5.686 | completed |
+| `voyage-4-lite` + `rerank-3-lite` | 0.80 | 0.85 | 1.00 | 0.855 | 1257.086 | 2438.125 | 2840.285 | completed |
+
+The p50/p95/max columns are warm end-to-end latency over those 20 queries: cache lookup, local
+cosine ranking, and configured reranking are included. Percentiles use linear interpolation. API
+network latency counts actual Voyage REST attempts only, never cache hits. Consequently, the four
+embedding-only arms made no measured API requests. The rerank arm made 20 measured rerank requests
+with network p50/p95/max of 1237.019/2413.831/2819.568 ms, accounting for most of its end-to-end
+latency.
+
+Keep `voyage-4-lite` as the default and keep reranking disabled. The mixed-model arm produced the
+best Recall@1 and MRR in this fixture, but `voyage-4-lite` already reached 1.00 Recall@3 and
+Recall@5. Adding `rerank-3-lite` harmed quality: versus `voyage-4-lite`, Recall@1 fell from 0.95 to
+0.80, Recall@3 from 1.00 to 0.85, and MRR from 0.975 to 0.855, while warm p50 rose from 5.690 to
+1257.086 ms.
 
 ### Warm Funes HTTP latency
 

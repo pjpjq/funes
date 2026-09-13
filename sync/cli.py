@@ -144,7 +144,7 @@ def _native_diagnostic(cfg):
 def main(argv=None):
     ap=argparse.ArgumentParser(prog="funes-sync")
     sub=ap.add_subparsers(dest="cmd",required=True)
-    for n in ("backfill","run","drain","status","sources","doctor","install","uninstall","start","stop","restart","logs","mcp"): sub.add_parser(n)
+    for n in ("backfill","run","drain","reconcile","status","sources","doctor","install","uninstall","start","stop","restart","logs","mcp"): sub.add_parser(n)
     reindex = sub.add_parser("reindex")
     scope = reindex.add_mutually_exclusive_group(required=True)
     scope.add_argument("--retrieval-text", action="store_true")
@@ -198,12 +198,30 @@ def main(argv=None):
         elif a.cmd=="drain":
             d=SyncDaemon(cfg,store)
             print(json.dumps({"flushed": d.drain(), "remaining": store.pending_count()}, ensure_ascii=False))
+        elif a.cmd=="reconcile":
+            d=SyncDaemon(cfg,store)
+            result=d.reconcile_remote_sources(None,force=True)
+            if result.get("error"):
+                result.update({"flushed":0,"remaining":store.pending_count()})
+                print(json.dumps(result,ensure_ascii=False,indent=2))
+                return 2
+            result["flushed"]=d.drain(wait=False)
+            if not store.pending_count():
+                final=d.reconcile_remote_sources(1)
+                result["complete"]=bool(final.get("complete"))
+                if final.get("error"):
+                    result["error"]=final["error"]
+            result["remaining"]=store.pending_count()
+            print(json.dumps(result,ensure_ascii=False,indent=2))
+            if result["remaining"] or result.get("error") or not result.get("complete"):
+                return 2
         elif a.cmd=="status":
             from .client import SyncClient
             client=SyncClient(cfg)
             remote_ready=_remote_ready(client)
             remote_url=_safe_locator(cfg.remote_url)
-            status=store.stats(); status.update({"remote_url":remote_url,"remote_status":{"url":remote_url,"ready":remote_ready},"native_memory":_safe_locator(cfg.native_memory),"native_primary":cfg.native_primary,"remote_ready":remote_ready,"device_id":cfg.device_id,"interval":cfg.interval,"launch_agents":_launch_agent_diagnostics(cfg)})
+            daemon_state=SyncDaemon(cfg,store,client).state_status()
+            status=store.stats(); status.update({"remote_url":remote_url,"remote_status":{"url":remote_url,"ready":remote_ready},"native_memory":_safe_locator(cfg.native_memory),"native_primary":cfg.native_primary,"remote_ready":remote_ready,"device_id":cfg.device_id,"interval":cfg.interval,"launch_agents":_launch_agent_diagnostics(cfg),"backfill":daemon_state})
             print(json.dumps(status,ensure_ascii=False,indent=2))
         elif a.cmd=="sources": print(json.dumps([s.as_dict() for s in discover_sources(cfg)],ensure_ascii=False,indent=2))
         elif a.cmd=="doctor":
@@ -214,7 +232,8 @@ def main(argv=None):
             remote_url=_safe_locator(cfg.remote_url)
             launch_agents=_launch_agent_diagnostics(cfg)
             stats=store.stats()
-            checks={"state_dir":str(cfg.state_dir),"db":str(store.path),"remote_url":remote_url,"native_memory":_safe_locator(cfg.native_memory),"native_primary":cfg.native_primary,"token_configured":auth_ready,"auth_ready":auth_ready,"sources":stats["sources"],"remote_ready":remote_ready,"remote_status":{"url":remote_url,"auth_ready":auth_ready,"ready":remote_ready},"config":_config_diagnostic(cfg.config_path),"source_paths":_source_path_diagnostics(cfg),"translation":_translation_diagnostic(cfg),"watcher":_watcher_diagnostic(),"launch_agent":str(plist_path(cfg.home)),"launch_agents":[str(path) for path in plist_paths(cfg.home)],"launch_agent_status":launch_agents,"native":_native_diagnostic(cfg)}
+            daemon_state=SyncDaemon(cfg,store,client).state_status()
+            checks={"state_dir":str(cfg.state_dir),"db":str(store.path),"remote_url":remote_url,"native_memory":_safe_locator(cfg.native_memory),"native_primary":cfg.native_primary,"token_configured":auth_ready,"auth_ready":auth_ready,"sources":stats["sources"],"remote_ready":remote_ready,"remote_status":{"url":remote_url,"auth_ready":auth_ready,"ready":remote_ready},"config":_config_diagnostic(cfg.config_path),"source_paths":_source_path_diagnostics(cfg),"translation":_translation_diagnostic(cfg),"watcher":_watcher_diagnostic(),"launch_agent":str(plist_path(cfg.home)),"launch_agents":[str(path) for path in plist_paths(cfg.home)],"launch_agent_status":launch_agents,"native":_native_diagnostic(cfg),"backfill":daemon_state}
             print(json.dumps(checks,ensure_ascii=False,indent=2))
         elif a.cmd=="logs":
             p=cfg.home/"Library/Logs/funes-sync.log"; print(p.read_text(errors="replace")[-10000:] if p.exists() else "")

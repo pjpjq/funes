@@ -310,6 +310,42 @@ class SyncClient:
         except (OSError, error.URLError, RuntimeError):
             return False
 
+    def missing_source_identities(self, identities: list[str]) -> list[str]:
+        unique=list(dict.fromkeys(str(value) for value in identities))
+        if not unique:
+            return []
+        if len(unique)>5000 or any(not value for value in unique):
+            raise ValueError("source identity check requires 1-5000 non-empty identities")
+        body=json.dumps({"source_identities":unique},separators=(",",":")).encode()
+        req=request.Request(
+            self.config.remote_url.rstrip("/")+"/sources/check",
+            data=body,
+            headers=self._auth_headers(json_content=True),
+            method="POST",
+        )
+        timeout=min(60.0,float(os.environ.get("FUNES_REMOTE_TIMEOUT","900")))
+        if timeout<=0:
+            raise RuntimeError("FUNES_REMOTE_TIMEOUT must be greater than zero")
+        with open_no_redirect(req,timeout=timeout) as response:
+            raw=response.read(1024*1024+1)
+            if len(raw)>1024*1024:
+                raise RuntimeError("remote source check response exceeded size limit")
+            result=json.loads(raw) if raw else {}
+        if not isinstance(result,dict) or result.get("ok") is not True:
+            raise RuntimeError("remote source check returned an invalid response")
+        present=result.get("present")
+        missing=result.get("missing")
+        if not isinstance(present,list) or not isinstance(missing,list):
+            raise RuntimeError("remote source check returned invalid identity lists")
+        if any(not isinstance(value,str) for value in (*present,*missing)):
+            raise RuntimeError("remote source check returned a non-string identity")
+        if len(set(present))!=len(present) or len(set(missing))!=len(missing):
+            raise RuntimeError("remote source check returned duplicate identities")
+        expected=set(unique)
+        if set(present)&set(missing) or set(present)|set(missing)!=expected:
+            raise RuntimeError("remote source check returned an inconsistent inventory")
+        return missing
+
     def sync_snapshot(self) -> dict:
         headers=self._auth_headers(json_content=True)
         req=request.Request(self.config.remote_url.rstrip("/")+"/sync",data=b"{}",headers=headers,method="POST")

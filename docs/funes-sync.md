@@ -25,6 +25,7 @@ embedding/index。通知失败不影响本地已完成的 durable push。
 ```sh
 python3 -m sync sources
 python3 -m sync backfill                         # 首次扫描并尽量排空队列
+python3 -m sync reconcile                        # 强制核对远端 source identity 并仅补缺失项
 python3 -m sync status
 FUNES_BIN="$HOME/.local/bin/funes" FUNES_MEMORY=org/funes-memory \
   python3 -m sync run
@@ -39,6 +40,9 @@ content hash 和 pending queue。mtime/hash 未改变时不会重写源文件；
 - `backfill`：发现、解析、去重，并在远端返回 `durable=true` 后才删除 pending。
 - `run`：按 `FUNES_SYNC_INTERVAL`（默认 300 秒）循环；`drain` 只排空既有队列。
   每批同时受 `FUNES_SYNC_BATCH` 条数和 `FUNES_SYNC_MAX_BATCH_BYTES`（默认 16 MiB）限制。
+- `reconcile`：分页调用受保护的 `/sources/check`，用持久 cursor 断点核对远端；只把缺失
+  identity 重新入队。首次运行由 daemon 自动执行一次，切换远端会按 URL 隐私指纹重新执行；
+  显式命令会强制重查同一 URL，适合远端重建恢复。
 - `status`、`sources`、`doctor`、`logs [--follow]`：只读诊断。
 - `install`：原子写入 `~/Library/LaunchAgents/com.funes.sync.plist`；遇到非本工具 plist 会拒绝覆盖，`--force` 仅允许覆盖同 label。
 - `start`、`stop`、`restart`：macOS `launchctl bootstrap/bootout`；Linux 上安全返回错误，不启动后台进程。

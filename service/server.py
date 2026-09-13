@@ -48,6 +48,7 @@ QUERY_PROMPT_VERSION = "funes-query-retrieval-v1"
 ENCRYPTED_MAGIC = b"FUNES-SOURCE-V1\0"
 ENCRYPTED_AAD = b"funes-source-snapshot-v1"
 REINDEX_SCOPES = {"retrieval_text", "all"}
+MAX_SOURCE_CHECK_IDENTITIES = 5000
 NATIVE_SESSION_TYPES = {
     "session", "codex", "codex_session", "pi", "pi_session",
     "claude", "claude_session",
@@ -139,6 +140,19 @@ def expanded_candidate_limit(limit: int) -> int:
     """Bound per-route recall while leaving room for cross-route consensus."""
     limit = max(1, int(limit))
     return min(100, limit * 3)
+
+
+def validate_source_identity_batch(value: Any) -> list[str]:
+    """Validate and order-dedupe one bounded source reconciliation batch."""
+    if not isinstance(value, list):
+        raise ValueError("source_identities must be a list")
+    if len(value) > MAX_SOURCE_CHECK_IDENTITIES:
+        raise ValueError(
+            f"source_identities must contain at most {MAX_SOURCE_CHECK_IDENTITIES} items"
+        )
+    if any(not isinstance(identity, str) or not identity.strip() for identity in value):
+        raise ValueError("source_identities must contain only non-empty strings")
+    return list(dict.fromkeys(value))
 
 
 def result_identity(item: dict[str, Any]) -> str:
@@ -576,6 +590,21 @@ class Store:
                     item = self._row(row)
                     found[item["source_identity"]] = item
         return [found[value] for value in unique if value in found]
+
+    def existing_identities(self, identities: list[str]) -> list[str]:
+        """Return existing identities in request order without loading raw payloads."""
+        unique = list(dict.fromkeys(str(value) for value in identities if value))
+        found: set[str] = set()
+        with self.lock:
+            for begin in range(0, len(unique), 500):
+                current = unique[begin : begin + 500]
+                placeholders = ",".join("?" for _ in current)
+                rows = self.conn.execute(
+                    f"SELECT source_identity FROM memories WHERE source_identity IN ({placeholders})",
+                    current,
+                ).fetchall()
+                found.update(str(row["source_identity"]) for row in rows)
+        return [value for value in unique if value in found]
 
     def pending_translations(self, limit: int) -> list[dict[str, Any]]:
         """Return a bounded restart-safe reconciliation batch."""
@@ -2011,7 +2040,7 @@ class App:
         self.store.close()
 
 
-PROTECTED = {"/ingest", "/search", "/recall", "/get", "/sources", "/sync/status", "/reindex", "/sync"}
+PROTECTED = {"/ingest", "/search", "/recall", "/get", "/sources", "/sources/check", "/sync/status", "/reindex", "/sync"}
 
 
 def make_handler(app: App):
@@ -2111,6 +2140,15 @@ def make_handler(app: App):
                 return
             try:
                 body = self._body()
+                if self.path == "/sources/check":
+                    if app.syncer.restoring or app.syncer.restore_failed:
+                        error = "restore_in_progress" if app.syncer.restoring else "restore_failed"
+                        return self._json(503, {"ok": False, "error": error})
+                    identities = validate_source_identity_batch(body.get("source_identities"))
+                    present = app.store.existing_identities(identities)
+                    present_set = set(present)
+                    missing = [identity for identity in identities if identity not in present_set]
+                    return self._json(200, {"ok": True, "present": present, "missing": missing})
                 if self.path == "/ingest":
                     if app.syncer.restoring or app.syncer.restore_failed:
                         return self._json(503, {"error": "restore_in_progress" if app.syncer.restoring else "restore_failed", "durable": False})

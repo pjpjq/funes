@@ -214,6 +214,26 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(store.get("1")["raw_text"], "numeric identity")
         store.close()
 
+    def test_existing_identities_is_ordered_chunked_and_selects_no_raw_payload(self):
+        store = Store(self.tmp.name)
+        store.ingest(
+            [{"source_identity": "present", "raw_text": "raw-secret-must-not-load"}]
+        )
+        statements = []
+        store.conn.set_trace_callback(statements.append)
+        try:
+            identities = ["missing-first", "present", "present"] + [
+                f"missing-{index}" for index in range(500)
+            ]
+            self.assertEqual(store.existing_identities(identities), ["present"])
+        finally:
+            store.conn.set_trace_callback(None)
+            store.close()
+        selects = [statement for statement in statements if statement.startswith("SELECT")]
+        self.assertEqual(len(selects), 2)
+        self.assertTrue(all(statement.startswith("SELECT source_identity FROM") for statement in selects))
+        self.assertTrue(all("raw_text" not in statement for statement in selects))
+
     def _server(self):
         app = App()
         server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(app))
@@ -285,6 +305,66 @@ class ServiceTests(unittest.TestCase):
         status, item = self._request(server, "POST", "/get", {"id": ident})
         self.assertEqual(status, 200)
         self.assertEqual(item["source_path"], "x")
+
+    def test_sources_check_requires_auth_and_returns_only_present_and_missing(self):
+        server = self._server()
+        secret = "raw-secret-must-not-leak"
+        status, _ = self._request(
+            server,
+            "POST",
+            "/ingest",
+            {"source_identity": "present", "raw_text": secret},
+        )
+        self.assertEqual(status, 200)
+        payload = {"source_identities": ["missing", "present", "missing", "present"]}
+        status, body = self._request(
+            server, "POST", "/sources/check", payload, token="bad"
+        )
+        self.assertEqual(status, 401)
+        status, body = self._request(server, "POST", "/sources/check", payload)
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            body,
+            {"ok": True, "present": ["present"], "missing": ["missing"]},
+        )
+        self.assertNotIn(secret, json.dumps(body))
+
+    def test_sources_check_validates_bounds_and_restore_readiness(self):
+        server = self._server()
+        status, body = self._request(
+            server, "POST", "/sources/check", {"source_identities": "invalid"}
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"], "source_identities must be a list")
+        status, body = self._request(
+            server,
+            "POST",
+            "/sources/check",
+            {"source_identities": [f"id-{index}" for index in range(5001)]},
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("at most 5000", body["error"])
+
+        app = App()
+        app.syncer.restoring = True
+        unavailable = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(app))
+        thread = threading.Thread(target=unavailable.serve_forever, daemon=True)
+        thread.start()
+        try:
+            status, body = self._request(
+                unavailable,
+                "POST",
+                "/sources/check",
+                {"source_identities": ["id"]},
+            )
+        finally:
+            app.syncer.restoring = False
+            unavailable.shutdown()
+            unavailable.server_close()
+            thread.join(timeout=2)
+            app.close()
+        self.assertEqual(status, 503)
+        self.assertEqual(body, {"ok": False, "error": "restore_in_progress"})
 
     def test_compatibility_search_fuses_expanded_raw_and_rewrite_rankings(self):
         calls = []

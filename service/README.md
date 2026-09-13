@@ -8,12 +8,14 @@ search, BM25, reranking, recency and neighbors.
 ## API
 
 - `GET /health`, `GET /ready` (no auth)
-- Bearer-authenticated `POST /ingest`, `/search`, `/recall`, `/get`, `/reindex`, `/sync`
+- Bearer-authenticated `POST /ingest`, `/search`, `/recall`, `/get`, `/reindex`, `/sync`, `/sources/check`
 - Bearer-authenticated `GET /sources`, `/sync/status`
 
 Set `FUNES_AUTH_TOKEN` in local compatibility deployments. Ingest documents with
 `raw_text` and optional identity/version/metadata fields. Responses include
 `raw_text`; logs never include authorization or document bodies.
+`/sources/check` accepts at most 5,000 source identities and returns only the
+ordered `present`/`missing` identity lists; it never returns stored text.
 
 For production, configure `FUNES_STORAGE_REPO`, `HF_TOKEN`, and
 `FUNES_STORAGE_KEY`. Snapshot and delta objects are compressed then encrypted with

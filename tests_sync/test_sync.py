@@ -162,7 +162,7 @@ def test_native_primary_daemon_does_not_queue_http_records(tmp_path):
     assert native.calls == 1
     assert s.pending_count() == 0
     assert s.stats()["sources"] == 0
-    assert not (c.state_dir / "source-schema-v2.complete").exists()
+    assert not (c.state_dir / "source-schema-v3.complete").exists()
     s.close()
 
 
@@ -183,7 +183,7 @@ def test_schema_epoch_reprocesses_unchanged_source_once(tmp_path, monkeypatch):
     monkeypatch.setattr('sync.daemon.parse_file', tracked_parse)
     s=Store(config=c); d=SyncDaemon(c, s, type("Client", (), {})())
     d.scan_once()
-    marker=c.state_dir/'source-schema-v2.complete'
+    marker=c.state_dir/'source-schema-v3.complete'
     marker.unlink(missing_ok=True)
     calls.clear()
 
@@ -194,6 +194,42 @@ def test_schema_epoch_reprocesses_unchanged_source_once(tmp_path, monkeypatch):
     calls.clear()
     d.scan_once()
     assert calls == []
+    s.close()
+
+
+def test_schema_epoch_reprocesses_unchanged_zero_record_source_at_eof(
+    tmp_path, monkeypatch
+):
+    from sync.discovery import Source
+
+    c=cfg(tmp_path)
+    p=tmp_path/'claude.jsonl'
+    p.write_text(
+        json.dumps({"type":"user","message":{"role":"user","content":"previously skipped Claude turn"}})+"\n",
+        encoding='utf-8',
+    )
+    source=Source('claude:~/.claude/projects/agent.jsonl','claude',p,c.device_id)
+    monkeypatch.setattr('sync.daemon.discover_sources', lambda _config: [source])
+    starts=[]
+    real_parse=parse_file
+
+    def tracked_parse(item, start=0):
+        starts.append(start)
+        return real_parse(item, start)
+
+    monkeypatch.setattr('sync.daemon.parse_file', tracked_parse)
+    s=Store(config=c)
+    stat=p.stat()
+    s.register_source(source,stat)
+    s.set_cursor(source.source_key,stat.st_size,stat.st_ino,stat.st_size)
+    (c.state_dir/'initial-backfill.complete').write_text('legacy', encoding='utf-8')
+    (c.state_dir/'source-schema-v2.complete').write_text('legacy', encoding='utf-8')
+    d=SyncDaemon(c,s,type("Client",(),{})())
+
+    assert d.scan_once() == 1
+    assert starts == [0]
+    assert s.stats()["records"] == 1
+    assert (c.state_dir/'source-schema-v3.complete').exists()
     s.close()
 
 
@@ -223,7 +259,7 @@ def test_schema_epoch_bypasses_initial_backfill_eof_seed(tmp_path, monkeypatch):
     d.scan_once()
 
     assert starts == [0]
-    assert (c.state_dir/'source-schema-v2.complete').exists()
+    assert (c.state_dir/'source-schema-v3.complete').exists()
     assert (c.state_dir/'initial-backfill.complete').exists()
     s.close()
 
@@ -242,7 +278,7 @@ def test_fresh_install_without_initial_backfill_seeds_eof(tmp_path, monkeypatch)
     assert s.pending_count() == 0
     assert s.cursor(source.source_key)["offset"] == p.stat().st_size
     assert (c.state_dir/'initial-backfill.complete').exists()
-    assert (c.state_dir/'source-schema-v2.complete').exists()
+    assert (c.state_dir/'source-schema-v3.complete').exists()
     s.close()
 
 
@@ -309,6 +345,99 @@ def test_one_shot_backfill_drains_all_pending(tmp_path):
     SyncDaemon(c, s, Client()).run(once=True)
     assert s.stats()['pending'] == 0
     s.close()
+
+
+def test_remote_source_reconciliation_resumes_and_only_queues_missing(tmp_path):
+    class Client:
+        def __init__(self):
+            self.calls=[]
+
+        def missing_source_identities(self,identities):
+            self.calls.append(list(identities))
+            return [identity for identity in identities if identity in {"b","d"}]
+
+    c=cfg(tmp_path)
+    s=Store(config=c)
+    for record_id in ("d","a","c","b"):
+        from sync.parsers import Chunk
+        s.upsert_chunks(
+            [Chunk(record_id,"source","codex","session.jsonl","session",0,"user",record_id,record_id)]
+        )
+    s.ack(["a","b","c","d"])
+    client=Client()
+    daemon=SyncDaemon(c,s,client)
+
+    first=daemon.reconcile_remote_sources(1)
+
+    assert first == {"complete":False,"checked":4,"queued":2}
+    assert client.calls == [["a","b","c","d"]]
+    assert s.meta_value(daemon._remote_source_cursor_key) == "d"
+    assert s.pending_count() == 2
+    assert not daemon._remote_source_marker.exists()
+
+    resumed=SyncDaemon(c,s,client).reconcile_remote_sources(1)
+    assert resumed == {"complete":False,"checked":0,"queued":0}
+    s.ack(["b","d"])
+    completed=SyncDaemon(c,s,client).reconcile_remote_sources(1)
+    assert completed == {"complete":True,"checked":0,"queued":0}
+    assert daemon._remote_source_marker.exists()
+    assert s.meta_value(daemon._remote_source_cursor_key) == ""
+
+    forced=SyncDaemon(c,s,client).reconcile_remote_sources(1,force=True)
+    assert forced == {"complete":False,"checked":4,"queued":2}
+
+    other=cfg(tmp_path)
+    other.remote_url="https://other-memory.example"
+    other_daemon=SyncDaemon(other,s,client)
+    assert other_daemon._remote_source_marker != daemon._remote_source_marker
+    assert other_daemon._remote_source_cursor_key != daemon._remote_source_cursor_key
+    assert other_daemon.reconcile_remote_sources(1)["checked"] == 4
+    s.close()
+
+
+def test_remote_source_reconciliation_stops_between_batches(tmp_path):
+    class InventoryStore:
+        def __init__(self):
+            self.cursor=""
+
+        def meta_value(self,_key):
+            return self.cursor
+
+        def set_meta(self,_key,value):
+            self.cursor=value
+
+        def record_ids_after(self,after,_limit):
+            return [] if after == "second" else (["first"] if not after else ["second"])
+
+        def enqueue_records(self,_identities):
+            return 0
+
+        def pending_count(self):
+            return 0
+
+    class Client:
+        def __init__(self):
+            self.calls=0
+
+        def missing_source_identities(self,_identities):
+            self.calls+=1
+            daemon.running=False
+            return []
+
+    store=InventoryStore()
+    client=Client()
+    daemon=SyncDaemon(cfg(tmp_path),store,client)
+    daemon.running=True
+
+    result=daemon.reconcile_remote_sources(3,interruptible=True)
+
+    assert result == {
+        "complete":False,
+        "checked":1,
+        "queued":0,
+        "interrupted":True,
+    }
+    assert client.calls == 1
 
 
 def test_shutdown_interrupts_one_shot_backfill(tmp_path):

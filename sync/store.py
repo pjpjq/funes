@@ -46,20 +46,20 @@ class Store:
         with self.db:
             for c in chunks:
                 h=hashlib.sha256(c.raw_text.encode("utf-8")).hexdigest()
-                old=self.db.execute("SELECT content_hash,version,payload FROM records WHERE record_id=?",(c.record_id,)).fetchone()
+                old=self.db.execute("SELECT content_hash,version,payload,source_key FROM records WHERE record_id=?",(c.record_id,)).fetchone()
                 value=c.as_dict()
                 prior=json.loads(old[2]) if old else {}
                 stamp=datetime.fromtimestamp(now, timezone.utc).isoformat()
                 value["ingested_at"]=prior.get("ingested_at", stamp)
                 value["updated_at"]=prior.get("updated_at", stamp)
                 payload=json.dumps(value,ensure_ascii=False,sort_keys=True)
-                if old and old[0] == h and old[2] == payload:
+                if old and old[0] == h and old[2] == payload and old[3] == c.source_key:
                     count += 1
                     continue
                 value["updated_at"]=stamp
                 payload=json.dumps(value,ensure_ascii=False,sort_keys=True)
                 version=(old[1]+1 if old and old[0]!=h else (old[1] if old else 1))
-                self.db.execute("INSERT INTO records(record_id,source_key,content_hash,version,payload,updated_at) VALUES(?,?,?,?,?,?) ON CONFLICT(record_id) DO UPDATE SET content_hash=excluded.content_hash,version=excluded.version,payload=excluded.payload,updated_at=excluded.updated_at",(c.record_id,c.source_key,h,version,payload,now))
+                self.db.execute("INSERT INTO records(record_id,source_key,content_hash,version,payload,updated_at) VALUES(?,?,?,?,?,?) ON CONFLICT(record_id) DO UPDATE SET source_key=excluded.source_key,content_hash=excluded.content_hash,version=excluded.version,payload=excluded.payload,updated_at=excluded.updated_at",(c.record_id,c.source_key,h,version,payload,now))
                 self.db.execute("INSERT INTO queue(record_id,attempts,next_at,last_error,queued_at) VALUES(?,?,?,?,?) ON CONFLICT(record_id) DO UPDATE SET next_at=MIN(queue.next_at,excluded.next_at),last_error=NULL",(c.record_id,0,0,None,now)); count+=1
         return count
     def reconcile_source(self, source_key: str, current_ids: set[str]):
@@ -96,6 +96,23 @@ class Store:
     def pending_count(self) -> int:
         """Return queue size without the JSON aggregation used by ``stats``."""
         return int(self.db.execute("SELECT count(*) FROM queue").fetchone()[0])
+    def record_ids_after(self, after: str = "", limit: int = 5000) -> list[str]:
+        rows=self.db.execute(
+            "SELECT record_id FROM records WHERE record_id>? ORDER BY record_id LIMIT ?",
+            (after,max(1,int(limit))),
+        ).fetchall()
+        return [str(row[0]) for row in rows]
+    def enqueue_records(self, record_ids: list[str]) -> int:
+        if not record_ids:
+            return 0
+        before=self.db.total_changes
+        now=time.time()
+        with self.db:
+            self.db.executemany(
+                "INSERT OR IGNORE INTO queue(record_id,attempts,next_at,last_error,queued_at) SELECT record_id,0,0,NULL,? FROM records WHERE record_id=?",
+                ((now,record_id) for record_id in dict.fromkeys(record_ids)),
+            )
+        return self.db.total_changes-before
     def ack(self,ids:list[str]):
         if ids:
             now=time.time()
@@ -146,6 +163,13 @@ class Store:
     def meta_value(self,key):
         row=self.db.execute("SELECT value FROM meta WHERE key=?",(key,)).fetchone()
         return row[0] if row else None
+    def set_meta(self,key,value):
+        now=time.time()
+        with self.db:
+            self.db.execute(
+                "INSERT INTO meta(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+                (key,str(value),now),
+            )
     def record_counts_by_agent(self):
         rows=self.db.execute('''
             WITH record_counts AS (

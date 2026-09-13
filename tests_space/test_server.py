@@ -2065,7 +2065,10 @@ def test_http_exact_sidecar_skips_slow_native(
         status, body = _post(
             server,
             "/search",
-            {"query": "previous_response_id 为什么失败？", "limit": requested_limit},
+            {
+                "query": "Codex 调用 CPA 时 previous_response_id 和 chatcmpl-* 的问题",
+                "limit": requested_limit,
+            },
         )
     finally:
         server.shutdown()
@@ -2083,6 +2086,10 @@ def test_http_exact_sidecar_skips_slow_native(
         ("之前 error: 为什么失败？", "error details"),
         ("之前 src/ 为什么失败？", "src code"),
         ("之前 foo* 为什么失败？", "foo result"),
+        (
+            "mostly English API request with many filler words 为什么失败？",
+            "capital request notes",
+        ),
     ),
 )
 def test_http_weak_cjk_sidecar_uses_short_native_budget(

@@ -1718,13 +1718,16 @@ class Handler(BaseHTTPRequestHandler):
                     search_source_rankings(raw_query, limit, filters, harness)
                 )
                 sidecar_results = stable_rrf(source_rankings, limit)
-                cjk_query = (
+                has_cjk = (
                     LANGUAGE_MODE == "auto"
+                    and any("\u4e00" <= char <= "\u9fff" for char in raw_query)
+                )
+                cjk_query = (
+                    has_cjk
                     and cjk_ratio(raw_query) >= TRANSLATION_THRESHOLD
                 )
                 exact_sidecar = (
-                    cjk_query
-                    and len(sidecar_results) >= min(limit, 3)
+                    len(sidecar_results) >= min(limit, 3)
                     and sidecar_has_exact_entities(raw_query, sidecar_results)
                 )
                 # Reuse the source-side query rewrite for native semantic
@@ -1762,7 +1765,7 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 native_budget = (
                     CJK_NATIVE_TIMEOUT
-                    if cjk_query and sidecar_results
+                    if has_cjk and sidecar_results
                     else HTTP_NATIVE_TIMEOUT
                 )
                 native_deadline = time.monotonic() + native_budget

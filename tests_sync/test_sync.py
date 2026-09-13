@@ -48,6 +48,22 @@ def test_memory_only_daemon_does_not_require_native_binary(tmp_path):
     s.close()
 
 
+def test_memory_only_companion_still_discovers_raw_agent_sessions(tmp_path):
+    c = cfg(tmp_path)
+    c.memory_only = True
+    for path in (
+        tmp_path / ".codex/sessions/codex.jsonl",
+        tmp_path / ".pi/agent/sessions/pi.jsonl",
+        tmp_path / ".claude/projects/claude.jsonl",
+    ):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('{"type":"message","message":{"role":"user","content":"raw"}}\n')
+
+    kinds = {source.kind for source in discover_sources(c)}
+
+    assert {"codex", "pi", "claude"}.issubset(kinds)
+
+
 def test_native_primary_daemon_does_not_queue_http_records(tmp_path):
     class Native:
         def __init__(self):

@@ -1324,7 +1324,10 @@ class NativeMcpWorker:
         # rmcp/serde ignores unknown optional fields while native recall still
         # receives the same query and bounded tuning values.
         arguments.update({name: value for name, value in extra.items() if value is not None})
-        return self.call_tool("recall", arguments, timeout=timeout)
+        result = self.call_tool("recall", arguments, timeout=timeout)
+        if result.startswith("recall error:"):
+            raise NativeMcpError("native recall failed")
+        return result
 
     def get(
         self,
@@ -1343,7 +1346,10 @@ class NativeMcpWorker:
         if to is not None:
             arguments["to"] = to
         arguments.update({name: value for name, value in extra.items() if value is not None})
-        return self.call_tool("get", arguments, timeout=timeout)
+        result = self.call_tool("get", arguments, timeout=timeout)
+        if result.startswith("get error:"):
+            raise NativeMcpError("native get failed")
+        return result
 
 
 MCP_WORKER = None

@@ -147,6 +147,22 @@ def test_native_mcp_worker_reuses_child_and_passes_hf_environment(monkeypatch, t
     assert processes[0].messages[3]["params"]["name"] == "get"
 
 
+def test_native_mcp_worker_rejects_tool_error_text(monkeypatch, tmp_path):
+    worker = bridge.NativeMcpWorker(
+        "fake-funes", "owner/memory", tmp_path, timeout=1, handshake_timeout=1
+    )
+    monkeypatch.setattr(
+        worker,
+        "call_tool",
+        lambda name, _arguments, **_kwargs: f"{name} error: provider detail",
+    )
+
+    with pytest.raises(bridge.NativeMcpError, match="native recall failed"):
+        worker.recall("probe")
+    with pytest.raises(bridge.NativeMcpError, match="native get failed"):
+        worker.get("session-1")
+
+
 def test_native_mcp_worker_restarts_after_eof(monkeypatch, tmp_path):
     processes = []
 

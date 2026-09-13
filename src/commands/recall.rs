@@ -1,15 +1,15 @@
 //! The read surface: `recall`, `get`, `status` over the existing index.
-//! Recall pipeline: hybrid (vector + BM25, fused by reciprocal rank) → cross-encoder rerank →
+//! Recall pipeline: hybrid (vector + BM25, fused by reciprocal rank) → optional rerank →
 //! recency reweight → neighbor expansion. `recall`/`get` return results rendered in the agent
 //! format; `recall_hits`/`get_turns` return the structured results for other renderings
 //! (see `render`).
 
 use crate::chunk;
-use crate::inference::{self, Embedder, Reranker};
+use crate::inference::{self, Embedder, EmbeddingProfile, RerankScoreKind, Reranker};
 use crate::memory::dataset;
 use crate::memory::{Memory, MemoryState};
 use crate::traces::harness::Harness;
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, Result};
 use arrow_array::{Float32Array, Int64Array, RecordBatch, StringArray, UInt64Array};
 use chrono::{DateTime, Utc};
 use futures::TryStreamExt;
@@ -246,6 +246,13 @@ fn recency_weight(ts: &str, now: DateTime<Utc>, half_life: f64) -> f64 {
     }
 }
 
+fn rerank_relevance(kind: RerankScoreKind, score: f32) -> f64 {
+    match kind {
+        RerankScoreKind::Logit => 1.0 / (1.0 + (-(score as f64)).exp()),
+        RerankScoreKind::Relevance => score as f64,
+    }
+}
+
 /// A dataset opened for reading.
 struct Read {
     ds: Dataset,
@@ -311,9 +318,24 @@ async fn open_read(memory: &Memory) -> Result<Read> {
             note: None,
             memory_label: Some(memory.label()),
         }),
-        ReadOutcome::Offline => degrade_offline(&memory.label()).await,
+        ReadOutcome::Offline if native_fallback_enabled() => degrade_offline(&memory.label()).await,
+        ReadOutcome::Offline => Err(anyhow!(
+            "remote {} unavailable; native fallback is disabled",
+            memory.label()
+        )),
         ReadOutcome::NoIndex => Err(no_index_error()),
     }
+}
+
+fn native_fallback_enabled() -> bool {
+    !matches!(
+        std::env::var("FUNES_NATIVE_FALLBACK")
+            .unwrap_or_else(|_| "true".to_string())
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "0" | "false" | "no" | "off"
+    )
 }
 
 /// The error a read verb returns when the default local memory has no index yet — points at the
@@ -353,19 +375,25 @@ pub fn memory_hint(read: Option<&str>) -> String {
 /// after. The `Mutex` serializes recalls (both models run with `&mut`), which is fine: the work is
 /// CPU-bound and the server's calls are serial anyway.
 struct Models {
+    profile_fingerprint: String,
     embedder: Box<dyn Embedder>,
-    reranker: Box<dyn Reranker>,
+    reranker: Option<Box<dyn Reranker>>,
 }
 
 static MODELS: OnceCell<Mutex<Models>> = OnceCell::const_new();
 
 /// The shared model cache, built on first use.
-async fn models() -> Result<&'static Mutex<Models>> {
+async fn models(profile: &EmbeddingProfile) -> Result<&'static Mutex<Models>> {
+    let profile = profile.clone();
     MODELS
-        .get_or_try_init(|| async {
-            let embedder = inference::embedder()?;
+        .get_or_try_init(|| async move {
+            let embedder = inference::embedder_for(&profile)?;
             let reranker = inference::reranker()?;
-            Ok::<_, anyhow::Error>(Mutex::new(Models { embedder, reranker }))
+            Ok::<_, anyhow::Error>(Mutex::new(Models {
+                profile_fingerprint: profile.fingerprint,
+                embedder,
+                reranker,
+            }))
         })
         .await
 }
@@ -483,16 +511,6 @@ pub async fn recall_hits_filtered(
         .transpose()?
         .map(|h| h.as_str().to_string());
 
-    progress("loading model…");
-    let mut guard = models().await?.lock().await;
-    let Models { embedder, reranker } = &mut *guard;
-
-    let qv: Vec<f32> = embedder
-        .embed(&[query.as_str()])?
-        .into_iter()
-        .next()
-        .context("empty embedding")?;
-
     progress(&format!("searching {}…", memory.label()));
     let read = open_read(&memory).await?;
     let note = read.note.clone().unwrap_or_default();
@@ -509,6 +527,21 @@ pub async fn recall_hits_filtered(
     }
     let where_clause = build_facet_where(&filter);
 
+    // Open and validate the memory before loading/calling any provider. This both fails fast on a
+    // profile mismatch and ensures a Voyage query vector is never sent to a local-BGE memory.
+    let profile = inference::embedding_profile()?;
+    progress("loading embedding provider…");
+    let mut guard = models(&profile).await?.lock().await;
+    if guard.profile_fingerprint != profile.fingerprint {
+        return Err(anyhow!(
+            "embedding profile changed while the process was running; restart before recalling"
+        ));
+    }
+    let Models {
+        embedder, reranker, ..
+    } = &mut *guard;
+    let qv = embedder.embed_query(query.as_str())?;
+
     // Hybrid retrieval: a vector ANN scan and a BM25 scan, fused by reciprocal rank. The FTS index
     // can be absent (it's best-effort at index time), so the FTS leg is skipped when it errors —
     // recall then falls back to vector-only.
@@ -517,27 +550,43 @@ pub async fn recall_hits_filtered(
         return Ok((note, read.memory_label.clone(), Vec::new()));
     }
 
-    let docs: Vec<&str> = hits.iter().map(|h| h.text.as_str()).collect();
-    progress(&format!("reranking {} candidates…", docs.len()));
-    let scores = reranker.rerank(query.as_str(), &docs)?;
-
     let now = Utc::now();
-    let mut scored: Vec<(usize, f64)> = scores
-        .iter()
-        .enumerate()
-        .map(|(i, &s)| {
-            let relevance = 1.0 / (1.0 + (-(s as f64)).exp());
-            (i, relevance * recency_weight(&hits[i].ts, now, half_life))
-        })
-        .collect();
+    let rank_scores = || {
+        (0..hits.len())
+            .map(|i| {
+                let relevance = hits[i].1;
+                (i, relevance * recency_weight(&hits[i].0.ts, now, half_life))
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut scored = if let Some(reranker) = reranker.as_deref_mut() {
+        let docs: Vec<&str> = hits.iter().map(|(hit, _)| hit.text.as_str()).collect();
+        let score_kind = reranker.score_kind();
+        progress(&format!("reranking {} candidates…", docs.len()));
+        match reranker.rerank(query.as_str(), &docs) {
+            Ok(scores) if scores.len() == hits.len() => scores
+                .iter()
+                .enumerate()
+                .map(|(i, &score)| {
+                    let relevance = rerank_relevance(score_kind, score);
+                    (i, relevance * recency_weight(&hits[i].0.ts, now, half_life))
+                })
+                .collect(),
+            // Reranking is optional. A provider error must not discard the already-computed RRF
+            // result or fall through to a slow local cross-encoder.
+            Ok(_) | Err(_) => rank_scores(),
+        }
+    } else {
+        rank_scores()
+    };
     scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     scored.truncate(k);
 
     // Keep only the top-k hits, in scored order, carrying their score along.
     let mut top: Vec<(Hit, f64)> = Vec::with_capacity(scored.len());
-    let mut taken: Vec<Option<Hit>> = hits.into_iter().map(Some).collect();
+    let mut taken: Vec<Option<(Hit, f64)>> = hits.into_iter().map(Some).collect();
     for (idx, score) in &scored {
-        if let Some(h) = taken[*idx].take() {
+        if let Some((h, _)) = taken[*idx].take() {
             top.push((h, *score));
         }
     }
@@ -559,7 +608,7 @@ async fn hybrid_candidates(
     query: &str,
     candidates: usize,
     filter: Option<&str>,
-) -> Result<Vec<Hit>> {
+) -> Result<Vec<(Hit, f64)>> {
     let vector = vector_candidates(ds, qv, candidates, filter).await?;
     let fts = fts_candidates(ds, query, candidates, filter).await.unwrap_or_default();
     Ok(rrf_fuse(vector, fts, candidates))
@@ -679,8 +728,8 @@ async fn collect_hits(scan: lance::dataset::scanner::Scanner) -> Result<Vec<(u64
 }
 
 /// Reciprocal-rank fusion (k=60): each list contributes `1/(rank + 60)` to a row's score; return
-/// the top `limit` rows by fused score, deduped by `_rowid`.
-fn rrf_fuse(vector: Vec<(u64, Hit)>, fts: Vec<(u64, Hit)>, limit: usize) -> Vec<Hit> {
+/// the top `limit` rows with their fused score, deduped by `_rowid`.
+fn rrf_fuse(vector: Vec<(u64, Hit)>, fts: Vec<(u64, Hit)>, limit: usize) -> Vec<(Hit, f64)> {
     const K: f32 = 60.0;
     let mut scores: HashMap<u64, f32> = HashMap::new();
     let mut rows: HashMap<u64, Hit> = HashMap::new();
@@ -693,7 +742,10 @@ fn rrf_fuse(vector: Vec<(u64, Hit)>, fts: Vec<(u64, Hit)>, limit: usize) -> Vec<
     let mut ranked: Vec<(u64, f32)> = scores.into_iter().collect();
     ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     ranked.truncate(limit);
-    ranked.into_iter().filter_map(|(id, _)| rows.remove(&id)).collect()
+    ranked
+        .into_iter()
+        .filter_map(|(id, score)| rows.remove(&id).map(|hit| (hit, score as f64)))
+        .collect()
 }
 
 /// For each hit, pull chunks in the same session within `window` of its seq (excluding the
@@ -1467,6 +1519,20 @@ mod tests {
     use super::*;
     use chrono::TimeZone;
 
+    fn hit(text: &str) -> Hit {
+        Hit {
+            text: text.to_string(),
+            session_id: String::new(),
+            workdir: String::new(),
+            turn_uuid: String::new(),
+            seq: 0,
+            ts: "2026-01-31T00:00:00Z".to_string(),
+            block_type: "text".to_string(),
+            harness: String::new(),
+            neighbors: Vec::new(),
+        }
+    }
+
     #[test]
     fn is_scaffolding_flags_wrappers_and_headings() {
         assert!(is_scaffolding("<ide_opened_file>/foo/bar.rs</ide_opened_file>"));
@@ -1559,5 +1625,30 @@ mod tests {
         assert!((recency_weight("2026-02-10T00:00:00Z", now, 30.0) - 1.0).abs() < 1e-9);
         // unparseable -> neutral 1.0
         assert_eq!(recency_weight("not-a-date", now, 30.0), 1.0);
+    }
+
+    #[test]
+    fn rrf_keeps_the_true_fused_score_for_recency_weighting() {
+        let fused = rrf_fuse(
+            vec![(1, hit("vector-only")), (2, hit("shared"))],
+            vec![(2, hit("shared")), (3, hit("fts-only"))],
+            3,
+        );
+
+        assert_eq!(fused[0].0.text, "shared");
+        assert!((fused[0].1 - (1.0 / 60.0 + 1.0 / 61.0)).abs() < 1e-7);
+        for (hit, score) in &fused[1..] {
+            assert!(
+                (*score - 1.0 / 60.0).abs() < 1e-7 || (*score - 1.0 / 61.0).abs() < 1e-7,
+                "{} kept an invented rank score: {score}",
+                hit.text
+            );
+        }
+    }
+
+    #[test]
+    fn reranker_score_contract_only_sigmoids_local_logits() {
+        assert!((rerank_relevance(RerankScoreKind::Logit, 0.0) - 0.5).abs() < f64::EPSILON);
+        assert!((rerank_relevance(RerankScoreKind::Relevance, 0.1) - 0.1).abs() < 1e-7);
     }
 }

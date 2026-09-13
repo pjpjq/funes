@@ -24,12 +24,16 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use hf_hub::HFError;
 use lance::dataset::Dataset;
 
 use crate::hub::{client, hf_token, is_offline_error, is_remote_shorthand, parse_hf};
-use dataset::{DIM, MODEL};
+use crate::inference::{self, EmbeddingProfile};
+use dataset::{
+    DIM, EMBEDDING_DIMENSIONS_KEY, EMBEDDING_FINGERPRINT_KEY, EMBEDDING_MODEL_KEY,
+    EMBEDDING_PROVIDER_KEY, EMBEDDING_SCHEMA_VERSION_KEY,
+};
 
 /// A memory to recall from: a local Lance directory or a remote dataset on the HF Hub.
 #[derive(Debug, Clone)]
@@ -95,8 +99,7 @@ impl Memory {
     }
 
     /// Open the `chunks` dataset for this memory; remote memories stream lazily over `hf://`.
-    /// Rejects a memory whose `vector` dimension isn't funes's `DIM` — a coarse guard, since a
-    /// matching dimension doesn't prove a matching embedding model.
+    /// Rejects any embedding-space mismatch, including same-width vectors from another provider.
     pub async fn open(&self) -> Result<Dataset> {
         let ds = match self {
             Memory::Local { path } => {
@@ -291,34 +294,90 @@ pub(crate) fn dataset_absent(err: &anyhow::Error) -> bool {
     })
 }
 
-/// Reject a memory funes can't query with its own embeddings: the `vector` dimension must be
-/// funes's `DIM`, and — when the memory records an embedding model in its schema metadata — that
-/// model must be funes's. A memory with no recorded model (pre-metadata) is guarded by the
-/// dimension alone.
+/// Reject a memory that was built in a different embedding space. Legacy memories without a full
+/// profile are recognized only as the historical local BGE/384 contract; Voyage always requires
+/// all profile metadata, so equal dimensions can never make incompatible vectors look valid.
 fn check_compat(ds: &Dataset) -> Result<()> {
+    let expected = inference::embedding_profile()?;
+    check_compat_with_profile(ds, &expected)
+}
+
+pub(crate) fn check_compat_with_profile(ds: &Dataset, expected: &EmbeddingProfile) -> Result<()> {
     let schema = arrow_schema::Schema::from(ds.schema());
-
-    if let Some(model) = schema.metadata().get("embedding_model") {
-        if model != MODEL {
-            return Err(anyhow!(
-                "memory built with embedding model {model:?}, not funes's {MODEL:?}"
-            ));
-        }
-    }
-
     let field = schema
         .field_with_name("vector")
         .map_err(|_| anyhow!("memory has no `vector` column"))?;
-    if let arrow_schema::DataType::FixedSizeList(_, dim) = field.data_type() {
-        if *dim != DIM {
+    let arrow_schema::DataType::FixedSizeList(_, dimension) = field.data_type() else {
+        return Err(anyhow!("memory `vector` column is not a fixed-size list"));
+    };
+    if *dimension as usize != expected.dimensions {
+        return Err(anyhow!(
+            "memory vector dimension {dimension} != configured {}; refusing to mix embedding spaces",
+            expected.dimensions
+        ));
+    }
+
+    let metadata = schema.metadata();
+    let Some(provider) = metadata.get(EMBEDDING_PROVIDER_KEY) else {
+        if expected.provider != "local" || expected.dimensions != DIM as usize {
             return Err(anyhow!(
-                "memory vector dim {dim} != funes's {DIM}; it was built with a different embedding model"
+                "legacy memory has no embedding provider fingerprint; refusing to use it with {}",
+                expected.provider
             ));
         }
-        Ok(())
-    } else {
-        Err(anyhow!("memory `vector` column is not a fixed-size list"))
+        if let Some(model) = metadata.get(EMBEDDING_MODEL_KEY) {
+            if model != &expected.model {
+                return Err(anyhow!(
+                    "memory built with embedding model {model:?}, not configured {:?}",
+                    expected.model
+                ));
+            }
+        }
+        return Ok(());
+    };
+
+    for (key, actual, wanted) in [
+        (EMBEDDING_PROVIDER_KEY, provider.as_str(), expected.provider.as_str()),
+        (
+            EMBEDDING_MODEL_KEY,
+            metadata.get(EMBEDDING_MODEL_KEY).map(String::as_str).unwrap_or(""),
+            expected.model.as_str(),
+        ),
+        (
+            EMBEDDING_SCHEMA_VERSION_KEY,
+            metadata
+                .get(EMBEDDING_SCHEMA_VERSION_KEY)
+                .map(String::as_str)
+                .unwrap_or(""),
+            expected.schema_version.as_str(),
+        ),
+        (
+            EMBEDDING_FINGERPRINT_KEY,
+            metadata
+                .get(EMBEDDING_FINGERPRINT_KEY)
+                .map(String::as_str)
+                .unwrap_or(""),
+            expected.fingerprint.as_str(),
+        ),
+    ] {
+        if actual != wanted {
+            return Err(anyhow!(
+                "memory {key} {actual:?} != configured {wanted:?}; refusing to mix embedding spaces"
+            ));
+        }
     }
+    let metadata_dimension = metadata
+        .get(EMBEDDING_DIMENSIONS_KEY)
+        .context("memory is missing embedding_dimensions metadata")?
+        .parse::<usize>()
+        .context("memory has invalid embedding_dimensions metadata")?;
+    if metadata_dimension != expected.dimensions || metadata_dimension != *dimension as usize {
+        return Err(anyhow!(
+            "memory embedding_dimensions metadata {metadata_dimension} does not match vector width {dimension} and configured {}",
+            expected.dimensions
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -470,7 +529,7 @@ mod tests {
         )
         .await;
         let err = check_compat(&ds).unwrap_err().to_string();
-        assert!(err.contains("different embedding model"), "{err}");
+        assert!(err.contains("refusing to mix embedding spaces"), "{err}");
     }
 
     #[tokio::test]
@@ -503,6 +562,26 @@ mod tests {
         let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
         let ds = Dataset::write(reader, &uri, None).await.unwrap();
         let err = check_compat(&ds).unwrap_err().to_string();
-        assert!(err.contains("other-model") && err.contains("not funes's"), "{err}");
+        assert!(err.contains("other-model") && err.contains("not configured"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn check_compat_rejects_same_dimension_from_another_embedding_space() {
+        let stored = EmbeddingProfile::voyage("voyage-4-lite", 1024).unwrap();
+        let expected = EmbeddingProfile::voyage("voyage-4", 1024).unwrap();
+        let metadata = dataset::schema_for(&stored).metadata().clone();
+        let schema = Arc::new(Schema::new_with_metadata(
+            vec![Field::new("id", DataType::Int64, true), vector_field(1024)],
+            metadata,
+        ));
+        let batch = RecordBatch::try_new(schema.clone(), vec![ids(2), vectors(2, 1024)]).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let uri = format!("{}/chunks.lance", dir.path().to_str().unwrap());
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let ds = Dataset::write(reader, &uri, None).await.unwrap();
+
+        assert!(check_compat_with_profile(&ds, &stored).is_ok());
+        let error = check_compat_with_profile(&ds, &expected).unwrap_err().to_string();
+        assert!(error.contains("embedding_model") || error.contains("embedding_fingerprint"), "{error}");
     }
 }

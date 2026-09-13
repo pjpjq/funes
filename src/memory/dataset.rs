@@ -3,7 +3,8 @@
 //! it holds the incremental state and the local memory at `…/memory` (the `chunks` Lance dataset).
 
 use crate::chunk;
-use std::collections::HashMap;
+use crate::inference::EmbeddingProfile;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -16,7 +17,7 @@ use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::{BatchUDF, Dataset, NewColumnTransform};
 use lance::index::vector::VectorIndexParams;
 use lance::index::DatasetIndexExt;
-use lance_index::scalar::InvertedIndexParams;
+use lance_index::scalar::{InvertedIndexParams, ScalarIndexParams};
 use lance_index::vector::ivf::IvfBuildParams;
 use lance_index::vector::pq::PQBuildParams;
 use lance_index::IndexType;
@@ -26,11 +27,15 @@ use lance_linalg::distance::MetricType;
 /// The table (Lance dataset) name within a memory.
 pub const TABLE: &str = "chunks";
 
-/// The embedding model a memory's vectors are built with, and their width. Pinned in the schema
-/// metadata and enforced on open ([`super::Memory::open`]): a memory built with another model
-/// can't be queried with funes's embeddings.
+/// Legacy local-BGE profile constants. New memories pin the complete runtime
+/// [`EmbeddingProfile`] in their schema metadata; these remain public for old callers and tests.
 pub const MODEL: &str = "BAAI/bge-small-en-v1.5";
 pub const DIM: i32 = 384;
+pub const EMBEDDING_PROVIDER_KEY: &str = "embedding_provider";
+pub const EMBEDDING_MODEL_KEY: &str = "embedding_model";
+pub const EMBEDDING_DIMENSIONS_KEY: &str = "embedding_dimensions";
+pub const EMBEDDING_SCHEMA_VERSION_KEY: &str = "embedding_schema_version";
+pub const EMBEDDING_FINGERPRINT_KEY: &str = "embedding_fingerprint";
 
 /// Columns introduced additively after the original transcript schema. The order matches
 /// [`schema`], because `add_columns` appends fields in exactly the order supplied here.
@@ -137,6 +142,7 @@ pub async fn scan_rows(
 const VECTOR_INDEX_MIN_ROWS: usize = 256;
 const TEXT_INDEX_NAME: &str = "text_idx";
 const VECTOR_INDEX_NAME: &str = "vector_idx";
+const SOURCE_IDENTITY_INDEX_NAME: &str = "source_identity_idx";
 
 /// Build the FTS index on `text` and, once it has enough rows to train, the IVF_PQ index on
 /// `vector`. A small corpus falls back to brute-force vector recall until it reaches Lance's
@@ -149,26 +155,81 @@ pub async fn build_indexes(
     ds: &mut Dataset,
     on_phase: impl Fn(&str),
 ) -> Result<()> {
-    on_phase("text search index");
-    ds
-        .create_index(
+    maintain_required_indexes(ds, on_phase, true).await?;
+    Ok(())
+}
+
+/// Create every index required by the dataset's current schema and row count, leaving existing
+/// bases intact. This is also the remote reindex entry point: a memory first published below the
+/// IVF training floor gains its vector index once later appends make it large enough.
+pub(crate) async fn ensure_required_indexes(
+    ds: &mut Dataset,
+    on_phase: impl Fn(&str),
+) -> Result<bool> {
+    maintain_required_indexes(ds, on_phase, false).await
+}
+
+async fn maintain_required_indexes(
+    ds: &mut Dataset,
+    on_phase: impl Fn(&str),
+    replace_existing: bool,
+) -> Result<bool> {
+    let mut existing = ds
+        .load_indices()
+        .await
+        .context("listing indexes before index maintenance")?
+        .iter()
+        .map(|index| index.name.clone())
+        .collect::<HashSet<_>>();
+    let mut created = false;
+
+    if replace_existing || !existing.contains(TEXT_INDEX_NAME) {
+        on_phase("text search index");
+        ds.create_index(
             &["text"],
             IndexType::Inverted,
-            None,
+            Some(TEXT_INDEX_NAME.to_string()),
             &InvertedIndexParams::default(),
-            true,
+            replace_existing,
         )
         .await
         .context("creating text search index")?;
+        existing.insert(TEXT_INDEX_NAME.to_string());
+        created = true;
+    }
     if vector_index_required(ds).await? {
-        let params = ivf_pq_params(ds).expect("required vector index has a vector column");
-        on_phase("vector index");
-        ds
-            .create_index(&["vector"], IndexType::Vector, None, &params, true)
+        if replace_existing || !existing.contains(VECTOR_INDEX_NAME) {
+            let params = ivf_pq_params(ds).expect("required vector index has a vector column");
+            on_phase("vector index");
+            ds.create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some(VECTOR_INDEX_NAME.to_string()),
+                &params,
+                replace_existing,
+            )
             .await
             .context("creating vector index")?;
+            existing.insert(VECTOR_INDEX_NAME.to_string());
+            created = true;
+        }
     }
-    Ok(())
+    if Schema::from(ds.schema()).column_with_name("source_identity").is_some()
+        && (replace_existing || !existing.contains(SOURCE_IDENTITY_INDEX_NAME))
+    {
+        on_phase("source identity index");
+        ds.create_index(
+            &["source_identity"],
+            IndexType::BTree,
+            Some(SOURCE_IDENTITY_INDEX_NAME.to_string()),
+            &ScalarIndexParams::default(),
+            replace_existing,
+        )
+        .await
+        .context("creating source identity index")?;
+        created = true;
+    }
+    Ok(created)
 }
 
 /// Whether a no-new-chunk indexing pass must rebuild its indexes. This closes the crash window
@@ -180,13 +241,15 @@ pub(crate) async fn indexes_need_rebuild(ds: &Dataset) -> Result<bool> {
         return Ok(false);
     }
     let indexes = ds.load_indices().await.context("listing indexes for index health")?;
-    let required = if vector_index_required(ds).await? {
-        [TEXT_INDEX_NAME, VECTOR_INDEX_NAME].as_slice()
-    } else {
-        [TEXT_INDEX_NAME].as_slice()
-    };
+    let mut required = vec![TEXT_INDEX_NAME];
+    if vector_index_required(ds).await? {
+        required.push(VECTOR_INDEX_NAME);
+    }
+    if Schema::from(ds.schema()).column_with_name("source_identity").is_some() {
+        required.push(SOURCE_IDENTITY_INDEX_NAME);
+    }
     for name in required {
-        if !indexes.iter().any(|index| index.name == *name) {
+        if !indexes.iter().any(|index| index.name == name) {
             return Ok(true);
         }
         let statistics = ds
@@ -235,9 +298,10 @@ fn ivf_pq_params(ds: &Dataset) -> Option<VectorIndexParams> {
 }
 
 /// The table schema (column order is load-bearing for Lance).
-pub(crate) fn schema() -> Arc<Schema> {
+pub(crate) fn schema_for(profile: &EmbeddingProfile) -> Arc<Schema> {
     let utf8 = |name: &str| Field::new(name, DataType::Utf8, true);
     let i64f = |name: &str| Field::new(name, DataType::Int64, true);
+    let dimensions = i32::try_from(profile.dimensions).expect("embedding dimension fits in i32");
     Arc::new(Schema::new_with_metadata(
         vec![
             utf8("id"),
@@ -256,7 +320,7 @@ pub(crate) fn schema() -> Arc<Schema> {
             i64f("split_idx"),
             Field::new(
                 "vector",
-                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), DIM),
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), dimensions),
                 true,
             ),
             // After `vector`: `add_columns` appends a migrated column at the end, so a
@@ -276,8 +340,28 @@ pub(crate) fn schema() -> Arc<Schema> {
             Field::new("source_missing", DataType::Boolean, true),
             utf8("metadata_json"),
         ],
-        HashMap::from([("embedding_model".to_string(), MODEL.to_string())]),
+        HashMap::from([
+            (EMBEDDING_PROVIDER_KEY.to_string(), profile.provider.clone()),
+            (EMBEDDING_MODEL_KEY.to_string(), profile.model.clone()),
+            (
+                EMBEDDING_DIMENSIONS_KEY.to_string(),
+                profile.dimensions.to_string(),
+            ),
+            (
+                EMBEDDING_SCHEMA_VERSION_KEY.to_string(),
+                profile.schema_version.clone(),
+            ),
+            (
+                EMBEDDING_FINGERPRINT_KEY.to_string(),
+                profile.fingerprint.clone(),
+            ),
+        ]),
     ))
+}
+
+/// Legacy local schema used by fixtures and migrations whose vector contract is already known.
+pub(crate) fn schema() -> Arc<Schema> {
+    schema_for(&EmbeddingProfile::local())
 }
 
 /// Build the null-valued additive migration needed before canonical rows can be merged into `ds`.
@@ -326,6 +410,7 @@ pub(crate) async fn ensure_canonical_columns(ds: &mut Dataset) -> Result<bool> {
     Ok(true)
 }
 
+#[cfg(test)]
 pub(crate) fn build_batch(chunks: &[chunk::Chunk], vectors: &[Vec<f32>]) -> Result<RecordBatch> {
     build_batch_for_schema(chunks, vectors, schema())
 }
@@ -337,6 +422,28 @@ pub(crate) fn build_batch_for_schema(
     vectors: &[Vec<f32>],
     target: Arc<Schema>,
 ) -> Result<RecordBatch> {
+    if chunks.len() != vectors.len() {
+        anyhow::bail!(
+            "embedding provider returned {} vectors for {} chunks",
+            vectors.len(),
+            chunks.len()
+        );
+    }
+    let dimension = match target.field_with_name("vector")?.data_type() {
+        DataType::FixedSizeList(_, dimension) => *dimension,
+        _ => anyhow::bail!("memory `vector` column is not a fixed-size list"),
+    };
+    for (index, vector) in vectors.iter().enumerate() {
+        if vector.len() != dimension as usize {
+            anyhow::bail!(
+                "embedding vector {index} has dimension {}, expected {dimension}",
+                vector.len()
+            );
+        }
+        if vector.iter().any(|value| !value.is_finite()) {
+            anyhow::bail!("embedding vector {index} contains a non-finite value");
+        }
+    }
     let s = |f: &dyn Fn(&chunk::Chunk) -> Option<String>| -> ArrayRef {
         Arc::new(chunks.iter().map(f).collect::<StringArray>())
     };
@@ -347,7 +454,7 @@ pub(crate) fn build_batch_for_schema(
         vectors
             .iter()
             .map(|v| Some(v.iter().map(|&x| Some(x)).collect::<Vec<_>>())),
-        DIM,
+        dimension,
     );
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(target.fields().len());
     for field in target.fields() {
@@ -391,6 +498,7 @@ mod tests {
     use super::*;
     use arrow_array::RecordBatchIterator;
     use lance::dataset::WriteParams;
+    use lance_index::optimize::OptimizeOptions;
 
     fn text_schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![Field::new("text", DataType::Utf8, false)]))
@@ -400,6 +508,47 @@ mod tests {
         RecordBatch::try_new(
             text_schema(),
             vec![Arc::new(StringArray::from(texts.to_vec()))],
+        )
+        .unwrap()
+    }
+
+    fn indexable_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("text", DataType::Utf8, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 16),
+                false,
+            ),
+            Field::new("source_identity", DataType::Utf8, true),
+        ]))
+    }
+
+    fn indexable_batch(start: usize, rows: usize) -> RecordBatch {
+        let schema = indexable_schema();
+        let texts = (start..start + rows)
+            .map(|row| format!("canonical document {row}"))
+            .collect::<Vec<_>>();
+        let identities = (start..start + rows)
+            .map(|row| Some(format!("source-{row}")))
+            .collect::<Vec<_>>();
+        let vectors = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
+            (start..start + rows).map(|row| {
+                Some(
+                    (0..16)
+                        .map(|column| Some(((row * 17 + column * 31) % 997) as f32 / 997.0))
+                        .collect::<Vec<_>>(),
+                )
+            }),
+            16,
+        );
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(texts)),
+                Arc::new(vectors),
+                Arc::new(StringArray::from(identities)),
+            ],
         )
         .unwrap()
     }
@@ -445,6 +594,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn voyage_schema_pins_the_complete_embedding_profile() {
+        let profile = EmbeddingProfile::voyage("voyage-4-lite", 1024).unwrap();
+        let schema = schema_for(&profile);
+        let DataType::FixedSizeList(_, dimension) = schema.field_with_name("vector").unwrap().data_type() else {
+            panic!("vector must be fixed-size")
+        };
+        assert_eq!(*dimension, 1024);
+        assert_eq!(schema.metadata().get(EMBEDDING_PROVIDER_KEY), Some(&"voyage".to_string()));
+        assert_eq!(schema.metadata().get(EMBEDDING_MODEL_KEY), Some(&"voyage-4-lite".to_string()));
+        assert_eq!(schema.metadata().get(EMBEDDING_DIMENSIONS_KEY), Some(&"1024".to_string()));
+        assert_eq!(schema.metadata().get(EMBEDDING_SCHEMA_VERSION_KEY), Some(&"2".to_string()));
+        assert_eq!(
+            schema.metadata().get(EMBEDDING_FINGERPRINT_KEY),
+            Some(&profile.fingerprint)
+        );
+    }
+
     #[tokio::test]
     async fn interrupted_index_finalization_is_repaired_without_new_source_rows() {
         let dir = tempfile::tempdir().unwrap();
@@ -475,6 +642,53 @@ mod tests {
         .unwrap();
         assert!(indexes_need_rebuild(&ds).await.unwrap());
         build_indexes(&mut ds, |_| {}).await.unwrap();
+        assert!(!indexes_need_rebuild(&ds).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn index_maintenance_adds_vector_and_source_identity_indexes_after_growth() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().join("chunks.lance");
+        let first = indexable_batch(0, VECTOR_INDEX_MIN_ROWS - 1);
+        let mut ds = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(first)].into_iter(), indexable_schema()),
+            uri.to_str().unwrap(),
+            Some(WriteParams::default()),
+        )
+        .await
+        .unwrap();
+
+        build_indexes(&mut ds, |_| {}).await.unwrap();
+        let initial = ds
+            .load_indices()
+            .await
+            .unwrap()
+            .iter()
+            .map(|index| index.name.clone())
+            .collect::<HashSet<_>>();
+        assert!(initial.contains(TEXT_INDEX_NAME));
+        assert!(initial.contains(SOURCE_IDENTITY_INDEX_NAME));
+        assert!(!initial.contains(VECTOR_INDEX_NAME));
+
+        let appended = indexable_batch(VECTOR_INDEX_MIN_ROWS - 1, 77);
+        ds.append(
+            RecordBatchIterator::new(vec![Ok(appended)].into_iter(), indexable_schema()),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(indexes_need_rebuild(&ds).await.unwrap());
+        assert!(ensure_required_indexes(&mut ds, |_| {}).await.unwrap());
+        ds.optimize_indices(&OptimizeOptions::append()).await.unwrap();
+
+        let maintained = ds
+            .load_indices()
+            .await
+            .unwrap()
+            .iter()
+            .map(|index| index.name.clone())
+            .collect::<HashSet<_>>();
+        assert!(maintained.contains(VECTOR_INDEX_NAME));
         assert!(!indexes_need_rebuild(&ds).await.unwrap());
     }
 

@@ -281,6 +281,7 @@ pub(crate) async fn reindex(
 ) -> Result<Reindexed> {
     let parent = head_oid(repo, rev).await?;
     let (mut ds, wrapper) = open_capturing(dataset_uri, storage_options).await?;
+    dataset::ensure_required_indexes(&mut ds, |_| {}).await?;
 
     for (name, subs) in sub_index_counts(&ds).await? {
         // subs = base + deltas; merge(deltas) folds every delta into one, sparing the base.

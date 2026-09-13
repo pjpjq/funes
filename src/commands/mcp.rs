@@ -24,7 +24,7 @@ pub struct RecallRequest {
     #[schemars(description = "Adjacent chunks attached to each hit for context; 0 returns the hits alone.")]
     pub neighbors: Option<i64>,
     #[schemars(
-        description = "How many fused candidates to rerank. Raise it when a topic is rare and the first pass may not surface it."
+        description = "How many fused candidates to retain before optional reranking. Raise it when a topic is rare and the first pass may not surface it."
     )]
     pub candidates: Option<usize>,
     #[schemars(description = "Restrict to a block type: text | thinking | tool_use | tool_result")]

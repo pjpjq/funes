@@ -1,6 +1,6 @@
 //! funes — recall over your past AI Agent sessions.
 //!
-//! `recall` reads the index (hybrid → rerank → recency); `index` builds/updates it from the local
+//! `recall` reads the index (hybrid → optional rerank → recency); `index` builds/updates it from the local
 //! harness session dirs (Claude Code, Codex, pi) or an explicit path/parquet/repo. funes's home is
 //! `$FUNES_HOME` or `~/.funes`.
 
@@ -31,7 +31,7 @@ struct Cli {
 // surface and avoids boxing individual optional strings only to shrink this transient enum.
 #[allow(clippy::large_enum_variant)]
 enum Cmd {
-    /// Recall passages from past sessions (hybrid → rerank → recency → neighbors).
+    /// Recall passages from past sessions (hybrid → optional rerank → recency → neighbors).
     Recall {
         /// What to recall (free text).
         #[arg(required = true, num_args = 1..)]
@@ -39,7 +39,7 @@ enum Cmd {
         /// How many results to show.
         #[arg(short, long, default_value_t = recall::DEFAULT_K)]
         k: usize,
-        /// How many fused candidates to rerank.
+        /// How many fused candidates to retain before optional reranking.
         #[arg(long, default_value_t = recall::DEFAULT_CANDIDATES)]
         candidates: usize,
         /// Recency half-life in days (a hit this old keeps half its weight). 0 disables.
@@ -139,11 +139,17 @@ enum Cmd {
     },
     /// Ingest canonical document JSONL directly into a memory, replacing each source revision.
     IngestDocs {
-        /// Canonical JSONL containing source identity, revision, retrieval text, and metadata.
+        /// Canonical JSONL containing source identity, revision, raw text, and metadata.
         #[arg(value_name = "JSONL")]
         path: PathBuf,
         #[command(flatten)]
         memory: MemoryOpts,
+    },
+    /// Refresh a remote memory's Lance indexes without reading a local memory.
+    #[command(hide = true)]
+    OptimizeIndex {
+        #[arg(value_name = "MEMORY")]
+        memory: String,
     },
     /// Find a literal string everywhere in one session — exhaustive, unranked.
     Scan {
@@ -599,6 +605,10 @@ async fn main() -> Result<()> {
         }
         Cmd::IngestDocs { path, memory } => {
             print!("{}", ingest_docs::run(&path, memory.resolve()).await?);
+            Ok(())
+        }
+        Cmd::OptimizeIndex { memory: target } => {
+            print!("{}", push::run_reindex_only(memory::Memory::parse(&target)).await?);
             Ok(())
         }
         Cmd::Status { memory } => {

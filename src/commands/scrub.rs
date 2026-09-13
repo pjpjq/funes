@@ -3,7 +3,7 @@
 //! re-indexing cannot. Operates only on the local memory; it does not touch a published remote.
 
 use crate::inference::{self, embed_batched, Embedder};
-use crate::memory::dataset::{self, build_batch, schema};
+use crate::memory::dataset::{self, build_batch_for_schema};
 use crate::memory::lock;
 use crate::{chunk, scan};
 use anyhow::Result;
@@ -27,6 +27,9 @@ pub async fn run() -> Result<()> {
         println!("no local memory to scrub");
         return Ok(());
     };
+    let profile = inference::embedding_profile()?;
+    crate::memory::check_compat_with_profile(&ds, &profile)?;
+    let target_schema = std::sync::Arc::new(arrow_schema::Schema::from(ds.schema()));
     let scanner = scan::Trufflehog::find()?;
 
     eprintln!("loading the local memory…");
@@ -85,7 +88,7 @@ pub async fn run() -> Result<()> {
     let replacement_batch = if replacements.is_empty() {
         None
     } else {
-        let mut embedder: Box<dyn Embedder> = inference::embedder()?;
+        let mut embedder: Box<dyn Embedder> = inference::embedder_for(&profile)?;
         let rtexts: Vec<&str> = replacements.iter().map(|c| c.text.as_str()).collect();
         let n = rtexts.len();
         eprintln!("re-embedding {n} redacted chunk(s)…");
@@ -99,7 +102,11 @@ pub async fn run() -> Result<()> {
             "\r    embedded {n} chunk(s) in {:.1}s          ",
             t0.elapsed().as_secs_f64()
         );
-        Some(build_batch(&replacements, &vectors)?)
+        Some(build_batch_for_schema(
+            &replacements,
+            &vectors,
+            target_schema.clone(),
+        )?)
     };
 
     // Rewrite the memory in a single Overwrite commit: every clean row (with its existing vector) plus
@@ -109,7 +116,7 @@ pub async fn run() -> Result<()> {
     // `cid` hashes only coordinates, so a same-piece-count re-split reuses the old ids and a later
     // delete couldn't tell the fresh rows from the stale ones. (Cost: scrub rewrites the whole table,
     // fine for a rare remediation.)
-    let schema = schema();
+    let schema = target_schema;
     let mut out: Vec<RecordBatch> = Vec::new();
     let mut base = 0usize;
     for b in &batches {

@@ -9,8 +9,8 @@
 
 use crate::chunk::{self, Tier};
 use crate::hub;
-use crate::inference::{self, embed_batched, Embedder};
-use crate::memory::dataset::{self, build_batch_for_schema, schema, MODEL};
+use crate::inference::{self, embed_batched, Embedder, EmbeddingProfile};
+use crate::memory::dataset::{self, build_batch_for_schema, schema_for};
 use crate::memory::lock;
 use crate::scan;
 use crate::traces::harness::Harness;
@@ -245,6 +245,7 @@ pub(crate) fn local_index_coverage() -> Option<IndexCoverage> {
 struct Indexer {
     uri: String,
     ds: Option<Dataset>,
+    profile: EmbeddingProfile,
     /// [`stored_ids`] at open plus everything appended this run — the dedup baseline for new chunks.
     existing: HashSet<String>,
     embedder: Box<dyn Embedder>,
@@ -319,17 +320,12 @@ impl Indexer {
 
         let uri = dataset::table_uri(&dataset::local_memory_dir());
         let mut ds = dataset::open(&uri, HashMap::new()).await.ok();
+        let profile = inference::embedding_profile()?;
 
-        // Model-pin: refuse to add to a memory built with a different embedding model. The id rides
-        // in the dataset's schema metadata; a pre-metadata memory (no id) is tolerated and guarded
-        // only by the dimension check until it is reindexed.
+        // Profile-pin: provider/model/dimension/schema/input contract must all match. Same-width
+        // vectors from different providers are not interchangeable.
         if let Some(ds) = &ds {
-            let schema = arrow_schema::Schema::from(ds.schema());
-            if let Some(em) = schema.metadata().get("embedding_model") {
-                if em != MODEL {
-                    return Err(anyhow!("index built with model {em:?}, refusing to mix with {MODEL:?}"));
-                }
-            }
+            crate::memory::check_compat_with_profile(ds, &profile)?;
         }
         if let Some(ds) = &mut ds {
             dataset::ensure_canonical_columns(ds).await?;
@@ -351,7 +347,7 @@ impl Indexer {
                 .unwrap_or_default()
         };
 
-        let embedder: Box<dyn Embedder> = inference::embedder()?;
+        let embedder: Box<dyn Embedder> = inference::embedder_for(&profile)?;
         // Best-effort secret redaction: if the scanner isn't installed, indexing continues
         // unredacted — the push gate still scans, fail-closed, before any upload, so a secret can't
         // reach the Hub.
@@ -376,6 +372,7 @@ impl Indexer {
         Ok(Indexer {
             uri,
             ds,
+            profile,
             existing,
             embedder,
             scanner,
@@ -542,7 +539,7 @@ impl Indexer {
             .ds
             .as_ref()
             .map(|d| Arc::new(arrow_schema::Schema::from(d.schema())))
-            .unwrap_or_else(schema);
+            .unwrap_or_else(|| schema_for(&self.profile));
         let batch = build_batch_for_schema(new_chunks, &vectors, target_schema.clone())?;
         let reader = RecordBatchIterator::new(vec![Ok(batch)], target_schema);
         let uri = self.uri.clone();

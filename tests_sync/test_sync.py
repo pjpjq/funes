@@ -277,6 +277,126 @@ def test_shutdown_interrupts_one_shot_backfill(tmp_path):
     assert store.remaining == 2
 
 
+def test_idle_daemon_does_not_call_operator_snapshot_without_new_work(tmp_path):
+    class IdleStore:
+        db = None
+
+        def pending(self, _limit):
+            return []
+
+        def pending_count(self):
+            return 0
+
+    class Client:
+        def __init__(self):
+            self.health_calls = 0
+            self.snapshot_calls = 0
+
+        def health(self):
+            self.health_calls += 1
+            return True
+
+        def sync_snapshot(self):
+            self.snapshot_calls += 1
+
+    class Wake:
+        def __init__(self):
+            self.waits = 0
+
+        def is_set(self):
+            return False
+
+        def wait(self, _timeout):
+            self.waits += 1
+            if self.waits == 2:
+                daemon.running = False
+
+        def clear(self):
+            return None
+
+        def set(self):
+            return None
+
+    c = cfg(tmp_path)
+    c.auto_discover = False
+    client = Client()
+    daemon = SyncDaemon(c, IdleStore(), client)
+    daemon._wake = Wake()
+    daemon.scan_once = lambda: 0
+    daemon._start_watcher = lambda: None
+    daemon._stop_watcher = lambda: None
+
+    daemon.run()
+
+    assert daemon._wake.waits == 2
+    assert client.health_calls == 0
+    assert client.snapshot_calls == 0
+
+
+def test_successful_ingest_is_not_followed_by_full_snapshot(tmp_path):
+    class StoreWithOneRecord:
+        db = None
+
+        def __init__(self):
+            self.has_pending = True
+
+        def pending(self, _limit):
+            if not self.has_pending:
+                return []
+            return [{"record_id": "one", "payload": '{"raw_text":"one"}', "attempts": 0}]
+
+        def ack(self, _record_ids):
+            self.has_pending = False
+
+        def pending_count(self):
+            return int(self.has_pending)
+
+    class Client:
+        def __init__(self):
+            self.ingest_calls = 0
+            self.health_calls = 0
+            self.snapshot_calls = 0
+
+        def ingest(self, records):
+            self.ingest_calls += 1
+            return {"accepted": len(records)}
+
+        def health(self):
+            self.health_calls += 1
+            return True
+
+        def sync_snapshot(self):
+            self.snapshot_calls += 1
+
+    class Wake:
+        def is_set(self):
+            return False
+
+        def wait(self, _timeout):
+            daemon.running = False
+
+        def clear(self):
+            return None
+
+        def set(self):
+            return None
+
+    c = cfg(tmp_path)
+    c.auto_discover = False
+    client = Client()
+    daemon = SyncDaemon(c, StoreWithOneRecord(), client)
+    daemon._wake = Wake()
+    daemon.scan_once = lambda: 0
+    daemon._start_watcher = lambda: None
+    daemon._stop_watcher = lambda: None
+
+    daemon.run()
+
+    assert client.ingest_calls == 1
+    assert client.health_calls == 0
+    assert client.snapshot_calls == 0
+
+
 def test_flush_batch_respects_serialized_byte_limit(tmp_path):
     payloads = [
         json.dumps({"raw_text": "a" * 20}),

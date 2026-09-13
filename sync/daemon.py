@@ -186,11 +186,6 @@ class SyncDaemon:
                     # then rescan before sending another batch.
                     if not self.running or self._wake.is_set():
                         break
-            if self.running and self.store.pending_count() == 0 and self.client.health():
-                try:
-                    self.client.sync_snapshot()
-                except Exception as exc:
-                    log.warning("snapshot sync unavailable: %s", type(exc).__name__)
             if once: break
             if not self.running: break
             self._wake.wait(max(1,self.config.interval)); self._wake.clear()

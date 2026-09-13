@@ -79,6 +79,7 @@ TECHNICAL_ENTITY_RE = re.compile(
     r"https?://\S+|(?:[~/]|\.{1,2}/)[^\s]+|[A-Za-z][A-Za-z0-9_.*:/-]*"
 )
 ASCII_FTS_TERM_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]{1,63}")
+CJK_SEQUENCE_RE = re.compile(r"[\u3400-\u9fff\uf900-\ufaff]+")
 ARABIC_NUMBER_RE = re.compile(r"\d+(?:\.\d+)*")
 
 
@@ -114,6 +115,24 @@ def technical_fts_terms(value: str, limit: int = 12) -> list[str]:
 
 def technical_fts_query(terms: list[str]) -> str:
     return " OR ".join(f'"{term.replace(chr(34), chr(34) * 2)}"' for term in terms)
+
+
+def cjk_retrieval_terms(value: str, limit: int = 24) -> list[str]:
+    """Return bounded CJK tri/bi-grams for in-memory candidate reranking."""
+    terms = []
+    seen = set()
+    sequences = CJK_SEQUENCE_RE.findall(value)
+    for width in (3, 2):
+        for sequence in sequences:
+            for index in range(max(0, len(sequence) - width + 1)):
+                term = sequence[index:index + width]
+                if term in seen:
+                    continue
+                seen.add(term)
+                terms.append(term)
+                if len(terms) >= limit:
+                    return terms
+    return terms
 
 
 def expanded_candidate_limit(limit: int) -> int:
@@ -858,7 +877,7 @@ class Store:
                 # expensive substring compatibility path below.
                 rows = []
                 strict_fts_failed = True
-            if not rows and cjk_ratio(query) > 0:
+            if cjk_ratio(query) > 0:
                 # Mixed Chinese/technical queries are common in agent history.
                 # Try their safe ASCII identifiers through FTS before the
                 # character-level compatibility scan touches every raw row.
@@ -872,13 +891,25 @@ class Store:
                     term for term in technical_terms if term.casefold() not in facet_terms
                 ] or technical_terms
                 if technical_terms:
-                    rows = self.conn.execute(
+                    technical_rows = self.conn.execute(
                         """SELECT m.*, bm25(memories_fts) AS score FROM memories_fts
                         JOIN memories m ON m.id=memories_fts.rowid WHERE memories_fts MATCH ?"""
                         + facet
                         + " ORDER BY score LIMIT ?",
-                        [technical_fts_query(content_terms), *params, limit],
+                        [
+                            technical_fts_query(content_terms),
+                            *params,
+                            min(100, max(32, limit * 4)),
+                        ],
                     ).fetchall()
+                    combined = []
+                    seen = set()
+                    for row in [*rows, *technical_rows]:
+                        if row["id"] in seen:
+                            continue
+                        seen.add(row["id"])
+                        combined.append(row)
+                    rows = combined
                 covered = any(
                     all(
                         term.casefold()
@@ -926,7 +957,23 @@ class Store:
                             continue
                         seen.add(row["id"])
                         combined.append(row)
-                    rows = combined[:limit]
+                    rows = combined
+                cjk_terms = cjk_retrieval_terms(query)
+                if rows and cjk_terms:
+                    rows.sort(
+                        key=lambda row: sum(
+                            len(term)
+                            for term in cjk_terms
+                            if term
+                            in (
+                                str(row["retrieval_text"] or "")
+                                + " "
+                                + str(row["raw_text"] or "")
+                            )
+                        ),
+                        reverse=True,
+                    )
+                rows = rows[:limit]
             if not rows and strict_fts_failed:
                 # FTS MATCH is intentionally strict; a plain substring fallback keeps recall useful.
                 like = "%" + query.replace("%", "\\%") + "%"

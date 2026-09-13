@@ -4,7 +4,7 @@
 
 use crate::home;
 use crate::inference::{self, embed_batched, Embedder};
-use crate::memory::dataset::{self, build_batch};
+use crate::memory::dataset::{self, build_batch_for_schema};
 use crate::memory::lock;
 use crate::memory::Memory;
 use crate::{chunk, scan, ui};
@@ -26,7 +26,9 @@ pub async fn run() -> Result<()> {
         println!("no local memory to scrub");
         return Ok(());
     };
-    let model = dataset::embedding_model(&ds)?;
+    let profile = dataset::embedding_profile(&ds)?;
+    crate::memory::check_compat_with_profile(&ds, &profile)?;
+    let target_schema = std::sync::Arc::new(arrow_schema::Schema::from(ds.schema()));
     let scanner = scan::Trufflehog::find()?;
 
     eprintln!("loading the local memory…");
@@ -87,7 +89,7 @@ pub async fn run() -> Result<()> {
     let replacement_batch = if replacements.is_empty() {
         None
     } else {
-        let mut embedder: Box<dyn Embedder> = inference::embedder(model)?;
+        let mut embedder: Box<dyn Embedder> = inference::embedder_for(&profile)?;
         let rtexts: Vec<&str> = replacements.iter().map(|c| c.text.as_str()).collect();
         let n = rtexts.len();
         eprintln!("re-embedding {n} redacted chunk(s)…");
@@ -101,7 +103,7 @@ pub async fn run() -> Result<()> {
             "\r    embedded {n} chunk(s) in {:.1}s          ",
             t0.elapsed().as_secs_f64()
         );
-        Some(build_batch(model, &replacements, Some(&vectors))?)
+        Some(build_batch_for_schema(&replacements, &vectors, target_schema.clone())?)
     };
 
     // Rewrite the memory in a single Overwrite commit: every clean row (with its existing vector) plus
@@ -122,7 +124,7 @@ pub async fn run() -> Result<()> {
     }
     out.extend(replacement_batch);
     eprintln!("rewriting the memory…");
-    let mut ds = dataset::overwrite(&uri, out, model).await?;
+    let mut ds = dataset::overwrite(&uri, out, &profile).await?;
     dataset::build_indexes(&mut ds, ui::index_progress).await?;
     sweep(&ds).await?;
 

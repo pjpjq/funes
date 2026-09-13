@@ -2615,6 +2615,7 @@ dependencies = [
  "objc2-metal-performance-shaders-graph",
  "object_store",
  "ratatui",
+ "reqwest 0.12.28",
  "rmcp",
  "safetensors",
  "serde",
@@ -3251,6 +3252,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower-service",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -6169,6 +6171,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "encoding_rs",
+ "futures-channel",
  "futures-core",
  "futures-util",
  "h2",
@@ -6206,6 +6209,7 @@ dependencies = [
  "wasm-bindgen-futures",
  "wasm-streams 0.4.2",
  "web-sys",
+ "webpki-roots",
 ]
 
 [[package]]

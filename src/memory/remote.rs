@@ -91,6 +91,15 @@ pub(crate) enum Compacted {
     Conflict,
 }
 
+pub(crate) enum Reindexed {
+    /// The index delta was committed; carries the new commit oid.
+    Committed(String),
+    /// Nothing to optimize — the index was already current.
+    AlreadyCurrent,
+    /// The branch head moved before our commit; the caller may retry against the new head.
+    Conflict,
+}
+
 /// Outcome of one canonical-document replace attempt.
 pub(crate) enum Replaced {
     Committed(String),
@@ -169,12 +178,12 @@ pub(crate) async fn append(
 /// Refuse rows embedded with another model than `ds`'s: Lance appends them whatever model their
 /// schema records.
 fn same_model(ds: &Dataset, rows: &Schema) -> Result<()> {
-    let (there, here) = (dataset::embedding_model(ds)?, dataset::stamped_model(rows)?);
+    let (there, here) = (dataset::embedding_profile(ds)?, dataset::profile_from_schema(rows)?);
     ensure!(
         here == there,
         "the remote memory is embedded with {}, and the rows to append with {}: a memory takes one embedding model",
-        there.id(),
-        here.id()
+        there.model,
+        here.model
     );
     Ok(())
 }
@@ -585,6 +594,31 @@ async fn commit_in_parts(
         oid = info.commit_oid;
     }
     Ok(oid)
+}
+
+/// Refresh indexes in a guarded commit; do not compact data fragments or delete versions.
+pub(crate) async fn reindex(
+    repo: &HFRepository<RepoTypeDataset>,
+    dataset_uri: &str,
+    mut storage_options: HashMap<String, String>,
+    rev: &str,
+    message: String,
+) -> Result<Reindexed> {
+    let parent = head_oid(repo, rev).await?;
+    storage_options.insert("revision".into(), parent.clone());
+    storage_options.insert("hf_revision".into(), parent.clone());
+    let (mut ds, wrapper) = open_capturing(dataset_uri, storage_options).await?;
+    dataset::build_indexes(&mut ds, |_| {}).await?;
+    let files = captured_files(&wrapper);
+    if files.is_empty() {
+        return Ok(Reindexed::AlreadyCurrent);
+    }
+    let (ops, _dir) = write_ops(&files)?;
+    match send_commit(repo, ops, Some(parent), rev, message).await {
+        Ok(info) => Ok(Reindexed::Committed(info.commit_oid.unwrap_or_else(|| "?".into()))),
+        Err(error) if head_moved(&error) => Ok(Reindexed::Conflict),
+        Err(error) => Err(anyhow::Error::new(error).context("reindex commit failed")),
+    }
 }
 
 /// Rename a column on the remote dataset in one head-guarded commit. `alter_columns` is

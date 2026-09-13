@@ -262,8 +262,8 @@ impl BlasEmbedder {
 }
 
 impl Embedder for BlasEmbedder {
-    fn model(&self) -> EmbeddingModel {
-        self.model
+    fn model(&self) -> Option<EmbeddingModel> {
+        Some(self.model)
     }
 
     fn encode(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {

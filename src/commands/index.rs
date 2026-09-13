@@ -11,7 +11,7 @@
 use super::compact;
 use crate::chunk::{self, Tier};
 use crate::home;
-use crate::inference::{self, embed_batched, Embedder};
+use crate::inference::{self, embed_batched, Embedder, EmbeddingProfile};
 use crate::memory::dataset::{self, model};
 use crate::memory::lock;
 use crate::memory::Memory;
@@ -120,7 +120,7 @@ pub async fn run(args: IndexArgs) -> Result<()> {
         }
     };
     if multilingual {
-        ensure_local_memory(model::MULTILINGUAL).await?;
+        ensure_local_memory(&inference::EmbeddingProfile::local_model(model::MULTILINGUAL)).await?;
     }
     if roots.is_empty() {
         println!(
@@ -138,26 +138,28 @@ pub async fn run(args: IndexArgs) -> Result<()> {
 }
 
 /// The embedding model the local memory records, `None` when there is no local memory yet.
-pub async fn local_memory_model() -> Result<Option<inference::EmbeddingModel>> {
+pub async fn local_memory_profile() -> Result<Option<inference::EmbeddingProfile>> {
     Memory::local()
         .dataset()
         .await?
-        .map(|ds| dataset::embedding_model(&ds))
+        .map(|ds| dataset::embedding_profile(&ds))
         .transpose()
 }
 
-pub async fn ensure_local_memory(model: inference::EmbeddingModel) -> Result<()> {
+pub async fn ensure_local_memory(profile: &inference::EmbeddingProfile) -> Result<()> {
+    profile.validate()?;
     std::fs::create_dir_all(home::dir())?;
     let _lock = acquire_lock(std::io::stdin().is_terminal()).await?;
-    match local_memory_model().await? {
-        Some(current) if current != model => Err(anyhow!(
+    match local_memory_profile().await? {
+        Some(current) if &current != profile => Err(anyhow!(
             "the local memory is embedded with {}, not {}: a memory keeps the model it was created with",
-            current.id(),
-            model.id()
+            current.model,
+            profile.model
         )),
         Some(_) => Ok(()),
         None => {
-            dataset::create_empty(&dataset::table_uri(home::memory_dir()), model).await?;
+            let batch = dataset::build_batch_for_schema(&[], &[], dataset::schema_for(profile))?;
+            dataset::create(&dataset::table_uri(home::memory_dir()), batch).await?;
             Ok(())
         }
     }
@@ -466,6 +468,7 @@ pub(crate) fn local_index_coverage() -> Option<IndexCoverage> {
 struct Indexer {
     uri: String,
     ds: Option<Dataset>,
+    profile: EmbeddingProfile,
     /// [`stored_ids`] at open plus everything written this run — the dedup baseline for new chunks.
     existing: HashSet<String>,
     embedder: Box<dyn Embedder>,
@@ -546,9 +549,9 @@ impl Indexer {
             dataset::ensure_canonical_columns(ds).await?;
         }
 
-        let model = match &ds {
-            Some(ds) => dataset::embedding_model(ds)?,
-            None => model::ENGLISH,
+        let profile = match &ds {
+            Some(ds) => dataset::embedding_profile(ds)?,
+            None => inference::embedding_profile()?,
         };
         // Re-indexing keeps only the chunks whose id isn't stored, so a grown session contributes
         // just its new turns — nothing is re-embedded or deleted (a rewritten turn arrives under
@@ -574,7 +577,7 @@ impl Indexer {
                 .unwrap_or_default()
         };
 
-        let embedder: Box<dyn Embedder> = inference::embedder(model)?;
+        let embedder: Box<dyn Embedder> = inference::embedder_for(&profile)?;
         let scanner = find_scanner();
 
         let units = collect_units(&sources)?;
@@ -595,6 +598,7 @@ impl Indexer {
         Ok(Indexer {
             uri,
             ds,
+            profile,
             existing,
             embedder,
             scanner,
@@ -798,7 +802,7 @@ impl Indexer {
             .ds
             .as_ref()
             .map(|ds| Arc::new(arrow_schema::Schema::from(ds.schema())))
-            .unwrap_or_else(|| dataset::schema(self.embedder.model()));
+            .unwrap_or_else(|| dataset::schema_for(&self.profile));
         let batch = dataset::build_batch_optional_for_schema(chunks, None, target_schema)?;
         if let Some(languages) = &mut self.languages {
             languages.add(&batch);
@@ -1327,8 +1331,8 @@ mod tests {
     }
 
     impl Embedder for TestEmbedder {
-        fn model(&self) -> inference::EmbeddingModel {
-            model::ENGLISH
+        fn model(&self) -> Option<inference::EmbeddingModel> {
+            Some(model::ENGLISH)
         }
 
         fn encode(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {

@@ -7,7 +7,7 @@
 use super::push;
 use super::target::Target;
 use crate::chunk;
-use crate::inference::{self, Embedder, EmbeddingModel, Reranker};
+use crate::inference::{self, Embedder, EmbeddingProfile, RerankScoreKind, Reranker};
 use crate::memory::dataset::{self, RecordBatch};
 use crate::memory::{Memory, MemoryState};
 use crate::traces;
@@ -261,6 +261,13 @@ fn harness_spellings(h: String) -> Vec<String> {
     }
 }
 
+fn rerank_relevance(kind: RerankScoreKind, score: f32) -> f64 {
+    match kind {
+        RerankScoreKind::Logit => 1.0 / (1.0 + (-(score as f64)).exp()),
+        RerankScoreKind::Relevance => score as f64,
+    }
+}
+
 /// A dataset opened for reading.
 struct Read {
     ds: Dataset,
@@ -323,9 +330,24 @@ async fn open_read(memory: &Memory) -> Result<Read> {
             note: None,
             memory_label: Some(memory.label()),
         }),
-        ReadOutcome::Offline => degrade_offline(&memory.label()).await,
+        ReadOutcome::Offline if native_fallback_enabled() => degrade_offline(&memory.label()).await,
+        ReadOutcome::Offline => Err(anyhow!(
+            "remote {} unavailable; native fallback is disabled",
+            memory.label()
+        )),
         ReadOutcome::NoIndex => Err(no_index_error()),
     }
+}
+
+fn native_fallback_enabled() -> bool {
+    !matches!(
+        std::env::var("FUNES_NATIVE_FALLBACK")
+            .unwrap_or_else(|_| "true".to_string())
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "0" | "false" | "no" | "off"
+    )
 }
 
 /// The error a read verb returns when the default local memory has no index yet — points at the
@@ -367,25 +389,25 @@ pub fn memory_hint(read: Option<&str>) -> String {
 /// the work is CPU-bound and the server's calls are serial anyway.
 #[derive(Default)]
 struct Models {
-    embedders: HashMap<EmbeddingModel, Box<dyn Embedder>>,
+    embedders: HashMap<String, Box<dyn Embedder>>,
     reranker: Option<Box<dyn Reranker>>,
 }
 
 impl Models {
-    fn embedder(&mut self, model: EmbeddingModel) -> Result<&mut dyn Embedder> {
-        let embedder = match self.embedders.entry(model) {
+    fn embedder(&mut self, profile: &EmbeddingProfile) -> Result<&mut dyn Embedder> {
+        let embedder = match self.embedders.entry(profile.fingerprint.clone()) {
             Entry::Occupied(e) => e.into_mut(),
-            Entry::Vacant(e) => e.insert(inference::embedder(model)?),
+            Entry::Vacant(e) => e.insert(inference::embedder_for(profile)?),
         };
         Ok(embedder.as_mut())
     }
 
     /// The reranker, built on its first use.
-    fn reranker(&mut self) -> Result<&mut dyn Reranker> {
+    fn reranker(&mut self) -> Result<Option<&mut (dyn Reranker + 'static)>> {
         if self.reranker.is_none() {
-            self.reranker = Some(inference::reranker()?);
+            self.reranker = inference::reranker()?;
         }
-        Ok(self.reranker.as_deref_mut().expect("built above"))
+        Ok(self.reranker.as_deref_mut())
     }
 }
 
@@ -526,7 +548,7 @@ impl RecallFilter {
 /// [`Search::candidates`] from one or more memories, pooled into a single [`Search::rank`].
 pub struct Search {
     query: String,
-    qv: OnceCell<(EmbeddingModel, Vec<f32>)>,
+    qv: OnceCell<(String, Vec<f32>)>,
     candidates: usize,
     /// The columns `where_clause` reads that a migration added, which an older memory lacks.
     migrated: Vec<&'static str>,
@@ -615,21 +637,24 @@ impl Search {
         if let Some(column) = self.migrated.iter().find(|c| !dataset::has_column(&read.ds, c)) {
             bail!("this memory predates the {column} facet — reindex it, or drop --{column}");
         }
-        let model = dataset::embedding_model(&read.ds)?;
+        let profile = dataset::embedding_profile(&read.ds)?;
         let (embedded_by, qv) = self
             .qv
             .get_or_try_init(|| async {
                 progress("loading model…");
-                let qv = models().await.lock().await.embedder(model)?.embed_query(&self.query)?;
-                Ok::<_, anyhow::Error>((model, qv))
+                let qv = models()
+                    .await
+                    .lock()
+                    .await
+                    .embedder(&profile)?
+                    .embed_query(&self.query)?;
+                Ok::<_, anyhow::Error>((profile.fingerprint.clone(), qv))
             })
             .await?;
-        if *embedded_by != model {
+        if embedded_by != &profile.fingerprint {
             bail!(
-                "{} is embedded with {}, and the other memory of this search with {}",
-                memory.label(),
-                model.id(),
-                embedded_by.id()
+                "{} and the other memory of this search use different embedding profiles",
+                memory.label()
             );
         }
         progress(&format!("searching {}…", memory.label()));
@@ -672,22 +697,32 @@ impl Search {
             return Ok((note, Vec::new()));
         }
 
-        let mut scored: Vec<(usize, f64)> = if reranks(k, hits.len()) {
-            let docs: Vec<&str> = hits.iter().map(|(_, h)| h.text.as_str()).collect();
-            progress(&format!("reranking {} candidates…", docs.len()));
-            let scores = models()
-                .await
-                .lock()
-                .await
-                .reranker()?
-                .rerank(self.query.as_str(), &docs)?;
-            scores
-                .iter()
+        let rank_scores = || {
+            hits.iter()
                 .enumerate()
-                .map(|(i, &s)| (i, 1.0 / (1.0 + (-(s as f64)).exp())))
-                .collect()
+                .map(|(i, (_, h))| (i, h.fused as f64))
+                .collect::<Vec<_>>()
+        };
+        let mut scored = if reranks(k, hits.len()) {
+            let mut models = models().await.lock().await;
+            if let Some(reranker) = models.reranker()? {
+                let docs: Vec<&str> = hits.iter().map(|(_, hit)| hit.text.as_str()).collect();
+                progress(&format!("reranking {} candidates…", docs.len()));
+                let kind = reranker.score_kind();
+                match reranker.rerank(&self.query, &docs) {
+                    Ok(scores) if scores.len() == hits.len() => scores
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &score)| (i, rerank_relevance(kind, score)))
+                        .collect(),
+                    // Reranking is optional; retain the existing RRF result on provider failure.
+                    Ok(_) | Err(_) => rank_scores(),
+                }
+            } else {
+                rank_scores()
+            }
         } else {
-            hits.iter().enumerate().map(|(i, (_, h))| (i, h.fused as f64)).collect()
+            rank_scores()
         };
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         scored.truncate(k);
@@ -1754,6 +1789,23 @@ mod tests {
     use chrono::TimeZone;
     use std::path::Path;
 
+    fn hit(text: &str) -> Hit {
+        Hit {
+            id: text.to_string(),
+            memory: String::new(),
+            fused: 0.0,
+            text: text.to_string(),
+            session_id: String::new(),
+            workdir: String::new(),
+            turn_uuid: String::new(),
+            seq: 0,
+            ts: "2026-01-31T00:00:00Z".to_string(),
+            block_type: "text".to_string(),
+            harness: String::new(),
+            neighbors: Vec::new(),
+        }
+    }
+
     #[test]
     fn age_picks_the_coarsest_readable_unit() {
         let now = Utc.with_ymd_and_hms(2026, 7, 9, 12, 0, 0).unwrap();
@@ -2207,5 +2259,31 @@ mod tests {
         ] {
             assert_eq!(week.holds(ts), ("2026-09-14".."2026-09-21").contains(&ts), "{ts}");
         }
+    }
+
+    #[test]
+    fn rrf_keeps_the_true_fused_score_for_recency_weighting() {
+        let fused = rrf_fuse(
+            vec![(1, hit("vector-only")), (2, hit("shared"))],
+            vec![(2, hit("shared")), (3, hit("fts-only"))],
+            3,
+        );
+
+        assert_eq!(fused[0].text, "shared");
+        assert!((fused[0].fused as f64 - (1.0 / 60.0 + 1.0 / 61.0)).abs() < 1e-7);
+        for hit in &fused[1..] {
+            let score = hit.fused as f64;
+            assert!(
+                (score - 1.0 / 60.0).abs() < 1e-7 || (score - 1.0 / 61.0).abs() < 1e-7,
+                "{} kept an invented rank score: {score}",
+                hit.text
+            );
+        }
+    }
+
+    #[test]
+    fn reranker_score_contract_only_sigmoids_local_logits() {
+        assert!((rerank_relevance(RerankScoreKind::Logit, 0.0) - 0.5).abs() < f64::EPSILON);
+        assert!((rerank_relevance(RerankScoreKind::Relevance, 0.1) - 0.1).abs() < 1e-7);
     }
 }

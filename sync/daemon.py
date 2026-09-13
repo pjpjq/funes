@@ -18,7 +18,9 @@ class SyncDaemon:
         self.running=False; self._wake=threading.Event(); self._observer=None
         self._source_cache=None; self._source_cache_at=0.0; self._source_cache_lock=threading.Lock()
         self._backfill_marker = self.config.state_dir / "initial-backfill.complete"
-        self._source_schema_marker = self.config.state_dir / "source-schema-v3.complete"
+        self._source_schema_marker = self.config.state_dir / "source-schema-v2.complete"
+        self._zero_record_marker = self.config.state_dir / "zero-record-repair-v1.complete"
+        self._automation_identity_marker = self.config.state_dir / "automation-identity-v2.complete"
         remote_fingerprint=hashlib.sha256(self.config.remote_url.rstrip("/").encode()).hexdigest()[:16]
         self._remote_source_marker = self.config.state_dir / f"remote-source-v1-{remote_fingerprint}.complete"
         self._remote_source_cursor_key = f"remote_source_v1_after_{remote_fingerprint}"
@@ -58,6 +60,8 @@ class SyncDaemon:
         if not self.config.enabled or not self.config.auto_discover:
             return 0
         source_schema_missing=not self._source_schema_marker.exists()
+        zero_record_repair_missing=not self._zero_record_marker.exists()
+        automation_identity_missing=not self._automation_identity_marker.exists()
         legacy_state=bool(self.store.db.execute(
             "SELECT EXISTS(SELECT 1 FROM records) OR EXISTS(SELECT 1 FROM sources)"
         ).fetchone()[0])
@@ -91,11 +95,18 @@ class SyncDaemon:
             old=self.store.db.execute("SELECT size,mtime,inode FROM sources WHERE source_key=?", (s.source_key,)).fetchone()
             self.store.register_source(s,st)
             cur=self.store.cursor(s.source_key); start=0
+            has_records=bool(self.store.db.execute(
+                "SELECT EXISTS(SELECT 1 FROM records WHERE source_key=? LIMIT 1)",
+                (s.source_key,),
+            ).fetchone()[0])
+            seeded_without_backfill=not self.config.initial_backfill and self._backfill_marker.exists()
+            repair_zero_record=zero_record_repair_missing and not seeded_without_backfill and not has_records
+            repair_automation=automation_identity_missing and not seeded_without_backfill and s.kind=="codex_memory" and "/automations/" in s.source_key.replace("\\","/")
             # No full reparse for unchanged files; append-only growth resumes at the byte cursor.
-            if not refresh_source_schema and old and old[0] == st.st_size and old[1] == st.st_mtime and old[2] == st.st_ino:
+            if not refresh_source_schema and not repair_zero_record and not repair_automation and old and old[0] == st.st_size and old[1] == st.st_mtime and old[2] == st.st_ino:
                 continue
             appendable = s.kind in {"codex", "pi", "claude", "codex_session", "pi_session", "claude_session"} or s.kind.endswith("session")
-            if not refresh_source_schema and appendable and cur and cur.get("inode")==st.st_ino and st.st_size>=cur.get("size",0):
+            if not refresh_source_schema and not repair_zero_record and not repair_automation and has_records and appendable and cur and cur.get("inode")==st.st_ino and st.st_size>=cur.get("size",0):
                 start=cur.get("offset",0)
             chunks=parse_file(s,start)
             total += self.store.upsert_chunks(chunks)
@@ -108,6 +119,12 @@ class SyncDaemon:
         if source_schema_missing:
             self._source_schema_marker.parent.mkdir(parents=True, exist_ok=True)
             self._source_schema_marker.write_text(str(time.time()), encoding="utf-8")
+        if zero_record_repair_missing:
+            self._zero_record_marker.parent.mkdir(parents=True,exist_ok=True)
+            self._zero_record_marker.write_text(str(time.time()),encoding="utf-8")
+        if automation_identity_missing:
+            self._automation_identity_marker.parent.mkdir(parents=True, exist_ok=True)
+            self._automation_identity_marker.write_text(str(time.time()),encoding="utf-8")
         return total
 
     def reconcile_remote_sources(
@@ -155,6 +172,8 @@ class SyncDaemon:
         return {
             "initial_backfill_complete":self._backfill_marker.exists(),
             "source_schema_complete":self._source_schema_marker.exists(),
+            "zero_record_repair_complete":self._zero_record_marker.exists(),
+            "automation_identity_complete":self._automation_identity_marker.exists(),
             "remote_source_reconciliation":{
                 "complete":self._remote_source_marker.exists(),
                 "cursor_saved":bool(self.store.meta_value(self._remote_source_cursor_key)),

@@ -162,7 +162,7 @@ def test_native_primary_daemon_does_not_queue_http_records(tmp_path):
     assert native.calls == 1
     assert s.pending_count() == 0
     assert s.stats()["sources"] == 0
-    assert not (c.state_dir / "source-schema-v3.complete").exists()
+    assert not (c.state_dir / "source-schema-v2.complete").exists()
     s.close()
 
 
@@ -183,7 +183,7 @@ def test_schema_epoch_reprocesses_unchanged_source_once(tmp_path, monkeypatch):
     monkeypatch.setattr('sync.daemon.parse_file', tracked_parse)
     s=Store(config=c); d=SyncDaemon(c, s, type("Client", (), {})())
     d.scan_once()
-    marker=c.state_dir/'source-schema-v3.complete'
+    marker=c.state_dir/'source-schema-v2.complete'
     marker.unlink(missing_ok=True)
     calls.clear()
 
@@ -229,7 +229,91 @@ def test_schema_epoch_reprocesses_unchanged_zero_record_source_at_eof(
     assert d.scan_once() == 1
     assert starts == [0]
     assert s.stats()["records"] == 1
-    assert (c.state_dir/'source-schema-v3.complete').exists()
+    assert (c.state_dir/'source-schema-v2.complete').exists()
+    s.close()
+
+
+def test_automation_identity_migration_reprocesses_only_once(tmp_path,monkeypatch):
+    from sync.discovery import Source
+
+    c=cfg(tmp_path)
+    p=tmp_path/'.codex/automations/job/automation.toml'
+    p.parent.mkdir(parents=True)
+    p.write_text('name = "job"\n',encoding='utf-8')
+    source=Source('codex_memory:~/.codex/automations/job/automation.toml','codex_memory',p,c.device_id)
+    monkeypatch.setattr('sync.daemon.discover_sources',lambda _config:[source])
+    calls=[]
+    real_parse=parse_file
+
+    def tracked_parse(item,start=0):
+        calls.append(start)
+        return real_parse(item,start)
+
+    monkeypatch.setattr('sync.daemon.parse_file',tracked_parse)
+    s=Store(config=c)
+    stat=p.stat()
+    s.register_source(source,stat)
+    s.upsert_chunks(real_parse(source))
+    s.ack([chunk.record_id for chunk in real_parse(source)])
+    s.set_cursor(source.source_key,stat.st_size,stat.st_ino,stat.st_size)
+    (c.state_dir/'initial-backfill.complete').write_text('legacy',encoding='utf-8')
+    (c.state_dir/'source-schema-v2.complete').write_text('legacy',encoding='utf-8')
+    daemon=SyncDaemon(c,s,type("Client",(),{})())
+
+    daemon.scan_once()
+    daemon.scan_once()
+
+    assert calls == [0]
+    assert daemon._automation_identity_marker.exists()
+    s.close()
+
+
+def test_zero_record_migration_does_not_replay_converged_sources_forever(
+    tmp_path,monkeypatch
+):
+    from sync.discovery import Source
+
+    c=cfg(tmp_path)
+    first_path=tmp_path/'first.jsonl'
+    second_path=tmp_path/'second.jsonl'
+    content=json.dumps({
+        "type":"user",
+        "sessionId":"shared-session",
+        "uuid":"shared-message",
+        "message":{"role":"user","content":"same copied turn"},
+    })+"\n"
+    first_path.write_text(content,encoding='utf-8')
+    second_path.write_text(content,encoding='utf-8')
+    sources=[
+        Source('claude:first','claude',first_path,c.device_id),
+        Source('claude:second','claude',second_path,c.device_id),
+    ]
+    monkeypatch.setattr('sync.daemon.discover_sources',lambda _config:sources)
+    calls=[]
+    real_parse=parse_file
+
+    def tracked_parse(item,start=0):
+        calls.append(item.source_key)
+        return real_parse(item,start)
+
+    monkeypatch.setattr('sync.daemon.parse_file',tracked_parse)
+    s=Store(config=c)
+    for source in sources:
+        stat=source.path.stat()
+        s.register_source(source,stat)
+        s.set_cursor(source.source_key,stat.st_size,stat.st_ino,stat.st_size)
+    (c.state_dir/'initial-backfill.complete').write_text('legacy',encoding='utf-8')
+    (c.state_dir/'source-schema-v2.complete').write_text('legacy',encoding='utf-8')
+    daemon=SyncDaemon(c,s,type("Client",(),{})())
+
+    daemon.scan_once()
+    first_calls=list(calls)
+    calls.clear()
+    daemon.scan_once()
+
+    assert first_calls == ['claude:first','claude:second']
+    assert calls == []
+    assert daemon._zero_record_marker.exists()
     s.close()
 
 
@@ -259,7 +343,7 @@ def test_schema_epoch_bypasses_initial_backfill_eof_seed(tmp_path, monkeypatch):
     d.scan_once()
 
     assert starts == [0]
-    assert (c.state_dir/'source-schema-v3.complete').exists()
+    assert (c.state_dir/'source-schema-v2.complete').exists()
     assert (c.state_dir/'initial-backfill.complete').exists()
     s.close()
 
@@ -278,7 +362,7 @@ def test_fresh_install_without_initial_backfill_seeds_eof(tmp_path, monkeypatch)
     assert s.pending_count() == 0
     assert s.cursor(source.source_key)["offset"] == p.stat().st_size
     assert (c.state_dir/'initial-backfill.complete').exists()
-    assert (c.state_dir/'source-schema-v3.complete').exists()
+    assert (c.state_dir/'source-schema-v2.complete').exists()
     s.close()
 
 

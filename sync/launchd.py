@@ -144,7 +144,7 @@ def render_plist(python=None, config=None, previous_env=None):
     # fall back to Apple's system Python (which may lack the user's packages
     # and has different Keychain/runtime behavior).
     previous_env=previous_env or {}
-    env={"PYTHON":str(Path(python).expanduser()), "PYTHONPATH":str(root), "HOME":str(config.home), "USER":os.environ.get("USER") or str(os.getuid()), "FUNES_CONFIG":str(config.config_path), "FUNES_REMOTE_URL":config.remote_url, "FUNES_MEMORY_ONLY":"1", "FUNES_STATE_DIR":str(config.state_dir), "FUNES_SYNC_BATCH":_tuning(config, "FUNES_SYNC_BATCH", previous_env, "batch_size", "batch_size")}
+    env={"PYTHON":str(Path(python).expanduser()), "PYTHONPATH":str(root), "HOME":str(config.home), "USER":os.environ.get("USER") or str(os.getuid()), "FUNES_CONFIG":str(config.config_path), "FUNES_REMOTE_URL":config.remote_url, "FUNES_MEMORY_ONLY":"1", "FUNES_STATE_DIR":str(config.state_dir), "FUNES_SYNC_BATCH":_tuning(config, "FUNES_SYNC_BATCH", previous_env, "batch_size", "batch_size"), "FUNES_SYNC_MAX_BATCH_BYTES":_tuning(config, "FUNES_SYNC_MAX_BATCH_BYTES", previous_env, "max_batch_bytes", "max_batch_bytes")}
     # The launcher loads FUNES_API_TOKEN from macOS Keychain at runtime; never
     # persist the bearer token in a world-readable plist.
     for key, config_key in (("FUNES_REMOTE_TIMEOUT", "remote_timeout"),):

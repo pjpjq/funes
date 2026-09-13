@@ -1852,7 +1852,10 @@ def test_sidecar_search_partitions_native_sessions_and_filters_harness(monkeypat
 
     rewritten, primary, fallback = bridge.search_source_rankings("raw query", 5, {})
     assert rewritten == "provider query"
-    assert [[item["source_identity"] for item in ranking] for ranking in primary] == [["memory"]]
+    assert [[item["source_identity"] for item in ranking] for ranking in primary] == [
+        ["memory", "codex", "claude", "claude-code"],
+        ["pi"],
+    ]
     assert [[item["source_identity"] for item in ranking] for ranking in fallback] == [
         ["codex", "claude", "claude-code"],
         ["pi"],
@@ -1915,6 +1918,7 @@ def test_http_rrf_promotes_dual_hit_and_keeps_sidecar_raw(monkeypatch, tmp_path)
         [
             {"source_identity": "sidecar-only", "raw_text": "raw BM25"},
             {"source_identity": "both", "raw_text": "triple raw"},
+            {"source_identity": "session-fallback", "raw_text": "fallback raw"},
         ],
         [
             {"source_identity": "provider-only", "raw_text": "provider raw"},
@@ -1946,7 +1950,7 @@ def test_http_rrf_promotes_dual_hit_and_keeps_sidecar_raw(monkeypatch, tmp_path)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
-        status, body = _post(server, "/search", {"query": "raw query", "limit": 3})
+        status, body = _post(server, "/search", {"query": "raw query", "limit": 5})
     finally:
         server.shutdown()
         server.server_close()
@@ -1957,10 +1961,74 @@ def test_http_rrf_promotes_dual_hit_and_keeps_sidecar_raw(monkeypatch, tmp_path)
         "both",
         "sidecar-only",
         "provider-only",
+        "native-only",
+        "session-fallback",
     ]
-    assert body["results_text"] == "triple raw\n\nraw BM25\n\nprovider raw"
+    assert body["results_text"] == (
+        "triple raw\n\nraw BM25\n\nprovider raw\n\nnative raw\n\nfallback raw"
+    )
     assert "ENGLISH SHADOW" not in json.dumps(body["results"], ensure_ascii=False)
-    assert "fallback raw" not in body["results_text"]
+    assert "fallback raw" in body["results_text"]
+
+
+def test_http_rrf_preserves_exact_session_rank_before_native(monkeypatch):
+    exact = {
+        "source_identity": "exact-session",
+        "source_type": "session",
+        "source_agent": "codex",
+        "raw_text": "exact identifier",
+        "retrieval_text": "shadow",
+    }
+    related = {
+        "source_identity": "related-memory",
+        "source_type": "memory",
+        "raw_text": "related result",
+        "retrieval_text": "shadow",
+    }
+    rewritten_related = {
+        "source_identity": "rewritten-related",
+        "source_type": "memory",
+        "raw_text": "rewritten related",
+        "retrieval_text": "shadow",
+    }
+    app = SimpleNamespace(
+        translator=SimpleNamespace(rewrite_query=lambda _query: "rewritten identifier"),
+        store=SimpleNamespace(
+            search=lambda query, *_args, **_kwargs: (
+                [exact, related] if query == "identifier" else [rewritten_related]
+            )
+        ),
+        syncer=SimpleNamespace(restoring=False, restore_failed=False),
+    )
+    monkeypatch.setattr(bridge, "SOURCE_APP", app)
+    monkeypatch.setattr(bridge, "TOKEN", "test-token")
+    monkeypatch.setattr(bridge, "recall", lambda *_args, **_kwargs: "native")
+    monkeypatch.setattr(
+        bridge,
+        "materialize_native_results",
+        lambda *_args, **_kwargs: [
+            {"source_identity": "native-related", "raw_text": "native related"}
+        ],
+    )
+    server = ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        status, body = _post(server, "/search", {"query": "identifier", "limit": 1})
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert status == 200
+    assert body["results"] == [
+        {
+            "source_identity": "exact-session",
+            "source_type": "session",
+            "source_agent": "codex",
+            "raw_text": "exact identifier",
+        }
+    ]
 
 
 @pytest.mark.parametrize(
@@ -1984,7 +2052,11 @@ def test_http_native_failure_returns_raw_sidecar_results(
     monkeypatch.setattr(
         bridge,
         "search_source_rankings",
-        lambda query, limit, filters, harness: ("provider query", [], source_rankings),
+        lambda query, limit, filters, harness: (
+            "provider query",
+            source_rankings,
+            source_rankings,
+        ),
     )
     monkeypatch.setattr(
         bridge,
@@ -2019,7 +2091,7 @@ def test_http_native_empty_uses_session_sidecar_fallback(monkeypatch, tmp_path):
     monkeypatch.setattr(
         bridge,
         "search_source_rankings",
-        lambda query, limit, filters, harness: ("provider query", [], fallback),
+        lambda query, limit, filters, harness: ("provider query", fallback, fallback),
     )
     monkeypatch.setattr(bridge, "recall", lambda *_args, **_kwargs: "")
     server = ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)

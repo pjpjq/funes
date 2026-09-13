@@ -489,10 +489,10 @@ def search_source_rankings(
     native_filterable = set(filters).issubset({"source_agent", "repo"})
     expected_agent = _normalized_harness_agent(harness) if harness else None
     fallback_enabled = not harness or expected_agent is not None
-    primary_rankings = []
+    source_rankings = []
     session_fallback_rankings = []
     for hits in (raw_hits, rewritten_hits):
-        primary_hits = []
+        eligible_hits = []
         fallback_hits = []
         for item in hits:
             public_item = dict(item)
@@ -503,20 +503,23 @@ def search_source_rankings(
                 if fallback_enabled and (
                     expected_agent is None or source_agent == expected_agent
                 ):
+                    eligible_hits.append(public_item)
                     fallback_hits.append(public_item)
                 continue
-            primary_hits.append(public_item)
-        if primary_hits:
-            primary_rankings.append(primary_hits)
+            eligible_hits.append(public_item)
+        if eligible_hits:
+            # This single sequence preserves both the source store's cross-type
+            # ranks and raw-query-before-rewrite ordering for hybrid fusion.
+            source_rankings.append(eligible_hits)
         if fallback_hits:
             session_fallback_rankings.append(fallback_hits)
-    return rewritten, primary_rankings, session_fallback_rankings
+    return rewritten, source_rankings, session_fallback_rankings
 
 
 def search_source_documents(query: str, limit: int, filters: dict[str, object]) -> tuple[str, list[dict]]:
     """Compatibility helper for callers that consume a fused sidecar ranking."""
-    rewritten, rankings, fallback_rankings = search_source_rankings(query, limit, filters)
-    return rewritten, stable_rrf([*rankings, *fallback_rankings], limit)
+    rewritten, rankings, _fallback_rankings = search_source_rankings(query, limit, filters)
+    return rewritten, stable_rrf(rankings, limit)
 
 # A remote Lance memory can take longer than the Space ingress timeout to open
 # on the first recall (model + snapshot + ANN/FTS handles).  Warm it in the
@@ -1750,9 +1753,10 @@ class Handler(BaseHTTPRequestHandler):
                     retrieval_degraded = "native_mcp_unavailable"
                 else:
                     retrieval_degraded = ""
+                # Source rankings already preserve raw/rewrite and cross-type
+                # order. Always fuse them with native semantic hits so exact
+                # identifiers are not hidden by merely related passages.
                 rankings = [*source_rankings, results]
-                if not results:
-                    rankings.extend(session_fallback_rankings)
                 results = stable_rrf(rankings, limit)
                 results_text = "\n\n".join(
                     str(item.get("raw_text", ""))

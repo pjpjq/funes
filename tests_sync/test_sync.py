@@ -220,6 +220,48 @@ def test_one_shot_backfill_drains_all_pending(tmp_path):
     s.close()
 
 
+def test_flush_batch_respects_serialized_byte_limit(tmp_path):
+    payloads = [
+        json.dumps({"raw_text": "a" * 20}),
+        json.dumps({"raw_text": "b" * 20}),
+        json.dumps({"raw_text": "c" * 20}),
+    ]
+
+    class FakeStore:
+        def __init__(self):
+            self.acked = []
+
+        def pending(self, limit):
+            return [
+                {"record_id": str(index), "payload": payload, "attempts": 0}
+                for index, payload in enumerate(payloads[:limit])
+            ]
+
+        def ack(self, record_ids):
+            self.acked.extend(record_ids)
+
+        def fail(self, *_args):
+            raise AssertionError("successful upload must not fail queue rows")
+
+    class Client:
+        def __init__(self):
+            self.records = []
+
+        def ingest(self, records):
+            self.records = records
+            return {"accepted": len(records)}
+
+    c = cfg(tmp_path)
+    c.batch_size = 3
+    c.max_batch_bytes = len(payloads[0].encode("utf-8")) + 1
+    store = FakeStore()
+    client = Client()
+
+    assert SyncDaemon(c, store, client).flush_once() == 1
+    assert len(client.records) == 1
+    assert store.acked == ["0"]
+
+
 def test_remote_failure_keeps_pending_for_recovery(tmp_path):
     class OfflineClient:
         def ingest(self, records):

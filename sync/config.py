@@ -27,6 +27,7 @@ class Config:
     native_primary: bool = False
     native_bin: str = ""
     memory_only: bool = False
+    max_batch_bytes: int = 16 * 1024 * 1024
     def __post_init__(self):
         raw = self.device_id or os.environ.get("FUNES_DEVICE_ID") or socket.gethostname()
         self.device_id = "dev-" + hashlib.sha256(("funes:" + raw).encode()).hexdigest()[:20]
@@ -65,6 +66,7 @@ class Config:
                    os.environ.get("FUNES_MEMORY", remote.get("memory", "")),
                    truth(os.environ.get("FUNES_NATIVE_PRIMARY", section.get("native_primary", False))),
                    os.environ.get("FUNES_BIN", section.get("native_bin", "")),
-                   truth(os.environ.get("FUNES_MEMORY_ONLY", section.get("memory_only", False))))
+                   truth(os.environ.get("FUNES_MEMORY_ONLY", section.get("memory_only", False))),
+                   int(os.environ.get("FUNES_SYNC_MAX_BATCH_BYTES", section.get("max_batch_bytes", 16 * 1024 * 1024))))
     def ensure(self):
         self.state_dir.mkdir(parents=True, exist_ok=True)

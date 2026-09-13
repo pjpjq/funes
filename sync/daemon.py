@@ -114,6 +114,14 @@ class SyncDaemon:
             self._observer = None
     def flush_once(self):
         rows=self.store.pending(self.config.batch_size); sent=[]
+        selected=[]; selected_bytes=0
+        max_bytes=max(1, int(self.config.max_batch_bytes))
+        for row in rows:
+            row_bytes=len(str(row["payload"]).encode("utf-8"))+1
+            if selected and selected_bytes+row_bytes>max_bytes:
+                break
+            selected.append(row); selected_bytes+=row_bytes
+        rows=selected
         if not rows:return 0
         try:
             result=self.client.ingest([__import__('json').loads(r['payload']) for r in rows]); sent=[r['record_id'] for r in rows]

@@ -16,8 +16,41 @@ class SyncDaemon:
         # shared config enables the native primary path for interactive hooks.
         self.native=NativeFunes(self.config) if self.config.native_primary and not self.config.memory_only else None
         self.running=False; self._wake=threading.Event(); self._observer=None
+        self._source_cache=None; self._source_cache_at=0.0; self._source_cache_lock=threading.Lock()
         self._backfill_marker = self.config.state_dir / "initial-backfill.complete"
         self._source_schema_marker = self.config.state_dir / "source-schema-v2.complete"
+    def _discover_sources(self):
+        # Watchers wake on every transcript append. Re-walking all project
+        # directories for each turn is wasteful; cache the bounded discovery
+        # set until the periodic reconciliation interval expires. Creates,
+        # moves, and deletes invalidate it immediately below.
+        with self._source_cache_lock:
+            now=time.monotonic()
+            if self._source_cache is not None and now-self._source_cache_at < max(1,self.config.interval):
+                return list(self._source_cache)
+            sources=discover_sources(self.config)
+            self._source_cache=tuple(sources); self._source_cache_at=now
+            return list(sources)
+    def _invalidate_source_cache(self):
+        with self._source_cache_lock:
+            self._source_cache=None; self._source_cache_at=0.0
+    def _handle_filesystem_event(self, event):
+        paths=[str(getattr(event,"src_path",""))]
+        destination=str(getattr(event,"dest_path",""))
+        if destination:
+            paths.append(destination)
+        excluded={".git","target","logs",".venv","node_modules","__pycache__"}
+        paths=[path for path in paths if not any(part in excluded for part in Path(path).parts)]
+        if not paths:
+            return
+        event_type=str(getattr(event,"event_type",""))
+        structural=event_type in {"created","moved","deleted"}
+        source_file=any(Path(path).suffix.lower() in {".jsonl",".ndjson",".json",".md",".txt"} for path in paths)
+        if not source_file and not (structural and bool(getattr(event,"is_directory",False))):
+            return
+        if structural:
+            self._invalidate_source_cache()
+        self._wake.set()
     def scan_once(self):
         if not self.config.enabled or not self.config.auto_discover:
             return 0
@@ -32,7 +65,7 @@ class SyncDaemon:
             # Seed cursors at EOF once so existing history is left untouched,
             # while files created or appended after installation still flow
             # through the normal incremental path.
-            sources = discover_sources(self.config)
+            sources = self._discover_sources()
             present = {s.source_key for s in sources}
             self.store.mark_missing(present)
             for source in sources:
@@ -46,7 +79,7 @@ class SyncDaemon:
             self._backfill_marker.write_text(str(time.time()), encoding="utf-8")
             self._source_schema_marker.write_text(str(time.time()), encoding="utf-8")
             return 0
-        sources=discover_sources(self.config); present={s.source_key for s in sources}
+        sources=self._discover_sources(); present={s.source_key for s in sources}
         self.store.mark_missing(present)
         total=0
         for s in sources:
@@ -84,11 +117,7 @@ class SyncDaemon:
         daemon = self
         class Handler(FileSystemEventHandler):
             def on_any_event(self, _event):
-                path = str(getattr(_event, "src_path", ""))
-                if any(part in {".git", "target", "logs", ".venv", "node_modules", "__pycache__"} for part in Path(path).parts):
-                    return
-                if Path(path).suffix.lower() in {".jsonl", ".ndjson", ".json", ".md", ".txt"}:
-                    daemon._wake.set()
+                daemon._handle_filesystem_event(_event)
         observer = Observer()
         roots = {self.config.home / ".codex", self.config.home / ".pi", self.config.home / ".claude"}
         roots.update(_project_roots(self.config))

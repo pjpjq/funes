@@ -24,7 +24,11 @@ class Store:
         CREATE TABLE IF NOT EXISTS records(record_id TEXT PRIMARY KEY,source_key TEXT NOT NULL,content_hash TEXT NOT NULL,version INTEGER DEFAULT 1,payload TEXT NOT NULL,updated_at REAL);
         CREATE INDEX IF NOT EXISTS records_source ON records(source_key);
         CREATE TABLE IF NOT EXISTS queue(record_id TEXT PRIMARY KEY,attempts INTEGER DEFAULT 0,next_at REAL DEFAULT 0,last_error TEXT,queued_at REAL);
+        CREATE INDEX IF NOT EXISTS queue_failed ON queue(last_error) WHERE last_error IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS queue_schedule ON queue(next_at,queued_at);
         CREATE TABLE IF NOT EXISTS cursors(source_key TEXT PRIMARY KEY,offset INTEGER DEFAULT 0,inode INTEGER,size INTEGER,updated_at REAL);
+        CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL,updated_at REAL NOT NULL);
+        CREATE INDEX IF NOT EXISTS sources_active_kind ON sources(active,kind);
         '''); self.db.commit()
     def close(self): self.db.close()
     def register_source(self,s:Source,stat=None):
@@ -94,14 +98,61 @@ class Store:
         return int(self.db.execute("SELECT count(*) FROM queue").fetchone()[0])
     def ack(self,ids:list[str]):
         if ids:
-            self.db.executemany("DELETE FROM queue WHERE record_id=?",((i,) for i in ids)); self.db.commit()
+            now=time.time()
+            with self.db:
+                cursor=self.db.executemany("DELETE FROM queue WHERE record_id=?",((i,) for i in ids))
+                if cursor.rowcount > 0:
+                    stamp=datetime.fromtimestamp(now, timezone.utc).isoformat()
+                    self.db.execute("INSERT INTO meta(key,value,updated_at) VALUES('last_successful_sync',?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",(stamp,now))
     def fail(self,record_id,error,delay=30):
         self.db.execute("UPDATE queue SET attempts=attempts+1,next_at=?,last_error=? WHERE record_id=?",(time.time()+delay,error[:1000],record_id)); self.db.commit()
+    @staticmethod
+    def _source_category(kind: str) -> str|None:
+        if kind in {"codex", "codex_session"}:
+            return "codex_sessions"
+        if kind in {"pi", "pi_session"}:
+            return "pi_sessions"
+        if kind in {"claude", "claude_session"}:
+            return "claude_sessions"
+        if kind in {"codex_memory", "pi_memory", "claude_memory", "agents_md", "persistent"} or kind.endswith("_memory"):
+            return "memory_files"
+        return None
+    def source_counts(self):
+        discovered={name:0 for name in ("codex_sessions","pi_sessions","claude_sessions","memory_files")}
+        parsed=dict(discovered)
+        synced=dict(discovered)
+        rows=self.db.execute('''
+            SELECT s.kind,count(*) AS discovered,
+                   sum(CASE WHEN EXISTS (
+                       SELECT 1 FROM records r WHERE r.source_key=s.source_key LIMIT 1
+                   ) THEN 1 ELSE 0 END) AS parsed,
+                   sum(CASE WHEN EXISTS (
+                       SELECT 1 FROM records r WHERE r.source_key=s.source_key LIMIT 1
+                   ) AND NOT EXISTS (
+                       SELECT 1 FROM records r JOIN queue q ON q.record_id=r.record_id
+                       WHERE r.source_key=s.source_key LIMIT 1
+                   ) THEN 1 ELSE 0 END) AS synced
+            FROM sources s
+            WHERE s.active=1
+            GROUP BY s.kind
+        ''')
+        for row in rows:
+            category=self._source_category(row["kind"])
+            if category:
+                discovered[category]+=int(row["discovered"])
+                parsed[category]+=int(row["parsed"] or 0)
+                synced[category]+=int(row["synced"] or 0)
+        return {"discovered":discovered,"parsed":parsed,"synced":synced}
+    def meta_value(self,key):
+        row=self.db.execute("SELECT value FROM meta WHERE key=?",(key,)).fetchone()
+        return row[0] if row else None
     def stats(self):
         by_agent={}
         for row in self.db.execute("SELECT json_extract(payload,'$.source_agent') AS agent,count(*) AS n FROM records GROUP BY agent"):
             by_agent[row[0] or "unknown"]=row[1]
-        return {"sources":self.db.execute("SELECT count(*) FROM sources").fetchone()[0],"active_sources":self.db.execute("SELECT count(*) FROM sources WHERE active=1").fetchone()[0],"records":self.db.execute("SELECT count(*) FROM records").fetchone()[0],"pending":self.db.execute("SELECT count(*) FROM queue").fetchone()[0],"by_agent":by_agent}
+        pending=self.pending_count()
+        counts=self.source_counts()
+        return {"sources":self.db.execute("SELECT count(*) FROM sources").fetchone()[0],"active_sources":self.db.execute("SELECT count(*) FROM sources WHERE active=1").fetchone()[0],"records":self.db.execute("SELECT count(*) FROM records").fetchone()[0],"pending":pending,"pending_uploads":pending,"failed_uploads":self.db.execute("SELECT count(*) FROM queue WHERE last_error IS NOT NULL").fetchone()[0],"last_successful_sync":self.meta_value("last_successful_sync"),"discovered":counts["discovered"],"parsed":counts["parsed"],"synced":counts["synced"],"by_agent":by_agent}
     def search(self,query,limit=20):
         q=f"%{query}%"; rows=self.db.execute("SELECT payload FROM records WHERE payload LIKE ? ORDER BY updated_at DESC LIMIT ?",(q,limit)).fetchall(); return [json.loads(r[0]) for r in rows]
     def get(self,record_id):

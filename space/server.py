@@ -15,6 +15,7 @@ import re
 import select
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -68,6 +69,10 @@ INDEX_LOCK = threading.Lock()
 WRITE_LOCK = threading.Lock()
 SOURCE_APP = None
 SOURCE_APP_LOCK = threading.Lock()
+INGEST_OPERATION_LOCK = threading.Lock()
+INGEST_OPERATIONS: dict[str, dict[str, object]] = {}
+INGEST_ACTIVE_OPERATION: str | None = None
+INGEST_RESTART_SCHEDULED = False
 
 
 def source_app():
@@ -138,6 +143,323 @@ def ingest_source_documents(docs: list[dict]) -> tuple[int, dict, list[dict]] | 
     canonical = app.store.get_many(identities)
     result["ok"] = bool(result["durable"])
     return (200 if result["durable"] else 503), result, canonical
+
+
+def _ingest_operation_id(docs: list[dict]) -> str:
+    """Return a stable identifier without retaining another full JSON copy."""
+    digest = hashlib.sha256()
+    encoder = json.JSONEncoder(ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    for chunk in encoder.iterencode(docs):
+        digest.update(chunk.encode("utf-8"))
+    return digest.hexdigest()
+
+
+def _ingest_operation_limits() -> tuple[float, int, int]:
+    try:
+        ttl = max(1.0, float(os.getenv("FUNES_INGEST_OPERATION_TTL", "3600")))
+    except ValueError:
+        ttl = 3600.0
+    try:
+        completed = max(1, int(os.getenv("FUNES_INGEST_OPERATION_MAX_COMPLETED", "64")))
+    except ValueError:
+        completed = 64
+    try:
+        retry_after = max(1, int(os.getenv("FUNES_INGEST_RETRY_AFTER", "2")))
+    except ValueError:
+        retry_after = 2
+    return ttl, completed, retry_after
+
+
+def _ingest_operation_timeout() -> float:
+    try:
+        return max(0.1, float(os.getenv("FUNES_INGEST_OPERATION_TIMEOUT", "1800")))
+    except ValueError:
+        return 1800.0
+
+
+def _cleanup_ingest_operations_locked(now: float, preserve: str | None = None) -> None:
+    """Bound completed-operation metadata; active documents are never evicted."""
+    ttl, max_completed, _retry_after = _ingest_operation_limits()
+    completed = [
+        (operation_id, operation)
+        for operation_id, operation in INGEST_OPERATIONS.items()
+        if operation.get("state") != "running"
+    ]
+    for operation_id, operation in completed:
+        completed_at = float(operation.get("completed_at", now))
+        if operation_id != preserve and now - completed_at >= ttl:
+            INGEST_OPERATIONS.pop(operation_id, None)
+    completed = sorted(
+        (
+            (operation_id, operation)
+            for operation_id, operation in INGEST_OPERATIONS.items()
+            if operation.get("state") != "running"
+        ),
+        key=lambda item: (
+            float(item[1].get("completed_at", 0.0)),
+            item[0] == preserve,
+        ),
+        reverse=True,
+    )
+    for operation_id, _operation in completed[max_completed:]:
+        INGEST_OPERATIONS.pop(operation_id, None)
+
+
+def _safe_ingest_error(value: object) -> str:
+    error = str(value or "ingest_failed")
+    return error if error in {
+        "durability_pending",
+        "ingest_failed",
+        "ingest_operation_timeout",
+        "ingest_unavailable",
+        "restore_failed",
+        "restore_in_progress",
+    } else "ingest_failed"
+
+
+def _public_ingest_result(result: dict) -> dict[str, object]:
+    """Return durability/count metadata only, never raw source documents."""
+    durable = result.get("durable") is True
+    try:
+        accepted = (
+            int(result["accepted"])
+            if "accepted" in result
+            else int(result.get("created", 0))
+            + int(result.get("updated", 0))
+            + int(result.get("deduped", 0))
+        )
+    except (TypeError, ValueError):
+        accepted = 0
+    public: dict[str, object] = {
+        "ok": durable,
+        "durable": durable,
+        "accepted": accepted if durable else 0,
+    }
+    for name in ("created", "updated", "deduped"):
+        if name in result:
+            try:
+                public[name] = int(result[name])
+            except (TypeError, ValueError):
+                pass
+    if not durable:
+        public["error"] = _safe_ingest_error(result.get("error"))
+    return public
+
+
+def _ingest_operation_response(operation: dict[str, object]) -> tuple[int, dict[str, object]]:
+    operation_id = str(operation["operation_id"])
+    state = str(operation.get("state", "failed"))
+    payload: dict[str, object] = {
+        "ok": state == "succeeded",
+        "operation_id": operation_id,
+        "status": state,
+        "status_url": f"/ingest/operations/{operation_id}",
+        "durable": state == "succeeded",
+    }
+    if operation.get("timed_out") is True:
+        payload.update(
+            ok=False,
+            status="timed_out",
+            durable=False,
+            error="ingest_operation_timeout",
+        )
+        return 503, payload
+    if state == "running":
+        _ttl, _completed, retry_after = _ingest_operation_limits()
+        payload["retry_after"] = retry_after
+        return 202, payload
+    if state == "succeeded":
+        payload["accepted"] = int(operation.get("accepted", 0))
+        return 200, payload
+    payload["error"] = _safe_ingest_error(operation.get("error"))
+    return 503, payload
+
+
+def schedule_ingest_process_restart() -> None:
+    """Replace PID 1 after the timeout response has reached the caller."""
+    def terminate() -> None:
+        time.sleep(0.25)
+        try:
+            os.execv(sys.executable, [sys.executable, *sys.argv])
+        except OSError:
+            os._exit(75)
+
+    thread = threading.Thread(
+        target=terminate,
+        name="funes-ingest-fail-stop",
+        daemon=True,
+    )
+    try:
+        thread.start()
+    except RuntimeError:
+        os._exit(75)
+
+
+def _timed_out_active_operation_locked(
+    now: float,
+) -> tuple[dict[str, object] | None, bool]:
+    """Mark a hung worker without freeing its slot; return whether to restart."""
+    global INGEST_RESTART_SCHEDULED
+    if INGEST_ACTIVE_OPERATION is None:
+        return None, False
+    operation = INGEST_OPERATIONS.get(INGEST_ACTIVE_OPERATION)
+    if operation is None or operation.get("state") != "running":
+        return None, False
+    started_at = float(operation.get("started_at", now))
+    if operation.get("timed_out") is not True and now - started_at < _ingest_operation_timeout():
+        return None, False
+    operation["timed_out"] = True
+    operation["error"] = "ingest_operation_timeout"
+    if INGEST_RESTART_SCHEDULED:
+        return operation, False
+    INGEST_RESTART_SCHEDULED = True
+    return operation, True
+
+
+def _restart_pending_response() -> tuple[int, dict[str, object]]:
+    return 503, {
+        "ok": False,
+        "durable": False,
+        "status": "restart_pending",
+        "error": "ingest_operation_timeout",
+    }
+
+
+def _finish_ingest_operation(
+    operation_id: str,
+    *,
+    durable: bool,
+    accepted: int = 0,
+    error: str = "ingest_failed",
+) -> None:
+    global INGEST_ACTIVE_OPERATION
+    now = time.monotonic()
+    with INGEST_OPERATION_LOCK:
+        operation = INGEST_OPERATIONS.get(operation_id)
+        if operation is None or operation.get("state") != "running":
+            return
+        operation.pop("documents", None)
+        if operation.get("timed_out") is True:
+            # A process restart is already committed.  Do not clear the active
+            # slot or turn a post-timeout completion into a durable ACK.
+            operation["worker_finished"] = True
+            operation["completed_at"] = now
+            return
+        operation["state"] = "succeeded" if durable else "failed"
+        operation["accepted"] = accepted if durable else 0
+        operation["completed_at"] = now
+        if not durable:
+            operation["error"] = _safe_ingest_error(error)
+        if INGEST_ACTIVE_OPERATION == operation_id:
+            INGEST_ACTIVE_OPERATION = None
+        _cleanup_ingest_operations_locked(now, preserve=operation_id)
+
+
+def _run_ingest_operation(operation_id: str, docs: list[dict]) -> None:
+    try:
+        source_result = ingest_source_documents(docs)
+        if source_result is None:
+            _finish_ingest_operation(
+                operation_id,
+                durable=False,
+                error="ingest_unavailable",
+            )
+            return
+        _status, result, _canonical = source_result
+        public = _public_ingest_result(result)
+        if public["durable"] is True:
+            _finish_ingest_operation(
+                operation_id,
+                durable=True,
+                accepted=int(public["accepted"]),
+            )
+            return
+        _finish_ingest_operation(
+            operation_id,
+            durable=False,
+            error=str(public.get("error") or "ingest_failed"),
+        )
+    except Exception:
+        # Status responses intentionally expose no provider error text, paths,
+        # source contents, or other exception details.
+        _finish_ingest_operation(operation_id, durable=False)
+
+
+def start_ingest_operation(docs: list[dict]) -> tuple[int, dict[str, object]]:
+    """Start, deduplicate, or reject a bounded asynchronous ingest."""
+    global INGEST_ACTIVE_OPERATION
+    operation_id = _ingest_operation_id(docs)
+    now = time.monotonic()
+    operation = None
+    response = None
+    schedule_restart = False
+    with INGEST_OPERATION_LOCK:
+        _cleanup_ingest_operations_locked(now)
+        timed_out, schedule_restart = _timed_out_active_operation_locked(now)
+        if timed_out is not None:
+            response = _restart_pending_response()
+        elif INGEST_RESTART_SCHEDULED:
+            response = _restart_pending_response()
+        else:
+            existing = INGEST_OPERATIONS.get(operation_id)
+            if INGEST_ACTIVE_OPERATION is not None:
+                if INGEST_ACTIVE_OPERATION == operation_id and existing is not None:
+                    response = _ingest_operation_response(existing)
+                else:
+                    _ttl, _completed, retry_after = _ingest_operation_limits()
+                    response = 429, {
+                        "ok": False,
+                        "durable": False,
+                        "error": "ingest_busy",
+                        "retry_after": retry_after,
+                    }
+            elif existing is not None and existing.get("state") == "succeeded":
+                response = _ingest_operation_response(existing)
+            else:
+                operation = {
+                    "operation_id": operation_id,
+                    "state": "running",
+                    "documents": docs,
+                    "accepted": 0,
+                    "started_at": now,
+                }
+                INGEST_OPERATIONS[operation_id] = operation
+                INGEST_ACTIVE_OPERATION = operation_id
+    if schedule_restart:
+        schedule_ingest_process_restart()
+    if response is not None:
+        return response
+    assert operation is not None
+    thread = threading.Thread(
+        target=_run_ingest_operation,
+        args=(operation_id, docs),
+        name="funes-ingest-operation",
+        daemon=True,
+    )
+    try:
+        thread.start()
+    except RuntimeError:
+        _finish_ingest_operation(operation_id, durable=False)
+    with INGEST_OPERATION_LOCK:
+        return _ingest_operation_response(operation)
+
+
+def get_ingest_operation(operation_id: str) -> tuple[int, dict[str, object]]:
+    if not re.fullmatch(r"[0-9a-f]{64}", operation_id):
+        return 404, {"error": "not found"}
+    schedule_restart = False
+    with INGEST_OPERATION_LOCK:
+        now = time.monotonic()
+        _cleanup_ingest_operations_locked(now)
+        _timed_out, schedule_restart = _timed_out_active_operation_locked(now)
+        operation = INGEST_OPERATIONS.get(operation_id)
+        if operation is None:
+            response = 404, {"error": "not found"}
+        else:
+            response = _ingest_operation_response(operation)
+    if schedule_restart:
+        schedule_ingest_process_restart()
+    return response
 
 
 def _normalized_harness_agent(value: object) -> str | None:
@@ -1215,6 +1537,20 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/health":
             self.send_json(200, {"ok": True, "service": "funes"})
             return
+        operation_prefix = "/ingest/operations/"
+        if self.path.startswith(operation_prefix):
+            if not auth_ok(self):
+                self.send_json(401, {"error": "unauthorized"})
+                return
+            operation_id = self.path[len(operation_prefix):]
+            code, payload = get_ingest_operation(operation_id)
+            headers = (
+                {"Retry-After": str(payload["retry_after"])}
+                if code == 202
+                else None
+            )
+            self.send_json(code, payload, headers)
+            return
         if self.path in ("/ready", "/sync/status"):
             if not auth_ok(self):
                 self.send_json(401, {"error": "unauthorized"})
@@ -1444,10 +1780,25 @@ class Handler(BaseHTTPRequestHandler):
                 if not all(isinstance(doc, dict) for doc in docs):
                     self.send_json(400, {"error": "each document must be an object"})
                     return
+                prefer = self.headers.get("Prefer", "")
+                respond_async = any(
+                    item.strip().partition(";")[0].lower() == "respond-async"
+                    for item in prefer.split(",")
+                )
+                if respond_async:
+                    status, result = start_ingest_operation(docs)
+                    headers = {}
+                    if status == 202:
+                        headers["Location"] = str(result["status_url"])
+                        headers["Retry-After"] = str(result["retry_after"])
+                    elif status == 429:
+                        headers["Retry-After"] = str(result["retry_after"])
+                    self.send_json(status, result, headers)
+                    return
                 source_result = ingest_source_documents(docs)
                 if source_result is not None:
                     status, result, _canonical = source_result
-                    self.send_json(status, result)
+                    self.send_json(status, _public_ingest_result(result))
                     return
                 # The raw encrypted sidecar is mandatory for HTTP ingestion.
                 # Never fall through to the legacy synchronous transcript

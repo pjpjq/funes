@@ -37,11 +37,13 @@ content hash 和 pending queue。mtime/hash 未改变时不会重写源文件；
 
 - `backfill`：发现、解析、去重，并在远端返回 `durable=true` 后才删除 pending。
 - `run`：按 `FUNES_SYNC_INTERVAL`（默认 300 秒）循环；`drain` 只排空既有队列。
+  每批同时受 `FUNES_SYNC_BATCH` 条数和 `FUNES_SYNC_MAX_BATCH_BYTES`（默认 16 MiB）限制。
 - `status`、`sources`、`doctor`、`logs [--follow]`：只读诊断。
 - `install`：原子写入 `~/Library/LaunchAgents/com.funes.sync.plist`；遇到非本工具 plist 会拒绝覆盖，`--force` 仅允许覆盖同 label。
 - `start`、`stop`、`restart`：macOS `launchctl bootstrap/bootout`；Linux 上安全返回错误，不启动后台进程。
 
-离线 push 失败不会丢数据：pending 队列留在 SQLite，只有远端 durable ACK 才清空。原生
+离线 push 失败不会丢数据：pending 队列留在 SQLite，只有远端 Hub commit 完成并由 operation
+poll 返回 `durable=true` 后才清空。`202` 只表示处理中，永远不会触发本地 ACK。原生
 `funes push` 的 CAS、恢复失败保护和 TruffleHog gate 是远端发布的最终边界；LaunchAgent
 通过 macOS Keychain 读取 token，不把 token 写入 plist。
 

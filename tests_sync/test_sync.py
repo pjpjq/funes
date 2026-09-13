@@ -236,6 +236,47 @@ def test_one_shot_backfill_drains_all_pending(tmp_path):
     s.close()
 
 
+def test_shutdown_interrupts_one_shot_backfill(tmp_path):
+    class StoreWithBacklog:
+        db = None
+
+        def __init__(self):
+            self.remaining = 3
+
+        def pending(self, _limit):
+            if not self.remaining:
+                return []
+            return [{"record_id": str(self.remaining), "payload": '{"raw_text":"one"}', "attempts": 0}]
+
+        def ack(self, _record_ids):
+            self.remaining -= 1
+
+        def pending_count(self):
+            return self.remaining
+
+    class Client:
+        def __init__(self):
+            self.calls = 0
+
+        def ingest(self, records):
+            self.calls += 1
+            daemon.running = False
+            return {"accepted": len(records)}
+
+    c = cfg(tmp_path)
+    c.auto_discover = False
+    store = StoreWithBacklog()
+    client = Client()
+    daemon = SyncDaemon(c, store, client)
+    daemon.scan_once = lambda: 0
+    daemon._stop_watcher = lambda: None
+
+    daemon.run(once=True)
+
+    assert client.calls == 1
+    assert store.remaining == 2
+
+
 def test_flush_batch_respects_serialized_byte_limit(tmp_path):
     payloads = [
         json.dumps({"raw_text": "a" * 20}),
@@ -276,6 +317,94 @@ def test_flush_batch_respects_serialized_byte_limit(tmp_path):
     assert SyncDaemon(c, store, client).flush_once() == 1
     assert len(client.records) == 1
     assert store.acked == ["0"]
+
+
+def test_filesystem_event_interrupts_remote_flush_burst(tmp_path):
+    class StoreWithBacklog:
+        db = None
+
+        def pending(self, _limit):
+            return [{"record_id": "one", "payload": '{"raw_text":"one"}', "attempts": 0}]
+
+        def ack(self, _record_ids):
+            return None
+
+        def pending_count(self):
+            return 1
+
+    class Client:
+        def __init__(self):
+            self.calls = 0
+
+        def ingest(self, records):
+            self.calls += 1
+            daemon._wake.set()
+            if self.calls == 2:
+                daemon.running = False
+            return {"accepted": len(records)}
+
+    c = cfg(tmp_path)
+    c.auto_discover = False
+    client = Client()
+    daemon = SyncDaemon(c, StoreWithBacklog(), client)
+    daemon.scan_once = lambda: 0
+    daemon._start_watcher = lambda: None
+    daemon._stop_watcher = lambda: None
+
+    daemon.run()
+
+    assert client.calls == 2
+
+
+def test_shutdown_interrupts_remote_flush_burst_without_wake(tmp_path):
+    class StoreWithBacklog:
+        db = None
+
+        def __init__(self):
+            self.has_pending = True
+
+        def pending(self, _limit):
+            if not self.has_pending:
+                return []
+            return [{"record_id": "one", "payload": '{"raw_text":"one"}', "attempts": 0}]
+
+        def ack(self, _record_ids):
+            self.has_pending = False
+
+        def pending_count(self):
+            return int(self.has_pending)
+
+    class Client:
+        def __init__(self):
+            self.calls = 0
+            self.health_calls = 0
+            self.snapshot_calls = 0
+
+        def ingest(self, records):
+            self.calls += 1
+            daemon.running = False
+            return {"accepted": len(records)}
+
+        def health(self):
+            self.health_calls += 1
+            return True
+
+        def sync_snapshot(self):
+            self.snapshot_calls += 1
+
+    c = cfg(tmp_path)
+    c.auto_discover = False
+    client = Client()
+    daemon = SyncDaemon(c, StoreWithBacklog(), client)
+    daemon.scan_once = lambda: 0
+    daemon._start_watcher = lambda: None
+    daemon._stop_watcher = lambda: None
+
+    daemon.run()
+
+    assert client.calls == 1
+    assert client.health_calls == 0
+    assert client.snapshot_calls == 0
 
 
 def test_remote_failure_keeps_pending_for_recovery(tmp_path):

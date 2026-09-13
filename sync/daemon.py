@@ -150,7 +150,9 @@ class SyncDaemon:
         if not self.config.enabled:
             return 0
         self.running=True
-        def stop(*_): self.running=False
+        def stop(*_):
+            self.running=False
+            self._wake.set()
         signal.signal(signal.SIGTERM,stop); signal.signal(signal.SIGINT,stop)
         if not once:
             self._start_watcher()
@@ -172,19 +174,25 @@ class SyncDaemon:
             # the remote is offline, flush_once leaves the queue intact and this
             # exits promptly for a later retry.
             if once:
-                while self.store.pending_count():
+                while self.running and self.store.pending_count():
                     if not self.flush_once():
                         break
             else:
                 for _ in range(8):
                     if not self.flush_once():
                         break
-            if self.store.pending_count() == 0 and self.client.health():
+                    # A filesystem event must not wait behind the rest of a
+                    # large backfill burst. Finish the current durable request,
+                    # then rescan before sending another batch.
+                    if not self.running or self._wake.is_set():
+                        break
+            if self.running and self.store.pending_count() == 0 and self.client.health():
                 try:
                     self.client.sync_snapshot()
                 except Exception as exc:
                     log.warning("snapshot sync unavailable: %s", type(exc).__name__)
             if once: break
+            if not self.running: break
             self._wake.wait(max(1,self.config.interval)); self._wake.clear()
         finally:
             self._stop_watcher()

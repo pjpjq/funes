@@ -119,7 +119,6 @@ def _project_for(path: Path, scan_root: Path) -> str:
 
 def discover_sources(cfg: Config|None=None) -> list[Source]:
     cfg = cfg or Config.load(); h=cfg.home; out=[]; seen=set()
-    memory_only = getattr(cfg, "memory_only", False) or os.environ.get("FUNES_MEMORY_ONLY", "").lower() in {"1", "true", "yes", "on"}
     def add(kind,p,project=""):
         try: p=Path(p)
         except TypeError: return
@@ -127,9 +126,8 @@ def discover_sources(cfg: Config|None=None) -> list[Source]:
             seen.add(p); out.append(_source(kind,p,cfg,project))
     codex = Path(os.environ.get("CODEX_HOME", h/".codex")).expanduser()
     if cfg.source_codex:
-        if not memory_only:
-            for root in (codex/"sessions", codex/"archived_sessions", codex/"subagents", codex/"sessions"/"archive"):
-                for p in _files(root,("**/*.jsonl",)): add("codex",p)
+        for root in (codex/"sessions", codex/"archived_sessions", codex/"subagents", codex/"sessions"/"archive"):
+            for p in _files(root,("**/*.jsonl",)): add("codex",p)
         for p in _files(codex / "memories", ("**/*.md", "**/*.jsonl", "**/*.txt")):
             add("codex_memory", p)
         # Automation run logs/evaluations are operational output, not durable
@@ -145,19 +143,17 @@ def discover_sources(cfg: Config|None=None) -> list[Source]:
         if os.environ.get(key): pi_roots.append(Path(os.environ[key]).expanduser())
     pi_roots += [h/".pi/agent/sessions", h/".pi/sessions"]
     if cfg.source_pi:
-        if not memory_only:
-            for root in pi_roots:
-                for p in _files(root,("**/*.jsonl",)): add("pi",p)
-            # Older pi releases allowed a session directory directly under ~/.pi;
-            # retain that fallback for existing installations and test fixtures.
-            for p in _files(h/".pi", ("**/*.jsonl",)):
-                add("pi", p)
+        for root in pi_roots:
+            for p in _files(root,("**/*.jsonl",)): add("pi",p)
+        # Older pi releases allowed a session directory directly under ~/.pi;
+        # retain that fallback for existing installations and test fixtures.
+        for p in _files(h/".pi", ("**/*.jsonl",)):
+            add("pi", p)
         for root in (h/".pi/agent", h/".pi"):
             for p in _files(root,("**/*.md",)): add("pi_memory",p)
     claude = Path(os.environ.get("CLAUDE_CONFIG_DIR", h/".claude")).expanduser()
-    if not memory_only:
-        for root in (claude/"projects", claude/"history"):
-            for p in _files(root,("**/*.jsonl",)): add("claude",p)
+    for root in (claude/"projects", claude/"history"):
+        for p in _files(root,("**/*.jsonl",)): add("claude",p)
     for root in (claude/"memory", claude/"memories"):
         for p in _files(root,("**/*.md",)): add("claude_memory",p)
     for p in (claude/"CLAUDE.md", h/"CLAUDE.md", h/"MEMORY.md", h/"memory.md"):

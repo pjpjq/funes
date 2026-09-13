@@ -28,7 +28,19 @@ COPY --from=build /usr/local/bin/trufflehog /usr/local/bin/trufflehog
 COPY space/server.py /app/server.py
 COPY service /app/service
 RUN pip install --no-cache-dir -r /app/service/requirements.txt
-ENV FUNES_HOME=/data/.funes PYTHONUNBUFFERED=1 PORT=7860
+ENV FUNES_HOME=/data/.funes \
+    PYTHONUNBUFFERED=1 \
+    PORT=7860 \
+    FUNES_EMBEDDING_PROVIDER=voyage \
+    FUNES_EMBEDDING_MODEL=voyage-4-lite \
+    FUNES_EMBEDDING_DIMENSIONS=1024 \
+    FUNES_EMBEDDING_SCHEMA_VERSION=2 \
+    FUNES_RERANK_PROVIDER=none \
+    FUNES_RERANK_MODEL=rerank-3-lite \
+    FUNES_NATIVE_FALLBACK=false \
+    FUNES_RETRIEVAL_LANGUAGE_MODE=raw \
+    FUNES_CANONICAL_INDEX_BATCH=1024 \
+    FUNES_CANONICAL_INDEX_INTERVAL=1
 RUN mkdir -p /data/.funes/sources
 WORKDIR /app
 EXPOSE 7860

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from datetime import datetime
+from pathlib import PureWindowsPath
 from types import SimpleNamespace
 
 import pytest
@@ -247,7 +248,58 @@ def test_source_and_upload_counts_are_exact(tmp_path):
         }
         assert stats["pending_uploads"] == stats["pending"] == 1
         assert stats["failed_uploads"] == 1
+        assert stats["by_agent"] == {"codex": 1, "pi": 1, "shared": 1}
         assert "redacted failure" not in json.dumps(stats)
+    finally:
+        store.close()
+
+
+def test_record_counts_by_agent_use_source_identity_without_parsing_payload(tmp_path):
+    cfg = Config(tmp_path, tmp_path / ".state", tmp_path / "config.toml")
+    store = Store(config=cfg)
+    sources = [
+        Source("codex", "codex", tmp_path / "codex.jsonl", "device"),
+        Source("pi", "pi_memory", tmp_path / "memory.md", "device"),
+        Source("claude", "persistent", tmp_path / "CLAUDE.md", "device"),
+        Source("agents", "agents_md", tmp_path / "AGENTS.md", "device"),
+        Source("shared", "persistent", tmp_path / "MEMORY.md", "device"),
+        Source("windows-agents", "agents_md", PureWindowsPath(r"C:\repo\AGENTS.md"), "device"),
+        Source("windows-claude", "persistent", PureWindowsPath(r"C:\repo\Claude.md"), "device"),
+        Source("uppercase-kind", "Codex_session", tmp_path / "uppercase.jsonl", "device"),
+    ]
+    try:
+        for source in sources:
+            store.register_source(source)
+            store.upsert_chunks(
+                [
+                    Chunk(
+                        record_id=f"record:{source.source_key}",
+                        source_key=source.source_key,
+                        kind=source.kind,
+                        path=str(source.path),
+                        session_id=source.source_key,
+                        ordinal=0,
+                        role="user",
+                        text="raw",
+                        raw_text="raw",
+                        source_agent="legacy_unknown",
+                        source_type=source.source_type,
+                    )
+                ]
+            )
+        store.db.execute(
+            "INSERT INTO records(record_id,source_key,content_hash,version,payload,updated_at) VALUES(?,?,?,?,?,?)",
+            ("orphan", "missing", "hash", 1, "not-json", 0),
+        )
+        store.db.commit()
+
+        assert store.record_counts_by_agent() == {
+            "claude_code": 2,
+            "codex": 3,
+            "pi": 1,
+            "shared": 1,
+            "unknown": 2,
+        }
     finally:
         store.close()
 

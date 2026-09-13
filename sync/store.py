@@ -146,10 +146,30 @@ class Store:
     def meta_value(self,key):
         row=self.db.execute("SELECT value FROM meta WHERE key=?",(key,)).fetchone()
         return row[0] if row else None
+    def record_counts_by_agent(self):
+        rows=self.db.execute('''
+            WITH record_counts AS (
+                SELECT source_key,count(*) AS n
+                FROM records INDEXED BY records_source
+                GROUP BY source_key
+            )
+            SELECT CASE
+                       WHEN substr(s.kind,1,5)='codex' THEN 'codex'
+                       WHEN substr(s.kind,1,2)='pi' THEN 'pi'
+                       WHEN substr(s.kind,1,6)='claude' THEN 'claude_code'
+                       WHEN replace(upper(s.path),char(92),'/') LIKE '%/AGENTS.MD' OR upper(s.path)='AGENTS.MD' THEN 'codex'
+                       WHEN replace(upper(s.path),char(92),'/') LIKE '%/CLAUDE.MD' OR upper(s.path)='CLAUDE.MD' THEN 'claude_code'
+                       WHEN s.kind='persistent' THEN 'shared'
+                       ELSE 'unknown'
+                   END AS agent,
+                   sum(record_counts.n) AS n
+            FROM record_counts
+            LEFT JOIN sources s ON s.source_key=record_counts.source_key
+            GROUP BY agent
+        ''')
+        return {row["agent"]:int(row["n"]) for row in rows}
     def stats(self):
-        by_agent={}
-        for row in self.db.execute("SELECT json_extract(payload,'$.source_agent') AS agent,count(*) AS n FROM records GROUP BY agent"):
-            by_agent[row[0] or "unknown"]=row[1]
+        by_agent=self.record_counts_by_agent()
         pending=self.pending_count()
         counts=self.source_counts()
         return {"sources":self.db.execute("SELECT count(*) FROM sources").fetchone()[0],"active_sources":self.db.execute("SELECT count(*) FROM sources WHERE active=1").fetchone()[0],"records":self.db.execute("SELECT count(*) FROM records").fetchone()[0],"pending":pending,"pending_uploads":pending,"failed_uploads":self.db.execute("SELECT count(*) FROM queue WHERE last_error IS NOT NULL").fetchone()[0],"last_successful_sync":self.meta_value("last_successful_sync"),"discovered":counts["discovered"],"parsed":counts["parsed"],"synced":counts["synced"],"by_agent":by_agent}

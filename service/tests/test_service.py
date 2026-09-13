@@ -474,6 +474,63 @@ class ServiceTests(unittest.TestCase):
         )
         store.close()
 
+    def test_chinese_ngrams_rerank_older_technical_candidate(self):
+        store = Store(self.tmp.name)
+        documents = [
+            {
+                "source_identity": "context-loss-target",
+                "source_agent": "codex",
+                "role": "user",
+                "raw_text": "CPA 部署后第二轮 previous_response_id 导致上下文丢失。",
+                "updated_at": "2020-01-01T00:00:00Z",
+            }
+        ]
+        documents.extend(
+            {
+                "source_identity": f"generic-cpa-{index}",
+                "source_agent": "codex",
+                "role": "user",
+                "raw_text": "CPA unrelated deployment note",
+                "updated_at": f"2026-01-01T00:00:{index:02d}Z",
+            }
+            for index in range(20)
+        )
+        store.ingest(documents)
+
+        results = store.search(
+            "CPA 第二轮为什么丢上下文？",
+            limit=1,
+            filters={"source_agent": "codex", "role": "user"},
+        )
+
+        self.assertEqual(
+            [item["source_identity"] for item in results],
+            ["context-loss-target"],
+        )
+        store.close()
+
+    def test_single_cjk_character_technical_query_respects_limit(self):
+        store = Store(self.tmp.name)
+        store.ingest(
+            [
+                {
+                    "source_identity": f"cpa-note-{index}",
+                    "source_agent": "codex",
+                    "raw_text": "CPA note",
+                }
+                for index in range(40)
+            ]
+        )
+
+        results = store.search(
+            "查 CPA",
+            limit=1,
+            filters={"source_agent": "codex"},
+        )
+
+        self.assertEqual(len(results), 1)
+        store.close()
+
     def test_translation_cache_key_is_hashed_and_permanent_error_opens_circuit(self):
         store = Store(self.tmp.name)
         os.environ.update(

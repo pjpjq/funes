@@ -116,3 +116,72 @@ The English-only arm ties raw Chinese at Recall@3 and Recall@5 but remains 0.05 
 therefore this result does not support a blanket claim that translation improves retrieval. The
 deployed HTTP service mitigates that limitation by fusing raw-query, rewritten-query, and native
 rankings with RRF, while this controlled benchmark intentionally isolates the two representations.
+
+## Voyage embedding and rerank matrix
+
+`scripts/benchmark_voyage_retrieval.py` reuses the exact 60-memory/20-query fixture above and calls
+Voyage's native `/v1/embeddings` and `/v1/rerank` APIs. Documents always use
+`input_type=document`; queries always use `input_type=query`. The mixed arm is limited to
+`voyage-4` documents plus `voyage-4-lite` queries because those Voyage 4 models share an embedding
+space. `voyage-code-4` is never mixed with that space.
+
+With no mode flag the runner performs only an offline self-check: it does not read credentials,
+open sockets, create a cache, or spend API credit. Run that check before opting into the paid mode:
+
+```bash
+python3 scripts/benchmark_voyage_retrieval.py
+
+# Explicit paid run; VOYAGE_API_KEY is read only from the environment.
+python3 scripts/benchmark_voyage_retrieval.py --live-voyage \
+  --output docs/chinese-retrieval-voyage-results.local
+```
+
+The embedding cache option defaults to the base path
+`~/.cache/funes/voyage-retrieval-embeddings.json`; the runner derives a separate persistent cache
+namespace/file for each arm. It stores only the endpoint/model/input role, a SHA-256 text identity,
+and the returned vector—not raw fixture text or the API key. Before measuring an arm, the runner
+fully populates that arm's 60 document and 20 query embeddings. This gives every arm the same warm
+embedding-cache state and prevents a later arm from inheriting an earlier arm's entries.
+
+Recall uses cosine similarity with fixture ID as a stable tie-break. The rerank arm sends the top 20
+embedding candidates to `rerank-3-lite`. Every arm measures the same 20 fixture queries and reports
+Recall@1/@3/@5, MRR, and warm end-to-end p50/p95/max. API-network latency is reported separately
+from actual Voyage REST attempts during warmup or reranking; a cache hit is never represented as an
+API-latency sample. The response model is validated against the requested model, and each arm records
+the validated backend/model profile and observed embedding dimension. Five target memories share
+duplicate distractor text with other IDs, so the stable tie-break is part of the fixture definition.
+
+### Voyage result placeholder (not run)
+
+No paid Voyage request was made while adding this runner. Replace the dashes only from the
+sanitized JSON produced by a completed `--live-voyage` run.
+
+| arm | Recall@1 | Recall@3 | Recall@5 | MRR | p50 ms | p95 ms | max ms | status |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| `voyage-4-lite` | — | — | — | — | — | — | — | not run |
+| `voyage-4` | — | — | — | — | — | — | — | not run |
+| `voyage-4` document + `voyage-4-lite` query | — | — | — | — | — | — | — | not run |
+| `voyage-code-4` | — | — | — | — | — | — | — | not run |
+| `voyage-4-lite` + `rerank-3-lite` | — | — | — | — | — | — | — | not run |
+
+### Warm Funes HTTP latency
+
+The same script can warm `/recall` with one unmeasured request and then issue 50 measured requests
+covering Chinese, English, mixed Chinese/English, semantic paraphrase, exact identifier, and
+code/error queries. These 50 HTTP samples are separate from the 20-query direct matrix arms. It
+reads only `FUNES_REMOTE_URL` and `FUNES_API_TOKEN`. Every response must declare the expected
+top-level `retrieval_backend` and complete `embedding_profile`. Any non-empty
+`retrieval_degraded` value, backend mismatch, or Voyage provider/model/dimension/profile mismatch is
+counted as non-Voyage and makes the run's status `failed_validation` (and the CLI exit non-zero).
+The sanitized result records observed backend/profile counts and end-to-end HTTP latency, but not
+queries, returned memories, response bodies, URLs, or credentials.
+
+```bash
+python3 scripts/benchmark_voyage_retrieval.py --http-latency \
+  --latency-requests 50 \
+  --output docs/funes-http-latency-results.local
+```
+
+| scope | requests | p50 ms | p95 ms | max ms | status |
+| --- | ---: | ---: | ---: | ---: | --- |
+| all warm HTTP recall requests | 50 | — | — | — | not run |

@@ -682,6 +682,367 @@ def _post_bytes(server, path, body, headers=None):
     return response.status, payload
 
 
+def _async_post(server, payload, token="test-token"):
+    conn = HTTPConnection(*server.server_address)
+    conn.request(
+        "POST",
+        "/ingest",
+        json.dumps(payload, ensure_ascii=False).encode(),
+        {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "Prefer": "respond-async",
+        },
+    )
+    response = conn.getresponse()
+    body = json.loads(response.read())
+    headers = {name.lower(): value for name, value in response.getheaders()}
+    conn.close()
+    return response.status, body, headers
+
+
+def _operation_get(server, status_url, token="test-token"):
+    conn = HTTPConnection(*server.server_address)
+    conn.request("GET", status_url, headers={"Authorization": f"Bearer {token}"})
+    response = conn.getresponse()
+    body = json.loads(response.read())
+    headers = {name.lower(): value for name, value in response.getheaders()}
+    conn.close()
+    return response.status, body, headers
+
+
+def _clear_ingest_operations():
+    with bridge.INGEST_OPERATION_LOCK:
+        bridge.INGEST_OPERATIONS.clear()
+        bridge.INGEST_ACTIVE_OPERATION = None
+        if hasattr(bridge, "INGEST_RESTART_SCHEDULED"):
+            bridge.INGEST_RESTART_SCHEDULED = False
+
+
+def test_async_ingest_deduplicates_bounds_concurrency_and_requires_status_auth(monkeypatch):
+    _clear_ingest_operations()
+    monkeypatch.setattr(bridge, "TOKEN", "test-token")
+    monkeypatch.setenv("FUNES_INGEST_RETRY_AFTER", "7")
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    calls = []
+    secret = "raw-secret-must-not-be-returned"
+
+    def fake_ingest(docs):
+        calls.append(docs)
+        started.set()
+        assert release.wait(2)
+        finished.set()
+        return (
+            200,
+            {
+                "durable": True,
+                "accepted": len(docs),
+                "created": len(docs),
+                "items": [{"raw_text": secret}],
+            },
+            [{"raw_text": secret}],
+        )
+
+    monkeypatch.setattr(bridge, "ingest_source_documents", fake_ingest)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    document = {"raw_text": secret, "source_identity": "async-one"}
+    try:
+        status, first, headers = _async_post(server, {"documents": [document]})
+        assert status == 202
+        assert headers["location"] == first["status_url"]
+        assert headers["retry-after"] == "7"
+        assert started.wait(1)
+        assert first["durable"] is False
+        assert secret not in json.dumps(first)
+
+        reordered = {"source_identity": "async-one", "raw_text": secret}
+        duplicate_status, duplicate, _headers = _async_post(
+            server, {"documents": [reordered]}
+        )
+        assert duplicate_status == 202
+        assert duplicate["operation_id"] == first["operation_id"]
+        assert len(calls) == 1
+
+        busy_status, busy, busy_headers = _async_post(
+            server,
+            {"documents": [{"source_identity": "async-two", "raw_text": "different"}]},
+        )
+        assert busy_status == 429
+        assert busy == {
+            "ok": False,
+            "durable": False,
+            "error": "ingest_busy",
+            "retry_after": 7,
+        }
+        assert busy_headers["retry-after"] == "7"
+
+        unauthorized, _body, _headers = _operation_get(
+            server, first["status_url"], token="wrong-token"
+        )
+        assert unauthorized == 401
+        running_status, running, running_headers = _operation_get(
+            server, first["status_url"]
+        )
+        assert running_status == 202
+        assert running["durable"] is False
+        assert running_headers["retry-after"] == "7"
+
+        release.set()
+        assert finished.wait(1)
+        deadline = time.monotonic() + 1
+        while True:
+            done_status, done, _headers = _operation_get(server, first["status_url"])
+            if done_status != 202 or time.monotonic() >= deadline:
+                break
+            time.sleep(0.01)
+        assert done_status == 200
+        assert done["durable"] is True
+        assert done["accepted"] == 1
+        assert secret not in json.dumps(done)
+
+        cached_status, cached, _headers = _async_post(
+            server, {"documents": [reordered]}
+        )
+        assert cached_status == 200
+        assert cached == done
+        assert len(calls) == 1
+    finally:
+        release.set()
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=2)
+        _clear_ingest_operations()
+
+
+def test_failed_async_ingest_can_be_retried_without_exposing_failure_details(monkeypatch):
+    _clear_ingest_operations()
+    monkeypatch.setattr(bridge, "TOKEN", "test-token")
+    starts = [threading.Event(), threading.Event()]
+    releases = [threading.Event(), threading.Event()]
+    calls = []
+    secret = "provider-secret-and-raw-document"
+
+    def fake_ingest(docs):
+        attempt = len(calls)
+        calls.append(docs)
+        starts[attempt].set()
+        assert releases[attempt].wait(2)
+        if attempt == 0:
+            return 503, {"durable": False, "error": secret, "items": docs}, []
+        return 200, {"durable": True, "accepted": len(docs), "items": docs}, docs
+
+    monkeypatch.setattr(bridge, "ingest_source_documents", fake_ingest)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    payload = {"documents": [{"source_identity": "retry", "raw_text": secret}]}
+    try:
+        status, first, _headers = _async_post(server, payload)
+        assert status == 202
+        assert starts[0].wait(1)
+        releases[0].set()
+
+        deadline = time.monotonic() + 1
+        while True:
+            failed_status, failed, _headers = _operation_get(server, first["status_url"])
+            if failed_status != 202 or time.monotonic() >= deadline:
+                break
+            time.sleep(0.01)
+        assert failed_status == 503
+        assert failed["status"] == "failed"
+        assert failed["durable"] is False
+        assert failed["error"] == "ingest_failed"
+        assert secret not in json.dumps(failed)
+
+        retry_status, retry, _headers = _async_post(server, payload)
+        assert retry_status == 202
+        assert retry["operation_id"] == first["operation_id"]
+        assert starts[1].wait(1)
+        releases[1].set()
+
+        deadline = time.monotonic() + 1
+        while True:
+            done_status, done, _headers = _operation_get(server, retry["status_url"])
+            if done_status != 202 or time.monotonic() >= deadline:
+                break
+            time.sleep(0.01)
+        assert done_status == 200
+        assert done["durable"] is True
+        assert done["accepted"] == 1
+        assert len(calls) == 2
+    finally:
+        for event in releases:
+            event.set()
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=2)
+        _clear_ingest_operations()
+
+
+def test_completed_ingest_operation_cleanup_is_ttl_and_count_bounded(monkeypatch):
+    _clear_ingest_operations()
+    monkeypatch.setenv("FUNES_INGEST_OPERATION_TTL", "100")
+    monkeypatch.setenv("FUNES_INGEST_OPERATION_MAX_COMPLETED", "2")
+    active_id = "d" * 64
+    with bridge.INGEST_OPERATION_LOCK:
+        for index, operation_id in enumerate(("a" * 64, "b" * 64, "c" * 64)):
+            bridge.INGEST_OPERATIONS[operation_id] = {
+                "operation_id": operation_id,
+                "state": "succeeded",
+                "accepted": 1,
+                "completed_at": float(index),
+            }
+        bridge.INGEST_OPERATIONS[active_id] = {
+            "operation_id": active_id,
+            "state": "running",
+            "documents": [{"raw_text": "bounded-active"}],
+        }
+        bridge.INGEST_ACTIVE_OPERATION = active_id
+        bridge._cleanup_ingest_operations_locked(10.0)
+        assert set(bridge.INGEST_OPERATIONS) == {"b" * 64, "c" * 64, active_id}
+
+        monkeypatch.setenv("FUNES_INGEST_OPERATION_TTL", "1")
+        bridge._cleanup_ingest_operations_locked(20.0)
+        assert set(bridge.INGEST_OPERATIONS) == {active_id}
+    _clear_ingest_operations()
+
+
+def test_first_async_response_survives_concurrent_completed_operation_cleanup(monkeypatch):
+    _clear_ingest_operations()
+    monkeypatch.setenv("FUNES_INGEST_OPERATION_MAX_COMPLETED", "1")
+    docs_a = [{"source_identity": "race-a", "raw_text": "first"}]
+    docs_b = [{"source_identity": "race-b", "raw_text": "second"}]
+    operation_a = bridge._ingest_operation_id(docs_a)
+    nested = []
+
+    monkeypatch.setattr(
+        bridge,
+        "ingest_source_documents",
+        lambda docs: (200, {"durable": True, "accepted": len(docs)}, docs),
+    )
+
+    class ImmediateThread:
+        def __init__(self, *, target, args, **_kwargs):
+            self.target = target
+            self.args = args
+
+        def start(self):
+            self.target(*self.args)
+            if self.args[0] == operation_a:
+                nested.append(bridge.start_ingest_operation(docs_b))
+
+    monkeypatch.setattr(bridge.threading, "Thread", ImmediateThread)
+    status_a, result_a = bridge.start_ingest_operation(docs_a)
+
+    assert status_a == 200
+    assert result_a["operation_id"] == operation_a
+    assert result_a["durable"] is True
+    assert nested[0][0] == 200
+    assert set(bridge.INGEST_OPERATIONS) == {bridge._ingest_operation_id(docs_b)}
+    _clear_ingest_operations()
+
+
+def test_timed_out_async_ingest_fail_stops_once_without_releasing_active_slot(monkeypatch):
+    _clear_ingest_operations()
+    monkeypatch.setattr(bridge, "TOKEN", "test-token")
+    monkeypatch.setenv("FUNES_INGEST_OPERATION_TIMEOUT", "1")
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    calls = []
+    restarts = []
+
+    def fake_ingest(docs):
+        calls.append(docs)
+        started.set()
+        assert release.wait(2)
+        finished.set()
+        return 200, {"durable": True, "accepted": len(docs)}, docs
+
+    monkeypatch.setattr(bridge, "ingest_source_documents", fake_ingest)
+    monkeypatch.setattr(
+        bridge,
+        "schedule_ingest_process_restart",
+        lambda: restarts.append("scheduled"),
+    )
+    server = ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    payload = {"documents": [{"source_identity": "hung", "raw_text": "blocked"}]}
+    try:
+        status, first, _headers = _async_post(server, payload)
+        assert status == 202
+        assert started.wait(1)
+        with bridge.INGEST_OPERATION_LOCK:
+            bridge.INGEST_OPERATIONS[first["operation_id"]]["started_at"] -= 2.0
+
+        timed_out_status, timed_out, _headers = _operation_get(
+            server, first["status_url"]
+        )
+        assert timed_out_status == 503
+        assert timed_out["durable"] is False
+        assert timed_out["error"] == "ingest_operation_timeout"
+        assert restarts == ["scheduled"]
+
+        repeated_status, repeated, _headers = _operation_get(
+            server, first["status_url"]
+        )
+        assert repeated_status == 503
+        assert repeated["error"] == "ingest_operation_timeout"
+        assert restarts == ["scheduled"]
+
+        blocked_status, blocked, _headers = _async_post(
+            server,
+            {"documents": [{"source_identity": "other", "raw_text": "must not start"}]},
+        )
+        assert blocked_status == 503
+        assert blocked["error"] == "ingest_operation_timeout"
+        assert blocked["status"] == "restart_pending"
+        assert "operation_id" not in blocked
+        assert len(calls) == 1
+        with bridge.INGEST_OPERATION_LOCK:
+            assert bridge.INGEST_ACTIVE_OPERATION == first["operation_id"]
+            assert bridge.INGEST_OPERATIONS[first["operation_id"]]["state"] == "running"
+    finally:
+        release.set()
+        assert finished.wait(1)
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=2)
+        _clear_ingest_operations()
+
+
+def test_ingest_fail_stop_replaces_pid_one_and_has_hard_exit_fallback(monkeypatch):
+    calls = []
+
+    class ImmediateThread:
+        def __init__(self, *, target, **_kwargs):
+            self.target = target
+
+        def start(self):
+            self.target()
+
+    monkeypatch.setattr(bridge.threading, "Thread", ImmediateThread)
+    monkeypatch.setattr(bridge.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        bridge.os,
+        "execv",
+        lambda executable, argv: calls.append((executable, argv))
+        or (_ for _ in ()).throw(OSError("exec failed")),
+    )
+    monkeypatch.setattr(bridge.os, "_exit", lambda code: calls.append(("exit", code)))
+
+    bridge.schedule_ingest_process_restart()
+
+    assert calls[0][0] == bridge.sys.executable
+    assert calls[0][1][0] == bridge.sys.executable
+    assert calls[1] == ("exit", 75)
+
+
 def test_http_gzip_ingest_rejects_invalid_and_oversized_payloads(monkeypatch, tmp_path):
     app = _source_app(tmp_path)
     monkeypatch.setattr(bridge, "SOURCE_APP", app)

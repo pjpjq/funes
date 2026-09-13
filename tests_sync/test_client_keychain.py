@@ -1,5 +1,8 @@
 import gzip
 import json
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
 
 import pytest
@@ -185,3 +188,330 @@ def test_environment_credentials_take_precedence_over_keychain(tmp_path, monkeyp
 
     monkeypatch.setattr(client_module, "open_no_redirect", urlopen)
     assert SyncClient(cfg(tmp_path)).health()
+
+
+class _IngestResponse:
+    def __init__(self, status, payload, headers=None):
+        self.status = status
+        self.payload = payload
+        self.headers = headers or {}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        return False
+
+    def read(self):
+        return json.dumps(self.payload).encode()
+
+
+def _async_client_environment(monkeypatch, timeout="30"):
+    monkeypatch.setenv("FUNES_API_TOKEN", "api-environment-value")
+    monkeypatch.delenv("FUNES_HF_TOKEN", raising=False)
+    monkeypatch.delenv("HF_TOKEN", raising=False)
+    monkeypatch.setenv("FUNES_REMOTE_TIMEOUT", timeout)
+    monkeypatch.setattr(client_module, "_keychain_token", lambda _service: "")
+
+
+def test_ingest_requests_async_and_polls_until_durable_with_one_deadline(tmp_path, monkeypatch):
+    _async_client_environment(monkeypatch)
+    clock = [100.0]
+    sleeps = []
+    requests = []
+    timeouts = []
+    operation_id = "operation-1"
+    responses = [
+        _IngestResponse(
+            202,
+            {
+                "operation_id": operation_id,
+                "status_url": f"/ingest/operations/{operation_id}",
+                "status": "running",
+                "durable": False,
+            },
+            {"Retry-After": "3"},
+        ),
+        _IngestResponse(
+            202,
+            {"operation_id": operation_id, "status": "running", "durable": False},
+            {"Retry-After": "4"},
+        ),
+        _IngestResponse(
+            200,
+            {
+                "operation_id": operation_id,
+                "status": "succeeded",
+                "durable": True,
+                "accepted": 1,
+            },
+        ),
+    ]
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        clock[0] += seconds
+
+    def urlopen(req, timeout):
+        requests.append(req)
+        timeouts.append(timeout)
+        return responses.pop(0)
+
+    monkeypatch.setattr(client_module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(client_module.time, "sleep", sleep)
+    monkeypatch.setattr(client_module, "open_no_redirect", urlopen)
+
+    result = SyncClient(cfg(tmp_path)).ingest([{"raw_text": "queued until durable"}])
+
+    assert result["durable"] is True
+    assert result["accepted"] == 1
+    assert [req.get_method() for req in requests] == ["POST", "GET", "GET"]
+    assert requests[1].full_url == f"http://127.0.0.1:7860/ingest/operations/{operation_id}"
+    post_headers = {name.lower(): value for name, value in requests[0].header_items()}
+    assert post_headers["prefer"] == "respond-async"
+    assert "prefer" not in {
+        name.lower(): value for name, value in requests[1].header_items()
+    }
+    assert sleeps == [3.0, 4.0]
+    assert timeouts == [30.0, 27.0, 23.0]
+
+
+def test_ingest_reposts_same_payload_after_async_operation_failure(tmp_path, monkeypatch):
+    _async_client_environment(monkeypatch)
+    clock = [0.0]
+    requests = []
+    operation_id = "operation-retry"
+    responses = [
+        _IngestResponse(
+            202,
+            {
+                "operation_id": operation_id,
+                "status_url": f"/ingest/operations/{operation_id}",
+                "durable": False,
+            },
+            {"Retry-After": "1"},
+        ),
+        _IngestResponse(
+            503,
+            {
+                "operation_id": operation_id,
+                "status": "failed",
+                "durable": False,
+                "error": "ingest_failed",
+            },
+            {"Retry-After": "2"},
+        ),
+        _IngestResponse(
+            202,
+            {
+                "operation_id": operation_id,
+                "status_url": f"/ingest/operations/{operation_id}",
+                "durable": False,
+            },
+            {"Retry-After": "1"},
+        ),
+        _IngestResponse(
+            200,
+            {"operation_id": operation_id, "durable": True, "accepted": 1},
+        ),
+    ]
+
+    def urlopen(req, timeout):
+        requests.append((req, timeout))
+        return responses.pop(0)
+
+    monkeypatch.setattr(client_module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        client_module.time,
+        "sleep",
+        lambda seconds: clock.__setitem__(0, clock[0] + seconds),
+    )
+    monkeypatch.setattr(client_module, "open_no_redirect", urlopen)
+
+    result = SyncClient(cfg(tmp_path)).ingest([{"raw_text": "retry safely"}])
+
+    assert result["durable"] is True
+    assert [req.get_method() for req, _timeout in requests] == ["POST", "GET", "POST", "GET"]
+    assert requests[0][0].data == requests[2][0].data
+    assert all(0 < timeout <= 30 for _req, timeout in requests)
+
+
+def test_ingest_timeout_never_treats_running_operation_as_durable(tmp_path, monkeypatch):
+    _async_client_environment(monkeypatch, timeout="3")
+    clock = [0.0]
+    requests = []
+    operation_id = "operation-timeout"
+    responses = [
+        _IngestResponse(
+            202,
+            {
+                "operation_id": operation_id,
+                "status_url": f"/ingest/operations/{operation_id}",
+                "durable": False,
+            },
+            {"Retry-After": "1"},
+        ),
+        _IngestResponse(
+            202,
+            {"operation_id": operation_id, "status": "running", "durable": False},
+            {"Retry-After": "10"},
+        ),
+    ]
+
+    def urlopen(req, timeout):
+        requests.append((req, timeout))
+        return responses.pop(0)
+
+    monkeypatch.setattr(client_module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        client_module.time,
+        "sleep",
+        lambda seconds: clock.__setitem__(0, clock[0] + seconds),
+    )
+    monkeypatch.setattr(client_module, "open_no_redirect", urlopen)
+
+    with pytest.raises(RuntimeError, match="timed out before durable confirmation"):
+        SyncClient(cfg(tmp_path)).ingest([{"raw_text": "must remain locally queued"}])
+
+    assert [req.get_method() for req, _timeout in requests] == ["POST", "GET"]
+    assert [timeout for _req, timeout in requests] == [3.0, 2.0]
+    assert clock[0] == 3.0
+
+
+def test_ingest_does_not_retry_permanent_http_error(tmp_path, monkeypatch):
+    _async_client_environment(monkeypatch)
+    sleeps = []
+
+    def urlopen(req, timeout):
+        raise client_module.error.HTTPError(req.full_url, 401, "unauthorized", {}, None)
+
+    monkeypatch.setattr(client_module.time, "sleep", sleeps.append)
+    monkeypatch.setattr(client_module, "open_no_redirect", urlopen)
+    with pytest.raises(client_module.error.HTTPError) as exc_info:
+        SyncClient(cfg(tmp_path)).ingest([{"raw_text": "not acknowledged"}])
+    assert exc_info.value.code == 401
+    assert sleeps == []
+
+
+def test_ingest_reposts_same_payload_when_operation_status_is_missing(tmp_path, monkeypatch):
+    _async_client_environment(monkeypatch)
+    clock = [0.0]
+    requests = []
+    operation_id = "operation-missing"
+    responses = [
+        _IngestResponse(
+            202,
+            {
+                "operation_id": operation_id,
+                "status_url": f"/ingest/operations/{operation_id}",
+                "durable": False,
+            },
+            {"Retry-After": "1"},
+        ),
+        client_module.error.HTTPError(
+            f"http://127.0.0.1:7860/ingest/operations/{operation_id}",
+            404,
+            "not found",
+            {"Retry-After": "1"},
+            None,
+        ),
+        _IngestResponse(
+            202,
+            {
+                "operation_id": operation_id,
+                "status_url": f"/ingest/operations/{operation_id}",
+                "durable": False,
+            },
+            {"Retry-After": "1"},
+        ),
+        _IngestResponse(
+            200,
+            {"operation_id": operation_id, "durable": True, "accepted": 1},
+        ),
+    ]
+
+    def urlopen(req, timeout):
+        requests.append((req, timeout))
+        response = responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    monkeypatch.setattr(client_module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        client_module.time,
+        "sleep",
+        lambda seconds: clock.__setitem__(0, clock[0] + seconds),
+    )
+    monkeypatch.setattr(client_module, "open_no_redirect", urlopen)
+
+    result = SyncClient(cfg(tmp_path)).ingest([{"raw_text": "same request body"}])
+
+    assert result["durable"] is True
+    assert [req.get_method() for req, _timeout in requests] == ["POST", "GET", "POST", "GET"]
+    assert requests[0][0].data == requests[2][0].data
+
+
+def test_ingest_rejects_cross_origin_status_url_without_forwarding_auth(tmp_path, monkeypatch):
+    _async_client_environment(monkeypatch)
+    requests = []
+
+    def urlopen(req, timeout):
+        requests.append(req)
+        return _IngestResponse(
+            202,
+            {
+                "operation_id": "unsafe-operation",
+                "status_url": "https://attacker.invalid/collect",
+                "durable": False,
+            },
+        )
+
+    monkeypatch.setattr(client_module, "open_no_redirect", urlopen)
+    with pytest.raises(RuntimeError, match="status URL changed origin"):
+        SyncClient(cfg(tmp_path)).ingest([{"raw_text": "credential stays local"}])
+
+    assert len(requests) == 1
+    assert requests[0].full_url == "http://127.0.0.1:7860/ingest"
+    assert requests[0].get_method() == "POST"
+
+
+def test_ingest_trickle_response_cannot_outlive_total_deadline(tmp_path, monkeypatch):
+    _async_client_environment(monkeypatch, timeout="0.25")
+
+    class TrickleHandler(BaseHTTPRequestHandler):
+        def log_message(self, _fmt, *_args):
+            return
+
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            self.rfile.read(length)
+            payload = b'{"durable":true,"accepted":1}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            for byte in payload:
+                try:
+                    self.wfile.write(bytes([byte]))
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    break
+                time.sleep(0.05)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), TrickleHandler)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    config = cfg(tmp_path)
+    config.remote_url = f"http://127.0.0.1:{server.server_address[1]}"
+    started = time.monotonic()
+    try:
+        with pytest.raises(RuntimeError, match="timed out before durable confirmation"):
+            SyncClient(config).ingest([{"raw_text": "must remain queued"}])
+        elapsed = time.monotonic() - started
+    finally:
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=2)
+
+    assert elapsed < 0.8

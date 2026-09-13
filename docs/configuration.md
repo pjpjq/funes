@@ -77,6 +77,12 @@ file-grained cache design and cold-versus-warm behavior.
 | `FUNES_MEMORY` | Per-run memory override understood by the pi extension; otherwise its binding from `funes add pi [memory]` is used. |
 | `FUNES_NATIVE_PRIMARY` | When `true`, `funes-sync` delegates production index/push to native Funes instead of the migration HTTP path. |
 | `FUNES_SYNC_INTERVAL` | Continuous reconciliation interval in seconds; default `300`. |
+| `FUNES_SYNC_BATCH` | Maximum records per HTTP ingest segment; default `50`. |
+| `FUNES_SYNC_MAX_BATCH_BYTES` | Maximum serialized source bytes per ingest segment; default `16777216` (16 MiB). A single already-chunked record is never dropped. |
+| `FUNES_REMOTE_TIMEOUT` | Total deadline for starting and polling one durable ingest operation; default `900` seconds. |
+| `FUNES_REMOTE_MAX_RESPONSE_BYTES` | Maximum ingest/status response body; default `1048576` (1 MiB). |
+| `FUNES_HTTP_GZIP` | Compress HTTP ingest bodies when beneficial; enabled by default. |
+| `FUNES_INGEST_OPERATION_TIMEOUT` | Space-side durable worker deadline; default `1800` seconds. A stall fail-stops the process for platform restart without ACKing local data. |
 | `FUNES_API_TOKEN` | Bearer token for the compatibility HTTP bridge; never written to launchd plist, loaded from Keychain on macOS. |
 | `FUNES_TRUFFLEHOG` | Explicit TruffleHog binary for secret scanning. Index-time redaction is best-effort; push and scrub scanning fail closed. |
 | `HF_TOKEN`, `HUGGING_FACE_HUB_TOKEN`, `HUGGINGFACE_TOKEN` | Hugging Face authentication, in the precedence shown above. |

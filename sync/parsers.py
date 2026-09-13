@@ -321,6 +321,19 @@ def _memory_identity_context(source: Source) -> tuple[str, str]:
         marker = "/" + project.name.strip("/") + "/"
         if marker in key_path:
             relative = key_path.rsplit(marker, 1)[-1]
+    if not relative:
+        # Global agent memory lives outside a Git repository.  Preserve its
+        # home-relative directory from the canonical source key so distinct
+        # automation configs do not collapse to the same basename/heading ID.
+        key_path = source.source_key.split(":", 1)[-1].replace("\\", "/")
+        if source.kind == "codex_memory":
+            for directory in ("automations", "memories"):
+                marker = f"/{directory}/"
+                if marker in key_path:
+                    relative = f".codex/{directory}/" + key_path.rsplit(marker, 1)[-1]
+                    break
+        if not relative and key_path.startswith("~/"):
+            relative = key_path[2:]
     relative = relative or path.name
     return repo_identity, relative.replace("\\", "/")
 

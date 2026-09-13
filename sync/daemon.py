@@ -1,5 +1,5 @@
 from __future__ import annotations
-import logging, os, signal, threading, time
+import hashlib, logging, os, signal, threading, time
 from pathlib import Path
 from .config import Config
 from .discovery import _project_roots, discover_sources
@@ -18,7 +18,10 @@ class SyncDaemon:
         self.running=False; self._wake=threading.Event(); self._observer=None
         self._source_cache=None; self._source_cache_at=0.0; self._source_cache_lock=threading.Lock()
         self._backfill_marker = self.config.state_dir / "initial-backfill.complete"
-        self._source_schema_marker = self.config.state_dir / "source-schema-v2.complete"
+        self._source_schema_marker = self.config.state_dir / "source-schema-v3.complete"
+        remote_fingerprint=hashlib.sha256(self.config.remote_url.rstrip("/").encode()).hexdigest()[:16]
+        self._remote_source_marker = self.config.state_dir / f"remote-source-v1-{remote_fingerprint}.complete"
+        self._remote_source_cursor_key = f"remote_source_v1_after_{remote_fingerprint}"
     def _discover_sources(self):
         # Watchers wake on every transcript append. Re-walking all project
         # directories for each turn is wasteful; cache the bounded discovery
@@ -106,6 +109,57 @@ class SyncDaemon:
             self._source_schema_marker.parent.mkdir(parents=True, exist_ok=True)
             self._source_schema_marker.write_text(str(time.time()), encoding="utf-8")
         return total
+
+    def reconcile_remote_sources(
+        self,
+        max_batches: int|None = 16,
+        *,
+        force: bool = False,
+        interruptible: bool = False,
+    ) -> dict:
+        """Queue only local identities absent from the durable remote source store."""
+        required=("meta_value","record_ids_after","enqueue_records","set_meta")
+        if any(not hasattr(self.store,name) for name in required):
+            return {"complete":True,"checked":0,"queued":0,"skipped":True}
+        if force:
+            self._remote_source_marker.unlink(missing_ok=True)
+            self.store.set_meta(self._remote_source_cursor_key,"")
+        if self._remote_source_marker.exists():
+            return {"complete":True,"checked":0,"queued":0}
+        cursor=self.store.meta_value(self._remote_source_cursor_key) or ""
+        checked=queued=batches=0
+        while max_batches is None or batches<max_batches:
+            if interruptible and (not self.running or self._wake.is_set()):
+                return {"complete":False,"checked":checked,"queued":queued,"interrupted":True}
+            identities=self.store.record_ids_after(cursor,5000)
+            if not identities:
+                complete=self.store.pending_count()==0
+                if complete:
+                    self._remote_source_marker.parent.mkdir(parents=True,exist_ok=True)
+                    self._remote_source_marker.write_text(str(time.time()),encoding="utf-8")
+                    self.store.set_meta(self._remote_source_cursor_key,"")
+                return {"complete":complete,"checked":checked,"queued":queued}
+            try:
+                missing=self.client.missing_source_identities(identities)
+            except Exception as exc:
+                log.warning("remote source inventory unavailable: %s",type(exc).__name__)
+                return {"complete":False,"checked":checked,"queued":queued,"error":type(exc).__name__}
+            queued+=self.store.enqueue_records(missing)
+            checked+=len(identities)
+            batches+=1
+            cursor=identities[-1]
+            self.store.set_meta(self._remote_source_cursor_key,cursor)
+        return {"complete":False,"checked":checked,"queued":queued}
+
+    def state_status(self) -> dict:
+        return {
+            "initial_backfill_complete":self._backfill_marker.exists(),
+            "source_schema_complete":self._source_schema_marker.exists(),
+            "remote_source_reconciliation":{
+                "complete":self._remote_source_marker.exists(),
+                "cursor_saved":bool(self.store.meta_value(self._remote_source_cursor_key)),
+            },
+        }
 
     def _start_watcher(self) -> None:
         """Wake the bounded scanner on local changes; polling remains the safety net."""
@@ -196,6 +250,7 @@ class SyncDaemon:
                 self._wake.wait(max(1,self.config.interval)); self._wake.clear()
                 continue
             self.scan_once()
+            inventory=self.reconcile_remote_sources(None if once else 16,interruptible=True)
             # A one-shot backfill must drain the durable queue completely when
             # the remote is available; otherwise the first startup would leave
             # most history pending until the next 5-minute pass.  The continuous
@@ -206,6 +261,8 @@ class SyncDaemon:
                 while self.running and self.store.pending_count():
                     if not self.flush_once():
                         break
+                if self.running and not self.store.pending_count():
+                    inventory=self.reconcile_remote_sources(1,interruptible=True)
             else:
                 for _ in range(8):
                     if not self.flush_once():
@@ -217,6 +274,7 @@ class SyncDaemon:
                         break
             if once: break
             if not self.running: break
-            self._wake.wait(max(1,self.config.interval)); self._wake.clear()
+            wait=1 if not inventory.get("complete") and inventory.get("checked") else max(1,self.config.interval)
+            self._wake.wait(wait); self._wake.clear()
         finally:
             self._stop_watcher()

@@ -98,6 +98,62 @@ def test_sync_methods_use_keychain_credentials_when_environment_is_empty(tmp_pat
     assert json.loads(requests[-1].data) == {"scope": "all"}
 
 
+def test_source_inventory_check_is_bounded_and_validated(tmp_path, monkeypatch):
+    monkeypatch.setenv("FUNES_API_TOKEN", "api-environment-value")
+    monkeypatch.setattr(client_module, "_keychain_token", lambda _service: "")
+    requests=[]
+
+    class Response:
+        status=200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self,*_):
+            return False
+
+        def read(self,_limit):
+            return json.dumps(
+                {"ok":True,"present":["present"],"missing":["missing"]}
+            ).encode()
+
+    def urlopen(req,**_kwargs):
+        requests.append(req)
+        return Response()
+
+    monkeypatch.setattr(client_module,"open_no_redirect",urlopen)
+    client=SyncClient(cfg(tmp_path))
+
+    assert client.missing_source_identities([]) == []
+    assert client.missing_source_identities(["present","missing","present"]) == ["missing"]
+    assert json.loads(requests[0].data) == {
+        "source_identities":["present","missing"]
+    }
+    assert requests[0].full_url.endswith("/sources/check")
+    with pytest.raises(ValueError,match="1-5000"):
+        client.missing_source_identities([str(value) for value in range(5001)])
+
+
+def test_source_inventory_check_rejects_inconsistent_response(tmp_path, monkeypatch):
+    monkeypatch.setenv("FUNES_API_TOKEN", "api-environment-value")
+    monkeypatch.setattr(client_module,"_keychain_token",lambda _service: "")
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self,*_):
+            return False
+
+        def read(self,_limit):
+            return b'{"ok":true,"present":["one"],"missing":[]}'
+
+    monkeypatch.setattr(client_module,"open_no_redirect",lambda *_args,**_kwargs: Response())
+
+    with pytest.raises(RuntimeError,match="inconsistent inventory"):
+        SyncClient(cfg(tmp_path)).missing_source_identities(["one","two"])
+
+
 def test_ingest_gzips_large_payload_and_can_be_disabled(tmp_path, monkeypatch):
     monkeypatch.setenv("FUNES_API_TOKEN", "api-environment-value")
     monkeypatch.setattr(client_module, "_keychain_token", lambda _service: "")

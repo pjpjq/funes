@@ -7,3 +7,7 @@ the daemon then delegates indexing/publishing to the native `funes index`/`funes
 (Lance vector + BM25 + rerank + TruffleHog gate). `FUNES_API_TOKEN` is read only from the
 environment/Keychain. Use `python -m sync run` for polling, `install/uninstall` for a macOS
 LaunchAgent, and `python -m sync.mcp_bridge` as a stdio recall/get bridge.
+
+The daemon also performs a resumable, remote-scoped source inventory through
+authenticated `POST /sources/check`. Only missing identities are re-queued; use
+`python -m sync reconcile` to force the same check after rebuilding a remote.

@@ -32,6 +32,7 @@ from service.server import NATIVE_SESSION_TYPES
 from service.server import prepare_ingest_documents as prepare_source_ingest_documents
 from service.server import queue_reindex as queue_source_reindex
 from service.server import stable_rrf
+from service.server import validate_source_identity_batch
 
 
 FUNES_BIN = os.getenv("FUNES_BIN", "/usr/local/bin/funes")
@@ -1569,6 +1570,24 @@ class Handler(BaseHTTPRequestHandler):
             if self.path == "/sync/status":
                 code, payload = ready_payload()
                 self.send_json(code, payload)
+                return
+            if self.path == "/sources/check":
+                app = source_app()
+                if app is None:
+                    self.send_json(
+                        503,
+                        {"ok": False, "error": "FUNES_STORAGE_REPO is not configured"},
+                    )
+                    return
+                if app.syncer.restoring or app.syncer.restore_failed:
+                    error = "restore_in_progress" if app.syncer.restoring else "restore_failed"
+                    self.send_json(503, {"ok": False, "error": error})
+                    return
+                identities = validate_source_identity_batch(obj.get("source_identities"))
+                present = app.store.existing_identities(identities)
+                present_set = set(present)
+                missing = [identity for identity in identities if identity not in present_set]
+                self.send_json(200, {"ok": True, "present": present, "missing": missing})
                 return
             if self.path == "/sync":
                 app = source_app()

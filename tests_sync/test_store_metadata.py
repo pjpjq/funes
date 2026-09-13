@@ -51,6 +51,65 @@ def test_metadata_only_change_is_queued_without_content_version_bump(tmp_path):
         store.close()
 
 
+def test_record_source_key_stays_consistent_with_updated_payload(tmp_path):
+    cfg = Config(tmp_path, tmp_path / ".state", tmp_path / "config.toml")
+    store = Store(config=cfg)
+    base = {
+        "record_id": "shared-record",
+        "kind": "codex_memory",
+        "path": "automation.toml",
+        "session_id": "",
+        "ordinal": 0,
+        "role": "system",
+        "text": "raw",
+        "raw_text": "raw",
+    }
+    try:
+        store.upsert_chunks([Chunk(**base, source_key="source-a")])
+        store.ack(["shared-record"])
+        store.upsert_chunks([Chunk(**base, source_key="source-b")])
+
+        row = store.db.execute(
+            "SELECT source_key,payload FROM records WHERE record_id='shared-record'"
+        ).fetchone()
+        assert row["source_key"] == "source-b"
+        assert json.loads(row["payload"])["source_key"] == "source-b"
+    finally:
+        store.close()
+
+
+def test_identical_rescan_repairs_inconsistent_record_source_column(tmp_path):
+    cfg = Config(tmp_path, tmp_path / ".state", tmp_path / "config.toml")
+    store = Store(config=cfg)
+    chunk = Chunk(
+        record_id="record",
+        source_key="expected-source",
+        kind="codex_memory",
+        path="memory.md",
+        session_id="",
+        ordinal=0,
+        role="system",
+        text="raw",
+        raw_text="raw",
+    )
+    try:
+        store.upsert_chunks([chunk])
+        store.ack(["record"])
+        store.db.execute(
+            "UPDATE records SET source_key='stale-source' WHERE record_id='record'"
+        )
+        store.db.commit()
+
+        store.upsert_chunks([chunk])
+
+        assert store.db.execute(
+            "SELECT source_key FROM records WHERE record_id='record'"
+        ).fetchone()[0] == "expected-source"
+        assert store.pending_count() == 1
+    finally:
+        store.close()
+
+
 def test_memory_identity_does_not_depend_on_mutable_classification():
     old = SimpleNamespace(
         kind="persistent", source_agent="unknown", source_type="persistent"
@@ -186,6 +245,46 @@ def test_ack_updates_last_successful_sync_atomically(tmp_path):
     reopened = Store(config=cfg)
     try:
         assert reopened.meta_value("last_successful_sync") == stamp
+    finally:
+        reopened.close()
+
+
+def test_record_inventory_cursor_and_missing_queue_are_restart_safe(tmp_path):
+    cfg = Config(tmp_path, tmp_path / ".state", tmp_path / "config.toml")
+    store = Store(config=cfg)
+    try:
+        for record_id in ("c", "a", "b"):
+            store.upsert_chunks(
+                [
+                    Chunk(
+                        record_id=record_id,
+                        source_key="source",
+                        kind="codex",
+                        path="session.jsonl",
+                        session_id="session",
+                        ordinal=0,
+                        role="user",
+                        text=record_id,
+                        raw_text=record_id,
+                    )
+                ]
+            )
+        store.ack(["a", "b", "c"])
+
+        assert store.record_ids_after("", 2) == ["a", "b"]
+        assert store.record_ids_after("b", 2) == ["c"]
+        assert store.enqueue_records(["b", "missing", "b"]) == 1
+        assert store.pending_count() == 1
+        assert store.enqueue_records(["b"]) == 0
+        store.set_meta("remote_source_cursor", "b")
+    finally:
+        store.close()
+
+    reopened = Store(config=cfg)
+    try:
+        assert reopened.meta_value("remote_source_cursor") == "b"
+        assert reopened.record_ids_after("b", 2) == ["c"]
+        assert reopened.pending_count() == 1
     finally:
         reopened.close()
 

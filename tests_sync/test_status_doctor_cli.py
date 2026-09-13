@@ -89,6 +89,10 @@ def test_status_reports_exact_counts_and_safe_remote_state(
         "ready": True,
     }
     assert status["launch_agents"]["com.funes.sync"]["loaded"] is True
+    assert status["backfill"]["remote_source_reconciliation"] == {
+        "complete": False,
+        "cursor_saved": False,
+    }
     for secret in ("remote-secret", "query-secret", "native-secret", "native-query"):
         assert secret not in raw
 
@@ -167,6 +171,7 @@ def test_doctor_checks_paths_config_auth_translation_watcher_launchd_and_native(
     assert doctor["native"]["binary_found"] is True
     assert doctor["native"]["binary_executable"] is True
     assert doctor["native"]["index_exists"] is True
+    assert doctor["backfill"]["remote_source_reconciliation"]["complete"] is False
     for secret in (
         "keychain-only-secret",
         "translation-secret",
@@ -249,3 +254,59 @@ def test_doctor_reports_wrong_shape_config_without_traceback(
     assert result["config"]["parseable"] is True
     assert result["config"]["loadable"] is False
     assert result["config"]["load_error"] == "AttributeError"
+
+
+def test_reconcile_remote_error_does_not_drain_forever(
+    tmp_path, monkeypatch, capsys
+):
+    config=_config(tmp_path)
+    monkeypatch.setattr(cli.Config,"load",classmethod(lambda cls,home=None: config))
+
+    class Daemon:
+        def __init__(self,_config,_store):
+            pass
+
+        def reconcile_remote_sources(self,_batches,force=False):
+            assert force is True
+            return {"complete":False,"checked":0,"queued":0,"error":"HTTPError"}
+
+        def drain(self,wait=True):
+            raise AssertionError("error path must not drain")
+
+    monkeypatch.setattr(cli,"SyncDaemon",Daemon)
+
+    assert cli.main(["reconcile"]) == 2
+    result=json.loads(capsys.readouterr().out)
+    assert result["error"] == "HTTPError"
+    assert result["remaining"] == 0
+
+
+def test_reconcile_preserves_inventory_totals_after_completion_check(
+    tmp_path, monkeypatch, capsys
+):
+    config=_config(tmp_path)
+    monkeypatch.setattr(cli.Config,"load",classmethod(lambda cls,home=None: config))
+
+    class Daemon:
+        def __init__(self,_config,_store):
+            self.calls=0
+
+        def reconcile_remote_sources(self,_batches,force=False):
+            self.calls+=1
+            if self.calls == 1:
+                assert force is True
+                return {"complete":False,"checked":4,"queued":2}
+            return {"complete":True,"checked":0,"queued":0}
+
+        def drain(self,wait=True):
+            assert wait is False
+            return 2
+
+    monkeypatch.setattr(cli,"SyncDaemon",Daemon)
+
+    assert cli.main(["reconcile"]) == 0
+    result=json.loads(capsys.readouterr().out)
+    assert result["complete"] is True
+    assert result["checked"] == 4
+    assert result["queued"] == 2
+    assert result["flushed"] == 2

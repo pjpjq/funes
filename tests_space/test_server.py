@@ -657,18 +657,75 @@ def _source_app(tmp_path, durable=True):
     )
 
 
-def _post(server, path, payload):
+def _post(server, path, payload, token="test-token"):
     conn = HTTPConnection(*server.server_address)
     conn.request(
         "POST",
         path,
         json.dumps(payload, ensure_ascii=False).encode(),
-        {"Authorization": "Bearer test-token", "Content-Type": "application/json"},
+        {"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
     )
     response = conn.getresponse()
     body = json.loads(response.read())
     conn.close()
     return response.status, body
+
+
+def test_sources_check_requires_auth_and_returns_no_raw_payload(monkeypatch, tmp_path):
+    app = _source_app(tmp_path)
+    secret = "raw-secret-must-not-leak"
+    app.store.ingest([{"source_identity": "present", "raw_text": secret}])
+    monkeypatch.setattr(bridge, "SOURCE_APP", app)
+    monkeypatch.setattr(bridge, "TOKEN", "test-token")
+    server = ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    payload = {"source_identities": ["missing", "present", "missing", "present"]}
+    try:
+        status, _body = _post(server, "/sources/check", payload, token="bad")
+        assert status == 401
+        status, body = _post(server, "/sources/check", payload)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+        app.store.close()
+    assert status == 200
+    assert body == {"ok": True, "present": ["present"], "missing": ["missing"]}
+    assert secret not in json.dumps(body)
+
+
+def test_sources_check_validates_bounds_and_source_restore_availability(
+    monkeypatch, tmp_path
+):
+    app = _source_app(tmp_path)
+    monkeypatch.setattr(bridge, "SOURCE_APP", app)
+    monkeypatch.setattr(bridge, "TOKEN", "test-token")
+    server = ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        status, body = _post(server, "/sources/check", {"source_identities": [1]})
+        assert status == 400
+        assert body["error"] == "source_identities must contain only non-empty strings"
+        status, body = _post(
+            server,
+            "/sources/check",
+            {"source_identities": [f"id-{index}" for index in range(5001)]},
+        )
+        assert status == 400
+        assert "at most 5000" in body["error"]
+        app.syncer.restore_failed = True
+        status, body = _post(
+            server, "/sources/check", {"source_identities": ["present"]}
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+        app.store.close()
+    assert status == 503
+    assert body == {"ok": False, "error": "restore_failed"}
 
 
 def _post_bytes(server, path, body, headers=None):

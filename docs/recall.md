@@ -9,9 +9,20 @@ them on its own — but they work the same from a terminal.
 funes recall "why did we switch off the streaming parser"
 ```
 
-Retrieval is one pipeline: hybrid search (vector + BM25, fused by reciprocal rank) → cross-encoder
-rerank → recency reweight → neighbor expansion. What comes back is the **actual passage from the
-actual turn**, not a summary written about it.
+Retrieval is one pipeline: hybrid search (vector + raw BM25, fused by reciprocal rank) → optional
+rerank → recency reweight → neighbor expansion. BM25 receives the unchanged query so exact terms
+remain available to the lexical branch; RRF combines its rank with the vector branch without mixing
+their incomparable raw scores. What comes back is the **actual passage from the actual turn**, not a
+summary written about it.
+
+The embedding provider is selected at runtime with `FUNES_EMBEDDING_PROVIDER=local|voyage`.
+`local` preserves the existing pinned BGE behavior. `voyage` sends original multilingual passages
+with `input_type=document` at index time and the original query with `input_type=query` at recall
+time. Production sets `FUNES_RETRIEVAL_LANGUAGE_MODE=raw`, so there is no translation or English
+shadow-text path. Reranking is independently selected with
+`FUNES_RERANK_PROVIDER=none|local|voyage`; production defaults to `none`, retaining the fused RRF
+order before recency reweighting. See [configuration](configuration.md#retrieval-providers) for the
+full profile and credential contract.
 
 `funes recall` prints one stable, parseable layout — the **agent format** — everywhere, terminal or
 pipe. It's shaped for an agent to read, but it's the raw evidence for you too. If you want an
@@ -41,7 +52,7 @@ presentation; don't parse it loosely.
 | Flag | Default | Meaning |
 | --- | --- | --- |
 | `-k` | 8 | hits returned |
-| `--candidates` | 30 | fused pool reranked before the top-k cut |
+| `--candidates` | 30 | fused pool retained before optional reranking and the top-k cut |
 | `--half-life` | 30 | recency decay in days (a hit this old keeps half its weight); 0 disables |
 | `--neighbors` | 1 | adjacent chunks (by seq) attached per hit; 0 disables |
 | `--type` | — | restrict to `text \| thinking \| tool_use \| tool_result` |
@@ -98,6 +109,10 @@ funes recall "why is funes append-only" --memory huggingface/funes-memory
 Recall over a remote caches whole files to local disk, so warm calls run at local speed — see
 [hub-caching.md](hub-caching.md). Publishing your own memory to read this way is covered in
 [push.md](push.md).
+
+By default, an unreachable remote may fall back to the local memory for offline use. Set
+`FUNES_NATIVE_FALLBACK=false` to disable that substitution and surface the remote error instead;
+production uses this setting so a requested remote is never silently replaced by local data.
 
 ## See also
 

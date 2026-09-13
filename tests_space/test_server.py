@@ -2032,6 +2032,111 @@ def test_http_rrf_preserves_exact_session_rank_before_native(monkeypatch):
 
 
 @pytest.mark.parametrize(
+    ("requested_limit", "expected_identities"),
+    ((2, ["first", "second"]), (0, ["first"]), (-1, ["first"])),
+)
+def test_http_exact_sidecar_skips_slow_native(
+    monkeypatch, requested_limit, expected_identities
+):
+    sidecar = [[
+        {"source_identity": "first", "raw_text": "previous_response_id exact raw"},
+        {"source_identity": "second", "raw_text": "second raw"},
+    ]]
+    app = SimpleNamespace(syncer=SimpleNamespace(restoring=False, restore_failed=False))
+    monkeypatch.setattr(bridge, "SOURCE_APP", app)
+    monkeypatch.setattr(bridge, "TOKEN", "test-token")
+    monkeypatch.setattr(bridge, "LANGUAGE_MODE", "auto")
+    monkeypatch.setattr(
+        bridge,
+        "search_source_rankings",
+        lambda *_args, **_kwargs: ("rewritten query", sidecar, []),
+    )
+    monkeypatch.setattr(
+        bridge,
+        "recall",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("an exact sidecar page must not wait for native")
+        ),
+    )
+    server = ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        status, body = _post(
+            server,
+            "/search",
+            {"query": "previous_response_id 为什么失败？", "limit": requested_limit},
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert status == 200
+    assert [item["source_identity"] for item in body["results"]] == expected_identities
+
+
+@pytest.mark.parametrize(
+    ("query", "weak_raw"),
+    (
+        ("之前 API 为什么失败？", "capital allocation notes"),
+        ("之前 error: 为什么失败？", "error details"),
+        ("之前 src/ 为什么失败？", "src code"),
+        ("之前 foo* 为什么失败？", "foo result"),
+    ),
+)
+def test_http_weak_cjk_sidecar_uses_short_native_budget(
+    monkeypatch, query, weak_raw
+):
+    sidecar = [[
+        {"source_identity": "weak-first", "raw_text": weak_raw},
+        {"source_identity": "weak-second", "raw_text": "另一个弱匹配"},
+    ]]
+    timeouts = []
+    app = SimpleNamespace(syncer=SimpleNamespace(restoring=False, restore_failed=False))
+    monkeypatch.setattr(bridge, "SOURCE_APP", app)
+    monkeypatch.setattr(bridge, "TOKEN", "test-token")
+    monkeypatch.setattr(bridge, "LANGUAGE_MODE", "auto")
+    monkeypatch.setattr(bridge, "CJK_NATIVE_TIMEOUT", 5.0)
+    monkeypatch.setattr(
+        bridge,
+        "search_source_rankings",
+        lambda *_args, **_kwargs: ("rewritten query", sidecar, []),
+    )
+
+    def native_recall(*_args, **kwargs):
+        timeouts.append(kwargs["timeout"])
+        return "native"
+
+    monkeypatch.setattr(bridge, "recall", native_recall)
+    monkeypatch.setattr(
+        bridge,
+        "materialize_native_results",
+        lambda *_args, **_kwargs: [
+            {"source_identity": "semantic", "raw_text": "强语义结果"}
+        ],
+    )
+    server = ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        status, body = _post(
+            server,
+            "/search",
+            {"query": query, "limit": 2},
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert status == 200
+    assert len(timeouts) == 1
+    assert 0 < timeouts[0] <= 5.0
+    assert any(item["source_identity"] == "semantic" for item in body["results"])
+
+
+@pytest.mark.parametrize(
     ("native_error", "degraded"),
     (
         (bridge.NativeMcpError("timed out"), "native_mcp_unavailable"),

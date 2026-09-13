@@ -61,6 +61,13 @@ try:
     HTTP_NATIVE_TIMEOUT = min(50.0, max(0.1, float(os.getenv("FUNES_HTTP_NATIVE_TIMEOUT", "12"))))
 except ValueError:
     HTTP_NATIVE_TIMEOUT = 12.0
+try:
+    CJK_NATIVE_TIMEOUT = min(
+        HTTP_NATIVE_TIMEOUT,
+        max(0.1, float(os.getenv("FUNES_CJK_NATIVE_TIMEOUT", "5"))),
+    )
+except ValueError:
+    CJK_NATIVE_TIMEOUT = min(HTTP_NATIVE_TIMEOUT, 5.0)
 PROMPT_VERSION = "funes-retrieval-v1"
 LANGUAGE_MODE = os.getenv("FUNES_RETRIEVAL_LANGUAGE_MODE", "auto").lower()
 INDEX_LOCK = threading.Lock()
@@ -678,6 +685,39 @@ def cjk_ratio(text: str) -> float:
     if not text:
         return 0.0
     return sum("\u4e00" <= c <= "\u9fff" for c in text) / max(1, len(text))
+
+
+def technical_query_entities(text: str) -> tuple[str, ...]:
+    """Return distinctive mixed-language identifiers suitable for an exact hit."""
+    entities = []
+    for token in re.findall(r"[A-Za-z][A-Za-z0-9_.*:/-]{1,}", text):
+        normalized = token.lower().rstrip("*:-/")
+        if (
+            "_" in normalized
+            or "/" in normalized
+            or ":" in normalized
+            or any(char.isdigit() for char in normalized)
+        ):
+            if normalized and normalized not in entities:
+                entities.append(normalized)
+    return tuple(entities)
+
+
+def sidecar_has_exact_entities(query: str, results: list[dict]) -> bool:
+    entities = technical_query_entities(query)
+    if not entities:
+        return False
+    return any(
+        all(
+            re.search(
+                rf"(?<![A-Za-z0-9_]){re.escape(entity)}(?![A-Za-z0-9_])",
+                str(item.get("raw_text", "")),
+                re.IGNORECASE,
+            )
+            for entity in entities
+        )
+        for item in results[:3]
+    )
 
 
 def query_text(raw: str) -> str:
@@ -1648,7 +1688,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not raw_query:
                     self.send_json(400, {"error": "query is required"})
                     return
-                limit = min(int(obj.get("limit", obj.get("k", 8))), 50)
+                limit = max(1, min(int(obj.get("limit", obj.get("k", 8))), 50))
                 facet_values = obj.get("facets") or {}
                 if not isinstance(facet_values, dict):
                     raise ValueError("facets must be an object")
@@ -1677,6 +1717,16 @@ class Handler(BaseHTTPRequestHandler):
                 source_query, source_rankings, session_fallback_rankings = (
                     search_source_rankings(raw_query, limit, filters, harness)
                 )
+                sidecar_results = stable_rrf(source_rankings, limit)
+                cjk_query = (
+                    LANGUAGE_MODE == "auto"
+                    and cjk_ratio(raw_query) >= TRANSLATION_THRESHOLD
+                )
+                exact_sidecar = (
+                    cjk_query
+                    and len(sidecar_results) >= min(limit, 3)
+                    and sidecar_has_exact_entities(raw_query, sidecar_results)
+                )
                 # Reuse the source-side query rewrite for native semantic
                 # retrieval. query_text is deterministic fallback only, so a
                 # search can make at most one provider request.
@@ -1685,7 +1735,7 @@ class Handler(BaseHTTPRequestHandler):
                 # search bounded so the CPU Space does not spend its entire
                 # request window reranking broad generic terms.
                 tuning = {}
-                if LANGUAGE_MODE == "auto" and cjk_ratio(raw_query) >= TRANSLATION_THRESHOLD:
+                if cjk_query:
                     tuning = {
                         "candidates": max(6, min(20, limit * 3)),
                         "neighbors": 0,
@@ -1706,8 +1756,16 @@ class Handler(BaseHTTPRequestHandler):
                     if name in filters:
                         tuning[name] = filters[name]
                 # Date/role filtering remains authoritative in the sidecar.
-                native_allowed = not any(key in filters for key in ("role", "since", "until"))
-                native_deadline = time.monotonic() + HTTP_NATIVE_TIMEOUT
+                native_allowed = (
+                    not exact_sidecar
+                    and not any(key in filters for key in ("role", "since", "until"))
+                )
+                native_budget = (
+                    CJK_NATIVE_TIMEOUT
+                    if cjk_query and sidecar_results
+                    else HTTP_NATIVE_TIMEOUT
+                )
+                native_deadline = time.monotonic() + native_budget
                 try:
                     # The native CLI defaults to 30 fused candidates, recency
                     # weighting, and neighbor expansion. Those defaults are
@@ -1756,8 +1814,11 @@ class Handler(BaseHTTPRequestHandler):
                 # Source rankings already preserve raw/rewrite and cross-type
                 # order. Always fuse them with native semantic hits so exact
                 # identifiers are not hidden by merely related passages.
-                rankings = [*source_rankings, results]
-                results = stable_rrf(rankings, limit)
+                results = (
+                    stable_rrf([*source_rankings, results], limit)
+                    if results
+                    else sidecar_results
+                )
                 results_text = "\n\n".join(
                     str(item.get("raw_text", ""))
                     for item in results

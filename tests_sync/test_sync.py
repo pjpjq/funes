@@ -64,6 +64,81 @@ def test_memory_only_companion_still_discovers_raw_agent_sessions(tmp_path):
     assert {"codex", "pi", "claude"}.issubset(kinds)
 
 
+def test_daemon_caches_discovery_until_invalidated(tmp_path, monkeypatch):
+    from sync.discovery import Source
+
+    c = cfg(tmp_path)
+    memory = tmp_path / "memory.md"
+    memory.write_text("stable memory", encoding="utf-8")
+    source = Source("memory:~/memory.md", "persistent", memory, c.device_id)
+    calls = []
+
+    def discover(_config):
+        calls.append(True)
+        return [source]
+
+    monkeypatch.setattr("sync.daemon.discover_sources", discover)
+    store = Store(config=c)
+    daemon = SyncDaemon(c, store, type("Client", (), {})())
+
+    daemon.scan_once()
+    daemon.scan_once()
+    assert len(calls) == 1
+
+    daemon._invalidate_source_cache()
+    daemon.scan_once()
+    assert len(calls) == 2
+    store.close()
+
+
+def test_directory_create_invalidates_discovery_cache_and_wakes(tmp_path):
+    c = cfg(tmp_path)
+    store = Store(config=c)
+    daemon = SyncDaemon(c, store, type("Client", (), {})())
+    daemon._source_cache = ()
+    daemon._source_cache_at = time.monotonic()
+    event = type(
+        "Event",
+        (),
+        {
+            "src_path": str(tmp_path / ".codex/sessions/imported"),
+            "dest_path": "",
+            "event_type": "created",
+            "is_directory": True,
+        },
+    )()
+
+    daemon._handle_filesystem_event(event)
+
+    assert daemon._source_cache is None
+    assert daemon._wake.is_set()
+    store.close()
+
+
+def test_cross_boundary_directory_move_invalidates_discovery_cache(tmp_path):
+    c = cfg(tmp_path)
+    store = Store(config=c)
+    daemon = SyncDaemon(c, store, type("Client", (), {})())
+    daemon._source_cache = ()
+    daemon._source_cache_at = time.monotonic()
+    event = type(
+        "Event",
+        (),
+        {
+            "src_path": str(tmp_path / "logs/imported"),
+            "dest_path": str(tmp_path / ".codex/sessions/imported"),
+            "event_type": "moved",
+            "is_directory": True,
+        },
+    )()
+
+    daemon._handle_filesystem_event(event)
+
+    assert daemon._source_cache is None
+    assert daemon._wake.is_set()
+    store.close()
+
+
 def test_native_primary_daemon_does_not_queue_http_records(tmp_path):
     class Native:
         def __init__(self):

@@ -1,6 +1,7 @@
 import gzip
 import json
 import os
+import sqlite3
 import tempfile
 import threading
 import unittest
@@ -16,10 +17,10 @@ from service.server import QUERY_PROMPT_VERSION, QUERY_RETRIEVAL_PROMPT, RETRIEV
 class ServiceTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.old = {k: os.environ.get(k) for k in ("FUNES_DATA_DIR", "FUNES_AUTH_TOKEN", "FUNES_API_TOKEN", "FUNES_STORAGE_KEY", "FUNES_STORAGE_REPO", "FUNES_SNAPSHOT_FILE", "HF_TOKEN", "FUNES_REQUIRE_DURABLE_ACK", "FUNES_ALLOW_EMPTY_REMOTE", "FUNES_MAX_BODY_BYTES", "TRANSLATION_BASE_URL", "TRANSLATION_API_KEY", "TRANSLATION_MODEL", "TRANSLATION_MAX_PER_INGEST", "TRANSLATION_QUERY_MAX_TOKENS", "TRANSLATION_RECONCILE_INTERVAL", "RETURN_RETRIEVAL_TEXT")}
+        self.old = {k: os.environ.get(k) for k in ("FUNES_DATA_DIR", "FUNES_AUTH_TOKEN", "FUNES_API_TOKEN", "FUNES_STORAGE_KEY", "FUNES_STORAGE_REPO", "FUNES_SNAPSHOT_FILE", "HF_TOKEN", "FUNES_REQUIRE_DURABLE_ACK", "FUNES_ALLOW_EMPTY_REMOTE", "FUNES_MAX_BODY_BYTES", "FUNES_RETRIEVAL_LANGUAGE_MODE", "TRANSLATION_BASE_URL", "TRANSLATION_API_KEY", "TRANSLATION_MODEL", "TRANSLATION_MAX_PER_INGEST", "TRANSLATION_QUERY_MAX_TOKENS", "TRANSLATION_RECONCILE_INTERVAL", "RETURN_RETRIEVAL_TEXT")}
         os.environ["FUNES_DATA_DIR"] = self.tmp.name
         os.environ["FUNES_AUTH_TOKEN"] = "test-token"
-        for k in ("FUNES_API_TOKEN", "FUNES_STORAGE_KEY", "FUNES_STORAGE_REPO", "FUNES_SNAPSHOT_FILE", "HF_TOKEN", "FUNES_REQUIRE_DURABLE_ACK", "FUNES_ALLOW_EMPTY_REMOTE", "FUNES_MAX_BODY_BYTES", "TRANSLATION_BASE_URL", "TRANSLATION_API_KEY", "TRANSLATION_MODEL", "TRANSLATION_MAX_PER_INGEST", "TRANSLATION_QUERY_MAX_TOKENS", "TRANSLATION_RECONCILE_INTERVAL", "RETURN_RETRIEVAL_TEXT"):
+        for k in ("FUNES_API_TOKEN", "FUNES_STORAGE_KEY", "FUNES_STORAGE_REPO", "FUNES_SNAPSHOT_FILE", "HF_TOKEN", "FUNES_REQUIRE_DURABLE_ACK", "FUNES_ALLOW_EMPTY_REMOTE", "FUNES_MAX_BODY_BYTES", "FUNES_RETRIEVAL_LANGUAGE_MODE", "TRANSLATION_BASE_URL", "TRANSLATION_API_KEY", "TRANSLATION_MODEL", "TRANSLATION_MAX_PER_INGEST", "TRANSLATION_QUERY_MAX_TOKENS", "TRANSLATION_RECONCILE_INTERVAL", "RETURN_RETRIEVAL_TEXT"):
             os.environ.pop(k, None)
 
     def tearDown(self):
@@ -40,6 +41,132 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(store.count(), 1)
         self.assertEqual(store.get("a.md")["raw_text"], "hello revised")
         store.close()
+
+    def test_legacy_retrieval_only_fts_migrates_to_raw_primary_once(self):
+        store = Store(self.tmp.name)
+        store.ingest(
+            [{
+                "source_identity": "legacy-raw",
+                "raw_text": "raw-only-needle",
+                "retrieval_text": "unrelated shadow",
+            }]
+        )
+        with store.lock, store.conn:
+            for trigger in ("memories_ai", "memories_ad", "memories_au"):
+                store.conn.execute(f"DROP TRIGGER {trigger}")
+            store.conn.execute("DROP TABLE memories_fts")
+            store.conn.execute(
+                """CREATE VIRTUAL TABLE memories_fts USING fts5(
+                retrieval_text, content='memories', content_rowid='id', tokenize='unicode61'
+                )"""
+            )
+            store.conn.execute(
+                """CREATE TRIGGER memories_ai AFTER INSERT ON memories BEGIN
+                INSERT INTO memories_fts(rowid, retrieval_text) VALUES (new.id, new.retrieval_text);
+                END"""
+            )
+            store.conn.execute(
+                """CREATE TRIGGER memories_ad AFTER DELETE ON memories BEGIN
+                INSERT INTO memories_fts(memories_fts, rowid, retrieval_text)
+                VALUES('delete', old.id, old.retrieval_text);
+                END"""
+            )
+            store.conn.execute(
+                """CREATE TRIGGER memories_au AFTER UPDATE ON memories BEGIN
+                INSERT INTO memories_fts(memories_fts, rowid, retrieval_text)
+                VALUES('delete', old.id, old.retrieval_text);
+                INSERT INTO memories_fts(rowid, retrieval_text) VALUES (new.id, new.retrieval_text);
+                END"""
+            )
+            store.conn.execute("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')")
+        store.close()
+
+        migrated = Store(self.tmp.name)
+        try:
+            columns = [
+                row[1]
+                for row in migrated.conn.execute("PRAGMA table_info(memories_fts)")
+            ]
+            self.assertEqual(
+                columns, ["raw_text", "retrieval_text", "search_identifiers"]
+            )
+            self.assertEqual(
+                migrated.search("raw-only-needle")[0]["source_identity"],
+                "legacy-raw",
+            )
+        finally:
+            migrated.close()
+
+        reopened = Store(self.tmp.name)
+        try:
+            self.assertEqual(
+                [row[1] for row in reopened.conn.execute("PRAGMA table_info(memories_fts)")],
+                ["raw_text", "retrieval_text", "search_identifiers"],
+            )
+        finally:
+            reopened.close()
+
+    def test_bm25_prefers_raw_match_over_retrieval_shadow_match(self):
+        store = Store(self.tmp.name)
+        store.ingest(
+            [
+                {
+                    "source_identity": "raw-hit",
+                    "raw_text": "primaryneedle in original text",
+                    "retrieval_text": "unrelated shadow",
+                },
+                {
+                    "source_identity": "shadow-hit",
+                    "raw_text": "unrelated original",
+                    "retrieval_text": "primaryneedle in derived shadow",
+                },
+            ]
+        )
+        try:
+            self.assertEqual(
+                [item["source_identity"] for item in store.search("primaryneedle")],
+                ["raw-hit", "shadow-hit"],
+            )
+        finally:
+            store.close()
+
+    def test_search_can_disable_broad_scans_without_losing_indexed_hits(self):
+        store = Store(self.tmp.name)
+        store.ingest(
+            [
+                {
+                    "source_identity": "raw-hit",
+                    "raw_text": "primaryneedle appears only in raw source",
+                    "retrieval_text": "unrelated shadow",
+                },
+                {
+                    "source_identity": "identifier-hit",
+                    "raw_text": "讨论通过Tailscale连接办公室网络",
+                },
+            ]
+        )
+        statements = []
+        store.conn.set_trace_callback(statements.append)
+        try:
+            self.assertEqual(
+                store.search("primaryneedle", allow_broad_scan=False)[0][
+                    "source_identity"
+                ],
+                "raw-hit",
+            )
+            self.assertEqual(
+                store.search(
+                    "之前的 Tailscale 延迟", allow_broad_scan=False
+                )[0]["source_identity"],
+                "identifier-hit",
+            )
+            self.assertEqual(
+                store.search('没有匹配 "', allow_broad_scan=False), []
+            )
+        finally:
+            store.conn.set_trace_callback(None)
+            store.close()
+        self.assertFalse(any(" LIKE " in sql.upper() for sql in statements))
 
     def test_translation_defaults_to_background_only(self):
         store = Store(self.tmp.name)
@@ -191,6 +318,41 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(item["native_index_status"], "held_secret")
         self.assertIsNone(item["native_index_error"])
         store.close()
+
+    def test_restore_does_not_regress_new_profile_terminal_checkpoint(self):
+        store = Store(self.tmp.name)
+        base = {
+            "source_identity": "profile-monotonic",
+            "source_version": "raw-v1",
+            "raw_text": "durable raw",
+            "translation_status": "skipped_raw_mode",
+        }
+        old_profile = {
+            **base,
+            "native_index_version": "old-version",
+            "native_index_status": "indexed",
+            "native_index_profile": "old-profile",
+            "native_indexed_at": "2026-09-13T01:00:00Z",
+        }
+        new_profile = {
+            **base,
+            "native_index_version": "new-version",
+            "native_index_status": "indexed",
+            "native_index_profile": "new-profile",
+            "native_indexed_at": "2026-09-13T02:00:00.123456+00:00",
+        }
+        store.ingest([old_profile])
+        store.ingest([new_profile])
+        store.restore_documents([old_profile])
+        try:
+            item = store.get("profile-monotonic")
+            self.assertEqual(item["native_index_version"], "new-version")
+            self.assertEqual(item["native_index_profile"], "new-profile")
+            self.assertEqual(
+                item["native_indexed_at"], "2026-09-13T02:00:00.123456+00:00"
+            )
+        finally:
+            store.close()
 
     def test_multiple_chunks_same_source_path(self):
         store = Store(self.tmp.name)
@@ -425,7 +587,7 @@ class ServiceTests(unittest.TestCase):
         tr = Translator(store)
         self.assertEqual(tr.rewrite("  中文   查询 "), "中文 查询")
         # Configure an unreachable endpoint: retries must fall back without raising.
-        os.environ.update(TRANSLATION_BASE_URL="http://127.0.0.1:1", TRANSLATION_API_KEY="x", TRANSLATION_MODEL="m")
+        os.environ.update(FUNES_RETRIEVAL_LANGUAGE_MODE="auto", TRANSLATION_BASE_URL="http://127.0.0.1:1", TRANSLATION_API_KEY="x", TRANSLATION_MODEL="m")
         tr = Translator(store)
         self.assertEqual(tr.rewrite("中文 查询"), "中文 查询")
         store.translation_put(tr._cache_key("中文 查询"), "cached words")
@@ -469,8 +631,8 @@ class ServiceTests(unittest.TestCase):
         store.conn.set_trace_callback(None)
         self.assertEqual([item["source_identity"] for item in results], ["target"])
         traced = "\n".join(statements).upper()
-        self.assertIn("LIKE '%TAILSCALE%'", traced)
-        self.assertNotIn("LIKE '%之%'", traced)
+        self.assertIn("MATCH '\"TAILSCALE\"'", traced)
+        self.assertNotIn(" LIKE ", traced)
 
         statements.clear()
         store.conn.set_trace_callback(statements.append)
@@ -483,8 +645,8 @@ class ServiceTests(unittest.TestCase):
             [item["source_identity"] for item in malformed_results], ["target"]
         )
         malformed_trace = "\n".join(statements).upper()
-        self.assertIn("LIKE '%TAILSCALE%'", malformed_trace)
-        self.assertNotIn("LIKE '%之前 TAILSCALE", malformed_trace)
+        self.assertIn("MATCH '\"TAILSCALE\"'", malformed_trace)
+        self.assertNotIn(" LIKE ", malformed_trace)
         store.close()
 
     def test_chinese_technical_fts_skips_like_when_one_hit_covers_all_terms(self):
@@ -614,6 +776,7 @@ class ServiceTests(unittest.TestCase):
     def test_translation_cache_key_is_hashed_and_permanent_error_opens_circuit(self):
         store = Store(self.tmp.name)
         os.environ.update(
+            FUNES_RETRIEVAL_LANGUAGE_MODE="auto",
             TRANSLATION_BASE_URL="https://provider.example/v1",
             TRANSLATION_API_KEY="test-key",
             TRANSLATION_MODEL="test-model",
@@ -634,6 +797,7 @@ class ServiceTests(unittest.TestCase):
     def test_query_rewrite_rejects_hallucinations_and_does_not_cache_them(self):
         store = Store(self.tmp.name)
         os.environ.update(
+            FUNES_RETRIEVAL_LANGUAGE_MODE="auto",
             TRANSLATION_BASE_URL="https://provider.example/v1",
             TRANSLATION_API_KEY="test-key",
             TRANSLATION_MODEL="test-model",
@@ -679,6 +843,7 @@ class ServiceTests(unittest.TestCase):
     def test_query_rewrite_uses_query_prompt_token_limit_and_versioned_cache(self):
         store = Store(self.tmp.name)
         os.environ.update(
+            FUNES_RETRIEVAL_LANGUAGE_MODE="auto",
             TRANSLATION_BASE_URL="https://provider.example/v1",
             TRANSLATION_API_KEY="test-key",
             TRANSLATION_MODEL="test-model",
@@ -723,6 +888,7 @@ class ServiceTests(unittest.TestCase):
     def test_document_normalization_keeps_original_prompt_and_english_only_shadow(self):
         store = Store(self.tmp.name)
         os.environ.update(
+            FUNES_RETRIEVAL_LANGUAGE_MODE="auto",
             TRANSLATION_BASE_URL="https://provider.example/v1",
             TRANSLATION_API_KEY="test-key",
             TRANSLATION_MODEL="test-model",
@@ -787,10 +953,14 @@ class ServiceTests(unittest.TestCase):
                 "retrieval_updated_at": "2026-09-13T01:00:00Z",
                 "native_index_version": "canonical-v1",
                 "native_index_status": "indexed",
+                "native_index_profile": "profile-v1",
+                "native_index_memory": "memory-v1",
                 "native_indexed_at": "2026-09-13T02:00:00Z",
                 "native_index_error": None,
             }]
         )
+        profile = {"fingerprint": "profile-v1"}
+        before = source.native_index_checkpoint(profile, "memory-v1")
         snapshot = Path(self.tmp.name) / "state.jsonl.gz"
         source.snapshot(snapshot)
         second_dir = tempfile.TemporaryDirectory()
@@ -800,8 +970,404 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(item["retrieval_updated_at"], "2026-09-13T01:00:00Z")
         self.assertEqual(item["native_index_version"], "canonical-v1")
         self.assertEqual(item["native_index_status"], "indexed")
+        self.assertEqual(item["native_index_profile"], "profile-v1")
+        self.assertEqual(item["native_index_memory"], "memory-v1")
         self.assertEqual(item["native_indexed_at"], "2026-09-13T02:00:00Z")
+        with gzip.open(snapshot, "rt", encoding="utf-8") as stream:
+            state_lines = [
+                json.loads(line)
+                for line in stream
+                if '"_funes_record": "native_index_state"' in line
+            ]
+        self.assertEqual(len(state_lines), 1)
+        self.assertEqual(state_lines[0]["state_version"], 1)
+        self.assertNotIn("raw_text", state_lines[0])
+        after = target.native_index_checkpoint(profile, "memory-v1")
+        self.assertEqual(after["revision"], before["revision"])
+        self.assertEqual(after["index_fingerprint"], before["index_fingerprint"])
         source.close(); target.close(); second_dir.cleanup()
+
+    def test_restore_builds_fts_exactly_once(self):
+        source = Store(self.tmp.name)
+        source.ingest([{"source_identity": "one", "raw_text": "single build"}])
+        snapshot = Path(self.tmp.name) / "single-build.jsonl.gz"
+        source.snapshot(snapshot)
+        directory = tempfile.TemporaryDirectory()
+        target = Store(directory.name)
+        statements = []
+        target.conn.set_trace_callback(statements.append)
+        try:
+            self.assertEqual(target.restore(snapshot), 1)
+        finally:
+            target.conn.set_trace_callback(None)
+        rebuilds = [
+            sql
+            for sql in statements
+            if "INSERTINTOMEMORIES_FTS(MEMORIES_FTS)VALUES('REBUILD')"
+            in sql.upper().replace(" ", "")
+        ]
+        self.assertEqual(len(rebuilds), 1, statements)
+        self.assertEqual(target.search("single")[0]["source_identity"], "one")
+        source.close(); target.close(); directory.cleanup()
+
+    def test_canonical_checkpoint_rebuilds_profile_mismatch_including_session(self):
+        store = Store(self.tmp.name)
+        store.ingest(
+            [
+                {
+                    "source_identity": "memory-old-profile",
+                    "source_type": "memory",
+                    "raw_text": "memory raw",
+                    "translation_status": "skipped_raw_mode",
+                    "native_index_status": "indexed",
+                    "native_index_profile": "old-profile",
+                    "native_index_memory": "old-memory",
+                },
+                {
+                    "source_identity": "session-old-profile",
+                    "source_type": "session",
+                    "raw_text": "session raw",
+                    "translation_status": "skipped_native_session",
+                    "native_index_status": "indexed",
+                    "native_index_profile": "old-profile",
+                    "native_index_memory": "old-memory",
+                },
+                {
+                    "source_identity": "already-current",
+                    "source_type": "memory",
+                    "raw_text": "current raw",
+                    "translation_status": "skipped_raw_mode",
+                    "native_index_status": "indexed",
+                    "native_index_profile": "new-profile",
+                    "native_index_memory": "new-memory",
+                },
+                {
+                    "source_identity": "low-value",
+                    "source_type": "memory",
+                    "content_type": "tool_result",
+                    "raw_text": "tool output",
+                    "translation_status": "skipped_low_value",
+                    "native_index_status": "indexed",
+                    "native_index_profile": "old-profile",
+                    "native_index_memory": "old-memory",
+                },
+            ]
+        )
+        profile = {
+            "provider": "voyage",
+            "model": "voyage-4-lite",
+            "dimensions": 1024,
+            "schema_version": 2,
+            "fingerprint": "new-profile",
+        }
+        try:
+            self.assertEqual(
+                {
+                    item["source_identity"]
+                    for item in store.canonical_index_candidates(
+                        10, "new-profile", "new-memory"
+                    )
+                },
+                {"memory-old-profile", "session-old-profile"},
+            )
+            checkpoint = store.native_index_checkpoint(profile, "new-memory")
+            self.assertEqual({key: checkpoint[key] for key in profile}, profile)
+            self.assertEqual(checkpoint["eligible"], 3)
+            self.assertEqual(checkpoint["indexed"], 1)
+            self.assertEqual(checkpoint["pending"], 2)
+            self.assertFalse(checkpoint["complete"])
+            self.assertEqual(checkpoint["memory"], "new-memory")
+        finally:
+            store.close()
+
+    def test_native_pending_paths_are_indexed_and_checkpoint_is_constant_work(self):
+        store = Store(self.tmp.name)
+        store.ingest(
+            [
+                {
+                    "source_identity": "indexed",
+                    "raw_text": "indexed raw",
+                    "native_index_status": "indexed",
+                    "native_index_profile": "profile",
+                    "native_index_memory": "memory-a",
+                },
+                {
+                    "source_identity": "retry-first",
+                    "raw_text": "retry raw",
+                    "updated_at": "2020-01-01T00:00:00Z",
+                    "native_index_status": "retry",
+                },
+                {
+                    "source_identity": "fresh-second",
+                    "raw_text": "fresh raw",
+                    "updated_at": "2021-01-01T00:00:00Z",
+                    "translation_status": "pending_provider",
+                },
+            ]
+        )
+        profile = {
+            "provider": "voyage",
+            "model": "voyage-4-lite",
+            "dimensions": 1024,
+            "schema_version": 2,
+            "fingerprint": "profile",
+        }
+        self.assertEqual(
+            store.canonical_index_candidates(1, "profile", "memory-a")[0][
+                "source_identity"
+            ],
+            "fresh-second",
+        )
+        candidate_plan = " ".join(
+            str(value)
+            for row in store.conn.execute(
+                """EXPLAIN QUERY PLAN SELECT id FROM memories
+                WHERE native_index_pending=1
+                ORDER BY CASE WHEN native_index_status='retry' THEN 1 ELSE 0 END,
+                COALESCE(retrieval_updated_at, updated_at), id LIMIT 1"""
+            )
+            for value in row
+        )
+        translation_plan = " ".join(
+            str(value)
+            for row in store.conn.execute(
+                """EXPLAIN QUERY PLAN SELECT id FROM memories
+                WHERE translation_status='pending_provider'
+                AND COALESCE(native_index_status, '') != 'waiting_durability'
+                ORDER BY updated_at, id LIMIT 1"""
+            )
+            for value in row
+        )
+        self.assertIn("memories_canonical_pending_idx", candidate_plan)
+        self.assertIn("memories_translation_pending_idx", translation_plan)
+
+        statements = []
+        store.conn.set_trace_callback(statements.append)
+        checkpoint = store.native_index_checkpoint(profile, "memory-a")
+        store.conn.set_trace_callback(None)
+        self.assertEqual(checkpoint["eligible"], 3)
+        self.assertEqual(checkpoint["indexed"], 1)
+        self.assertEqual(checkpoint["pending"], 2)
+        self.assertGreater(checkpoint["revision"], 0)
+        self.assertFalse(
+            any("FROM MEMORIES" in sql.upper() for sql in statements), statements
+        )
+        store.close()
+
+    def test_native_state_record_can_project_pre_durable_status_update(self):
+        store = Store(self.tmp.name)
+        store.ingest([{"source_identity": "row", "raw_text": "raw"}])
+        item = store.canonical_index_candidates(1, "profile", "memory-a")[0]
+        before = store.native_index_checkpoint(
+            {"fingerprint": "profile"}, "memory-a"
+        )
+        update = {
+            "source_identity": item["source_identity"],
+            "source_version": item["source_version"],
+            "content_hash": item["content_hash"],
+            "native_generation": item["native_generation"],
+            "native_index_version": "canonical-v1",
+            "native_index_status": "indexed",
+            "native_index_profile": "profile",
+            "native_index_memory": "memory-a",
+            "native_indexed_at": "2026-09-13T02:00:00Z",
+        }
+        projected = store.native_index_state_record([update])
+        self.assertEqual(projected["revision"], before["revision"] + 1)
+        self.assertEqual(projected["indexed"], 1)
+        self.assertEqual(
+            store.native_index_checkpoint(
+                {"fingerprint": "profile"}, "memory-a"
+            )["indexed"],
+            0,
+        )
+        self.assertEqual(store.update_native_index([update]), 1)
+        actual = store.native_index_checkpoint(
+            {"fingerprint": "profile"}, "memory-a"
+        )
+        self.assertEqual(actual["revision"], projected["revision"])
+        self.assertEqual(actual["index_fingerprint"], projected["index_fingerprint"])
+        store.close()
+
+    def test_native_state_migration_backfills_once_and_is_restart_safe(self):
+        store = Store(self.tmp.name)
+        store.ingest([{"source_identity": "pending", "raw_text": "raw"}])
+        store.close()
+        connection = sqlite3.connect(Path(self.tmp.name) / "funes.sqlite3")
+        with connection:
+            connection.execute(
+                "UPDATE sync_state SET native_checkpoint_state_version=0"
+            )
+            connection.execute("UPDATE memories SET native_index_pending=0")
+            connection.execute("DROP INDEX memories_canonical_pending_idx")
+            connection.execute("DROP INDEX memories_translation_pending_idx")
+            for trigger in (
+                "memories_native_ai",
+                "memories_native_ad",
+                "memories_native_au",
+            ):
+                connection.execute(f"DROP TRIGGER {trigger}")
+        connection.close()
+
+        migrated = Store(self.tmp.name)
+        self.assertEqual(
+            migrated.conn.execute(
+                "SELECT native_checkpoint_state_version FROM sync_state WHERE id=1"
+            ).fetchone()[0],
+            1,
+        )
+        self.assertEqual(
+            migrated.conn.execute(
+                "SELECT native_index_pending FROM memories WHERE source_identity='pending'"
+            ).fetchone()[0],
+            1,
+        )
+        migrated.close()
+        reopened = Store(self.tmp.name)
+        self.assertEqual(reopened.conn.total_changes, 0)
+        reopened.close()
+
+    def test_held_invalid_is_terminal_and_does_not_regress(self):
+        store = Store(self.tmp.name)
+        terminal = {
+            "source_identity": "invalid",
+            "source_version": "v1",
+            "raw_text": "deterministically invalid canonical row",
+            "native_index_version": "canonical-v1",
+            "native_index_status": "held_invalid",
+            "native_index_profile": "profile",
+            "native_index_memory": "memory-a",
+            "native_indexed_at": "2026-09-13T02:00:00Z",
+        }
+        store.ingest([terminal])
+        self.assertEqual(
+            store.canonical_index_candidates(10, "profile", "memory-a"), []
+        )
+        checkpoint = store.native_index_checkpoint(
+            {"fingerprint": "profile"}, "memory-a"
+        )
+        self.assertEqual(checkpoint["held"], 1)
+        self.assertEqual(checkpoint["invalid"], 1)
+        self.assertTrue(checkpoint["complete"])
+        store.ingest(
+            [{
+                **terminal,
+                "native_index_status": "retry",
+                "native_indexed_at": "2026-09-13T01:00:00Z",
+            }]
+        )
+        self.assertEqual(store.get("invalid")["native_index_status"], "held_invalid")
+        store.ingest(
+            [{
+                **terminal,
+                "native_index_status": "indexed",
+                "native_indexed_at": None,
+            }]
+        )
+        self.assertEqual(store.get("invalid")["native_index_status"], "held_invalid")
+        store.close()
+
+    def test_native_index_fingerprint_is_stable_across_restore_row_order(self):
+        profile = {
+            "provider": "voyage",
+            "model": "voyage-4-lite",
+            "dimensions": 1024,
+            "schema_version": 2,
+            "fingerprint": "stable-profile",
+        }
+        documents = [
+            {
+                "source_identity": identity,
+                "raw_text": f"raw {identity}",
+                "translation_status": "skipped_raw_mode",
+                "native_index_version": f"version-{identity}",
+                "native_index_status": "indexed",
+                "native_index_profile": "stable-profile",
+                "native_indexed_at": "2026-09-13T02:00:00Z",
+            }
+            for identity in ("a", "b")
+        ]
+        first_dir = tempfile.TemporaryDirectory()
+        second_dir = tempfile.TemporaryDirectory()
+        first = Store(first_dir.name)
+        second = Store(second_dir.name)
+        try:
+            first.ingest(documents)
+            second.ingest(list(reversed(documents)))
+            self.assertEqual(
+                first.native_index_checkpoint(profile)["index_fingerprint"],
+                second.native_index_checkpoint(profile)["index_fingerprint"],
+            )
+        finally:
+            first.close()
+            second.close()
+            first_dir.cleanup()
+            second_dir.cleanup()
+
+    def test_native_optimize_checkpoint_restore_uses_monotonic_revision(self):
+        store = Store(self.tmp.name)
+        profile = {
+            "provider": "voyage",
+            "model": "voyage-4-lite",
+            "dimensions": 1024,
+            "schema_version": 2,
+            "fingerprint": "profile",
+            "index_fingerprint": "index",
+            "memory": "memory-a",
+        }
+        pending = {
+            **profile,
+            "status": "pending",
+            "optimized_at": "2026-09-13T02:00:00Z",
+            "revision": 2,
+        }
+        stale_optimized = {
+            **profile,
+            "status": "optimized",
+            "optimized_at": "2026-09-13T03:00:00Z",
+            "revision": 1,
+        }
+        current_optimized = {
+            **profile,
+            "status": "optimized",
+            "optimized_at": "2026-09-13T04:00:00Z",
+            "revision": 3,
+        }
+        try:
+            self.assertTrue(store.set_native_optimize_checkpoint(pending))
+            self.assertFalse(store.set_native_optimize_checkpoint(stale_optimized))
+            self.assertEqual(store.native_optimize_checkpoint()["status"], "pending")
+            self.assertTrue(store.set_native_optimize_checkpoint(current_optimized))
+            same_revision_pending = {
+                **profile,
+                "status": "pending",
+                "optimized_at": "2026-09-13T05:00:00Z",
+                "revision": 3,
+            }
+            self.assertFalse(
+                store.set_native_optimize_checkpoint(same_revision_pending)
+            )
+            self.assertEqual(
+                store.native_optimize_checkpoint()["status"], "optimized"
+            )
+            other_memory = {
+                **same_revision_pending,
+                "memory": "memory-b",
+                "optimized_at": "2026-09-13T06:00:00Z",
+            }
+            self.assertTrue(store.set_native_optimize_checkpoint(other_memory))
+            self.assertEqual(
+                store.native_optimize_checkpoint()["memory"], "memory-b"
+            )
+            store.restore_documents(
+                [{**pending, "_funes_record": "native_optimize_checkpoint"}]
+            )
+            checkpoint = store.native_optimize_checkpoint()
+            self.assertEqual(checkpoint["status"], "pending")
+            self.assertEqual(checkpoint["memory"], "memory-b")
+            self.assertEqual(checkpoint["revision"], 3)
+        finally:
+            store.close()
 
     def test_http_never_returns_retrieval_text_even_when_legacy_flag_is_set(self):
         os.environ["RETURN_RETRIEVAL_TEXT"] = "true"

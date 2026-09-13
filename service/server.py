@@ -39,7 +39,8 @@ FIELDS = (
     "parent_session_id", "agent_id",
     "translation_hash", "translation_version", "translation_status",
     "retrieval_updated_at", "native_index_version", "native_index_status",
-    "native_indexed_at", "native_index_error", "retrieval_generation",
+    "native_index_profile", "native_index_memory", "native_indexed_at",
+    "native_index_error", "retrieval_generation",
     "native_generation",
 )
 CJK_RE = re.compile(r"[\u3400-\u9fff\uf900-\ufaff]")
@@ -54,6 +55,9 @@ NATIVE_SESSION_TYPES = {
     "claude", "claude_session",
 }
 LOW_VALUE_CONTENT_TYPES = {"tool_call", "tool_result", "shell_output", "progress"}
+NATIVE_TERMINAL_STATUSES = {"indexed", "held_secret", "held_invalid"}
+NATIVE_CHECKPOINT_STATE_VERSION = 1
+FTS_SCHEMA_VERSION = 3
 RETRIEVAL_PROMPT = """You are a retrieval normalization engine.
 Convert the natural-language Chinese portions of the input into concise English optimized for semantic retrieval.
 Rules:
@@ -116,6 +120,22 @@ def technical_fts_terms(value: str, limit: int = 12) -> list[str]:
 
 def technical_fts_query(terms: list[str]) -> str:
     return " OR ".join(f'"{term.replace(chr(34), chr(34) * 2)}"' for term in terms)
+
+
+def technical_index_text(raw_text: Any, retrieval_text: Any) -> str:
+    """Materialize bounded ASCII identifiers so mixed CJK tokens stay indexable."""
+    terms = []
+    seen = set()
+    for value in (raw_text, retrieval_text):
+        for term in ASCII_FTS_TERM_RE.findall(str(value or "")):
+            key = term.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            terms.append(term)
+            if len(terms) >= 256:
+                return " ".join(terms)
+    return " ".join(terms)
 
 
 def cjk_retrieval_terms(value: str, limit: int = 24) -> list[str]:
@@ -198,8 +218,12 @@ class Store:
         self.lock = threading.RLock()
         self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
+        self.conn.create_function(
+            "funes_identifiers", 2, technical_index_text, deterministic=True
+        )
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA busy_timeout=5000")
+        self._bulk_restore_depth = 0
         self._init_schema()
 
     def _init_schema(self) -> None:
@@ -212,6 +236,7 @@ class Store:
                     source_version TEXT NOT NULL DEFAULT '',
                     raw_text TEXT NOT NULL,
                     retrieval_text TEXT NOT NULL,
+                    search_identifiers TEXT NOT NULL DEFAULT '',
                     metadata_json TEXT NOT NULL DEFAULT '{}',
                     source_agent TEXT, source_type TEXT, device_id TEXT, project TEXT,
                     repo TEXT, worktree TEXT, session_id TEXT, message_id TEXT, role TEXT,
@@ -221,32 +246,40 @@ class Store:
                     source_missing INTEGER NOT NULL DEFAULT 0, agent_type TEXT,
                     parent_session_id TEXT, agent_id TEXT,
                     translation_hash TEXT, translation_version TEXT, translation_status TEXT,
-                    native_index_version TEXT, native_index_status TEXT,
+                    native_index_version TEXT, native_index_status TEXT, native_index_profile TEXT,
+                    native_index_memory TEXT,
                     native_indexed_at TEXT, native_index_error TEXT,
+                    native_index_pending INTEGER NOT NULL DEFAULT 1,
                     retrieval_generation INTEGER NOT NULL DEFAULT 0,
                     native_generation INTEGER NOT NULL DEFAULT 0,
                     UNIQUE(source_identity)
                 );
                 CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
-                    retrieval_text, content='memories', content_rowid='id', tokenize='unicode61'
+                    raw_text, retrieval_text, search_identifiers,
+                    content='memories', content_rowid='id', tokenize='unicode61'
                 );
-                CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
-                    INSERT INTO memories_fts(rowid, retrieval_text) VALUES (new.id, new.retrieval_text);
-                END;
-                CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories BEGIN
-                    INSERT INTO memories_fts(memories_fts, rowid, retrieval_text) VALUES('delete', old.id, old.retrieval_text);
-                END;
-                CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories BEGIN
-                    INSERT INTO memories_fts(memories_fts, rowid, retrieval_text) VALUES('delete', old.id, old.retrieval_text);
-                    INSERT INTO memories_fts(rowid, retrieval_text) VALUES (new.id, new.retrieval_text);
-                END;
                 CREATE TABLE IF NOT EXISTS translation_cache (
                     query TEXT PRIMARY KEY, rewritten TEXT NOT NULL, created_at TEXT NOT NULL,
                     translation_hash TEXT, translation_version TEXT, translation_status TEXT
                 );
                 CREATE TABLE IF NOT EXISTS sync_state (
                     id INTEGER PRIMARY KEY CHECK(id=1), last_sync TEXT, last_error TEXT,
-                    snapshot_path TEXT, restored_at TEXT
+                    snapshot_path TEXT, restored_at TEXT,
+                    native_optimize_provider TEXT, native_optimize_model TEXT,
+                    native_optimize_dimensions INTEGER, native_optimize_schema_version INTEGER,
+                    native_optimize_memory TEXT,
+                    native_optimize_fingerprint TEXT, native_optimize_index_fingerprint TEXT,
+                    native_optimize_status TEXT, native_optimized_at TEXT,
+                    native_optimize_revision INTEGER NOT NULL DEFAULT 0,
+                    native_checkpoint_profile TEXT NOT NULL DEFAULT '',
+                    native_checkpoint_memory TEXT NOT NULL DEFAULT '',
+                    native_index_revision INTEGER NOT NULL DEFAULT 0,
+                    native_eligible_count INTEGER NOT NULL DEFAULT 0,
+                    native_indexed_count INTEGER NOT NULL DEFAULT 0,
+                    native_held_count INTEGER NOT NULL DEFAULT 0,
+                    native_invalid_count INTEGER NOT NULL DEFAULT 0,
+                    native_checkpoint_state_version INTEGER NOT NULL DEFAULT 0,
+                    fts_schema_version INTEGER NOT NULL DEFAULT 0
                 );
                 INSERT OR IGNORE INTO sync_state(id) VALUES(1);
                 CREATE TABLE IF NOT EXISTS reindex_controls (
@@ -272,11 +305,21 @@ class Store:
                 "retrieval_updated_at",
                 "native_index_version",
                 "native_index_status",
+                "native_index_profile",
+                "native_index_memory",
                 "native_indexed_at",
                 "native_index_error",
             ):
                 if name not in columns:
                     self.conn.execute(f"ALTER TABLE memories ADD COLUMN {name} TEXT")
+            if "search_identifiers" not in columns:
+                self.conn.execute(
+                    "ALTER TABLE memories ADD COLUMN search_identifiers TEXT NOT NULL DEFAULT ''"
+                )
+            if "native_index_pending" not in columns:
+                self.conn.execute(
+                    "ALTER TABLE memories ADD COLUMN native_index_pending INTEGER NOT NULL DEFAULT 1"
+                )
             for name in ("retrieval_generation", "native_generation"):
                 if name not in columns:
                     self.conn.execute(
@@ -286,6 +329,30 @@ class Store:
             for name in ("translation_hash", "translation_version", "translation_status"):
                 if name not in cache_columns:
                     self.conn.execute(f"ALTER TABLE translation_cache ADD COLUMN {name} TEXT")
+            sync_columns = {row[1] for row in self.conn.execute("PRAGMA table_info(sync_state)")}
+            for name, sql_type in (
+                ("native_optimize_provider", "TEXT"),
+                ("native_optimize_model", "TEXT"),
+                ("native_optimize_dimensions", "INTEGER"),
+                ("native_optimize_schema_version", "INTEGER"),
+                ("native_optimize_memory", "TEXT"),
+                ("native_optimize_fingerprint", "TEXT"),
+                ("native_optimize_index_fingerprint", "TEXT"),
+                ("native_optimize_status", "TEXT"),
+                ("native_optimized_at", "TEXT"),
+                ("native_optimize_revision", "INTEGER NOT NULL DEFAULT 0"),
+                ("native_checkpoint_profile", "TEXT NOT NULL DEFAULT ''"),
+                ("native_checkpoint_memory", "TEXT NOT NULL DEFAULT ''"),
+                ("native_index_revision", "INTEGER NOT NULL DEFAULT 0"),
+                ("native_eligible_count", "INTEGER NOT NULL DEFAULT 0"),
+                ("native_indexed_count", "INTEGER NOT NULL DEFAULT 0"),
+                ("native_held_count", "INTEGER NOT NULL DEFAULT 0"),
+                ("native_invalid_count", "INTEGER NOT NULL DEFAULT 0"),
+                ("native_checkpoint_state_version", "INTEGER NOT NULL DEFAULT 0"),
+                ("fts_schema_version", "INTEGER NOT NULL DEFAULT 0"),
+            ):
+                if name not in sync_columns:
+                    self.conn.execute(f"ALTER TABLE sync_state ADD COLUMN {name} {sql_type}")
             control_columns = {
                 row[1] for row in self.conn.execute("PRAGMA table_info(reindex_controls)")
             }
@@ -294,6 +361,338 @@ class Store:
                     """ALTER TABLE reindex_controls ADD COLUMN row_cursor
                     INTEGER NOT NULL DEFAULT 0"""
                 )
+            fts_columns = [
+                row[1] for row in self.conn.execute("PRAGMA table_info(memories_fts)")
+            ]
+            fts_version = int(
+                self.conn.execute(
+                    "SELECT fts_schema_version FROM sync_state WHERE id=1"
+                ).fetchone()[0]
+                or 0
+            )
+            if (
+                fts_columns != ["raw_text", "retrieval_text", "search_identifiers"]
+                or fts_version < FTS_SCHEMA_VERSION
+            ):
+                # The first sidecar indexed only the derived retrieval shadow.
+                # Rebuild exactly once at startup so existing durable raw rows
+                # become the primary lexical source without client re-upload.
+                self._drop_fts_triggers_locked()
+                self.conn.execute(
+                    """UPDATE memories SET search_identifiers=
+                    funes_identifiers(raw_text, retrieval_text)"""
+                )
+                if fts_columns != [
+                    "raw_text", "retrieval_text", "search_identifiers"
+                ]:
+                    self.conn.execute("DROP TABLE memories_fts")
+                    self.conn.execute(
+                        """CREATE VIRTUAL TABLE memories_fts USING fts5(
+                        raw_text, retrieval_text, search_identifiers,
+                        content='memories', content_rowid='id', tokenize='unicode61')"""
+                    )
+                self.conn.execute("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')")
+                self.conn.execute(
+                    "UPDATE sync_state SET fts_schema_version=? WHERE id=1",
+                    (FTS_SCHEMA_VERSION,),
+                )
+            self._create_fts_triggers_locked()
+
+            native_state_version = int(
+                self.conn.execute(
+                    "SELECT native_checkpoint_state_version FROM sync_state WHERE id=1"
+                ).fetchone()[0]
+                or 0
+            )
+            if native_state_version < NATIVE_CHECKPOINT_STATE_VERSION:
+                self._drop_native_state_triggers_locked()
+                state = self.conn.execute(
+                    """SELECT native_checkpoint_profile,native_checkpoint_memory,
+                    native_optimize_fingerprint,native_optimize_memory
+                    FROM sync_state WHERE id=1"""
+                ).fetchone()
+                profile = str(
+                    state["native_checkpoint_profile"]
+                    or state["native_optimize_fingerprint"]
+                    or ""
+                )
+                memory = str(
+                    state["native_checkpoint_memory"]
+                    or state["native_optimize_memory"]
+                    or ""
+                )
+                if not profile:
+                    terminal = self.conn.execute(
+                        """SELECT COALESCE(native_index_profile, '') AS profile,
+                        COALESCE(native_index_memory, '') AS memory, count(*) AS amount
+                        FROM memories
+                        WHERE native_index_status IN
+                            ('indexed','held_secret','held_invalid')
+                        GROUP BY profile,memory ORDER BY amount DESC,profile,memory LIMIT 1"""
+                    ).fetchone()
+                    if terminal is not None:
+                        profile = str(terminal["profile"])
+                        memory = str(terminal["memory"])
+                self._rebuild_native_checkpoint_state_locked(
+                    profile, memory, initialize=True
+                )
+            self._create_native_state_triggers_locked()
+            self.conn.execute(
+                """CREATE INDEX IF NOT EXISTS memories_translation_pending_idx
+                ON memories(updated_at,id)
+                WHERE translation_status='pending_provider'
+                AND COALESCE(native_index_status, '') != 'waiting_durability'"""
+            )
+            self.conn.execute(
+                """CREATE INDEX IF NOT EXISTS memories_canonical_pending_idx
+                ON memories(
+                    CASE WHEN native_index_status='retry' THEN 1 ELSE 0 END,
+                    COALESCE(retrieval_updated_at,updated_at),id)
+                WHERE native_index_pending=1"""
+            )
+
+    def _drop_fts_triggers_locked(self) -> None:
+        for trigger in ("memories_ai", "memories_ad", "memories_au"):
+            self.conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+
+    def _create_fts_triggers_locked(self) -> None:
+        self.conn.execute(
+            """CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
+            INSERT INTO memories_fts(rowid,raw_text,retrieval_text,search_identifiers)
+            VALUES(new.id,new.raw_text,new.retrieval_text,new.search_identifiers); END"""
+        )
+        self.conn.execute(
+            """CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories BEGIN
+            INSERT INTO memories_fts(
+                memories_fts,rowid,raw_text,retrieval_text,search_identifiers)
+            VALUES(
+                'delete',old.id,old.raw_text,old.retrieval_text,old.search_identifiers); END"""
+        )
+        self.conn.execute(
+            """CREATE TRIGGER IF NOT EXISTS memories_au
+            AFTER UPDATE OF raw_text,retrieval_text,search_identifiers ON memories
+            WHEN old.raw_text IS NOT new.raw_text
+                OR old.retrieval_text IS NOT new.retrieval_text
+                OR old.search_identifiers IS NOT new.search_identifiers
+            BEGIN
+            INSERT INTO memories_fts(
+                memories_fts,rowid,raw_text,retrieval_text,search_identifiers)
+            VALUES(
+                'delete',old.id,old.raw_text,old.retrieval_text,old.search_identifiers);
+            INSERT INTO memories_fts(rowid,raw_text,retrieval_text,search_identifiers)
+            VALUES(new.id,new.raw_text,new.retrieval_text,new.search_identifiers); END"""
+        )
+
+    def _drop_native_state_triggers_locked(self) -> None:
+        for trigger in (
+            "memories_native_ai",
+            "memories_native_ad",
+            "memories_native_au",
+        ):
+            self.conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+
+    def _create_native_state_triggers_locked(self) -> None:
+        eligible_new = (
+            "lower(COALESCE(new.content_type,'')) NOT IN "
+            "('tool_call','tool_result','shell_output','progress')"
+        )
+        eligible_old = (
+            "lower(COALESCE(old.content_type,'')) NOT IN "
+            "('tool_call','tool_result','shell_output','progress')"
+        )
+        current_new = (
+            "COALESCE(new.native_index_profile,'')=native_checkpoint_profile "
+            "AND COALESCE(new.native_index_memory,'')=native_checkpoint_memory"
+        )
+        current_old = (
+            "COALESCE(old.native_index_profile,'')=native_checkpoint_profile "
+            "AND COALESCE(old.native_index_memory,'')=native_checkpoint_memory"
+        )
+        pending_current_new = (
+            "COALESCE(new.native_index_profile,'')="
+            "(SELECT native_checkpoint_profile FROM sync_state WHERE id=1) "
+            "AND COALESCE(new.native_index_memory,'')="
+            "(SELECT native_checkpoint_memory FROM sync_state WHERE id=1)"
+        )
+        terminal_new = (
+            "COALESCE(new.native_index_status,'') IN "
+            "('indexed','held_secret','held_invalid')"
+        )
+        self.conn.execute(
+            f"""CREATE TRIGGER IF NOT EXISTS memories_native_ai
+            AFTER INSERT ON memories BEGIN
+            UPDATE sync_state SET
+                native_index_revision=native_index_revision+
+                    CASE WHEN {eligible_new} THEN 1 ELSE 0 END,
+                native_eligible_count=native_eligible_count+
+                    CASE WHEN {eligible_new} THEN 1 ELSE 0 END,
+                native_indexed_count=native_indexed_count+
+                    CASE WHEN {eligible_new} AND new.native_index_status='indexed'
+                        AND {current_new} THEN 1 ELSE 0 END,
+                native_held_count=native_held_count+
+                    CASE WHEN {eligible_new}
+                        AND new.native_index_status IN ('held_secret','held_invalid')
+                        AND {current_new} THEN 1 ELSE 0 END,
+                native_invalid_count=native_invalid_count+
+                    CASE WHEN {eligible_new}
+                        AND new.native_index_status='held_invalid'
+                        AND {current_new} THEN 1 ELSE 0 END
+            WHERE id=1;
+            UPDATE memories SET native_index_pending=CASE
+                WHEN {eligible_new}
+                    AND COALESCE(new.native_index_status,'')!='waiting_durability'
+                    AND NOT ({terminal_new} AND {pending_current_new})
+                THEN 1 ELSE 0 END
+            WHERE id=new.id; END"""
+        )
+        self.conn.execute(
+            f"""CREATE TRIGGER IF NOT EXISTS memories_native_ad
+            AFTER DELETE ON memories BEGIN
+            UPDATE sync_state SET
+                native_index_revision=native_index_revision+
+                    CASE WHEN {eligible_old} THEN 1 ELSE 0 END,
+                native_eligible_count=native_eligible_count-
+                    CASE WHEN {eligible_old} THEN 1 ELSE 0 END,
+                native_indexed_count=native_indexed_count-
+                    CASE WHEN {eligible_old} AND old.native_index_status='indexed'
+                        AND {current_old} THEN 1 ELSE 0 END,
+                native_held_count=native_held_count-
+                    CASE WHEN {eligible_old}
+                        AND old.native_index_status IN ('held_secret','held_invalid')
+                        AND {current_old} THEN 1 ELSE 0 END,
+                native_invalid_count=native_invalid_count-
+                    CASE WHEN {eligible_old}
+                        AND old.native_index_status='held_invalid'
+                        AND {current_old} THEN 1 ELSE 0 END
+            WHERE id=1; END"""
+        )
+        self.conn.execute(
+            f"""CREATE TRIGGER IF NOT EXISTS memories_native_au
+            AFTER UPDATE OF source_identity,source_version,raw_text,retrieval_text,
+                content_hash,content_type,source_missing,translation_hash,
+                translation_version,native_index_version,native_index_status,
+                native_index_profile,native_index_memory,native_indexed_at,
+                native_generation ON memories
+            WHEN (old.source_identity IS NOT new.source_identity
+                OR old.source_version IS NOT new.source_version
+                OR old.raw_text IS NOT new.raw_text
+                OR old.retrieval_text IS NOT new.retrieval_text
+                OR old.content_hash IS NOT new.content_hash
+                OR old.content_type IS NOT new.content_type
+                OR old.source_missing IS NOT new.source_missing
+                OR old.translation_hash IS NOT new.translation_hash
+                OR old.translation_version IS NOT new.translation_version
+                OR old.native_index_version IS NOT new.native_index_version
+                OR old.native_index_status IS NOT new.native_index_status
+                OR old.native_index_profile IS NOT new.native_index_profile
+                OR old.native_index_memory IS NOT new.native_index_memory
+                OR old.native_indexed_at IS NOT new.native_indexed_at
+                OR old.native_generation IS NOT new.native_generation)
+            BEGIN
+            UPDATE sync_state SET
+                native_index_revision=native_index_revision+
+                    CASE WHEN {eligible_old} OR {eligible_new} THEN 1 ELSE 0 END,
+                native_eligible_count=native_eligible_count
+                    +CASE WHEN {eligible_new} THEN 1 ELSE 0 END
+                    -CASE WHEN {eligible_old} THEN 1 ELSE 0 END,
+                native_indexed_count=native_indexed_count
+                    +CASE WHEN {eligible_new} AND new.native_index_status='indexed'
+                        AND {current_new} THEN 1 ELSE 0 END
+                    -CASE WHEN {eligible_old} AND old.native_index_status='indexed'
+                        AND {current_old} THEN 1 ELSE 0 END,
+                native_held_count=native_held_count
+                    +CASE WHEN {eligible_new}
+                        AND new.native_index_status IN ('held_secret','held_invalid')
+                        AND {current_new} THEN 1 ELSE 0 END
+                    -CASE WHEN {eligible_old}
+                        AND old.native_index_status IN ('held_secret','held_invalid')
+                        AND {current_old} THEN 1 ELSE 0 END,
+                native_invalid_count=native_invalid_count
+                    +CASE WHEN {eligible_new}
+                        AND new.native_index_status='held_invalid'
+                        AND {current_new} THEN 1 ELSE 0 END
+                    -CASE WHEN {eligible_old}
+                        AND old.native_index_status='held_invalid'
+                        AND {current_old} THEN 1 ELSE 0 END
+            WHERE id=1;
+            UPDATE memories SET native_index_pending=CASE
+                WHEN {eligible_new}
+                    AND COALESCE(new.native_index_status,'')!='waiting_durability'
+                    AND NOT ({terminal_new} AND {pending_current_new})
+                THEN 1 ELSE 0 END
+            WHERE id=new.id; END"""
+        )
+
+    def _rebuild_native_checkpoint_state_locked(
+        self, profile_fingerprint: str, memory: str, *, initialize: bool = False
+    ) -> None:
+        profile_fingerprint = str(profile_fingerprint or "")
+        memory = str(memory or "")
+        self.conn.execute(
+            """UPDATE memories SET native_index_pending=CASE
+            WHEN lower(COALESCE(content_type,'')) NOT IN
+                ('tool_call','tool_result','shell_output','progress')
+                AND COALESCE(native_index_status,'')!='waiting_durability'
+                AND NOT (
+                    COALESCE(native_index_status,'') IN
+                        ('indexed','held_secret','held_invalid')
+                    AND COALESCE(native_index_profile,'')=?
+                    AND COALESCE(native_index_memory,'')=?)
+            THEN 1 ELSE 0 END""",
+            (profile_fingerprint, memory),
+        )
+        counts = self.conn.execute(
+            """SELECT count(*) AS eligible,
+            sum(CASE WHEN native_index_status='indexed'
+                AND COALESCE(native_index_profile,'')=?
+                AND COALESCE(native_index_memory,'')=? THEN 1 ELSE 0 END) AS indexed,
+            sum(CASE WHEN native_index_status IN ('held_secret','held_invalid')
+                AND COALESCE(native_index_profile,'')=?
+                AND COALESCE(native_index_memory,'')=? THEN 1 ELSE 0 END) AS held,
+            sum(CASE WHEN native_index_status='held_invalid'
+                AND COALESCE(native_index_profile,'')=?
+                AND COALESCE(native_index_memory,'')=? THEN 1 ELSE 0 END) AS invalid
+            FROM memories WHERE lower(COALESCE(content_type,'')) NOT IN
+                ('tool_call','tool_result','shell_output','progress')""",
+            (
+                profile_fingerprint, memory,
+                profile_fingerprint, memory,
+                profile_fingerprint, memory,
+            ),
+        ).fetchone()
+        current_revision = int(
+            self.conn.execute(
+                "SELECT native_index_revision FROM sync_state WHERE id=1"
+            ).fetchone()[0]
+            or 0
+        )
+        eligible = int(counts["eligible"] or 0)
+        if initialize and current_revision == 0:
+            current_revision = eligible
+        self.conn.execute(
+            """UPDATE sync_state SET native_checkpoint_profile=?,
+            native_checkpoint_memory=?, native_index_revision=?,
+            native_eligible_count=?,native_indexed_count=?,native_held_count=?,
+            native_invalid_count=?,native_checkpoint_state_version=? WHERE id=1""",
+            (
+                profile_fingerprint, memory, current_revision, eligible,
+                int(counts["indexed"] or 0), int(counts["held"] or 0),
+                int(counts["invalid"] or 0), NATIVE_CHECKPOINT_STATE_VERSION,
+            ),
+        )
+
+    def _ensure_native_checkpoint_profile_locked(
+        self, profile_fingerprint: str, memory: str
+    ) -> None:
+        state = self.conn.execute(
+            """SELECT native_checkpoint_profile,native_checkpoint_memory
+            FROM sync_state WHERE id=1"""
+        ).fetchone()
+        if (
+            str(state["native_checkpoint_profile"] or "") != str(profile_fingerprint or "")
+            or str(state["native_checkpoint_memory"] or "") != str(memory or "")
+        ):
+            self._rebuild_native_checkpoint_state_locked(profile_fingerprint, memory)
 
     def close(self) -> None:
         with self.lock:
@@ -308,6 +707,7 @@ class Store:
                 if not raw:
                     raise ValueError("raw_text/text is required")
                 retrieval = str(doc.get("retrieval_text") or normalize_text(raw))
+                search_identifiers = technical_index_text(raw, retrieval)
                 metadata = dict(doc.get("metadata") or {})
                 source_identity = str(doc.get("source_identity") or self._identity(doc, metadata, raw))
                 source_version = str(doc.get("source_version", metadata.get("source_version", "")))
@@ -318,7 +718,8 @@ class Store:
                     """SELECT id, content_hash, source_version, updated_at, retrieval_text,
                     translation_hash, translation_version, translation_status,
                     retrieval_updated_at, native_index_version, native_index_status,
-                    native_indexed_at, native_index_error, source_missing,
+                    native_index_profile, native_index_memory, native_indexed_at,
+                    native_index_error, source_missing,
                     retrieval_generation, native_generation
                     FROM memories WHERE source_identity=?""",
                     (source_identity,),
@@ -338,6 +739,8 @@ class Store:
                             "retrieval_updated_at",
                             "native_index_version",
                             "native_index_status",
+                            "native_index_profile",
+                            "native_index_memory",
                             "native_indexed_at",
                             "native_index_error",
                             "retrieval_generation",
@@ -398,6 +801,8 @@ class Store:
                     incoming_native = (
                         values.get("native_index_version") if "native_index_version" in doc else row["native_index_version"],
                         values.get("native_index_status") if "native_index_status" in doc else row["native_index_status"],
+                        values.get("native_index_profile") if "native_index_profile" in doc else row["native_index_profile"],
+                        values.get("native_index_memory") if "native_index_memory" in doc else row["native_index_memory"],
                         values.get("native_indexed_at") if "native_indexed_at" in doc else row["native_indexed_at"],
                         values.get("native_index_error") if "native_index_error" in doc else row["native_index_error"],
                     )
@@ -406,6 +811,8 @@ class Store:
                         incoming_native = (
                             row["native_index_version"],
                             row["native_index_status"],
+                            row["native_index_profile"],
+                            row["native_index_memory"],
                             row["native_indexed_at"],
                             row["native_index_error"],
                         )
@@ -415,14 +822,31 @@ class Store:
                         for name in (
                             "native_index_version",
                             "native_index_status",
+                            "native_index_profile",
+                            "native_index_memory",
                             "native_indexed_at",
                             "native_index_error",
                         )
                     ):
-                        incoming_native = (None, None, None, None)
-                    if (
-                        row["native_index_status"] in {"indexed", "held_secret"}
-                        and incoming_native[1] not in {"indexed", "held_secret"}
+                        incoming_native = (None, None, None, None, None, None)
+                    terminal_checkpoint_regression = (
+                        row["native_index_status"] in NATIVE_TERMINAL_STATUSES
+                        and incoming_native[1] in NATIVE_TERMINAL_STATUSES
+                        and incoming_native_generation <= row["native_generation"]
+                        and (
+                            row["native_index_status"] == "held_invalid"
+                            or incoming_native[2] != row["native_index_profile"]
+                            or incoming_native[3] != row["native_index_memory"]
+                            or incoming_native[4] is not None
+                        )
+                        and not self._newer_timestamp(
+                            incoming_native[4], row["native_indexed_at"]
+                        )
+                        and not source_missing_changed
+                    )
+                    if terminal_checkpoint_regression or (
+                        row["native_index_status"] in NATIVE_TERMINAL_STATUSES
+                        and incoming_native[1] not in NATIVE_TERMINAL_STATUSES
                         and not translation_changed
                         and not source_missing_changed
                     ):
@@ -432,6 +856,8 @@ class Store:
                         incoming_native = (
                             row["native_index_version"],
                             row["native_index_status"],
+                            row["native_index_profile"],
+                            row["native_index_memory"],
                             row["native_indexed_at"],
                             row["native_index_error"],
                         )
@@ -456,6 +882,8 @@ class Store:
                         row["source_missing"],
                         row["native_index_version"],
                         row["native_index_status"],
+                        row["native_index_profile"],
+                        row["native_index_memory"],
                         row["native_indexed_at"],
                         row["native_index_error"],
                         row["native_generation"],
@@ -465,13 +893,20 @@ class Store:
                         # lifecycles.  A reconciled shadow must update in place even
                         # when the source bytes/version are unchanged.
                         self.conn.execute(
-                            """UPDATE memories SET retrieval_text=?, translation_hash=?,
+                            """UPDATE memories SET retrieval_text=?, search_identifiers=?,
+                            translation_hash=?,
                             translation_version=?, translation_status=?, retrieval_updated_at=?,
                             retrieval_generation=?,
                             source_missing=?,
-                            native_index_version=?, native_index_status=?, native_indexed_at=?,
+                            native_index_version=?, native_index_status=?, native_index_profile=?,
+                            native_index_memory=?, native_indexed_at=?,
                             native_index_error=?, native_generation=? WHERE id=?""",
-                            (*incoming_derived, row["id"]),
+                            (
+                                incoming_derived[0],
+                                technical_index_text(raw, incoming_derived[0]),
+                                *incoming_derived[1:],
+                                row["id"],
+                            ),
                         )
                         updated += 1
                         results.append({"id": row["id"], "status": "derived_updated", "source_identity": source_identity})
@@ -487,38 +922,40 @@ class Store:
                     continue
                 if row:
                     self.conn.execute(
-                        """UPDATE memories SET source_version=?, raw_text=?, retrieval_text=?, metadata_json=?,
+                        """UPDATE memories SET source_version=?, raw_text=?, retrieval_text=?,
+                        search_identifiers=?, metadata_json=?,
                         source_agent=?, source_type=?, device_id=?, project=?, repo=?, worktree=?, session_id=?,
                         message_id=?, role=?, timestamp=?, source_path=?, content_hash=?, updated_at=?, retrieval_updated_at=?, content_type=?,
                         source_missing=?, agent_type=?, parent_session_id=?, agent_id=?, translation_hash=?, translation_version=?, translation_status=?,
-                        native_index_version=?, native_index_status=?, native_indexed_at=?, native_index_error=?,
+                        native_index_version=?, native_index_status=?, native_index_profile=?,
+                        native_index_memory=?, native_indexed_at=?, native_index_error=?,
                         retrieval_generation=?, native_generation=? WHERE id=?""",
-                        (source_version, raw, retrieval, json.dumps(metadata, ensure_ascii=False),
+                        (source_version, raw, retrieval, search_identifiers, json.dumps(metadata, ensure_ascii=False),
                          values.get("source_agent"), values.get("source_type"), values.get("device_id"),
                          values.get("project"), values.get("repo"), values.get("worktree"), values.get("session_id"),
                          values.get("message_id"), values.get("role"), values.get("timestamp"), values.get("source_path"),
                          content_hash, incoming_updated, values.get("retrieval_updated_at"), values.get("content_type"), values["source_missing"], values.get("agent_type"),
                          values.get("parent_session_id"), values.get("agent_id"), values.get("translation_hash"), values.get("translation_version"), values.get("translation_status"),
-                         values.get("native_index_version"), values.get("native_index_status"), values.get("native_indexed_at"), values.get("native_index_error"),
+                         values.get("native_index_version"), values.get("native_index_status"), values.get("native_index_profile"), values.get("native_index_memory"), values.get("native_indexed_at"), values.get("native_index_error"),
                          values["retrieval_generation"], values["native_generation"], row["id"]),
                     )
                     updated += 1
                     results.append({"id": row["id"], "status": "updated", "source_identity": source_identity})
                 else:
                     cur = self.conn.execute(
-                        """INSERT INTO memories(source_identity,source_version,raw_text,retrieval_text,metadata_json,
+                        """INSERT INTO memories(source_identity,source_version,raw_text,retrieval_text,search_identifiers,metadata_json,
                         source_agent,source_type,device_id,project,repo,worktree,session_id,message_id,role,timestamp,
                         source_path,content_hash,ingested_at,updated_at,retrieval_updated_at,content_type,source_missing,agent_type,parent_session_id,agent_id,translation_hash,translation_version,translation_status,
-                        native_index_version,native_index_status,native_indexed_at,native_index_error,
+                        native_index_version,native_index_status,native_index_profile,native_index_memory,native_indexed_at,native_index_error,
                         retrieval_generation,native_generation)
-                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                        (source_identity, source_version, raw, retrieval, json.dumps(metadata, ensure_ascii=False),
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (source_identity, source_version, raw, retrieval, search_identifiers, json.dumps(metadata, ensure_ascii=False),
                          values.get("source_agent"), values.get("source_type"), values.get("device_id"), values.get("project"),
                          values.get("repo"), values.get("worktree"), values.get("session_id"), values.get("message_id"),
                          values.get("role"), values.get("timestamp"), values.get("source_path"), content_hash, values.get("ingested_at") or now, incoming_updated, values.get("retrieval_updated_at"),
                          values.get("content_type"), values["source_missing"], values.get("agent_type"),
                          values.get("parent_session_id"), values.get("agent_id"), values.get("translation_hash"), values.get("translation_version"), values.get("translation_status"),
-                         values.get("native_index_version"), values.get("native_index_status"), values.get("native_indexed_at"), values.get("native_index_error"),
+                         values.get("native_index_version"), values.get("native_index_status"), values.get("native_index_profile"), values.get("native_index_memory"), values.get("native_indexed_at"), values.get("native_index_error"),
                          values["retrieval_generation"], values["native_generation"]),
                     )
                     created += 1
@@ -536,6 +973,25 @@ class Store:
             except ValueError:
                 return (1, text)
         return key(candidate) < key(current)
+
+    @staticmethod
+    def _newer_timestamp(candidate: Any, current: Any) -> bool:
+        if not candidate:
+            return False
+        if not current:
+            return True
+
+        def key(value: Any):
+            text = str(value)
+            try:
+                parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                return (1, parsed.timestamp())
+            except ValueError:
+                return (0, text)
+
+        return key(candidate) > key(current)
 
     @staticmethod
     def _identity(doc: dict[str, Any], metadata: dict[str, Any], raw: str) -> str:
@@ -557,6 +1013,8 @@ class Store:
 
     def _row(self, row: sqlite3.Row) -> dict[str, Any]:
         out = dict(row)
+        out.pop("search_identifiers", None)
+        out.pop("native_index_pending", None)
         out["source_missing"] = bool(out.get("source_missing"))
         try:
             out["metadata"] = json.loads(out.pop("metadata_json") or "{}")
@@ -665,11 +1123,7 @@ class Store:
 
     @staticmethod
     def _canonical_reindex_eligible(item: dict[str, Any]) -> bool:
-        return (
-            str(item.get("source_type") or "").lower() not in NATIVE_SESSION_TYPES
-            and str(item.get("content_type") or "").lower()
-            not in LOW_VALUE_CONTENT_TYPES
-        )
+        return str(item.get("content_type") or "").lower() not in LOW_VALUE_CONTENT_TYPES
 
     def apply_pending_reindex_controls(self, batch_size: int = 500) -> dict[str, int]:
         """Apply one restart-safe row batch without changing raw source truth."""
@@ -705,6 +1159,8 @@ class Store:
                 )
                 native_values = (
                     item.get("native_index_version"), item.get("native_index_status"),
+                    item.get("native_index_profile"),
+                    item.get("native_index_memory"),
                     item.get("native_indexed_at"), item.get("native_index_error"),
                 )
                 current_values = (
@@ -722,7 +1178,7 @@ class Store:
                         if generation > native_generation:
                             native_generation = generation
                             if item.get("native_index_status") != "waiting_durability":
-                                native_values = (None, None, None, None)
+                                native_values = (None, None, None, None, None, None)
                                 native_reset += 1
                 if scope == "all" and generation > native_generation:
                     native_generation = generation
@@ -730,7 +1186,7 @@ class Store:
                         self._canonical_reindex_eligible(item)
                         and item.get("native_index_status") != "waiting_durability"
                     ):
-                        native_values = (None, None, None, None)
+                        native_values = (None, None, None, None, None, None)
                         native_reset += 1
                 next_values = (
                     *retrieval_values, retrieval_generation, *native_values,
@@ -738,12 +1194,19 @@ class Store:
                 )
                 if next_values != current_values:
                     self.conn.execute(
-                        """UPDATE memories SET retrieval_text=?, translation_hash=?,
+                        """UPDATE memories SET retrieval_text=?, search_identifiers=?,
+                        translation_hash=?,
                         translation_version=?, translation_status=?, retrieval_updated_at=?,
                         retrieval_generation=?, native_index_version=?, native_index_status=?,
-                        native_indexed_at=?, native_index_error=?, native_generation=?
+                        native_index_profile=?, native_index_memory=?, native_indexed_at=?,
+                        native_index_error=?, native_generation=?
                         WHERE id=?""",
-                        (*next_values, row["id"]),
+                        (
+                            next_values[0],
+                            technical_index_text(item["raw_text"], next_values[0]),
+                            *next_values[1:],
+                            row["id"],
+                        ),
                     )
                     updated += 1
             scanned = len(rows)
@@ -815,22 +1278,294 @@ class Store:
                 )
             return {"kept": len(keep), "deleted": deleted}
 
-    def canonical_index_candidates(self, limit: int) -> list[dict[str, Any]]:
-        """Return final non-session retrieval shadows for native reconciliation."""
-        with self.lock:
+    def canonical_index_candidates(
+        self, limit: int, profile_fingerprint: str = "", memory: str = ""
+    ) -> list[dict[str, Any]]:
+        """Return durable raw rows whose native checkpoint is not current."""
+        with self.lock, self.conn:
+            self._ensure_native_checkpoint_profile_locked(
+                str(profile_fingerprint), str(memory)
+            )
             rows = self.conn.execute(
-                """SELECT * FROM memories
-                WHERE translation_status IN ('ok','skipped_non_cjk','skipped_raw_mode')
-                AND lower(COALESCE(source_type, '')) NOT IN
-                    ('session','codex','codex_session','pi','pi_session','claude','claude_session')
-                AND lower(COALESCE(content_type, '')) NOT IN
-                    ('tool_call','tool_result','shell_output','progress')
-                AND COALESCE(native_index_status, '') NOT IN
-                    ('indexed','held_secret','waiting_durability')
-                ORDER BY COALESCE(retrieval_updated_at, updated_at), id LIMIT ?""",
+                """SELECT * FROM memories WHERE native_index_pending=1
+                ORDER BY CASE WHEN native_index_status='retry' THEN 1 ELSE 0 END,
+                COALESCE(retrieval_updated_at,updated_at),id LIMIT ?""",
                 (max(1, int(limit)),),
             ).fetchall()
             return [self._row(row) for row in rows]
+
+    @staticmethod
+    def _native_state_fingerprint(state: dict[str, Any]) -> str:
+        profile_fingerprint = state.get("profile")
+        if profile_fingerprint is None:
+            profile_fingerprint = state.get("fingerprint")
+        payload = {
+            "profile": str(profile_fingerprint or ""),
+            "memory": str(state.get("memory") or ""),
+            "revision": int(state.get("revision") or 0),
+            "eligible": int(state.get("eligible") or 0),
+            "indexed": int(state.get("indexed") or 0),
+            "held": int(state.get("held") or 0),
+            "invalid": int(state.get("invalid") or 0),
+        }
+        return hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+
+    def native_index_checkpoint(
+        self, profile: dict[str, Any], memory: str = ""
+    ) -> dict[str, Any]:
+        """Return an O(1) durable checkpoint for one embedding target."""
+        fingerprint = str(profile.get("fingerprint", ""))
+        memory = str(memory or profile.get("memory") or "")
+        with self.lock, self.conn:
+            self._ensure_native_checkpoint_profile_locked(fingerprint, memory)
+            row = self.conn.execute(
+                """SELECT native_index_revision,native_eligible_count,
+                native_indexed_count,native_held_count,native_invalid_count
+                FROM sync_state WHERE id=1"""
+            ).fetchone()
+        eligible = int(row["native_eligible_count"] or 0)
+        indexed = int(row["native_indexed_count"] or 0)
+        held = int(row["native_held_count"] or 0)
+        invalid = int(row["native_invalid_count"] or 0)
+        revision = int(row["native_index_revision"] or 0)
+        pending = max(0, eligible - indexed - held)
+        checkpoint = {
+            **profile,
+            "memory": memory,
+            "revision": revision,
+            "eligible": eligible,
+            "indexed": indexed,
+            "held": held,
+            "invalid": invalid,
+            "pending": pending,
+            "complete": pending == 0,
+        }
+        checkpoint["index_fingerprint"] = self._native_state_fingerprint(checkpoint)
+        return checkpoint
+
+    @staticmethod
+    def _native_terminal_counts(
+        item: dict[str, Any], profile_fingerprint: str, memory: str
+    ) -> tuple[int, int, int]:
+        if (
+            str(item.get("native_index_profile") or "") != profile_fingerprint
+            or str(item.get("native_index_memory") or "") != memory
+        ):
+            return 0, 0, 0
+        status = str(item.get("native_index_status") or "")
+        return (
+            int(status == "indexed"),
+            int(status in {"held_secret", "held_invalid"}),
+            int(status == "held_invalid"),
+        )
+
+    def native_index_state_record(
+        self, updates: list[dict[str, Any]] | None = None
+    ) -> dict[str, Any]:
+        """Return a raw-free, versioned state record, optionally projected over updates."""
+        with self.lock:
+            state = self.conn.execute(
+                """SELECT native_checkpoint_profile,native_checkpoint_memory,
+                native_index_revision,native_eligible_count,native_indexed_count,
+                native_held_count,native_invalid_count FROM sync_state WHERE id=1"""
+            ).fetchone()
+            profile_fingerprint = str(state["native_checkpoint_profile"] or "")
+            memory = str(state["native_checkpoint_memory"] or "")
+            revision = int(state["native_index_revision"] or 0)
+            eligible = int(state["native_eligible_count"] or 0)
+            indexed = int(state["native_indexed_count"] or 0)
+            held = int(state["native_held_count"] or 0)
+            invalid = int(state["native_invalid_count"] or 0)
+            projected: dict[str, dict[str, Any]] = {}
+            for update in updates or []:
+                if update.get("_funes_record") not in (None, "memory"):
+                    continue
+                identity = str(update.get("source_identity") or "")
+                if not identity:
+                    continue
+                current = projected.get(identity)
+                if current is None:
+                    row = self.conn.execute(
+                        """SELECT source_identity,source_version,content_hash,content_type,
+                        native_generation,native_index_version,native_index_status,
+                        native_index_profile,native_index_memory,native_indexed_at
+                        FROM memories WHERE source_identity=?""",
+                        (identity,),
+                    ).fetchone()
+                    if row is None:
+                        continue
+                    current = dict(row)
+                if (
+                    ("source_version" in update and str(update["source_version"] or "") != str(current["source_version"] or ""))
+                    or ("content_hash" in update and str(update["content_hash"] or "") != str(current["content_hash"] or ""))
+                    or ("native_generation" in update and int(update["native_generation"] or 0) != int(current["native_generation"] or 0))
+                ):
+                    continue
+                desired = dict(current)
+                for name in (
+                    "native_index_version", "native_index_status",
+                    "native_index_profile", "native_index_memory",
+                    "native_indexed_at",
+                ):
+                    if name in update:
+                        desired[name] = update.get(name)
+                current_native = tuple(
+                    current.get(name)
+                    for name in (
+                        "native_index_version", "native_index_status",
+                        "native_index_profile", "native_index_memory",
+                        "native_indexed_at",
+                    )
+                )
+                desired_native = tuple(
+                    desired.get(name)
+                    for name in (
+                        "native_index_version", "native_index_status",
+                        "native_index_profile", "native_index_memory",
+                        "native_indexed_at",
+                    )
+                )
+                if current_native != desired_native and self._canonical_reindex_eligible(current):
+                    old_counts = self._native_terminal_counts(
+                        current, profile_fingerprint, memory
+                    )
+                    new_counts = self._native_terminal_counts(
+                        desired, profile_fingerprint, memory
+                    )
+                    revision += 1
+                    indexed += new_counts[0] - old_counts[0]
+                    held += new_counts[1] - old_counts[1]
+                    invalid += new_counts[2] - old_counts[2]
+                projected[identity] = desired
+        record = {
+            "_funes_record": "native_index_state",
+            "state_version": NATIVE_CHECKPOINT_STATE_VERSION,
+            "profile": profile_fingerprint,
+            "memory": memory,
+            "revision": revision,
+            "eligible": eligible,
+            "indexed": indexed,
+            "held": held,
+            "invalid": invalid,
+        }
+        record["index_fingerprint"] = self._native_state_fingerprint(record)
+        return record
+
+    def set_native_index_state(self, state: dict[str, Any]) -> bool:
+        """Monotonically merge raw-free checkpoint metadata during restore."""
+        if int(state.get("state_version") or 0) != NATIVE_CHECKPOINT_STATE_VERSION:
+            return False
+        incoming_revision = int(state.get("revision") or 0)
+        counts = [int(state.get(name) or 0) for name in ("eligible", "indexed", "held", "invalid")]
+        if incoming_revision < 0 or any(value < 0 for value in counts):
+            return False
+        profile_fingerprint = str(state.get("profile") or "")
+        memory = str(state.get("memory") or "")
+        expected = self._native_state_fingerprint(state)
+        if state.get("index_fingerprint") not in (None, expected):
+            return False
+        with self.lock, self.conn:
+            current = self.conn.execute(
+                """SELECT native_index_revision,native_checkpoint_profile,
+                native_checkpoint_memory FROM sync_state WHERE id=1"""
+            ).fetchone()
+            current_key = (
+                int(current["native_index_revision"] or 0),
+                str(current["native_checkpoint_profile"] or ""),
+                str(current["native_checkpoint_memory"] or ""),
+            )
+            incoming_key = (incoming_revision, profile_fingerprint, memory)
+            if incoming_key < current_key:
+                return False
+            if self._bulk_restore_depth:
+                self.conn.execute(
+                    """UPDATE sync_state SET native_checkpoint_profile=?,
+                    native_checkpoint_memory=?,native_index_revision=?,
+                    native_eligible_count=?,native_indexed_count=?,native_held_count=?,
+                    native_invalid_count=? WHERE id=1""",
+                    (profile_fingerprint, memory, incoming_revision, *counts),
+                )
+            elif incoming_revision > current_key[0]:
+                self.conn.execute(
+                    "UPDATE sync_state SET native_index_revision=? WHERE id=1",
+                    (incoming_revision,),
+                )
+        return True
+
+    def native_optimize_checkpoint(self) -> dict[str, Any]:
+        """Return the last durable optimize marker without provider secrets."""
+        with self.lock:
+            row = self.conn.execute("SELECT * FROM sync_state WHERE id=1").fetchone()
+        return {
+            "provider": row["native_optimize_provider"],
+            "model": row["native_optimize_model"],
+            "dimensions": row["native_optimize_dimensions"],
+            "schema_version": row["native_optimize_schema_version"],
+            "memory": row["native_optimize_memory"],
+            "fingerprint": row["native_optimize_fingerprint"],
+            "index_fingerprint": row["native_optimize_index_fingerprint"],
+            "status": row["native_optimize_status"],
+            "optimized_at": row["native_optimized_at"],
+            "revision": int(row["native_optimize_revision"] or 0),
+        }
+
+    def set_native_optimize_checkpoint(self, checkpoint: dict[str, Any]) -> bool:
+        """Apply a monotonic durable optimize marker restored from snapshots/deltas."""
+        incoming_at = str(checkpoint.get("optimized_at") or "")
+        incoming_revision = int(checkpoint.get("revision") or 0)
+        if not incoming_at or not checkpoint.get("fingerprint"):
+            return False
+        with self.lock, self.conn:
+            current = self.conn.execute(
+                """SELECT native_optimized_at,native_optimize_revision,
+                native_optimize_status,native_optimize_memory,
+                native_optimize_fingerprint FROM sync_state WHERE id=1"""
+            ).fetchone()
+            if current:
+                current_revision = int(current["native_optimize_revision"] or 0)
+                current_at = str(current["native_optimized_at"] or "")
+                current_namespace = (
+                    str(current["native_optimize_memory"] or ""),
+                    str(current["native_optimize_fingerprint"] or ""),
+                )
+                incoming_namespace = (
+                    str(checkpoint.get("memory") or ""),
+                    str(checkpoint.get("fingerprint") or ""),
+                )
+                if current_namespace == incoming_namespace:
+                    if incoming_revision < current_revision:
+                        return False
+                    if (
+                        incoming_revision == current_revision
+                        and current["native_optimize_status"] == "optimized"
+                        and checkpoint.get("status") != "optimized"
+                    ):
+                        return False
+                    if incoming_revision == current_revision and current_at > incoming_at:
+                        return False
+                elif (
+                    current_at > incoming_at
+                    or (current_at == incoming_at and current_namespace > incoming_namespace)
+                ):
+                    return False
+            self.conn.execute(
+                """UPDATE sync_state SET native_optimize_provider=?, native_optimize_model=?,
+                native_optimize_dimensions=?, native_optimize_schema_version=?,
+                native_optimize_memory=?,
+                native_optimize_fingerprint=?, native_optimize_index_fingerprint=?,
+                native_optimize_status=?, native_optimized_at=?,
+                native_optimize_revision=? WHERE id=1""",
+                (
+                    checkpoint.get("provider"), checkpoint.get("model"),
+                    checkpoint.get("dimensions"), checkpoint.get("schema_version"),
+                    checkpoint.get("memory"),
+                    checkpoint.get("fingerprint"), checkpoint.get("index_fingerprint"),
+                    checkpoint.get("status"), incoming_at, incoming_revision,
+                ),
+            )
+        return True
 
     def update_native_index(self, updates: list[dict[str, Any]]) -> int:
         """Persist derived native state only when the raw source revision still matches."""
@@ -839,12 +1574,15 @@ class Store:
             for item in updates:
                 cursor = self.conn.execute(
                     """UPDATE memories SET native_index_version=?, native_index_status=?,
-                    native_indexed_at=?, native_index_error=?
+                    native_index_profile=?, native_index_memory=?, native_indexed_at=?,
+                    native_index_error=?
                     WHERE source_identity=? AND source_version=? AND content_hash=?
                     AND native_generation=?""",
                     (
                         item.get("native_index_version"),
                         item.get("native_index_status"),
+                        item.get("native_index_profile"),
+                        item.get("native_index_memory"),
                         item.get("native_indexed_at"),
                         item.get("native_index_error"),
                         str(item.get("source_identity", "")),
@@ -861,7 +1599,9 @@ class Store:
         with self.lock, self.conn:
             for item in documents:
                 self.conn.execute(
-                    """UPDATE memories SET retrieval_text=raw_text, translation_status='pending_provider'
+                    """UPDATE memories SET retrieval_text=raw_text,
+                    search_identifiers=funes_identifiers(raw_text,raw_text),
+                    translation_status='pending_provider'
                     WHERE source_identity=? AND content_hash=? AND source_version=?
                     AND retrieval_text=? AND translation_status=?
                     AND retrieval_generation=?""",
@@ -875,7 +1615,15 @@ class Store:
                     ),
                 )
 
-    def search(self, query: str, limit: int = 20, rerank: Any = None, filters: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    def search(
+        self,
+        query: str,
+        limit: int = 20,
+        rerank: Any = None,
+        filters: dict[str, Any] | None = None,
+        *,
+        allow_broad_scan: bool = True,
+    ) -> list[dict[str, Any]]:
         limit = max(1, min(int(limit), 100))
         filters = filters or {}
         clauses = []
@@ -897,7 +1645,7 @@ class Store:
             strict_fts_failed = False
             try:
                 rows = self.conn.execute(
-                    """SELECT m.*, bm25(memories_fts) AS score FROM memories_fts
+                    """SELECT m.*, bm25(memories_fts, 5.0, 1.0, 2.0) AS score FROM memories_fts
                     JOIN memories m ON m.id=memories_fts.rowid WHERE memories_fts MATCH ?""" + facet +
                     " ORDER BY score LIMIT ?", [query, *params, limit]
                 ).fetchall()
@@ -921,7 +1669,7 @@ class Store:
                 ] or technical_terms
                 if technical_terms:
                     technical_rows = self.conn.execute(
-                        """SELECT m.*, bm25(memories_fts) AS score FROM memories_fts
+                        """SELECT m.*, bm25(memories_fts, 5.0, 1.0, 2.0) AS score FROM memories_fts
                         JOIN memories m ON m.id=memories_fts.rowid WHERE memories_fts MATCH ?"""
                         + facet
                         + " ORDER BY score LIMIT ?",
@@ -951,7 +1699,7 @@ class Store:
                     )
                     for row in rows
                 )
-                if content_terms and not covered:
+                if allow_broad_scan and content_terms and not covered:
                     # unicode61 can merge an identifier with adjacent Chinese
                     # characters. Facet indexes keep this compatibility lookup
                     # bounded for source-filtered agent recalls.
@@ -1003,11 +1751,11 @@ class Store:
                         reverse=True,
                     )
                 rows = rows[:limit]
-            if not rows and strict_fts_failed:
+            if allow_broad_scan and not rows and strict_fts_failed:
                 # FTS MATCH is intentionally strict; a plain substring fallback keeps recall useful.
                 like = "%" + query.replace("%", "\\%") + "%"
                 rows = self.conn.execute("SELECT m.*, 0.0 AS score FROM memories m WHERE (m.retrieval_text LIKE ? ESCAPE '\\' OR m.raw_text LIKE ? ESCAPE '\\')" + facet.replace("m.", "m.") + " ORDER BY m.updated_at DESC LIMIT ?", [like, like, *params, limit]).fetchall()
-            if not rows and cjk_ratio(query) > 0:
+            if allow_broad_scan and not rows and cjk_ratio(query) > 0:
                 # unicode61 does not segment every CJK script consistently;
                 # retain a character-level shadow fallback for Chinese recall.
                 chars = list(dict.fromkeys(c for c in query if CJK_RE.match(c)))
@@ -1066,6 +1814,8 @@ class Store:
                 """SELECT generation,scope,created_at FROM reindex_controls
                 ORDER BY generation"""
             ).fetchall()
+            optimize = self.native_optimize_checkpoint()
+            native_state = self.native_index_state_record()
             path.parent.mkdir(parents=True, exist_ok=True)
             opener = gzip.open if path.name.endswith(".gz") else open
             with opener(path, "wt", encoding="utf-8") as f:
@@ -1081,6 +1831,10 @@ class Store:
                     d = dict(row)
                     d["_funes_record"] = "reindex_control"
                     f.write(json.dumps(d, ensure_ascii=False) + "\n")
+                if optimize.get("fingerprint"):
+                    optimize["_funes_record"] = "native_optimize_checkpoint"
+                    f.write(json.dumps(optimize, ensure_ascii=False) + "\n")
+                f.write(json.dumps(native_state, ensure_ascii=False) + "\n")
 
     def iter_documents(self, batch_size: int = 500):
         """Yield durable rows in bounded batches for snapshot/delta transport."""
@@ -1112,6 +1866,20 @@ class Store:
                     total += result["created"] + result["updated"]
                     batch = []
                 self.record_reindex_control(item)
+                continue
+            if record_type == "native_optimize_checkpoint":
+                if batch:
+                    result = self.ingest(batch)
+                    total += result["created"] + result["updated"]
+                    batch = []
+                self.set_native_optimize_checkpoint(item)
+                continue
+            if record_type == "native_index_state":
+                if batch:
+                    result = self.ingest(batch)
+                    total += result["created"] + result["updated"]
+                    batch = []
+                self.set_native_index_state(item)
                 continue
             if record_type == "translation_cache":
                 query = str(item.get("query", ""))
@@ -1149,7 +1917,44 @@ class Store:
                 for line in f:
                     if line.strip():
                         yield json.loads(line)
-        return self.restore_documents(rows(), apply_controls=apply_controls)
+        self.begin_bulk_restore()
+        try:
+            return self.restore_documents(rows(), apply_controls=apply_controls)
+        finally:
+            self.finish_bulk_restore()
+
+    def begin_bulk_restore(self) -> None:
+        """Suspend per-row indexes while one logical restore is in flight."""
+        with self.lock, self.conn:
+            if self._bulk_restore_depth == 0:
+                self._drop_fts_triggers_locked()
+                self._drop_native_state_triggers_locked()
+            self._bulk_restore_depth += 1
+
+    def finish_bulk_restore(self) -> None:
+        """Rebuild derived indexes once after the outermost restore."""
+        with self.lock:
+            if self._bulk_restore_depth <= 0:
+                raise RuntimeError("bulk restore is not active")
+            self._bulk_restore_depth -= 1
+            if self._bulk_restore_depth:
+                return
+            with self.conn:
+                state = self.conn.execute(
+                    """SELECT native_checkpoint_profile,native_checkpoint_memory
+                    FROM sync_state WHERE id=1"""
+                ).fetchone()
+                self._rebuild_native_checkpoint_state_locked(
+                    str(state["native_checkpoint_profile"] or ""),
+                    str(state["native_checkpoint_memory"] or ""),
+                )
+                # FTS5 external-content tables need an explicit rebuild after
+                # restoring rows from a JSONL snapshot.
+                self.conn.execute(
+                    "INSERT INTO memories_fts(memories_fts) VALUES('rebuild')"
+                )
+                self._create_fts_triggers_locked()
+                self._create_native_state_triggers_locked()
 
 
 class Translator:
@@ -1167,7 +1972,7 @@ class Translator:
         self.retries = max(1, int(os.getenv("TRANSLATION_RETRIES", "2")))
         self.timeout = max(1.0, float(os.getenv("TRANSLATION_TIMEOUT", "12")))
         self.query_max_tokens = max(1, int(os.getenv("TRANSLATION_QUERY_MAX_TOKENS", "128")))
-        self.mode = os.getenv("FUNES_RETRIEVAL_LANGUAGE_MODE", "auto").lower()
+        self.mode = os.getenv("FUNES_RETRIEVAL_LANGUAGE_MODE", "raw").lower()
         self._provider_lock = threading.Lock()
         self._provider_disabled_until = 0.0
 
@@ -1403,18 +2208,22 @@ class SnapshotSync:
     def restore(self) -> int:
         if self.repo and self.token:
             try:
-                files = self._repo_files()
-                if not files:
-                    # Backwards-compatible single-file snapshot lookup.
-                    files = [self.filename + ".enc"]
-                restored = 0
-                for filename in files:
-                    restored += self._restore_file(filename)
-                # A complete Hub restore can replay an old generation-zero
-                # revision into an id below a partially persisted row cursor.
-                # Rewind only here; ordinary local restarts keep their cursor.
-                self.store.compact_reindex_controls(replay=True)
-                self.store.drain_reindex_controls(self.restore_batch)
+                self.store.begin_bulk_restore()
+                try:
+                    files = self._repo_files()
+                    if not files:
+                        # Backwards-compatible single-file snapshot lookup.
+                        files = [self.filename + ".enc"]
+                    restored = 0
+                    for filename in files:
+                        restored += self._restore_file(filename)
+                    # A complete Hub restore can replay an old generation-zero
+                    # revision into an id below a partially persisted row cursor.
+                    # Rewind only here; ordinary local restarts keep their cursor.
+                    self.store.compact_reindex_controls(replay=True)
+                    self.store.drain_reindex_controls(self.restore_batch)
+                finally:
+                    self.store.finish_bulk_restore()
                 self.restored = True
                 return restored
             except Exception as exc:  # optional recovery must never stop serving
@@ -1601,12 +2410,18 @@ class SnapshotSync:
             # makes retries idempotent.  `/sync` without documents still emits a
             # compact full snapshot for operators.
             if docs is not None:
-                digest = hashlib.sha256(json.dumps(docs, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:24]
+                durable_docs = list(docs)
+                if not any(
+                    item.get("_funes_record") == "native_index_state"
+                    for item in durable_docs
+                ):
+                    durable_docs.append(self.store.native_index_state_record())
+                digest = hashlib.sha256(json.dumps(durable_docs, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:24]
                 # Content addressing makes a retry upload the same immutable
                 # object. Restore is order-independent because Store.ingest
                 # applies updated_at LWW rather than trusting filename order.
                 path = self.store.data_dir / f"{self.delta_prefix}{digest}.jsonl.gz"
-                self._write_jsonl_gzip(docs, path)
+                self._write_jsonl_gzip(durable_docs, path)
             else:
                 path = self.snapshot_path()
                 self.store.snapshot(path)
@@ -1805,6 +2620,8 @@ def _persist_translation_documents(app: Any, documents: list[dict[str, Any]]) ->
         updated["retrieval_updated_at"] = utc_now()
         updated["native_index_version"] = None
         updated["native_index_status"] = None
+        updated["native_index_profile"] = None
+        updated["native_index_memory"] = None
         updated["native_indexed_at"] = None
         updated["native_index_error"] = None
         updates.append(updated)
@@ -1859,6 +2676,8 @@ def ingest_documents(app: Any, docs: list[dict[str, Any]]) -> dict[str, Any]:
         if existing and existing.get("native_index_status") == "waiting_durability":
             item["native_index_version"] = None
             item["native_index_status"] = "retry"
+            item["native_index_profile"] = None
+            item["native_index_memory"] = None
             item["native_indexed_at"] = None
             item["native_index_error"] = None
     result = app.store.ingest(prepared)
@@ -1971,10 +2790,6 @@ class App:
     def _restore_background(self) -> None:
         try:
             self.restore_result = self.syncer.restore()
-            if not self.syncer.restore_failed:
-                # FTS5 external-content tables need an explicit rebuild after
-                # restoring rows from a JSONL snapshot.
-                self.store.reindex()
         finally:
             self.syncer.restoring = False
             self.restore_done.set()

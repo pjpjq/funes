@@ -32,11 +32,13 @@ from service.server import NATIVE_SESSION_TYPES
 from service.server import prepare_ingest_documents as prepare_source_ingest_documents
 from service.server import queue_reindex as queue_source_reindex
 from service.server import stable_rrf
+from service.server import utc_now
 from service.server import validate_source_identity_batch
 
 
 FUNES_BIN = os.getenv("FUNES_BIN", "/usr/local/bin/funes")
 REMOTE = os.getenv("FUNES_MEMORY", "")
+INDEX_REMOTE = os.getenv("FUNES_INDEX_MEMORY", "")
 TOKEN = os.getenv("FUNES_API_TOKEN", "")
 HOME = Path(os.getenv("FUNES_HOME", "/data/.funes"))
 PORT = int(os.getenv("PORT", "7860"))
@@ -46,6 +48,7 @@ INGEST_PUSH_TIMEOUT = int(os.getenv("FUNES_INGEST_PUSH_TIMEOUT", "1800"))
 CANONICAL_INDEX_BATCH = max(1, int(os.getenv("FUNES_CANONICAL_INDEX_BATCH", "32")))
 CANONICAL_INDEX_INTERVAL = max(0.01, float(os.getenv("FUNES_CANONICAL_INDEX_INTERVAL", "30")))
 CANONICAL_INDEX_TIMEOUT = max(1, int(os.getenv("FUNES_CANONICAL_INDEX_TIMEOUT", "900")))
+CANONICAL_OPTIMIZE_TIMEOUT = max(1, int(os.getenv("FUNES_CANONICAL_OPTIMIZE_TIMEOUT", "900")))
 MCP_PROTOCOL_VERSION = "2024-11-05"
 MCP_TIMEOUT = float(os.getenv("FUNES_MCP_TIMEOUT", "180"))
 MCP_HANDSHAKE_TIMEOUT = float(os.getenv("FUNES_MCP_HANDSHAKE_TIMEOUT", "10"))
@@ -68,8 +71,15 @@ try:
     )
 except ValueError:
     CJK_NATIVE_TIMEOUT = min(HTTP_NATIVE_TIMEOUT, 5.0)
+try:
+    VOYAGE_NATIVE_TIMEOUT = min(
+        HTTP_NATIVE_TIMEOUT,
+        max(0.1, float(os.getenv("FUNES_VOYAGE_NATIVE_TIMEOUT", "4"))),
+    )
+except ValueError:
+    VOYAGE_NATIVE_TIMEOUT = min(HTTP_NATIVE_TIMEOUT, 4.0)
 PROMPT_VERSION = "funes-retrieval-v1"
-LANGUAGE_MODE = os.getenv("FUNES_RETRIEVAL_LANGUAGE_MODE", "auto").lower()
+LANGUAGE_MODE = os.getenv("FUNES_RETRIEVAL_LANGUAGE_MODE", "raw").lower()
 INDEX_LOCK = threading.Lock()
 # Writes use the native memory lock inside the `funes` process.  Keep their
 # Python-level serialization separate from reads so a background ingest/push
@@ -81,6 +91,104 @@ INGEST_OPERATION_LOCK = threading.Lock()
 INGEST_OPERATIONS: dict[str, dict[str, object]] = {}
 INGEST_ACTIVE_OPERATION: str | None = None
 INGEST_RESTART_SCHEDULED = False
+
+
+def _positive_int_env(name: str, default: int) -> int:
+    try:
+        return max(1, int(os.getenv(name, str(default))))
+    except ValueError:
+        return default
+
+
+def _embedding_profile(
+    provider: str,
+    model: str,
+    dimensions: int,
+    schema_version: int,
+) -> dict[str, object]:
+    """Build the exact native embedding contract and its stable fingerprint."""
+    contract = (
+        f"provider={provider}\n"
+        f"model={model}\n"
+        f"dimensions={dimensions}\n"
+        f"schema_version={schema_version}\n"
+        "document_input=document\n"
+        "query_input=query\n"
+        "normalization=l2\n"
+        "metric=l2"
+    )
+    return {
+        "provider": provider,
+        "model": model,
+        "dimensions": dimensions,
+        "schema_version": schema_version,
+        "fingerprint": hashlib.sha256(contract.encode("utf-8")).hexdigest(),
+    }
+
+
+def embedding_profile() -> dict[str, object]:
+    """Return the active query embedding contract."""
+    provider = os.getenv("FUNES_EMBEDDING_PROVIDER", "voyage").strip().lower() or "voyage"
+    model = os.getenv("FUNES_EMBEDDING_MODEL", "voyage-4-lite").strip() or "voyage-4-lite"
+    dimensions = _positive_int_env("FUNES_EMBEDDING_DIMENSIONS", 1024)
+    schema_version = _positive_int_env("FUNES_EMBEDDING_SCHEMA_VERSION", 2)
+    return _embedding_profile(provider, model, dimensions, schema_version)
+
+
+def index_memory() -> str:
+    """Return the blue/green build target, defaulting to the active memory."""
+    return INDEX_REMOTE.strip() or REMOTE
+
+
+def index_embedding_profile() -> dict[str, object]:
+    """Return the build profile without changing the active query profile."""
+    active = embedding_profile()
+    provider = (
+        os.getenv("FUNES_INDEX_EMBEDDING_PROVIDER", "").strip().lower()
+        or str(active["provider"])
+    )
+    provider_changed = provider != active["provider"]
+    defaults = {
+        "voyage": ("voyage-4-lite", 1024, 2),
+        "local": ("BAAI/bge-small-en-v1.5", 384, 1),
+    }
+    default_model, default_dimensions, default_schema = defaults.get(
+        provider,
+        (str(active["model"]), int(active["dimensions"]), int(active["schema_version"])),
+    )
+    model = (
+        os.getenv("FUNES_INDEX_EMBEDDING_MODEL", "").strip()
+        or (default_model if provider_changed else str(active["model"]))
+    )
+    dimensions = _positive_int_env(
+        "FUNES_INDEX_EMBEDDING_DIMENSIONS",
+        default_dimensions if provider_changed else int(active["dimensions"]),
+    )
+    schema_version = _positive_int_env(
+        "FUNES_INDEX_EMBEDDING_SCHEMA_VERSION",
+        default_schema if provider_changed else int(active["schema_version"]),
+    )
+    return _embedding_profile(provider, model, dimensions, schema_version)
+
+
+def native_environment(
+    home: Path = HOME,
+    profile: dict[str, object] | None = None,
+) -> dict[str, str]:
+    """Build a secret-preserving native environment for one embedding profile."""
+    env = os.environ.copy()
+    profile = profile or embedding_profile()
+    env["FUNES_HOME"] = str(home)
+    env["FUNES_EMBEDDING_PROVIDER"] = str(profile["provider"])
+    env["FUNES_EMBEDDING_MODEL"] = str(profile["model"])
+    env["FUNES_EMBEDDING_DIMENSIONS"] = str(profile["dimensions"])
+    env["FUNES_EMBEDDING_SCHEMA_VERSION"] = str(profile["schema_version"])
+    env["FUNES_RERANK_PROVIDER"] = os.getenv("FUNES_RERANK_PROVIDER", "none") or "none"
+    env["FUNES_NATIVE_FALLBACK"] = os.getenv("FUNES_NATIVE_FALLBACK", "false") or "false"
+    env["FUNES_RETRIEVAL_LANGUAGE_MODE"] = (
+        os.getenv("FUNES_RETRIEVAL_LANGUAGE_MODE", "raw") or "raw"
+    )
+    return env
 
 
 def source_app():
@@ -108,12 +216,30 @@ def source_state() -> dict[str, object]:
         return {"configured": True, "ready": False, "restoring": True, "documents": app.store.count()}
     if app.syncer.restore_failed:
         return {"configured": True, "ready": False, "error": "restore_failed", "documents": app.store.count()}
+    active_profile = embedding_profile()
+    build_profile = index_embedding_profile()
+    build_memory = index_memory()
+    checkpoint = app.store.native_index_checkpoint(build_profile, build_memory)
+    optimize = app.store.native_optimize_checkpoint()
+    checkpoint["optimize"] = optimize
+    checkpoint["memory"] = build_memory
+    checkpoint["cutover_ready"] = bool(
+        checkpoint.get("complete")
+        and checkpoint.get("indexed")
+        and optimize.get("status") == "optimized"
+        and optimize.get("fingerprint") == build_profile["fingerprint"]
+        and optimize.get("memory") == build_memory
+        and optimize.get("index_fingerprint") == checkpoint.get("index_fingerprint")
+    )
     return {
         "configured": True,
         "ready": True,
         "documents": app.store.count(),
         "restored": app.restore_result,
         "sync": app.store.sync_status(),
+        "active_index": {"memory": REMOTE, "profile": active_profile},
+        "build_index": {"memory": build_memory, "profile": build_profile},
+        "canonical_index": checkpoint,
     }
 
 
@@ -487,9 +613,20 @@ def search_source_rankings(
         return query, [], []
     rewritten = app.translator.rewrite_query(query)
     candidate_limit = expanded_candidate_limit(limit)
-    raw_hits = app.store.search(query, candidate_limit, filters=filters)
+    allow_broad_scan = embedding_profile()["provider"] != "voyage"
+    raw_hits = app.store.search(
+        query,
+        candidate_limit,
+        filters=filters,
+        allow_broad_scan=allow_broad_scan,
+    )
     rewritten_hits = (
-        app.store.search(rewritten, candidate_limit, filters=filters)
+        app.store.search(
+            rewritten,
+            candidate_limit,
+            filters=filters,
+            allow_broad_scan=allow_broad_scan,
+        )
         if rewritten != query
         else []
     )
@@ -745,14 +882,16 @@ def query_text(raw: str) -> str:
     return shadow or "memory context retrieval"
 
 
-def run(*args: str, timeout: int = 180) -> tuple[int, str, str]:
-    env = os.environ.copy()
-    env["FUNES_HOME"] = str(HOME)
+def run(
+    *args: str,
+    timeout: int = 180,
+    profile: dict[str, object] | None = None,
+) -> tuple[int, str, str]:
+    env = native_environment(profile=profile)
     p = subprocess.run([FUNES_BIN, *args], text=True, capture_output=True, timeout=timeout, env=env)
     return p.returncode, p.stdout, p.stderr
 
 
-CANONICAL_TRANSLATION_STATUSES = {"ok", "skipped_non_cjk", "skipped_raw_mode"}
 CANONICAL_FACETS = (
     "source_agent",
     "source_type",
@@ -772,6 +911,10 @@ NATIVE_GET_RE = re.compile(
 )
 NATIVE_REPORT_RE = re.compile(
     r"\bingested\s+sources=(\d+)\s+chunks=(\d+)\s+unchanged=(\d+)\s+stale=(\d+)\s+held=(\d+)(?:\s+commit=(\S+))?"
+)
+NATIVE_RECORD_ERROR_RE = re.compile(
+    r"invalid canonical JSONL record|must not be empty|must not contain NUL|invalid timestamp",
+    re.IGNORECASE,
 )
 CANONICAL_REF_PREFIX = "funes-doc:"
 
@@ -804,7 +947,8 @@ def _strip_raw_fields(value):
     return value
 
 
-def canonical_source_version(item: dict) -> str:
+def canonical_source_version(item: dict, profile: dict[str, object] | None = None) -> str:
+    profile = profile or embedding_profile()
     retrieval_hash = hashlib.sha256(str(item.get("retrieval_text", "")).encode()).hexdigest()
     parts = [
         str(item.get("source_version", "")),
@@ -814,20 +958,25 @@ def canonical_source_version(item: dict) -> str:
         retrieval_hash,
         "1" if item.get("source_missing") else "0",
         str(int(item.get("native_generation") or 0)),
+        str(profile["fingerprint"]),
     ]
     encoded = json.dumps(parts, ensure_ascii=False, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()
 
 
-def canonical_document(item: dict) -> dict:
-    """Build the native canonical envelope without copying raw source fields."""
+def canonical_document(
+    item: dict, profile: dict[str, object] | None = None
+) -> dict:
+    """Build the native canonical envelope from the durable raw source."""
+    profile = profile or embedding_profile()
     metadata = _strip_raw_fields(dict(item.get("metadata") or {}))
     metadata["source_version"] = str(item.get("source_version", ""))
     if item.get("session_id") is not None:
         metadata.setdefault("session_id", item["session_id"])
     document = {
         "source_identity": str(item["source_identity"]),
-        "source_version": canonical_source_version(item),
+        "source_version": canonical_source_version(item, profile),
+        "raw_text": str(item["raw_text"]),
         "retrieval_text": str(item["retrieval_text"]),
         "content_hash": str(item["content_hash"]),
         "updated_at": str(item.get("retrieval_updated_at") or item.get("updated_at")),
@@ -843,16 +992,27 @@ def canonical_document(item: dict) -> dict:
     return document
 
 
-def _native_update(item: dict, status: str, version: str | None, error: str | None = None) -> dict:
+def _native_update(
+    item: dict,
+    status: str,
+    version: str | None,
+    error: str | None = None,
+    *,
+    profile: dict[str, object] | None = None,
+    memory: str | None = None,
+) -> dict:
+    profile = profile or index_embedding_profile()
     return {
         "source_identity": str(item["source_identity"]),
         "source_version": str(item.get("source_version", "")),
         "content_hash": str(item["content_hash"]),
         "native_index_version": version,
         "native_index_status": status,
+        "native_index_profile": profile["fingerprint"],
+        "native_index_memory": memory or index_memory(),
         "native_indexed_at": (
-            time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-            if status == "indexed"
+            utc_now()
+            if status in {"indexed", "held_secret", "held_invalid"}
             else None
         ),
         "native_index_error": error,
@@ -867,38 +1027,73 @@ def _write_canonical_jsonl(path: Path, records: list[tuple[dict, dict]]) -> None
 
 
 def _ingest_canonical_subset(
-    records: list[tuple[dict, dict]], directory: Path, sequence: list[int]
+    records: list[tuple[dict, dict]],
+    directory: Path,
+    sequence: list[int],
+    *,
+    memory: str,
+    profile: dict[str, object],
 ) -> tuple[list[dict], bool]:
     sequence[0] += 1
     path = directory / f"batch-{sequence[0]:06d}.jsonl"
     _write_canonical_jsonl(path, records)
     try:
-        code, output, _ = run(
+        code, output, error_output = run(
             "ingest-docs",
             str(path),
             "--memory",
-            REMOTE,
+            memory,
             timeout=CANONICAL_INDEX_TIMEOUT,
+            profile=profile,
         )
     except subprocess.TimeoutExpired:
         return [
-            _native_update(item, "retry", None, "TimeoutExpired")
+            _native_update(
+                item, "retry", None, "TimeoutExpired", profile=profile, memory=memory
+            )
             for item, _ in records
         ], False
     except (OSError, subprocess.SubprocessError) as exc:
         return [
-            _native_update(item, "retry", None, type(exc).__name__)
+            _native_update(
+                item, "retry", None, type(exc).__name__, profile=profile, memory=memory
+            )
             for item, _ in records
         ], False
     if code != 0:
+        if NATIVE_RECORD_ERROR_RE.search(error_output or ""):
+            if len(records) == 1:
+                item, _ = records[0]
+                return [
+                    _native_update(
+                        item,
+                        "held_invalid",
+                        None,
+                        "invalid_source",
+                        profile=profile,
+                        memory=memory,
+                    )
+                ], False
+            middle = len(records) // 2
+            left, left_commit = _ingest_canonical_subset(
+                records[:middle], directory, sequence, memory=memory, profile=profile
+            )
+            right, right_commit = _ingest_canonical_subset(
+                records[middle:], directory, sequence, memory=memory, profile=profile
+            )
+            return left + right, left_commit or right_commit
         return [
-            _native_update(item, "retry", None, "native_exit")
+            _native_update(
+                item, "retry", None, "native_exit", profile=profile, memory=memory
+            )
             for item, _ in records
         ], False
     report = NATIVE_REPORT_RE.search(output)
     if report is None:
         return [
-            _native_update(item, "retry", None, "invalid_report")
+            _native_update(
+                item, "retry", None, "invalid_report", profile=profile, memory=memory
+            )
             for item, _ in records
         ], False
     sources = int(report.group(1))
@@ -908,48 +1103,87 @@ def _ingest_canonical_subset(
     committed = bool(report.group(6))
     if sources + unchanged + stale + held != len(records):
         return [
-            _native_update(item, "retry", None, "invalid_report")
+            _native_update(
+                item, "retry", None, "invalid_report", profile=profile, memory=memory
+            )
             for item, _ in records
         ], committed
     if held == 0 and stale == 0:
         return [
-            _native_update(item, "indexed", document["source_version"])
+            _native_update(
+                item,
+                "indexed",
+                document["source_version"],
+                profile=profile,
+                memory=memory,
+            )
             for item, document in records
         ], committed
     if len(records) == 1:
         item, document = records[0]
         if held == 1:
-            return [_native_update(item, "held_secret", document["source_version"])], committed
-        return [_native_update(item, "retry", None, "native_stale")], committed
+            return [
+                _native_update(
+                    item,
+                    "held_secret",
+                    document["source_version"],
+                    profile=profile,
+                    memory=memory,
+                )
+            ], committed
+        return [
+            _native_update(
+                item, "retry", None, "native_stale", profile=profile, memory=memory
+            )
+        ], committed
     middle = len(records) // 2
-    left, left_commit = _ingest_canonical_subset(records[:middle], directory, sequence)
-    right, right_commit = _ingest_canonical_subset(records[middle:], directory, sequence)
+    left, left_commit = _ingest_canonical_subset(
+        records[:middle], directory, sequence, memory=memory, profile=profile
+    )
+    right, right_commit = _ingest_canonical_subset(
+        records[middle:], directory, sequence, memory=memory, profile=profile
+    )
     return left + right, committed or left_commit or right_commit
 
 
 def reconcile_canonical_index(app) -> dict[str, object]:
     """Index one restart-safe batch and persist only derived status in the sidecar."""
-    if not REMOTE or app.syncer.restoring or app.syncer.restore_failed:
+    memory = index_memory()
+    if not memory or app.syncer.restoring or app.syncer.restore_failed:
         return {"attempted": 0, "indexed": 0, "held": 0, "durable": False}
+
+    profile = index_embedding_profile()
 
     def select_and_ingest(directory: Path):
         if app.syncer.restoring or app.syncer.restore_failed:
             return [], [], False
-        rows = app.store.canonical_index_candidates(CANONICAL_INDEX_BATCH)
+        rows = app.store.canonical_index_candidates(
+            CANONICAL_INDEX_BATCH,
+            str(profile["fingerprint"]),
+            memory,
+        )
         selected = []
         for item in rows:
-            if item.get("translation_status") not in CANONICAL_TRANSLATION_STATUSES:
-                continue
-            document = canonical_document(item)
+            document = canonical_document(item, profile)
             if (
-                item.get("native_index_status") in {"indexed", "held_secret"}
+                item.get("native_index_status") in {
+                    "indexed", "held_secret", "held_invalid"
+                }
                 and item.get("native_index_version") == document["source_version"]
+                and item.get("native_index_profile") == profile["fingerprint"]
+                and item.get("native_index_memory") == memory
             ):
                 continue
             selected.append((item, document))
         if not selected:
             return selected, [], False
-        updates, committed = _ingest_canonical_subset(selected, directory, [0])
+        updates, committed = _ingest_canonical_subset(
+            selected,
+            directory,
+            [0],
+            memory=memory,
+            profile=profile,
+        )
         return selected, updates, committed
 
     with tempfile.TemporaryDirectory(prefix="funes-canonical-") as temporary:
@@ -962,10 +1196,17 @@ def reconcile_canonical_index(app) -> dict[str, object]:
                     records, updates, committed = select_and_ingest(Path(temporary))
     if not records:
         durable = not app.syncer.restoring and not app.syncer.restore_failed
+        if durable:
+            optimize_canonical_index(app, profile, memory)
         return {"attempted": 0, "indexed": 0, "held": 0, "durable": durable}
-    if committed:
+    if (
+        committed
+        and memory == REMOTE
+        and profile["fingerprint"] == embedding_profile()["fingerprint"]
+    ):
         request_warm(force=True)
     status_documents = []
+    valid_updates = []
     for update in updates:
         current = app.store.get(update["source_identity"])
         if (
@@ -975,16 +1216,114 @@ def reconcile_canonical_index(app) -> dict[str, object]:
         ):
             continue
         status_documents.append({**current, **update})
+        valid_updates.append(update)
+    pending_marker = None
+    if any(update["native_index_status"] == "indexed" for update in valid_updates):
+        previous = app.store.native_optimize_checkpoint()
+        pending_marker = native_optimize_marker(
+            profile, "pending", previous, memory=memory
+        )
+        status_documents.append(pending_marker)
+    if valid_updates:
+        status_documents.append(app.store.native_index_state_record(valid_updates))
     sync = app.syncer.upload(status_documents) if status_documents else {"durable": False}
     durable = bool(sync.get("durable"))
     if durable:
-        app.store.update_native_index(updates)
+        app.store.update_native_index(valid_updates)
+        if pending_marker is not None:
+            app.store.set_native_optimize_checkpoint(pending_marker)
     return {
         "attempted": len(records),
         "indexed": sum(item["native_index_status"] == "indexed" for item in updates) if durable else 0,
-        "held": sum(item["native_index_status"] == "held_secret" for item in updates) if durable else 0,
+        "held": (
+            sum(
+                item["native_index_status"] in {"held_secret", "held_invalid"}
+                for item in valid_updates
+            )
+            if durable
+            else 0
+        ),
         "durable": durable,
     }
+
+
+def optimize_native_index(
+    memory: str | None = None,
+    profile: dict[str, object] | None = None,
+) -> bool:
+    """Optimize the committed remote index without rebuilding local fallback state."""
+    memory = memory or index_memory()
+    profile = profile or index_embedding_profile()
+    try:
+        code, _, _ = run(
+            "optimize-index",
+            memory,
+            timeout=CANONICAL_OPTIMIZE_TIMEOUT,
+            profile=profile,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return code == 0
+
+
+def native_optimize_marker(
+    profile: dict[str, object],
+    status: str,
+    previous: dict[str, object],
+    index_fingerprint: str | None = None,
+    *,
+    memory: str | None = None,
+) -> dict[str, object]:
+    """Build one monotonic marker for content-addressed restore ordering."""
+    return {
+        **profile,
+        "memory": memory or index_memory(),
+        "index_fingerprint": index_fingerprint,
+        "status": status,
+        "optimized_at": utc_now(),
+        "revision": int(previous.get("revision") or 0) + 1,
+        "_funes_record": "native_optimize_checkpoint",
+    }
+
+
+def optimize_canonical_index(
+    app,
+    profile: dict[str, object],
+    memory: str | None = None,
+) -> bool:
+    """Run and durably checkpoint one optimize after a profile backlog catches up."""
+    memory = memory or index_memory()
+    with WRITE_LOCK:
+        previous = app.store.native_optimize_checkpoint()
+        if (
+            previous.get("status") == "optimized"
+            and previous.get("fingerprint") == profile["fingerprint"]
+            and previous.get("memory") == memory
+            and int(previous.get("revision") or 0) > 0
+        ):
+            return False
+        checkpoint = app.store.native_index_checkpoint(profile, memory)
+        if not checkpoint["complete"] or not checkpoint["indexed"]:
+            return False
+        optimized = optimize_native_index(memory, profile)
+        marker = native_optimize_marker(
+            profile,
+            "optimized" if optimized else "retry",
+            previous,
+            str(checkpoint["index_fingerprint"]),
+            memory=memory,
+        )
+        sync = app.syncer.upload([marker])
+        if not sync.get("durable"):
+            return False
+        app.store.set_native_optimize_checkpoint(marker)
+    if (
+        optimized
+        and memory == REMOTE
+        and profile["fingerprint"] == embedding_profile()["fingerprint"]
+    ):
+        request_warm(force=True)
+    return optimized
 
 
 def _canonical_reconcile_background(app) -> None:
@@ -1001,7 +1340,7 @@ def _canonical_reconcile_background(app) -> None:
 
 
 def start_canonical_reconciler(app) -> None:
-    if not REMOTE or getattr(app, "canonical_index_thread", None) is not None:
+    if not index_memory() or getattr(app, "canonical_index_thread", None) is not None:
         return
     app.canonical_index_stop = threading.Event()
     app.canonical_index_thread = threading.Thread(
@@ -1115,9 +1454,7 @@ class NativeMcpWorker:
     def _environment(self) -> dict[str, str]:
         # Keep HF_TOKEN/HF_HOME and any other caller-provided Hub settings.  Only
         # FUNES_HOME is pinned to the Space's durable warm-cache directory.
-        env = os.environ.copy()
-        env["FUNES_HOME"] = str(self.home)
-        return env
+        return native_environment(self.home)
 
     @staticmethod
     def _alive(process) -> bool:
@@ -1406,7 +1743,12 @@ def native_worker() -> NativeMcpWorker:
     # Tests and embedders may supply a small fake directly; do not replace it.
     if MCP_WORKER is not None and not isinstance(MCP_WORKER, NativeMcpWorker):
         return MCP_WORKER
-    config = (FUNES_BIN, REMOTE, str(HOME), MCP_TIMEOUT, MCP_HANDSHAKE_TIMEOUT)
+    config = (
+        FUNES_BIN, REMOTE, str(HOME), MCP_TIMEOUT, MCP_HANDSHAKE_TIMEOUT,
+        embedding_profile()["fingerprint"],
+        os.getenv("FUNES_RERANK_PROVIDER", "none"),
+        os.getenv("FUNES_NATIVE_FALLBACK", "false"),
+    )
     with _MCP_WORKER_LOCK:
         # During the initial background warm there is intentionally no active
         # worker yet.  Do not race it by spawning a second native MCP child;
@@ -1442,7 +1784,12 @@ def close_native_worker() -> None:
 def _refresh_native_worker() -> None:
     """Warm a replacement child and atomically swap it with the active one."""
     global MCP_WORKER, _MCP_WORKER_CONFIG
-    config = (FUNES_BIN, REMOTE, str(HOME), MCP_TIMEOUT, MCP_HANDSHAKE_TIMEOUT)
+    config = (
+        FUNES_BIN, REMOTE, str(HOME), MCP_TIMEOUT, MCP_HANDSHAKE_TIMEOUT,
+        embedding_profile()["fingerprint"],
+        os.getenv("FUNES_RERANK_PROVIDER", "none"),
+        os.getenv("FUNES_NATIVE_FALLBACK", "false"),
+    )
     candidate = NativeMcpWorker(
         FUNES_BIN,
         REMOTE,
@@ -1451,7 +1798,9 @@ def _refresh_native_worker() -> None:
         handshake_timeout=MCP_HANDSHAKE_TIMEOUT,
     )
     try:
-        candidate.recall("memory", k=1, candidates=1, half_life=0, neighbors=0)
+        probe = candidate.recall("memory", k=1, candidates=1, half_life=0, neighbors=0)
+        if probe.startswith("recall error:"):
+            raise NativeMcpError("native recall failed")
     except Exception:
         candidate.close()
         raise
@@ -1533,6 +1882,7 @@ def ready_payload() -> tuple[int, dict[str, object]]:
             "error": err[-500:],
             "native_warm": warm_state(),
             "source_store": sources,
+            "embedding_profile": embedding_profile(),
         },
     )
 
@@ -1730,10 +2080,15 @@ class Handler(BaseHTTPRequestHandler):
                     len(sidecar_results) >= min(limit, 3)
                     and sidecar_has_exact_entities(raw_query, sidecar_results)
                 )
-                # Reuse the source-side query rewrite for native semantic
-                # retrieval. query_text is deterministic fallback only, so a
-                # search can make at most one provider request.
-                query = source_query if source_query != raw_query else query_text(raw_query)
+                embedding_provider = str(embedding_profile()["provider"])
+                # Voyage is multilingual: embed the user's original query.
+                # Query shadows remain available only to legacy local mode and
+                # never replace the returned or vectorized raw text.
+                query = (
+                    raw_query
+                    if LANGUAGE_MODE == "raw" or embedding_provider == "voyage"
+                    else source_query if source_query != raw_query else query_text(raw_query)
+                )
                 # CJK queries use the ASCII shadow above.  Keep the native
                 # search bounded so the CPU Space does not spend its entire
                 # request window reranking broad generic terms.
@@ -1760,7 +2115,7 @@ class Handler(BaseHTTPRequestHandler):
                         tuning[name] = filters[name]
                 # Date/role filtering remains authoritative in the sidecar.
                 native_allowed = (
-                    not exact_sidecar
+                    (embedding_provider == "voyage" or not exact_sidecar)
                     and not any(key in filters for key in ("role", "since", "until"))
                 )
                 native_budget = (
@@ -1768,6 +2123,8 @@ class Handler(BaseHTTPRequestHandler):
                     if has_cjk and sidecar_results
                     else HTTP_NATIVE_TIMEOUT
                 )
+                if embedding_provider == "voyage":
+                    native_budget = min(native_budget, VOYAGE_NATIVE_TIMEOUT)
                 native_deadline = time.monotonic() + native_budget
                 try:
                     # The native CLI defaults to 30 fused candidates, recency
@@ -1808,10 +2165,30 @@ class Handler(BaseHTTPRequestHandler):
                     retrieval_degraded = "native_mcp_busy"
                 except NativeMcpError:
                     if not any(source_rankings) and not any(session_fallback_rankings):
-                        self.send_json(503, {"ok": False, "results": [], "results_text": "", "error": "native_mcp_unavailable"})
+                        unavailable = (
+                            "voyage_unavailable"
+                            if embedding_provider == "voyage"
+                            else "native_mcp_unavailable"
+                        )
+                        self.send_json(
+                            503,
+                            {
+                                "ok": False,
+                                "results": [],
+                                "results_text": "",
+                                "error": "native_mcp_unavailable",
+                                "retrieval_degraded": unavailable,
+                                "retrieval_backend": "unavailable",
+                                "embedding_profile": embedding_profile(),
+                            },
+                        )
                         return
                     results = []
-                    retrieval_degraded = "native_mcp_unavailable"
+                    retrieval_degraded = (
+                        "voyage_unavailable"
+                        if embedding_provider == "voyage"
+                        else "native_mcp_unavailable"
+                    )
                 else:
                     retrieval_degraded = ""
                 # Source rankings already preserve raw/rewrite and cross-type
@@ -1827,7 +2204,20 @@ class Handler(BaseHTTPRequestHandler):
                     for item in results
                     if item.get("raw_text")
                 )
-                response = {"ok": True, "query": raw_query, "retrieval_query": source_query if source_query != raw_query else query, "results": results, "results_text": results_text, "error": ""}
+                response = {
+                    "ok": True,
+                    "query": raw_query,
+                    "retrieval_query": query,
+                    "results": results,
+                    "results_text": results_text,
+                    "error": "",
+                    "retrieval_backend": (
+                        "bm25"
+                        if retrieval_degraded or not native_allowed
+                        else f"{embedding_provider}_lance_bm25_rrf"
+                    ),
+                    "embedding_profile": embedding_profile(),
+                }
                 if retrieval_degraded:
                     response["retrieval_degraded"] = retrieval_degraded
                 self.send_json(200, response)

@@ -912,11 +912,21 @@ NATIVE_GET_RE = re.compile(
 NATIVE_REPORT_RE = re.compile(
     r"\bingested\s+sources=(\d+)\s+chunks=(\d+)\s+unchanged=(\d+)\s+stale=(\d+)\s+held=(\d+)(?:\s+commit=(\S+))?"
 )
+NATIVE_HELD_SOURCE_IDS_RE = re.compile(
+    r"(?m)[ \t]held_source_ids=(\[[^\r\n]*\])[ \t]*$"
+)
+NATIVE_HELD_SOURCE_ID_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
 NATIVE_RECORD_ERROR_RE = re.compile(
     r"invalid canonical JSONL record|must not be empty|must not contain NUL|invalid timestamp",
     re.IGNORECASE,
 )
 CANONICAL_REF_PREFIX = "funes-doc:"
+HELD_SOURCE_ID_DOMAIN = b"funes-held-source-v1\0"
+
+
+def _opaque_source_id(source_identity: str) -> str:
+    digest = hashlib.sha256(HELD_SOURCE_ID_DOMAIN + source_identity.encode()).hexdigest()
+    return "sha256:" + digest
 
 
 def canonical_reference(source_identity: str) -> str:
@@ -1026,6 +1036,35 @@ def _write_canonical_jsonl(path: Path, records: list[tuple[dict, dict]]) -> None
             stream.write(json.dumps(document, ensure_ascii=False, sort_keys=True) + "\n")
 
 
+def _reported_held_source_ids(
+    output: str,
+    records: list[tuple[dict, dict]],
+    held: int,
+) -> set[str] | None:
+    """Validate the opaque extended report field before trusting its batch mapping."""
+    matches = NATIVE_HELD_SOURCE_IDS_RE.findall(output)
+    if len(matches) != 1:
+        return None
+    try:
+        source_ids = json.loads(matches[0])
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(source_ids, list) or len(source_ids) != held:
+        return None
+    if any(
+        not isinstance(source_id, str)
+        or NATIVE_HELD_SOURCE_ID_RE.fullmatch(source_id) is None
+        for source_id in source_ids
+    ) or len(set(source_ids)) != held:
+        return None
+    record_source_ids = {
+        _opaque_source_id(str(item["source_identity"])) for item, _ in records
+    }
+    if len(record_source_ids) != len(records) or not set(source_ids) <= record_source_ids:
+        return None
+    return set(source_ids)
+
+
 def _ingest_canonical_subset(
     records: list[tuple[dict, dict]],
     directory: Path,
@@ -1119,6 +1158,26 @@ def _ingest_canonical_subset(
             )
             for item, document in records
         ], committed
+    # The extension identifies held rows only.  A stale row has no identity mapping, so preserve
+    # the legacy bisection fallback unless every non-held row is safe to mark indexed.
+    if stale == 0:
+        held_source_ids = _reported_held_source_ids(output, records, held)
+        if held_source_ids is not None:
+            return [
+                _native_update(
+                    item,
+                    (
+                        "held_secret"
+                        if _opaque_source_id(str(item["source_identity"]))
+                        in held_source_ids
+                        else "indexed"
+                    ),
+                    document["source_version"],
+                    profile=profile,
+                    memory=memory,
+                )
+                for item, document in records
+            ], committed
     if len(records) == 1:
         item, document = records[0]
         if held == 1:

@@ -16,6 +16,7 @@ use futures::TryStreamExt;
 use lance::dataset::{Dataset, MergeInsertBuilder, WhenMatched, WhenNotMatched, WhenNotMatchedBySource, WriteParams};
 use serde::Deserialize;
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
@@ -24,6 +25,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 const MAX_COMMIT_RETRIES: u32 = 10;
+const HELD_SOURCE_ID_DOMAIN: &[u8] = b"funes-held-source-v1\0";
 
 #[derive(Clone, Debug, Deserialize)]
 struct InputDocument {
@@ -126,7 +128,7 @@ struct Report {
     chunks: usize,
     unchanged: usize,
     stale: usize,
-    held: usize,
+    held_source_ids: Vec<String>,
     commit: Option<String>,
 }
 
@@ -152,9 +154,24 @@ impl Report {
             .as_ref()
             .map(|oid| format!(" commit={oid}"))
             .unwrap_or_default();
+        // A source identity is itself secret-scanned, so never echo it.  The stable digest lets
+        // callers classify a mixed clean/held batch without bisecting and re-running embeddings.
+        let held_source_ids = if self.held_source_ids.is_empty() {
+            String::new()
+        } else {
+            let encoded =
+                serde_json::to_string(&self.held_source_ids).expect("serializing source-id digests cannot fail");
+            format!(" held_source_ids={encoded}")
+        };
         format!(
-            "ingested sources={} chunks={} unchanged={} stale={} held={}{}\n",
-            self.sources, self.chunks, self.unchanged, self.stale, self.held, commit
+            "ingested sources={} chunks={} unchanged={} stale={} held={}{}{}\n",
+            self.sources,
+            self.chunks,
+            self.unchanged,
+            self.stale,
+            self.held_source_ids.len(),
+            commit,
+            held_source_ids
         )
     }
 }
@@ -163,13 +180,13 @@ impl Report {
 pub async fn run(input: &Path, memory: Memory) -> Result<String> {
     let docs = read_documents(input)?;
     let scanner = scan::Trufflehog::find()?;
-    let (docs, held) = secret_gate(docs, &scanner)?;
+    let (docs, held_source_ids) = secret_gate(docs, &scanner)?;
     let profile = inference::embedding_profile()?;
     let mut embedder = inference::embedder_for(&profile)?;
     let report = match memory {
-        Memory::Local { path } => ingest_local(path, &docs, held, embedder.as_mut(), &profile).await?,
+        Memory::Local { path } => ingest_local(path, &docs, &held_source_ids, embedder.as_mut(), &profile).await?,
         remote_memory @ Memory::Remote { .. } => {
-            ingest_remote(remote_memory, &docs, held, embedder.as_mut(), &profile).await?
+            ingest_remote(remote_memory, &docs, &held_source_ids, embedder.as_mut(), &profile).await?
         }
     };
     Ok(report.render())
@@ -323,7 +340,14 @@ fn stored_revision_order(revision: &StoredRevision) -> (i128, &str, &str, &str) 
     )
 }
 
-fn secret_gate(docs: Vec<Document>, scanner: &dyn SecretScanner) -> Result<(Vec<Document>, usize)> {
+fn opaque_source_id(source_identity: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(HELD_SOURCE_ID_DOMAIN);
+    digest.update(source_identity.as_bytes());
+    format!("sha256:{}", hex::encode(digest.finalize()))
+}
+
+fn secret_gate(docs: Vec<Document>, scanner: &dyn SecretScanner) -> Result<(Vec<Document>, Vec<String>)> {
     // Scan every persisted field without JSON-escaping its bytes. A finding in text, metadata, an
     // origin path, or any facet holds back every split, so a shorter dirty revision cannot delete
     // a clean tail.
@@ -342,15 +366,16 @@ fn secret_gate(docs: Vec<Document>, scanner: &dyn SecretScanner) -> Result<(Vec<
         dirty[owner] |= !found.is_empty();
     }
     let mut clean = Vec::with_capacity(docs.len());
-    let mut held = 0usize;
+    let mut held_source_ids = Vec::new();
     for (doc, found) in docs.into_iter().zip(dirty) {
         if !found {
             clean.push(doc);
         } else {
-            held += 1;
+            held_source_ids.push(opaque_source_id(&doc.source_identity));
         }
     }
-    Ok((clean, held))
+    held_source_ids.sort_unstable();
+    Ok((clean, held_source_ids))
 }
 
 fn persisted_revision_fields(doc: &Document) -> Vec<Cow<'_, str>> {
@@ -622,7 +647,7 @@ fn delete_filter(selection: &[&Document]) -> String {
 async fn ingest_local(
     path: PathBuf,
     docs: &[Document],
-    held: usize,
+    held_source_ids: &[String],
     embedder: &mut dyn Embedder,
     profile: &EmbeddingProfile,
 ) -> Result<Report> {
@@ -642,7 +667,7 @@ async fn ingest_local(
         return Ok(Report {
             unchanged: selection.unchanged,
             stale: selection.stale,
-            held,
+            held_source_ids: held_source_ids.to_vec(),
             ..Report::default()
         });
     }
@@ -679,7 +704,7 @@ async fn ingest_local(
         chunks: chunks.len(),
         unchanged: selection.unchanged,
         stale: selection.stale,
-        held,
+        held_source_ids: held_source_ids.to_vec(),
         commit: None,
     })
 }
@@ -687,7 +712,7 @@ async fn ingest_local(
 async fn ingest_remote(
     memory: Memory,
     docs: &[Document],
-    held: usize,
+    held_source_ids: &[String],
     embedder: &mut dyn Embedder,
     profile: &EmbeddingProfile,
 ) -> Result<Report> {
@@ -726,7 +751,7 @@ async fn ingest_remote(
             return Ok(Report {
                 unchanged: selection.unchanged,
                 stale: selection.stale,
-                held,
+                held_source_ids: held_source_ids.to_vec(),
                 ..Report::default()
             });
         }
@@ -766,7 +791,7 @@ async fn ingest_remote(
                     chunks: chunks.len(),
                     unchanged: selection.unchanged,
                     stale: selection.stale,
-                    held,
+                    held_source_ids: held_source_ids.to_vec(),
                     commit: Some(oid),
                 })
             }
@@ -948,7 +973,7 @@ mod tests {
         );
         let docs = read_documents(&input).unwrap();
         let (docs, held) = secret_gate(docs, &clean).unwrap();
-        let first = ingest_local(memory.clone(), &docs, held, &mut embedder, &profile)
+        let first = ingest_local(memory.clone(), &docs, &held, &mut embedder, &profile)
             .await
             .unwrap();
         assert!(first.chunks > 1);
@@ -967,7 +992,7 @@ mod tests {
         let before = stored_ds.version();
 
         // Same source revision is a true no-op: no Lance commit/version churn.
-        let same = ingest_local(memory.clone(), &docs, held, &mut embedder, &profile)
+        let same = ingest_local(memory.clone(), &docs, &held, &mut embedder, &profile)
             .await
             .unwrap();
         let after = dataset::open(&dataset::table_uri(&memory.to_string_lossy()), HashMap::new())
@@ -989,7 +1014,7 @@ mod tests {
         );
         let docs = read_documents(&input).unwrap();
         let (docs, held) = secret_gate(docs, &clean).unwrap();
-        let second = ingest_local(memory.clone(), &docs, held, &mut embedder, &profile)
+        let second = ingest_local(memory.clone(), &docs, &held, &mut embedder, &profile)
             .await
             .unwrap();
         assert_eq!(second.sources, 1);
@@ -1016,7 +1041,7 @@ mod tests {
             )],
         );
         let docs = read_documents(&input).unwrap();
-        let third = ingest_local(memory.clone(), &docs, 0, &mut embedder, &profile)
+        let third = ingest_local(memory.clone(), &docs, &[], &mut embedder, &profile)
             .await
             .unwrap();
         assert_eq!(third.sources, 1);
@@ -1042,7 +1067,7 @@ mod tests {
             )],
         );
         let docs = read_documents(&input).unwrap();
-        let stale = ingest_local(memory.clone(), &docs, 0, &mut embedder, &profile)
+        let stale = ingest_local(memory.clone(), &docs, &[], &mut embedder, &profile)
             .await
             .unwrap();
         assert_eq!(stale.stale, 1);
@@ -1061,10 +1086,10 @@ mod tests {
         let docs = read_documents(&input).unwrap();
         let (docs, held) = secret_gate(docs, &Dirty).unwrap();
         assert!(docs.is_empty());
-        let held_report = ingest_local(memory.clone(), &docs, held, &mut embedder, &profile)
+        let held_report = ingest_local(memory.clone(), &docs, &held, &mut embedder, &profile)
             .await
             .unwrap();
-        assert_eq!(held_report.held, 1);
+        assert_eq!(held_report.held_source_ids.len(), 1);
         assert_eq!(texts(&rows(&memory).await), vec!["short replacement"]);
     }
 
@@ -1116,7 +1141,7 @@ mod tests {
         let input: InputDocument = serde_json::from_value(value).unwrap();
         let (clean, held) = secret_gate(vec![normalize(input).unwrap()], &Contains("facet-secret-marker")).unwrap();
         assert!(clean.is_empty());
-        assert_eq!(held, 1);
+        assert_eq!(held.len(), 1);
     }
 
     #[test]
@@ -1126,7 +1151,34 @@ mod tests {
             serde_json::from_value(doc("v1", "2026-09-03T00:00:00Z", marker, serde_json::json!({}))).unwrap();
         let (clean, held) = secret_gate(vec![normalize(input).unwrap()], &Contains(marker)).unwrap();
         assert!(clean.is_empty());
-        assert_eq!(held, 1);
+        assert_eq!(held.len(), 1);
+    }
+
+    #[test]
+    fn held_report_uses_a_stable_opaque_source_id() {
+        assert_eq!(
+            Report::default().render(),
+            "ingested sources=0 chunks=0 unchanged=0 stale=0 held=0\n"
+        );
+        let identity = "identity-with-secret-marker";
+        let mut value = doc("v1", "2026-09-03T00:00:00Z", "otherwise clean", serde_json::json!({}));
+        value["source_identity"] = Value::String(identity.to_string());
+        let input: InputDocument = serde_json::from_value(value).unwrap();
+        let (clean, held_source_ids) =
+            secret_gate(vec![normalize(input).unwrap()], &Contains("secret-marker")).unwrap();
+        assert!(clean.is_empty());
+        assert_eq!(
+            held_source_ids,
+            vec!["sha256:1cfefd9638aac282a2a112dc1cfa62a18376b837315a9b67f6687f697168af9c"]
+        );
+
+        let rendered = Report {
+            held_source_ids,
+            ..Report::default()
+        }
+        .render();
+        assert!(rendered.contains("held=1 held_source_ids=[\"sha256:"));
+        assert!(!rendered.contains(identity));
     }
 
     #[tokio::test]
@@ -1183,7 +1235,7 @@ mod tests {
         let docs = read_documents(&input).unwrap();
         let mut embedder = FakeEmbedder;
         let profile = EmbeddingProfile::local();
-        ingest_local(memory.clone(), &docs, 0, &mut embedder, &profile)
+        ingest_local(memory.clone(), &docs, &[], &mut embedder, &profile)
             .await
             .unwrap();
         let stored = rows(&memory).await;

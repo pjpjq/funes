@@ -1518,6 +1518,12 @@ def test_canonical_source_version_has_unambiguous_field_boundaries():
     ) != bridge.canonical_source_version({**base, "native_generation": 2})
 
 
+def test_opaque_source_id_matches_native_domain_separated_contract():
+    assert bridge._opaque_source_id("identity-with-secret-marker") == (
+        "sha256:1cfefd9638aac282a2a112dc1cfa62a18376b837315a9b67f6687f697168af9c"
+    )
+
+
 def test_embedding_profile_matches_native_contract(monkeypatch):
     monkeypatch.setenv("FUNES_EMBEDDING_PROVIDER", "voyage")
     monkeypatch.setenv("FUNES_EMBEDDING_MODEL", "voyage-4-lite")
@@ -2031,7 +2037,7 @@ def test_invalid_canonical_row_isolated_without_blocking_clean_rows(
     assert pending == []
 
 
-def test_canonical_held_batch_is_bisected_and_source_revision_retries(monkeypatch, tmp_path):
+def test_canonical_held_batch_uses_opaque_fast_path_and_source_revision_retries(monkeypatch, tmp_path):
     app = _source_app(tmp_path)
     _canonical_source(app.store, "clean-doc")
     _canonical_source(app.store, "dirty-doc")
@@ -2047,7 +2053,14 @@ def test_canonical_held_batch_is_bisected_and_source_revision_retries(monkeypatc
         held = int("dirty-doc" in identities)
         sources = len(identities) - held
         commit = " commit=commit1" if sources else ""
-        return 0, f"ingested sources={sources} chunks={sources} unchanged=0 stale=0 held={held}{commit}\n", ""
+        held_source_ids = (
+            [bridge._opaque_source_id("dirty-doc")] if held else []
+        )
+        return 0, (
+            f"ingested sources={sources} chunks={sources} unchanged=0 "
+            f"stale=0 held={held}{commit} "
+            f"held_source_ids={json.dumps(held_source_ids)}\n"
+        ), ""
 
     monkeypatch.setattr(bridge, "run", held_run)
     try:
@@ -2086,7 +2099,7 @@ def test_canonical_held_batch_is_bisected_and_source_revision_retries(monkeypatc
         revised = app.store.get("dirty-doc")
     finally:
         app.store.close()
-    assert calls == [["clean-doc", "dirty-doc"], ["clean-doc"], ["dirty-doc"]]
+    assert calls == [["clean-doc", "dirty-doc"]]
     assert first == {"attempted": 2, "indexed": 1, "held": 1, "durable": True}
     assert clean["native_index_status"] == "indexed"
     assert dirty["native_index_status"] == "held_secret"
@@ -2094,6 +2107,126 @@ def test_canonical_held_batch_is_bisected_and_source_revision_retries(monkeypatc
     assert third["indexed"] == 1
     assert revised["native_index_status"] == "indexed"
     assert len(warm) == 2
+
+
+@pytest.mark.parametrize(
+    "reported_ids",
+    [
+        None,
+        "[not-json]",
+        json.dumps(["sha256:" + "f" * 64]),
+        "[]",
+    ],
+    ids=["legacy", "malformed", "unknown", "count-mismatch"],
+)
+def test_canonical_held_fast_path_rejects_untrusted_identity_reports(
+    monkeypatch, tmp_path, reported_ids
+):
+    app = _source_app(tmp_path)
+    _canonical_source(app.store, "clean-doc")
+    _canonical_source(app.store, "dirty-doc")
+    calls = []
+    monkeypatch.setattr(bridge, "REMOTE", "owner/memory")
+    monkeypatch.setattr(bridge, "request_warm", lambda **_kwargs: None)
+
+    def held_run(*args, **_kwargs):
+        identities = [
+            json.loads(line)["source_identity"]
+            for line in Path(args[1]).read_text().splitlines()
+        ]
+        calls.append(identities)
+        if len(identities) == 2:
+            extension = (
+                "" if reported_ids is None else f" held_source_ids={reported_ids}"
+            )
+            return 0, (
+                "ingested sources=1 chunks=1 unchanged=0 stale=0 held=1 "
+                f"commit=initial{extension}\n"
+            ), ""
+        if identities == ["dirty-doc"]:
+            held_source_ids = json.dumps(
+                [bridge._opaque_source_id("dirty-doc")]
+            )
+            return 0, (
+                "ingested sources=0 chunks=0 unchanged=0 stale=0 held=1 "
+                f"held_source_ids={held_source_ids}\n"
+            ), ""
+        return 0, (
+            "ingested sources=0 chunks=0 unchanged=1 stale=0 held=0 "
+            "held_source_ids=[]\n"
+        ), ""
+
+    monkeypatch.setattr(bridge, "run", held_run)
+    try:
+        result = bridge.reconcile_canonical_index(app)
+        clean = app.store.get("clean-doc")
+        dirty = app.store.get("dirty-doc")
+    finally:
+        app.store.close()
+
+    assert calls == [
+        ["clean-doc", "dirty-doc"],
+        ["clean-doc"],
+        ["dirty-doc"],
+    ]
+    assert result == {"attempted": 2, "indexed": 1, "held": 1, "durable": True}
+    assert clean["native_index_status"] == "indexed"
+    assert dirty["native_index_status"] == "held_secret"
+
+
+def test_canonical_mixed_stale_and_held_report_still_bisects(
+    monkeypatch, tmp_path
+):
+    app = _source_app(tmp_path)
+    _canonical_source(app.store, "stale-doc")
+    _canonical_source(app.store, "dirty-doc")
+    calls = []
+    monkeypatch.setattr(bridge, "REMOTE", "owner/memory")
+    monkeypatch.setattr(bridge, "request_warm", lambda **_kwargs: None)
+
+    def mixed_run(*args, **_kwargs):
+        identities = [
+            json.loads(line)["source_identity"]
+            for line in Path(args[1]).read_text().splitlines()
+        ]
+        calls.append(identities)
+        if len(identities) == 2:
+            held_source_ids = json.dumps(
+                [bridge._opaque_source_id("dirty-doc")]
+            )
+            return 0, (
+                "ingested sources=0 chunks=0 unchanged=0 stale=1 held=1 "
+                f"held_source_ids={held_source_ids}\n"
+            ), ""
+        if identities == ["dirty-doc"]:
+            held_source_ids = json.dumps(
+                [bridge._opaque_source_id("dirty-doc")]
+            )
+            return 0, (
+                "ingested sources=0 chunks=0 unchanged=0 stale=0 held=1 "
+                f"held_source_ids={held_source_ids}\n"
+            ), ""
+        return 0, (
+            "ingested sources=0 chunks=0 unchanged=0 stale=1 held=0\n"
+        ), ""
+
+    monkeypatch.setattr(bridge, "run", mixed_run)
+    try:
+        result = bridge.reconcile_canonical_index(app)
+        stale = app.store.get("stale-doc")
+        dirty = app.store.get("dirty-doc")
+    finally:
+        app.store.close()
+
+    assert calls == [
+        ["stale-doc", "dirty-doc"],
+        ["stale-doc"],
+        ["dirty-doc"],
+    ]
+    assert result == {"attempted": 2, "indexed": 0, "held": 1, "durable": True}
+    assert stale["native_index_status"] == "retry"
+    assert stale["native_index_error"] == "native_stale"
+    assert dirty["native_index_status"] == "held_secret"
 
 
 def test_canonical_failure_persists_retry_and_next_pass_succeeds(monkeypatch, tmp_path):

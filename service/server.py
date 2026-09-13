@@ -78,6 +78,7 @@ Apply the same preservation rules used for document normalization:
 TECHNICAL_ENTITY_RE = re.compile(
     r"https?://\S+|(?:[~/]|\.{1,2}/)[^\s]+|[A-Za-z][A-Za-z0-9_.*:/-]*"
 )
+ASCII_FTS_TERM_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]{1,63}")
 ARABIC_NUMBER_RE = re.compile(r"\d+(?:\.\d+)*")
 
 
@@ -94,6 +95,25 @@ def cjk_ratio(value: str) -> float:
         return 0.0
     chars = [c for c in value if not c.isspace()]
     return sum(bool(CJK_RE.match(c)) for c in chars) / max(1, len(chars))
+
+
+def technical_fts_terms(value: str, limit: int = 12) -> list[str]:
+    """Extract bounded, syntax-safe ASCII identifiers from mixed CJK text."""
+    terms = []
+    seen = set()
+    for term in ASCII_FTS_TERM_RE.findall(value):
+        key = term.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        terms.append(term)
+        if len(terms) >= limit:
+            break
+    return terms
+
+
+def technical_fts_query(terms: list[str]) -> str:
+    return " OR ".join(f'"{term.replace(chr(34), chr(34) * 2)}"' for term in terms)
 
 
 def expanded_candidate_limit(limit: int) -> int:
@@ -203,6 +223,10 @@ class Store:
                     row_cursor INTEGER NOT NULL DEFAULT 0,
                     applied_at TEXT
                 );
+                CREATE INDEX IF NOT EXISTS memories_source_agent_role_idx
+                    ON memories(source_agent, role);
+                CREATE INDEX IF NOT EXISTS memories_source_agent_type_idx
+                    ON memories(source_agent, source_type);
                 """
             )
             # Upgrades from the first HTTP prototype are additive and safe on a
@@ -822,6 +846,7 @@ class Store:
             clauses.append("m.timestamp <= ?"); params.append(str(filters["until"]))
         facet = (" AND " + " AND ".join(clauses)) if clauses else ""
         with self.lock:
+            strict_fts_failed = False
             try:
                 rows = self.conn.execute(
                     """SELECT m.*, bm25(memories_fts) AS score FROM memories_fts
@@ -829,6 +854,80 @@ class Store:
                     " ORDER BY score LIMIT ?", [query, *params, limit]
                 ).fetchall()
             except sqlite3.OperationalError:
+                # Let a syntax-safe technical query run before the more
+                # expensive substring compatibility path below.
+                rows = []
+                strict_fts_failed = True
+            if not rows and cjk_ratio(query) > 0:
+                # Mixed Chinese/technical queries are common in agent history.
+                # Try their safe ASCII identifiers through FTS before the
+                # character-level compatibility scan touches every raw row.
+                technical_terms = technical_fts_terms(query)
+                facet_terms = {
+                    str(value).casefold()
+                    for value in filters.values()
+                    if value is not None
+                }
+                content_terms = [
+                    term for term in technical_terms if term.casefold() not in facet_terms
+                ] or technical_terms
+                if technical_terms:
+                    rows = self.conn.execute(
+                        """SELECT m.*, bm25(memories_fts) AS score FROM memories_fts
+                        JOIN memories m ON m.id=memories_fts.rowid WHERE memories_fts MATCH ?"""
+                        + facet
+                        + " ORDER BY score LIMIT ?",
+                        [technical_fts_query(content_terms), *params, limit],
+                    ).fetchall()
+                covered = any(
+                    all(
+                        term.casefold()
+                        in (
+                            str(row["retrieval_text"] or "")
+                            + " "
+                            + str(row["raw_text"] or "")
+                        ).casefold()
+                        for term in content_terms
+                    )
+                    for row in rows
+                )
+                if content_terms and not covered:
+                    # unicode61 can merge an identifier with adjacent Chinese
+                    # characters. Facet indexes keep this compatibility lookup
+                    # bounded for source-filtered agent recalls.
+                    technical_clauses = " OR ".join(
+                        "(m.retrieval_text LIKE ? ESCAPE '\\' OR m.raw_text LIKE ? ESCAPE '\\')"
+                        for _ in content_terms
+                    )
+                    technical_params = []
+                    technical_score = " + ".join(
+                        "CASE WHEN (m.retrieval_text LIKE ? ESCAPE '\\' OR m.raw_text LIKE ? ESCAPE '\\') THEN ? ELSE 0 END"
+                        for _ in content_terms
+                    )
+                    score_params = []
+                    for term in content_terms:
+                        escaped = term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+                        pattern = f"%{escaped}%"
+                        technical_params.extend((pattern, pattern))
+                        score_params.extend((pattern, pattern, min(32, len(term))))
+                    technical_rows = self.conn.execute(
+                        f"SELECT m.*, 0.0 AS score FROM memories m WHERE ({technical_clauses}){facet} ORDER BY ({technical_score}) DESC, m.updated_at DESC LIMIT ?",
+                        [
+                            *technical_params,
+                            *params,
+                            *score_params,
+                            min(100, limit * 4),
+                        ],
+                    ).fetchall()
+                    combined = []
+                    seen = set()
+                    for row in [*technical_rows, *rows]:
+                        if row["id"] in seen:
+                            continue
+                        seen.add(row["id"])
+                        combined.append(row)
+                    rows = combined[:limit]
+            if not rows and strict_fts_failed:
                 # FTS MATCH is intentionally strict; a plain substring fallback keeps recall useful.
                 like = "%" + query.replace("%", "\\%") + "%"
                 rows = self.conn.execute("SELECT m.*, 0.0 AS score FROM memories m WHERE (m.retrieval_text LIKE ? ESCAPE '\\' OR m.raw_text LIKE ? ESCAPE '\\')" + facet.replace("m.", "m.") + " ORDER BY m.updated_at DESC LIMIT ?", [like, like, *params, limit]).fetchall()

@@ -354,6 +354,126 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(store.search("中文")[0]["raw_text"], "中文检索内容")
         store.close()
 
+    def test_chinese_query_uses_technical_fts_before_character_scan(self):
+        store = Store(self.tmp.name)
+        store.ingest(
+            [
+                {
+                    "source_identity": "target",
+                    "source_agent": "pi",
+                    "role": "user",
+                    "raw_text": "MacBook Pro通过Tailscale连接办公室Mac mini时高延迟。",
+                },
+                {
+                    "source_identity": "wrong-agent",
+                    "source_agent": "codex",
+                    "role": "user",
+                    "raw_text": "Pi Tailscale 延迟",
+                },
+                {
+                    "source_identity": "wrong-role",
+                    "source_agent": "pi",
+                    "role": "assistant",
+                    "raw_text": "Pi Tailscale 延迟",
+                },
+            ]
+        )
+        statements = []
+        store.conn.set_trace_callback(statements.append)
+
+        results = store.search(
+            "之前 Pi 里讨论过的 Tailscale 延迟",
+            filters={"source_agent": "pi", "role": "user"},
+        )
+
+        store.conn.set_trace_callback(None)
+        self.assertEqual([item["source_identity"] for item in results], ["target"])
+        traced = "\n".join(statements).upper()
+        self.assertIn("LIKE '%TAILSCALE%'", traced)
+        self.assertNotIn("LIKE '%之%'", traced)
+
+        statements.clear()
+        store.conn.set_trace_callback(statements.append)
+        malformed_results = store.search(
+            '之前 Tailscale "',
+            filters={"source_agent": "pi", "role": "user"},
+        )
+        store.conn.set_trace_callback(None)
+        self.assertEqual(
+            [item["source_identity"] for item in malformed_results], ["target"]
+        )
+        malformed_trace = "\n".join(statements).upper()
+        self.assertIn("LIKE '%TAILSCALE%'", malformed_trace)
+        self.assertNotIn("LIKE '%之前 TAILSCALE", malformed_trace)
+        store.close()
+
+    def test_chinese_technical_fts_skips_like_when_one_hit_covers_all_terms(self):
+        store = Store(self.tmp.name)
+        store.ingest(
+            [
+                {
+                    "source_identity": "fast-target",
+                    "source_agent": "pi",
+                    "project": "fast",
+                    "raw_text": "Pi Tailscale latency analysis",
+                },
+                {
+                    "source_identity": "wrong-project",
+                    "source_agent": "pi",
+                    "project": "other",
+                    "raw_text": "Pi Tailscale unrelated",
+                },
+            ]
+        )
+        statements = []
+        store.conn.set_trace_callback(statements.append)
+
+        results = store.search(
+            "之前 Pi Tailscale 的延迟",
+            filters={"project": "fast"},
+        )
+
+        store.conn.set_trace_callback(None)
+        self.assertEqual([item["source_identity"] for item in results], ["fast-target"])
+        self.assertFalse(any(" LIKE " in statement.upper() for statement in statements))
+        store.close()
+
+    def test_chinese_technical_like_recovers_strong_mixed_token(self):
+        store = Store(self.tmp.name)
+        documents = [
+            {
+                "source_identity": "mixed-target",
+                "source_agent": "pi",
+                "role": "user",
+                "project": "mixed",
+                "raw_text": "讨论通过Tailscale连接办公室网络",
+                "updated_at": "2020-01-01T00:00:00Z",
+            }
+        ]
+        documents.extend(
+            {
+                "source_identity": f"weak-distractor-{index}",
+                "source_agent": "pi",
+                "role": "user",
+                "project": "mixed",
+                "raw_text": "Mac unrelated notes",
+                "updated_at": f"2026-01-01T00:00:0{index}Z",
+            }
+            for index in range(6)
+        )
+        store.ingest(documents)
+
+        results = store.search(
+            "讨论 Mac Tailscale",
+            limit=1,
+            filters={"source_agent": "pi", "role": "user"},
+        )
+
+        self.assertEqual(
+            [item["source_identity"] for item in results], ["mixed-target"]
+        )
+        store.close()
+
     def test_translation_cache_key_is_hashed_and_permanent_error_opens_circuit(self):
         store = Store(self.tmp.name)
         os.environ.update(

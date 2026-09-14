@@ -1295,7 +1295,7 @@ class Store:
             return [self._row(row) for row in rows]
 
     def native_index_failure_counts(self) -> dict[str, int]:
-        """Return allowlisted retry diagnostics without exposing row data."""
+        """Return allowlisted pending diagnostics without exposing row data."""
         counts = {
             "timeout": 0,
             "native_exit": 0,
@@ -1314,8 +1314,9 @@ class Store:
         with self.lock:
             rows = self.conn.execute(
                 """SELECT native_index_error,count(*) AS amount FROM memories
-                WHERE native_index_pending=1 AND native_index_error IS NOT NULL
-                GROUP BY native_index_error"""
+                WHERE native_index_error IS NOT NULL AND (
+                    native_index_pending=1 OR native_index_status='waiting_durability'
+                ) GROUP BY native_index_error"""
             ).fetchall()
         for row in rows:
             category = categories.get(str(row["native_index_error"]), "other")

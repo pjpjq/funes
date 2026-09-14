@@ -1111,31 +1111,36 @@ def run(
     """Run native Funes with a total timeout and reap its whole process group."""
     env = native_environment(profile=profile)
     argv = [FUNES_BIN, *args]
-    process = subprocess.Popen(
-        argv,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env=env,
-        start_new_session=os.name == "posix",
-    )
-    try:
-        stdout, stderr = process.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        if os.name == "posix":
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            except OSError:
+    # Rust's scanner also creates plaintext temp files. Giving the whole native
+    # process tree a private parent-owned TMPDIR lets Python remove them even
+    # when SIGKILL prevents Rust destructors from running.
+    with tempfile.TemporaryDirectory(prefix="funes-native-") as runtime_tmp:
+        env["TMPDIR"] = runtime_tmp
+        process = subprocess.Popen(
+            argv,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            start_new_session=os.name == "posix",
+        )
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            if os.name == "posix":
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                except OSError:
+                    process.kill()
+            else:
                 process.kill()
-        else:
-            process.kill()
-        process.communicate()
-        # Never retain stdout/stderr or caller arguments in the exception: a
-        # descendant may have emitted provider payloads, paths, or raw memory.
-        raise subprocess.TimeoutExpired([FUNES_BIN], timeout) from None
-    return process.returncode, stdout, stderr
+            process.communicate()
+            # Never retain stdout/stderr or caller arguments in the exception:
+            # a descendant may have emitted payloads, paths, or raw memory.
+            raise subprocess.TimeoutExpired([FUNES_BIN], timeout) from None
+        return process.returncode, stdout, stderr
 
 
 CANONICAL_FACETS = (
@@ -1461,7 +1466,8 @@ def _initialize_canonical_reconcile_state(app) -> None:
         "last_finished_at": None,
         "last_duration_ms": None,
         "last_result": None,
-        "last_error_class": None,
+        "last_error": None,
+        "last_progress_at": None,
         "consecutive_failures": 0,
     }
 
@@ -1488,7 +1494,8 @@ def canonical_reconcile_state(app) -> dict[str, object]:
             "last_finished_at": None,
             "last_duration_ms": None,
             "last_result": None,
-            "last_error_class": None,
+            "last_error": None,
+            "last_progress_at": None,
             "consecutive_failures": 0,
         }
     else:
@@ -1699,6 +1706,14 @@ def optimize_canonical_index(
     return optimized
 
 
+def _canonical_error_code(exc: Exception) -> str:
+    if isinstance(exc, subprocess.TimeoutExpired):
+        return "native_timeout"
+    if isinstance(exc, (OSError, subprocess.SubprocessError)):
+        return "native_process_error"
+    return "unexpected"
+
+
 def _canonical_reconcile_background(app) -> None:
     app.restore_done.wait()
     while not app.canonical_index_stop.is_set():
@@ -1726,7 +1741,7 @@ def _canonical_reconcile_background(app) -> None:
                     0, round((time.monotonic() - started) * 1000)
                 ),
                 last_result=None,
-                last_error_class=type(exc).__name__,
+                last_error=_canonical_error_code(exc),
                 consecutive_failures=failures,
             )
             # Retry state remains in the encrypted source store. Never log raw
@@ -1736,19 +1751,31 @@ def _canonical_reconcile_background(app) -> None:
                 key: result.get(key)
                 for key in ("attempted", "indexed", "held", "durable")
             }
-            _set_canonical_reconcile_state(
-                app,
-                active=False,
-                phase="sleeping",
-                phase_started_at=utc_now(),
-                last_finished_at=utc_now(),
-                last_duration_ms=max(
+            state = canonical_reconcile_state(app)
+            durable = bool(result.get("durable"))
+            failures = (
+                0
+                if durable
+                else int(state.get("consecutive_failures") or 0) + 1
+            )
+            changes: dict[str, object] = {
+                "active": False,
+                "phase": "sleeping",
+                "phase_started_at": utc_now(),
+                "last_finished_at": utc_now(),
+                "last_duration_ms": max(
                     0, round((time.monotonic() - started) * 1000)
                 ),
-                last_result=safe_result,
-                last_error_class=None,
-                consecutive_failures=0,
-            )
+                "last_result": safe_result,
+                "last_error": None if durable else "status_not_durable",
+                "consecutive_failures": failures,
+            }
+            if durable and (
+                int(result.get("indexed") or 0) > 0
+                or int(result.get("held") or 0) > 0
+            ):
+                changes["last_progress_at"] = utc_now()
+            _set_canonical_reconcile_state(app, **changes)
         if app.canonical_index_stop.wait(CANONICAL_INDEX_INTERVAL):
             break
 

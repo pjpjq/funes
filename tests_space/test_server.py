@@ -2250,6 +2250,45 @@ def test_run_timeout_reaps_process_group_and_discards_sensitive_output(
     assert "SECRET PROVIDER PAYLOAD" not in rendered
 
 
+@pytest.mark.skipif(bridge.os.name != "posix", reason="POSIX process groups required")
+def test_run_timeout_reaps_real_descendant_and_cleans_private_tmpdir(
+    monkeypatch, tmp_path
+):
+    pid_path = tmp_path / "descendant.pid"
+    marker = "PRIVATE RAW SESSION MARKER"
+    code = (
+        "import os,subprocess,sys,time;"
+        "child=subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)']);"
+        f"open({str(pid_path)!r},'w').write(str(child.pid));"
+        f"open(os.path.join(os.environ['TMPDIR'],'raw.txt'),'w').write({marker!r});"
+        "time.sleep(60)"
+    )
+    monkeypatch.setattr(bridge, "FUNES_BIN", bridge.sys.executable)
+    monkeypatch.setattr(bridge.tempfile, "tempdir", str(tmp_path))
+
+    with pytest.raises(bridge.subprocess.TimeoutExpired) as raised:
+        bridge.run("-c", code, timeout=0.25)
+
+    descendant = int(pid_path.read_text())
+    state = ""
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline:
+        probe = bridge.subprocess.run(
+            ["/bin/ps", "-o", "stat=", "-p", str(descendant)],
+            capture_output=True,
+            text=True,
+        )
+        state = probe.stdout.strip()
+        if not state or state.startswith("Z"):
+            break
+        time.sleep(0.025)
+    assert not state or state.startswith("Z")
+    assert list(tmp_path.glob("funes-native-*")) == []
+    rendered = str(raised.value)
+    assert marker not in rendered
+    assert str(pid_path) not in rendered
+
+
 def test_blue_green_reconcile_writes_only_build_target_and_does_not_warm_active(
     monkeypatch, tmp_path
 ):
@@ -2561,7 +2600,28 @@ def test_source_state_reports_reconciler_while_restore_is_running(monkeypatch):
     assert status["canonical_reconciler"]["phase"] == "waiting_restore"
 
 
-def test_canonical_background_reports_only_exception_class(monkeypatch):
+def test_canonical_background_marks_non_durable_result_as_failure(monkeypatch):
+    app = SimpleNamespace(
+        restore_done=threading.Event(),
+        canonical_index_stop=threading.Event(),
+    )
+    app.restore_done.set()
+    bridge._initialize_canonical_reconcile_state(app)
+
+    def not_durable(_app):
+        app.canonical_index_stop.set()
+        return {"attempted": 2, "indexed": 0, "held": 0, "durable": False}
+
+    monkeypatch.setattr(bridge, "reconcile_canonical_index", not_durable)
+    bridge._canonical_reconcile_background(app)
+
+    status = bridge.canonical_reconcile_state(app)
+    assert status["last_error"] == "status_not_durable"
+    assert status["consecutive_failures"] == 1
+    assert status["last_result"]["durable"] is False
+
+
+def test_canonical_background_reports_only_allowlisted_error(monkeypatch):
     app = SimpleNamespace(
         restore_done=threading.Event(),
         canonical_index_stop=threading.Event(),
@@ -2579,7 +2639,7 @@ def test_canonical_background_reports_only_exception_class(monkeypatch):
     status = bridge.canonical_reconcile_state(app)
     assert status["active"] is False
     assert status["phase"] == "sleeping"
-    assert status["last_error_class"] == "RuntimeError"
+    assert status["last_error"] == "unexpected"
     assert status["consecutive_failures"] == 1
     assert status["last_result"] is None
     assert status["last_duration_ms"] >= 0

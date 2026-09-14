@@ -310,10 +310,11 @@ def _remote_call(path, payload):
     )
     deadline = time.monotonic() + total
 
-    # The Space reports HTTP 200 while its native worker is warming.  Waiting
-    # here is materially better than sending a request that sits behind the
-    # warm lock until the HF front door closes the connection.
-    if recall:
+    # /search owns its cold-restore/degraded behavior and must receive the
+    # entire fail-open deadline. A separate readiness request can consume most
+    # of that budget on a high-latency Space. Keep the legacy /recall preflight
+    # for callers that still use that endpoint.
+    if path == "/recall":
         state = _wait_until_ready(
             base, headers, deadline, default_timeout=2, default_polls=1
         )

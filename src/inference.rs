@@ -136,9 +136,7 @@ fn profile_from_values(
                 .as_deref()
                 .unwrap_or(VOYAGE_EMBEDDING_SCHEMA_VERSION);
             if schema_version != VOYAGE_EMBEDDING_SCHEMA_VERSION {
-                bail!(
-                    "unsupported FUNES_EMBEDDING_SCHEMA_VERSION `{schema_version}`; expected `2`"
-                )
+                bail!("unsupported FUNES_EMBEDDING_SCHEMA_VERSION `{schema_version}`; expected `2`")
             }
             EmbeddingProfile::voyage(model, dimensions)
         }
@@ -338,26 +336,8 @@ mod tests {
     #[test]
     fn profile_rejects_unknown_provider_and_invalid_dimensions() {
         assert!(profile_from_values(Some("unknown".to_string()), None, None, None).is_err());
-        assert!(profile_from_values(
-            Some("voyage".to_string()),
-            None,
-            Some("384".to_string()),
-            None
-        )
-        .is_err());
-        assert!(profile_from_values(
-            Some("voyage".to_string()),
-            None,
-            Some("wide".to_string()),
-            None
-        )
-        .is_err());
-        assert!(profile_from_values(
-            Some("voyage".to_string()),
-            None,
-            None,
-            Some("3".to_string())
-        )
-        .is_err());
+        assert!(profile_from_values(Some("voyage".to_string()), None, Some("384".to_string()), None).is_err());
+        assert!(profile_from_values(Some("voyage".to_string()), None, Some("wide".to_string()), None).is_err());
+        assert!(profile_from_values(Some("voyage".to_string()), None, None, Some("3".to_string())).is_err());
     }
 }

@@ -102,11 +102,7 @@ pub async fn run() -> Result<()> {
             "\r    embedded {n} chunk(s) in {:.1}s          ",
             t0.elapsed().as_secs_f64()
         );
-        Some(build_batch_for_schema(
-            &replacements,
-            &vectors,
-            target_schema.clone(),
-        )?)
+        Some(build_batch_for_schema(&replacements, &vectors, target_schema.clone())?)
     };
 
     // Rewrite the memory in a single Overwrite commit: every clean row (with its existing vector) plus

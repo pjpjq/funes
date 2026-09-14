@@ -483,10 +483,7 @@ async fn stored_revisions(ds: &Dataset, docs: &[Document]) -> Result<HashMap<Str
     Ok(revisions)
 }
 
-fn stored_revisions_scan(
-    ds: &Dataset,
-    docs: &[Document],
-) -> Result<lance::dataset::scanner::Scanner> {
+fn stored_revisions_scan(ds: &Dataset, docs: &[Document]) -> Result<lance::dataset::scanner::Scanner> {
     // A rebuild sends bounded source batches. Read only those identities through the scalar index
     // instead of downloading every fragment on every batch, which would make a backfill O(n²).
     let identities = docs
@@ -626,9 +623,7 @@ fn cached_selection_embeddings(
     let mut vectors = Vec::with_capacity(chunk_count);
     for doc in selection {
         let key = embedding_cache_key(doc, profile);
-        let cached = cache
-            .get(&key)
-            .context("embedding cache omitted a selected source")?;
+        let cached = cache.get(&key).context("embedding cache omitted a selected source")?;
         chunks.extend(cached.chunks.iter().cloned());
         vectors.extend(cached.vectors.iter().cloned());
     }
@@ -770,7 +765,7 @@ async fn ingest_remote(
                 &rev,
                 message,
             )
-                .await?
+            .await?
         } else {
             remote::replace_documents(
                 &repo,
@@ -1111,12 +1106,7 @@ mod tests {
 
     #[test]
     fn legacy_retrieval_text_is_only_an_input_fallback() {
-        let mut value = doc(
-            "v1",
-            "2026-09-01T00:00:00Z",
-            "authoritative raw",
-            serde_json::json!({}),
-        );
+        let mut value = doc("v1", "2026-09-01T00:00:00Z", "authoritative raw", serde_json::json!({}));
         value.as_object_mut().unwrap().remove("raw_text");
         value["retrieval_text"] = Value::String("legacy queued text".to_string());
         let input: InputDocument = serde_json::from_value(value).unwrap();
@@ -1271,8 +1261,7 @@ mod tests {
         let profile = EmbeddingProfile::local();
         let mut embedder = CountingEmbedder::default();
         let mut cache = HashMap::new();
-        let first_embedded =
-            cached_selection_embeddings(&first.changed, &profile, &mut embedder, &mut cache).unwrap();
+        let first_embedded = cached_selection_embeddings(&first.changed, &profile, &mut embedder, &mut cache).unwrap();
         assert_eq!(embedder.calls, 1);
         assert_eq!(embedder.texts, first_embedded.0.len());
 
@@ -1289,26 +1278,17 @@ mod tests {
         assert_eq!(embedder.texts, first_embedded.0.len());
 
         // This is what the production loop sees after reopening the head another writer moved.
-        let moved = HashMap::from([(
-            candidate.source_identity.clone(),
-            stored(&candidate),
-        )]);
+        let moved = HashMap::from([(candidate.source_identity.clone(), stored(&candidate))]);
         let retry = select_documents(std::slice::from_ref(&candidate), &moved);
         assert!(retry.changed.is_empty());
         assert_eq!(retry.unchanged, 1);
 
-        let next: InputDocument = serde_json::from_value(doc(
-            "v3",
-            "2026-09-03T00:00:00Z",
-            "newer",
-            serde_json::json!({}),
-        ))
-        .unwrap();
+        let next: InputDocument =
+            serde_json::from_value(doc("v3", "2026-09-03T00:00:00Z", "newer", serde_json::json!({}))).unwrap();
         let next = normalize(next).unwrap();
         let next_selection = select_documents(std::slice::from_ref(&next), &moved);
         let previous_texts = embedder.texts;
-        cached_selection_embeddings(&next_selection.changed, &profile, &mut embedder, &mut cache)
-            .unwrap();
+        cached_selection_embeddings(&next_selection.changed, &profile, &mut embedder, &mut cache).unwrap();
         assert_eq!(embedder.calls, 2);
         assert!(embedder.texts > previous_texts);
         assert_eq!(conflicts, 1);

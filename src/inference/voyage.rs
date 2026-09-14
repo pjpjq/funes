@@ -112,8 +112,8 @@ fn http_client() -> Result<Client> {
 }
 
 /// Keep reqwest's blocking runtime entirely outside a Tokio worker. The inference traits are
-/// synchronous, so each provider call waits for a scoped OS thread; that thread owns client
-/// construction, the request, response decoding, and client destruction.
+/// synchronous, so provider construction and each request run on a scoped OS thread. The retained
+/// client owns its connection pool across calls instead of rebuilding TLS state for every request.
 fn run_blocking_http<T: Send>(operation: &str, work: impl FnOnce() -> Result<T> + Send) -> Result<T> {
     thread::scope(|scope| {
         scope
@@ -159,11 +159,7 @@ fn normalize(vector: &mut [f32]) -> Result<()> {
     Ok(())
 }
 
-fn decode_embeddings(
-    response: EmbeddingsResponse,
-    expected: usize,
-    dimensions: usize,
-) -> Result<Vec<Vec<f32>>> {
+fn decode_embeddings(response: EmbeddingsResponse, expected: usize, dimensions: usize) -> Result<Vec<Vec<f32>>> {
     if response.data.len() != expected {
         bail!(
             "Voyage embeddings returned {} vectors for {expected} inputs",
@@ -193,6 +189,7 @@ fn decode_embeddings(
 
 /// Voyage embeddings with explicit document/query modes.
 pub struct VoyageEmbedder {
+    client: Client,
     api_key: String,
     endpoint: String,
     model: String,
@@ -237,7 +234,9 @@ impl VoyageEmbedder {
         if document_attempts == 0 {
             bail!("Voyage document attempts must be positive")
         }
+        let client = run_blocking_http("client setup", http_client)?;
         Ok(Self {
+            client,
             api_key,
             endpoint,
             model,
@@ -253,16 +252,10 @@ impl VoyageEmbedder {
         run_blocking_http("embeddings", || self.request_blocking(texts, input_type, documents))
     }
 
-    fn request_blocking(
-        &self,
-        texts: &[&str],
-        input_type: &'static str,
-        documents: bool,
-    ) -> Result<Vec<Vec<f32>>> {
+    fn request_blocking(&self, texts: &[&str], input_type: &'static str, documents: bool) -> Result<Vec<Vec<f32>>> {
         if texts.is_empty() {
-            return Ok(Vec::new())
+            return Ok(Vec::new());
         }
-        let client = http_client()?;
         let request = EmbeddingsRequest {
             input: texts.to_vec(),
             model: &self.model,
@@ -278,7 +271,8 @@ impl VoyageEmbedder {
         };
 
         for attempt in 0..attempts {
-            let response = client
+            let response = self
+                .client
                 .post(&self.endpoint)
                 .timeout(timeout)
                 .bearer_auth(&self.api_key)
@@ -286,16 +280,9 @@ impl VoyageEmbedder {
                 .send();
             let response = match response {
                 Ok(response) => response,
-                Err(error)
-                    if documents
-                        && retryable_request_error(&error)
-                        && attempt + 1 < attempts =>
-                {
-                    thread::sleep(
-                        self.document_retry_delay
-                            .saturating_mul((attempt + 1) as u32),
-                    );
-                    continue
+                Err(error) if documents && retryable_request_error(&error) && attempt + 1 < attempts => {
+                    thread::sleep(self.document_retry_delay.saturating_mul((attempt + 1) as u32));
+                    continue;
                 }
                 Err(error) => return Err(request_error("embeddings", &error)),
             };
@@ -303,32 +290,20 @@ impl VoyageEmbedder {
             if status.is_success() {
                 let response = match response.json::<EmbeddingsResponse>() {
                     Ok(response) => response,
-                    Err(error)
-                        if documents
-                            && retryable_request_error(&error)
-                            && attempt + 1 < attempts =>
-                    {
-                        thread::sleep(
-                            self.document_retry_delay
-                                .saturating_mul((attempt + 1) as u32),
-                        );
-                        continue
+                    Err(error) if documents && retryable_request_error(&error) && attempt + 1 < attempts => {
+                        thread::sleep(self.document_retry_delay.saturating_mul((attempt + 1) as u32));
+                        continue;
                     }
-                    Err(error) if retryable_request_error(&error) => {
-                        return Err(request_error("embeddings", &error))
-                    }
+                    Err(error) if retryable_request_error(&error) => return Err(request_error("embeddings", &error)),
                     Err(_) => bail!("Voyage embeddings returned invalid JSON"),
                 };
-                return decode_embeddings(response, texts.len(), self.dimensions)
+                return decode_embeddings(response, texts.len(), self.dimensions);
             }
             if documents && retryable(status) && attempt + 1 < attempts {
                 thread::sleep(self.document_retry_delay.saturating_mul((attempt + 1) as u32));
-                continue
+                continue;
             }
-            bail!(
-                "Voyage embeddings request failed with HTTP {}",
-                status.as_u16()
-            )
+            bail!("Voyage embeddings request failed with HTTP {}", status.as_u16())
         }
         unreachable!("positive attempt count always returns")
     }
@@ -378,6 +353,7 @@ fn decode_rerank(response: RerankResponse, expected: usize) -> Result<Vec<f32>> 
 
 /// Voyage `rerank-3-lite`, bounded to one query-time request.
 pub struct VoyageReranker {
+    client: Client,
     api_key: String,
     endpoint: String,
     model: String,
@@ -386,24 +362,16 @@ pub struct VoyageReranker {
 
 impl VoyageReranker {
     pub fn new() -> Result<Self> {
-        Self::with_config(
-            api_key()?,
-            RERANK_URL.to_string(),
-            rerank_model()?,
-            QUERY_TIMEOUT,
-        )
+        Self::with_config(api_key()?, RERANK_URL.to_string(), rerank_model()?, QUERY_TIMEOUT)
     }
 
-    fn with_config(
-        api_key: String,
-        endpoint: String,
-        model: String,
-        query_timeout: Duration,
-    ) -> Result<Self> {
+    fn with_config(api_key: String, endpoint: String, model: String, query_timeout: Duration) -> Result<Self> {
         if model.trim().is_empty() {
             bail!("Voyage rerank model must not be empty")
         }
+        let client = run_blocking_http("client setup", http_client)?;
         Ok(Self {
+            client,
             api_key,
             endpoint,
             model,
@@ -425,9 +393,8 @@ impl Reranker for VoyageReranker {
 impl VoyageReranker {
     fn rerank_blocking(&self, query: &str, docs: &[&str]) -> Result<Vec<f32>> {
         if docs.is_empty() {
-            return Ok(Vec::new())
+            return Ok(Vec::new());
         }
-        let client = http_client()?;
         let request = RerankRequest {
             query,
             documents: docs.to_vec(),
@@ -435,7 +402,8 @@ impl VoyageReranker {
             return_documents: false,
             truncation: false,
         };
-        let response = client
+        let response = self
+            .client
             .post(&self.endpoint)
             .timeout(self.query_timeout)
             .bearer_auth(&self.api_key)
@@ -446,15 +414,13 @@ impl VoyageReranker {
         if !status.is_success() {
             bail!("Voyage rerank request failed with HTTP {}", status.as_u16())
         }
-        let response = response
-            .json::<RerankResponse>()
-            .map_err(|error| {
-                if retryable_request_error(&error) {
-                    request_error("rerank", &error)
-                } else {
-                    anyhow!("Voyage rerank returned invalid JSON")
-                }
-            })?;
+        let response = response.json::<RerankResponse>().map_err(|error| {
+            if retryable_request_error(&error) {
+                request_error("rerank", &error)
+            } else {
+                anyhow!("Voyage rerank returned invalid JSON")
+            }
+        })?;
         decode_rerank(response, docs.len())
     }
 }
@@ -553,9 +519,7 @@ mod tests {
     }
 
     fn read_request(stream: &mut TcpStream) -> CapturedRequest {
-        stream
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
         let mut wire = Vec::new();
         let mut buffer = [0u8; 4096];
         let (header_end, content_length) = loop {
@@ -572,7 +536,7 @@ mod tests {
                             .then(|| value.trim().parse::<usize>().unwrap())
                     })
                     .unwrap();
-                break (header_end + 4, content_length)
+                break (header_end + 4, content_length);
             }
         };
         while wire.len() < header_end + content_length {
@@ -614,8 +578,15 @@ mod tests {
         })
     }
 
+    #[test]
+    fn retained_clients_are_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<VoyageEmbedder>();
+        assert_send_sync::<VoyageReranker>();
+    }
+
     #[tokio::test]
-    async fn blocking_client_lifecycle_is_safe_inside_tokio() {
+    async fn retained_blocking_client_lifecycle_is_safe_inside_tokio() {
         let server = MockServer::start(vec![MockResponse::json(
             200,
             embedding_response(vec![(0, unit_vector(0))]),
@@ -631,10 +602,7 @@ mod tests {
     #[test]
     fn document_and_query_payloads_are_distinct_and_dimensioned() {
         let server = MockServer::start(vec![
-            MockResponse::json(
-                200,
-                embedding_response(vec![(1, unit_vector(1)), (0, unit_vector(0))]),
-            ),
+            MockResponse::json(200, embedding_response(vec![(1, unit_vector(1)), (0, unit_vector(0))])),
             MockResponse::json(200, embedding_response(vec![(0, unit_vector(2))])),
         ]);
         let mut embedder = test_embedder(&server, TEST_DIMENSIONS);
@@ -684,10 +652,7 @@ mod tests {
             MockResponse::json(200, embedding_response(vec![(0, unit_vector(0))])),
         ]);
         let mut embedder = test_embedder(&server, TEST_DIMENSIONS);
-        assert_eq!(
-            embedder.embed_documents(&["document"]).unwrap(),
-            vec![unit_vector(0)]
-        );
+        assert_eq!(embedder.embed_documents(&["document"]).unwrap(), vec![unit_vector(0)]);
         assert_eq!(server.finish().len(), 3);
 
         let exhausted = MockServer::start(vec![
@@ -714,10 +679,7 @@ mod tests {
         ]);
         let mut embedder = test_embedder(&server, TEST_DIMENSIONS);
         embedder.document_timeout = Duration::from_millis(40);
-        assert_eq!(
-            embedder.embed_documents(&["document"]).unwrap(),
-            vec![unit_vector(1)]
-        );
+        assert_eq!(embedder.embed_documents(&["document"]).unwrap(), vec![unit_vector(1)]);
         assert_eq!(server.finish().len(), 2);
     }
 

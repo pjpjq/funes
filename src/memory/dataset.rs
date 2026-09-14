@@ -151,10 +151,7 @@ const SOURCE_IDENTITY_INDEX_NAME: &str = "source_identity_idx";
 /// `on_phase` is called with a human label before each index is built, so a caller can report
 /// progress around these opaque (no incremental hook), potentially slow Lance calls. Pass `|_| {}`
 /// to stay silent.
-pub async fn build_indexes(
-    ds: &mut Dataset,
-    on_phase: impl Fn(&str),
-) -> Result<()> {
+pub async fn build_indexes(ds: &mut Dataset, on_phase: impl Fn(&str)) -> Result<()> {
     maintain_required_indexes(ds, on_phase, true).await?;
     Ok(())
 }
@@ -162,18 +159,11 @@ pub async fn build_indexes(
 /// Create every index required by the dataset's current schema and row count, leaving existing
 /// bases intact. This is also the remote reindex entry point: a memory first published below the
 /// IVF training floor gains its vector index once later appends make it large enough.
-pub(crate) async fn ensure_required_indexes(
-    ds: &mut Dataset,
-    on_phase: impl Fn(&str),
-) -> Result<bool> {
+pub(crate) async fn ensure_required_indexes(ds: &mut Dataset, on_phase: impl Fn(&str)) -> Result<bool> {
     maintain_required_indexes(ds, on_phase, false).await
 }
 
-async fn maintain_required_indexes(
-    ds: &mut Dataset,
-    on_phase: impl Fn(&str),
-    replace_existing: bool,
-) -> Result<bool> {
+async fn maintain_required_indexes(ds: &mut Dataset, on_phase: impl Fn(&str), replace_existing: bool) -> Result<bool> {
     let mut existing = ds
         .load_indices()
         .await
@@ -197,22 +187,20 @@ async fn maintain_required_indexes(
         existing.insert(TEXT_INDEX_NAME.to_string());
         created = true;
     }
-    if vector_index_required(ds).await? {
-        if replace_existing || !existing.contains(VECTOR_INDEX_NAME) {
-            let params = ivf_pq_params(ds).expect("required vector index has a vector column");
-            on_phase("vector index");
-            ds.create_index(
-                &["vector"],
-                IndexType::Vector,
-                Some(VECTOR_INDEX_NAME.to_string()),
-                &params,
-                replace_existing,
-            )
-            .await
-            .context("creating vector index")?;
-            existing.insert(VECTOR_INDEX_NAME.to_string());
-            created = true;
-        }
+    if vector_index_required(ds).await? && (replace_existing || !existing.contains(VECTOR_INDEX_NAME)) {
+        let params = ivf_pq_params(ds).expect("required vector index has a vector column");
+        on_phase("vector index");
+        ds.create_index(
+            &["vector"],
+            IndexType::Vector,
+            Some(VECTOR_INDEX_NAME.to_string()),
+            &params,
+            replace_existing,
+        )
+        .await
+        .context("creating vector index")?;
+        existing.insert(VECTOR_INDEX_NAME.to_string());
+        created = true;
     }
     if Schema::from(ds.schema()).column_with_name("source_identity").is_some()
         && (replace_existing || !existing.contains(SOURCE_IDENTITY_INDEX_NAME))
@@ -343,18 +331,9 @@ pub(crate) fn schema_for(profile: &EmbeddingProfile) -> Arc<Schema> {
         HashMap::from([
             (EMBEDDING_PROVIDER_KEY.to_string(), profile.provider.clone()),
             (EMBEDDING_MODEL_KEY.to_string(), profile.model.clone()),
-            (
-                EMBEDDING_DIMENSIONS_KEY.to_string(),
-                profile.dimensions.to_string(),
-            ),
-            (
-                EMBEDDING_SCHEMA_VERSION_KEY.to_string(),
-                profile.schema_version.clone(),
-            ),
-            (
-                EMBEDDING_FINGERPRINT_KEY.to_string(),
-                profile.fingerprint.clone(),
-            ),
+            (EMBEDDING_DIMENSIONS_KEY.to_string(), profile.dimensions.to_string()),
+            (EMBEDDING_SCHEMA_VERSION_KEY.to_string(), profile.schema_version.clone()),
+            (EMBEDDING_FINGERPRINT_KEY.to_string(), profile.fingerprint.clone()),
         ]),
     ))
 }
@@ -505,11 +484,7 @@ mod tests {
     }
 
     fn text_batch(texts: &[&str]) -> RecordBatch {
-        RecordBatch::try_new(
-            text_schema(),
-            vec![Arc::new(StringArray::from(texts.to_vec()))],
-        )
-        .unwrap()
+        RecordBatch::try_new(text_schema(), vec![Arc::new(StringArray::from(texts.to_vec()))]).unwrap()
     }
 
     fn indexable_schema() -> Arc<Schema> {
@@ -602,10 +577,22 @@ mod tests {
             panic!("vector must be fixed-size")
         };
         assert_eq!(*dimension, 1024);
-        assert_eq!(schema.metadata().get(EMBEDDING_PROVIDER_KEY), Some(&"voyage".to_string()));
-        assert_eq!(schema.metadata().get(EMBEDDING_MODEL_KEY), Some(&"voyage-4-lite".to_string()));
-        assert_eq!(schema.metadata().get(EMBEDDING_DIMENSIONS_KEY), Some(&"1024".to_string()));
-        assert_eq!(schema.metadata().get(EMBEDDING_SCHEMA_VERSION_KEY), Some(&"2".to_string()));
+        assert_eq!(
+            schema.metadata().get(EMBEDDING_PROVIDER_KEY),
+            Some(&"voyage".to_string())
+        );
+        assert_eq!(
+            schema.metadata().get(EMBEDDING_MODEL_KEY),
+            Some(&"voyage-4-lite".to_string())
+        );
+        assert_eq!(
+            schema.metadata().get(EMBEDDING_DIMENSIONS_KEY),
+            Some(&"1024".to_string())
+        );
+        assert_eq!(
+            schema.metadata().get(EMBEDDING_SCHEMA_VERSION_KEY),
+            Some(&"2".to_string())
+        );
         assert_eq!(
             schema.metadata().get(EMBEDDING_FINGERPRINT_KEY),
             Some(&profile.fingerprint)
@@ -697,11 +684,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().join("chunks.lance");
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(StringArray::from(vec!["row"]))],
-        )
-        .unwrap();
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(StringArray::from(vec!["row"]))]).unwrap();
         let mut ds = Dataset::write(
             RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema),
             uri.to_str().unwrap(),

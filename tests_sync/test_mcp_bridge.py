@@ -37,7 +37,9 @@ def test_remote_search_waits_for_ready_and_retries_transient(monkeypatch):
     def fake_urlopen(req, timeout):
         calls.append((req.full_url, req.method, timeout))
         if req.full_url.endswith("/ready"):
-            return _Response({"native_warm": {"state": next(ready_states)}})
+            return _Response(
+                {"ok": True, "native_warm": {"state": next(ready_states)}}
+            )
         if len([call for call in calls if call[0].endswith("/search")]) == 1:
             raise OSError("connection reset")
         return _Response({"ok": True, "results": [{"raw_text": "原始中文"}]})
@@ -48,6 +50,43 @@ def test_remote_search_waits_for_ready_and_retries_transient(monkeypatch):
     assert result["ok"] is True
     assert [method for _, method, _ in calls] == ["GET", "GET", "POST", "POST"]
     assert all(timeout <= 50 for _, _, timeout in calls)
+
+
+@pytest.mark.parametrize(
+    "not_ready",
+    (
+        {"native_warm": {"state": "warming"}},
+        {
+            "native_warm": {"state": "ready"},
+            "source_store": {"configured": True, "ready": False, "restoring": True},
+        },
+    ),
+    ids=("native-warming", "source-restoring"),
+)
+def test_remote_search_polls_retryable_ready_503_until_ready(monkeypatch, not_ready):
+    monkeypatch.setenv("FUNES_REMOTE_URL", "https://memory.example")
+    monkeypatch.setenv("FUNES_API_TOKEN", "api-token")
+    monkeypatch.setenv("FUNES_REMOTE_READY_TIMEOUT", "1")
+    monkeypatch.setattr(bridge.time, "sleep", lambda _seconds: None)
+    calls = []
+    ready_attempt = 0
+
+    def fake_urlopen(req, timeout):
+        nonlocal ready_attempt
+        calls.append((req.full_url, req.method, timeout))
+        if req.full_url.endswith("/ready"):
+            ready_attempt += 1
+            if ready_attempt == 1:
+                body = io.BytesIO(json.dumps(not_ready).encode())
+                raise HTTPError(req.full_url, 503, "not ready", {}, body)
+            return _Response({"ok": True, "native_warm": {"state": "ready"}})
+        return _Response({"ok": True, "results": []})
+
+    monkeypatch.setattr(bridge, "open_no_redirect", fake_urlopen)
+    result = bridge._remote_call("/search", {"query": "previous decision"})
+
+    assert result == {"ok": True, "results": []}
+    assert [method for _, method, _ in calls] == ["GET", "GET", "POST"]
 
 
 def test_remote_call_does_not_retry_auth_failure(monkeypatch):

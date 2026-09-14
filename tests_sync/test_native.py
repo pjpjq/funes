@@ -166,6 +166,74 @@ def test_memory_update_is_one_record_and_queue_is_idempotent(tmp_path):
     store.close()
 
 
+def test_unheaded_persistent_memory_update_keeps_identity_and_increments_version(tmp_path):
+    path = tmp_path / "memory.md"
+    path.write_text("plain memory before edit\n", encoding="utf-8")
+    source = Source("memory:persistent", "persistent", path, "dev")
+    cfg = Config(tmp_path, tmp_path / "state", tmp_path / "config.toml")
+    store = Store(config=cfg)
+    try:
+        before = parse_file(source)
+        assert len(before) == 1
+        assert before[0].message_id.endswith(":__preamble__")
+        assert store.upsert_chunks(before) == 1
+
+        path.write_text("plain memory after edit\n", encoding="utf-8")
+        after = parse_file(source)
+        assert len(after) == 1
+        assert after[0].record_id == before[0].record_id
+        assert store.upsert_chunks(after) == 1
+
+        row = store.db.execute(
+            "SELECT version FROM records WHERE record_id=?", (after[0].record_id,)
+        ).fetchone()
+        assert row["version"] == 2
+        assert store.stats()["records"] == 1
+    finally:
+        store.close()
+
+
+def test_large_unheaded_persistent_memory_parts_are_unique_and_stable(tmp_path):
+    path = tmp_path / "memory.md"
+    path.write_text("a" * 6100, encoding="utf-8")
+    source = Source("memory:persistent", "persistent", path, "dev")
+
+    before = parse_file(source)
+    assert len(before) == 2
+    assert len({chunk.record_id for chunk in before}) == 2
+    assert all(len(chunk.raw_text) <= 6000 for chunk in before)
+
+    path.write_text("b" + "a" * 6099, encoding="utf-8")
+    after = parse_file(source)
+    assert [chunk.record_id for chunk in after] == [chunk.record_id for chunk in before]
+
+
+def test_repeated_memory_headings_are_unique_and_stable_across_updates(tmp_path):
+    path = tmp_path / "memory.md"
+    path.write_text("# decision\nfirst\n# decision\nsecond\n", encoding="utf-8")
+    source = Source("memory:persistent", "persistent", path, "dev")
+    cfg = Config(tmp_path, tmp_path / "state", tmp_path / "config.toml")
+    store = Store(config=cfg)
+    try:
+        before = parse_file(source)
+        assert len(before) == 2
+        assert len({chunk.record_id for chunk in before}) == 2
+        assert before[0].message_id.endswith(":# decision")
+        assert before[1].message_id.endswith(":# decision:occurrence:1")
+        assert store.upsert_chunks(before) == 2
+
+        path.write_text("# decision\nupdated first\n# decision\nupdated second\n", encoding="utf-8")
+        after = parse_file(source)
+        assert [chunk.record_id for chunk in after] == [chunk.record_id for chunk in before]
+        assert store.upsert_chunks(after) == 2
+
+        versions = store.db.execute("SELECT version FROM records ORDER BY record_id").fetchall()
+        assert [row["version"] for row in versions] == [2, 2]
+        assert store.stats()["records"] == 2
+    finally:
+        store.close()
+
+
 def test_discovery_excludes_auth_and_finds_archived(tmp_path):
     codex = tmp_path / ".codex"
     (codex / "archived_sessions").mkdir(parents=True)

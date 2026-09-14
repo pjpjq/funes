@@ -7,11 +7,70 @@ use crate::memory::Memory;
 use anyhow::Result;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{Implementation, ProtocolVersion, ServerCapabilities, ServerInfo};
+use rmcp::model::{CallToolResult, Content, Implementation, ProtocolVersion, ServerCapabilities, ServerInfo};
 use rmcp::transport::stdio;
 use rmcp::{schemars, tool, tool_handler, tool_router, ServerHandler, ServiceExt};
 use std::sync::Arc;
 use tokio::sync::OnceCell;
+
+#[derive(serde::Serialize)]
+struct StructuredRecall {
+    hits: Vec<StructuredHit>,
+}
+
+#[derive(serde::Serialize)]
+struct StructuredHit {
+    raw_text: String,
+    session_id: String,
+    seq: i64,
+    timestamp: String,
+    block_type: String,
+    harness: String,
+    score: f64,
+    neighbors: Vec<StructuredNeighbor>,
+}
+
+#[derive(serde::Serialize)]
+struct StructuredNeighbor {
+    raw_text: String,
+    seq: i64,
+    role: String,
+    block_type: String,
+}
+
+fn recall_tool_result(result: recall::RecallResult) -> CallToolResult {
+    let hits = result
+        .hits
+        .into_iter()
+        .map(|(hit, score)| StructuredHit {
+            raw_text: hit.text,
+            session_id: hit.session_id,
+            seq: hit.seq,
+            timestamp: hit.ts,
+            block_type: hit.block_type,
+            harness: hit.harness,
+            score,
+            neighbors: hit
+                .neighbors
+                .into_iter()
+                .map(|neighbor| StructuredNeighbor {
+                    raw_text: neighbor.text,
+                    seq: neighbor.seq,
+                    role: neighbor.role,
+                    block_type: neighbor.block_type,
+                })
+                .collect(),
+        })
+        .collect();
+    let mut response = CallToolResult::success(vec![Content::text(result.text)]);
+    response.structured_content =
+        Some(serde_json::to_value(StructuredRecall { hits }).expect("recall hits contain only JSON-compatible values"));
+    response
+}
+
+fn text_tool_result(text: String) -> CallToolResult {
+    CallToolResult::success(vec![Content::text(text)])
+}
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct RecallRequest {
@@ -221,7 +280,7 @@ impl Funes {
         half_life: f64,
         neighbors: i64,
         filter: recall::FacetFilter,
-    ) -> Result<String> {
+    ) -> Result<recall::RecallResult> {
         if self.pins_recall(&memory) {
             let cache = self
                 .pinned_recall
@@ -231,7 +290,8 @@ impl Funes {
             let pinned = cache.get_or_try_init(|| recall::pin_read(server_memory)).await?;
             recall::recall_filtered_pinned(pinned, query, k, candidates, half_life, neighbors, filter).await
         } else {
-            recall::recall_filtered(self.memory(memory), query, k, candidates, half_life, neighbors, filter).await
+            recall::recall_filtered_result(self.memory(memory), query, k, candidates, half_life, neighbors, filter)
+                .await
         }
     }
 
@@ -261,7 +321,7 @@ impl Funes {
             source_missing,
             memory,
         }): Parameters<RecallRequest>,
-    ) -> String {
+    ) -> CallToolResult {
         match self
             .recall_with_memory(
                 memory,
@@ -288,9 +348,8 @@ impl Funes {
             )
             .await
         {
-            Ok(s) if !s.is_empty() => s,
-            Ok(_) => "no results".to_string(),
-            Err(e) => format!("recall error: {e}"),
+            Ok(result) => recall_tool_result(result),
+            Err(e) => text_tool_result(format!("recall error: {e}")),
         }
     }
 
@@ -484,8 +543,11 @@ mod tests {
         );
         let first = first.unwrap();
         let concurrent = concurrent.unwrap();
-        assert_eq!(first, "no results");
-        assert_eq!(concurrent, "no results");
+        assert_eq!(first.text, "no results");
+        assert_eq!(concurrent.text, "no results");
+        let pinned_json = serde_json::to_value(recall_tool_result(first)).unwrap();
+        assert_eq!(pinned_json["content"][0]["text"], "no results");
+        assert_eq!(pinned_json["structuredContent"]["hits"], serde_json::json!([]));
 
         // Make a second Dataset::open impossible. The same server still recalls from its cached
         // handle, while an explicit call-level override must take the ordinary fresh-open path.
@@ -494,12 +556,15 @@ mod tests {
             .recall_with_memory(None, "unused".to_string(), 1, 1, 0.0, 0, absent_facet())
             .await
             .unwrap();
-        assert_eq!(second, "no results");
+        assert_eq!(second.text, "no results");
 
-        let override_error = server
+        let override_result = server
             .recall_with_memory(Some(spec), "unused".to_string(), 1, 1, 0.0, 0, absent_facet())
-            .await
-            .unwrap_err();
+            .await;
+        let override_error = match override_result {
+            Err(error) => error,
+            Ok(_) => panic!("an explicit override must open the removed dataset afresh"),
+        };
         assert!(override_error.to_string().contains("no index found"));
     }
 
@@ -526,5 +591,64 @@ mod tests {
         for value in [Some("1"), Some(" true "), Some("YES"), Some("on")] {
             assert!(pin_memory_value(value));
         }
+    }
+
+    #[test]
+    fn structured_recall_adds_raw_hits_without_changing_text_content() {
+        let hit = recall::Hit {
+            text: "complete raw hit\nwith a second line".to_string(),
+            session_id: "session-123".to_string(),
+            workdir: "/tmp/project".to_string(),
+            turn_uuid: "turn-1".to_string(),
+            seq: 17,
+            ts: "2026-09-14T01:02:03Z".to_string(),
+            block_type: "text".to_string(),
+            harness: "codex".to_string(),
+            neighbors: vec![recall::Neighbor {
+                seq: 16,
+                role: "user".to_string(),
+                block_type: "text".to_string(),
+                text: "raw neighboring turn".to_string(),
+            }],
+        };
+        let hits = vec![(hit, 0.875)];
+        let text = crate::ui::render::recall_agent("", "", &hits);
+
+        let response = recall_tool_result(recall::RecallResult {
+            text: text.clone(),
+            hits,
+        });
+        let json = serde_json::to_value(response).unwrap();
+
+        assert_eq!(json["content"][0]["text"], text);
+        assert_eq!(
+            json["structuredContent"]["hits"][0]["raw_text"],
+            "complete raw hit\nwith a second line"
+        );
+        assert_eq!(json["structuredContent"]["hits"][0]["session_id"], "session-123");
+        assert_eq!(json["structuredContent"]["hits"][0]["seq"], 17);
+        assert_eq!(
+            json["structuredContent"]["hits"][0]["timestamp"],
+            "2026-09-14T01:02:03Z"
+        );
+        assert_eq!(json["structuredContent"]["hits"][0]["block_type"], "text");
+        assert_eq!(json["structuredContent"]["hits"][0]["harness"], "codex");
+        assert_eq!(json["structuredContent"]["hits"][0]["score"], 0.875);
+        assert_eq!(
+            json["structuredContent"]["hits"][0]["neighbors"][0],
+            serde_json::json!({
+                "raw_text": "raw neighboring turn",
+                "seq": 16,
+                "role": "user",
+                "block_type": "text"
+            })
+        );
+    }
+
+    #[test]
+    fn recall_errors_keep_text_and_omit_structured_content() {
+        let json = serde_json::to_value(text_tool_result("recall error: broken".to_string())).unwrap();
+        assert_eq!(json["content"][0]["text"], "recall error: broken");
+        assert!(json.get("structuredContent").is_none());
     }
 }

@@ -1636,14 +1636,69 @@ def _public_source_item(item: dict) -> dict:
     return public
 
 
+NATIVE_STRUCTURED_PUBLIC_FIELDS = (
+    "raw_text",
+    "session_id",
+    "seq",
+    "timestamp",
+    "block_type",
+    "role",
+    "harness",
+    "score",
+)
+
+
+def _public_structured_native_hit(
+    item: dict,
+    *,
+    include_backend: bool = True,
+) -> dict:
+    """Keep only the documented non-secret native hit contract."""
+    public = {
+        name: item[name]
+        for name in NATIVE_STRUCTURED_PUBLIC_FIELDS
+        if name in item
+    }
+    neighbors = item.get("neighbors")
+    if isinstance(neighbors, list):
+        public["neighbors"] = [
+            _public_structured_native_hit(neighbor, include_backend=False)
+            for neighbor in neighbors
+            if isinstance(neighbor, dict)
+        ]
+    if include_backend:
+        public["retrieval_backend"] = "native_funes"
+    return public
+
+
+def structured_native_hits(result: object, limit: int) -> list[dict]:
+    """Extract raw native hits without interpreting agent-facing text."""
+    if not isinstance(result, dict) or result.get("isError"):
+        raise NativeMcpError("native MCP response malformed")
+    structured = result.get("structuredContent")
+    if not isinstance(structured, dict) or not isinstance(structured.get("hits"), list):
+        raise NativeMcpError("native MCP structured hits unavailable")
+    return [
+        _public_structured_native_hit(item)
+        for item in structured["hits"][:limit]
+        if isinstance(item, dict) and isinstance(item.get("raw_text"), str)
+    ]
+
+
 def materialize_native_results(
     output: str,
     app,
     limit: int,
     *,
     deadline: float | None = None,
+    structured_hits: list[dict] | None = None,
+    allow_sidecar: bool = True,
 ) -> list[dict]:
     """Resolve native rank coordinates to raw sidecar documents or sessions."""
+    if structured_hits is not None:
+        return structured_hits[:limit]
+    if not allow_sidecar:
+        raise NativeMcpError("native MCP structured hits unavailable")
     results = []
     for identity in native_result_ids(output)[:limit]:
         is_canonical_reference = identity.startswith(CANONICAL_REF_PREFIX)
@@ -1938,9 +1993,49 @@ class NativeMcpWorker:
         text = result.get("text")
         return text if isinstance(text, str) else ""
 
+    def call_tool_result(
+        self,
+        name: str,
+        arguments: dict,
+        *,
+        timeout: float | None = None,
+    ) -> object:
+        result = self._call(
+            "tools/call",
+            {"name": name, "arguments": arguments},
+            timeout=timeout,
+        )
+        if isinstance(result, dict) and result.get("isError"):
+            raise NativeMcpError("native MCP tool failed")
+        return result
+
     def call_tool(self, name: str, arguments: dict, *, timeout: float | None = None) -> str:
-        result = self._call("tools/call", {"name": name, "arguments": arguments}, timeout=timeout)
-        return self._text(result)
+        return self._text(self.call_tool_result(name, arguments, timeout=timeout))
+
+    @staticmethod
+    def _recall_arguments(
+        query: str,
+        *,
+        k: int,
+        candidates: int | None,
+        half_life: float | None,
+        neighbors: int | None,
+        block_type: str | None,
+        harness: str | None,
+        extra: dict,
+    ) -> dict:
+        arguments = {"query": str(query), "k": int(k)}
+        for name, value in (
+            ("candidates", candidates),
+            ("half_life", half_life),
+            ("neighbors", neighbors),
+            ("block_type", block_type),
+            ("harness", harness),
+        ):
+            if value is not None:
+                arguments[name] = value
+        arguments.update({name: value for name, value in extra.items() if value is not None})
+        return arguments
 
     def recall(
         self,
@@ -1955,24 +2050,48 @@ class NativeMcpWorker:
         timeout: float | None = None,
         **extra,
     ) -> str:
-        arguments = {"query": str(query), "k": int(k)}
-        for name, value in (
-            ("candidates", candidates),
-            ("half_life", half_life),
-            ("neighbors", neighbors),
-            ("block_type", block_type),
-            ("harness", harness),
-        ):
-            if value is not None:
-                arguments[name] = value
+        arguments = self._recall_arguments(
+            query,
+            k=k,
+            candidates=candidates,
+            half_life=half_life,
+            neighbors=neighbors,
+            block_type=block_type,
+            harness=harness,
+            extra=extra,
+        )
         # Keep compatibility with callers that used the old HTTP filter names;
         # rmcp/serde ignores unknown optional fields while native recall still
         # receives the same query and bounded tuning values.
-        arguments.update({name: value for name, value in extra.items() if value is not None})
         result = self.call_tool("recall", arguments, timeout=timeout)
         if result.startswith("recall error:"):
             raise NativeMcpError("native recall failed")
         return result
+
+    def recall_result(
+        self,
+        query: str,
+        *,
+        k: int = 8,
+        candidates: int | None = None,
+        half_life: float | None = None,
+        neighbors: int | None = None,
+        block_type: str | None = None,
+        harness: str | None = None,
+        timeout: float | None = None,
+        **extra,
+    ) -> object:
+        arguments = self._recall_arguments(
+            query,
+            k=k,
+            candidates=candidates,
+            half_life=half_life,
+            neighbors=neighbors,
+            block_type=block_type,
+            harness=harness,
+            extra=extra,
+        )
+        return self.call_tool_result("recall", arguments, timeout=timeout)
 
     def get(
         self,
@@ -2110,6 +2229,17 @@ def recall(query: str, *, timeout: float | None = None, **kwargs) -> str:
     )
 
 
+def recall_result(query: str, *, timeout: float | None = None, **kwargs) -> object:
+    return _locked_native_call(
+        lambda remaining: native_worker().recall_result(
+            query,
+            timeout=remaining,
+            **kwargs,
+        ),
+        timeout,
+    )
+
+
 def get(session_id: str, *, timeout: float | None = None, **kwargs) -> str:
     return _locked_native_call(
         lambda remaining: native_worker().get(
@@ -2180,6 +2310,8 @@ def _http_native_results(
     limit: int,
     tuning: dict[str, object],
     deadline: float,
+    *,
+    native_only: bool = False,
 ) -> list[dict]:
     """Recall and materialize raw text within one hard HTTP deadline."""
 
@@ -2187,6 +2319,17 @@ def _http_native_results(
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise NativeMcpTimeoutError("native MCP request timed out")
+        if native_only:
+            result = recall_result(query, k=limit, timeout=remaining, **tuning)
+            hits = structured_native_hits(result, limit)
+            return materialize_native_results(
+                "",
+                None,
+                limit,
+                deadline=deadline,
+                structured_hits=hits,
+                allow_sidecar=False,
+            )
         output = recall(query, k=limit, timeout=remaining, **tuning)
         return (
             materialize_native_results(output, app, limit, deadline=deadline)
@@ -2217,14 +2360,14 @@ def auth_ok(handler: BaseHTTPRequestHandler) -> bool:
     return bool(TOKEN) and handler.headers.get("Authorization", "") == "Bearer " + TOKEN
 
 
-def ready_payload() -> tuple[int, dict[str, object]]:
-    """Return the cheap authenticated readiness gate used by clients per call."""
+def _ready_payload(*, require_source: bool) -> tuple[int, dict[str, object]]:
+    """Return a cheap readiness snapshot without touching source/native data."""
     sources = source_readiness_state()
     warm = warm_state()
     source_ok = not sources.get("configured") or bool(sources.get("ready"))
     if (
         REMOTE
-        and source_ok
+        and (source_ok or not require_source)
         and warm.get("state") in {"error", "not_started"}
     ):
         # A failed initial warm must not leave Codex/Pi polling a permanent
@@ -2234,7 +2377,7 @@ def ready_payload() -> tuple[int, dict[str, object]]:
     warm_ok = warm.get("state") == "ready"
     if not REMOTE:
         error = "FUNES_MEMORY is not configured"
-    elif not source_ok:
+    elif require_source and not source_ok:
         error = (
             "restore_in_progress"
             if sources.get("restoring")
@@ -2244,7 +2387,7 @@ def ready_payload() -> tuple[int, dict[str, object]]:
         error = "native_warm_" + str(warm.get("state", "unavailable"))
     else:
         error = ""
-    ok = bool(REMOTE) and source_ok and warm_ok
+    ok = bool(REMOTE) and (source_ok or not require_source) and warm_ok
     return (
         200 if ok else 503,
         {
@@ -2257,6 +2400,21 @@ def ready_payload() -> tuple[int, dict[str, object]]:
             "embedding_profile": embedding_profile(),
         },
     )
+
+
+def ready_payload() -> tuple[int, dict[str, object]]:
+    """Return the backward-compatible overall/ingest readiness gate."""
+    return _ready_payload(require_source=True)
+
+
+def search_ready_payload() -> tuple[int, dict[str, object]]:
+    """Return readiness for the active search path.
+
+    Voyage can safely read the secret-gated raw text from Lance while the
+    encrypted source sidecar restores. The legacy local path still needs that
+    sidecar for canonical result materialization, so it must remain closed.
+    """
+    return _ready_payload(require_source=embedding_profile()["provider"] != "voyage")
 
 
 def sync_status_payload() -> tuple[int, dict[str, object]]:
@@ -2348,15 +2506,16 @@ class Handler(BaseHTTPRequestHandler):
             )
             self.send_json(code, payload, headers)
             return
-        if self.path in ("/ready", "/sync/status"):
+        if self.path in ("/ready", "/ready/search", "/ready/ingest", "/sync/status"):
             if not auth_ok(self):
                 self.send_json(401, {"error": "unauthorized"})
                 return
-            code, payload = (
-                ready_payload()
-                if self.path == "/ready"
-                else sync_status_payload()
-            )
+            if self.path == "/ready/search":
+                code, payload = search_ready_payload()
+            elif self.path in ("/ready", "/ready/ingest"):
+                code, payload = ready_payload()
+            else:
+                code, payload = sync_status_payload()
             self.send_json(code, payload)
             return
         self.send_json(404, {"error": "not found"})
@@ -2424,6 +2583,13 @@ class Handler(BaseHTTPRequestHandler):
                         },
                     )
                     return
+                if app.syncer.restoring or app.syncer.restore_failed:
+                    error = "restore_in_progress" if app.syncer.restoring else "restore_failed"
+                    self.send_json(
+                        503,
+                        {"queued": False, "durable": False, "error": error},
+                    )
+                    return
                 with WRITE_LOCK:
                     result = queue_source_reindex(app, scope)
                 self.send_json(202 if result.get("durable") else 503, result)
@@ -2460,16 +2626,42 @@ class Handler(BaseHTTPRequestHandler):
                     if obj.get(key, facet_values.get(key)) is not None
                 }
                 app = source_app()
-                if app is not None and (app.syncer.restoring or app.syncer.restore_failed):
-                    error = "restore_in_progress" if app.syncer.restoring else "restore_failed"
-                    self.send_json(503, {"ok": False, "results": [], "results_text": "", "error": error})
-                    return
                 harness = str(obj.get("harness", "")).strip() or None
                 profile = embedding_profile()
                 embedding_provider = str(profile["provider"])
                 sidecar_authoritative = any(
                     key in filters for key in ("role", "since", "until")
                 )
+                source_restore_error = ""
+                if app is not None and (app.syncer.restoring or app.syncer.restore_failed):
+                    source_restore_error = (
+                        "restore_in_progress" if app.syncer.restoring else "restore_failed"
+                    )
+                    if embedding_provider != "voyage" or sidecar_authoritative:
+                        self.send_json(
+                            503,
+                            {
+                                "ok": False,
+                                "results": [],
+                                "results_text": "",
+                                "error": source_restore_error,
+                            },
+                        )
+                        return
+                    if warm_state().get("state") != "ready":
+                        self.send_json(
+                            503,
+                            {
+                                "ok": False,
+                                "results": [],
+                                "results_text": "",
+                                "error": "native_mcp_unavailable",
+                                "retrieval_degraded": "source_" + source_restore_error,
+                                "retrieval_backend": "unavailable",
+                                "embedding_profile": profile,
+                            },
+                        )
+                        return
                 voyage_hot_path = (
                     embedding_provider == "voyage" and not sidecar_authoritative
                 )
@@ -2589,6 +2781,7 @@ class Handler(BaseHTTPRequestHandler):
                             limit,
                             tuning,
                             native_deadline,
+                            native_only=bool(source_restore_error),
                         )
                     else:
                         out = (
@@ -2631,9 +2824,14 @@ class Handler(BaseHTTPRequestHandler):
                         else "native_mcp_unavailable"
                     )
                 else:
-                    retrieval_degraded = ""
+                    retrieval_degraded = (
+                        "source_" + source_restore_error
+                        if source_restore_error
+                        else ""
+                    )
                     selective_bm25 = (
                         voyage_hot_path
+                        and not source_restore_error
                         and should_augment_with_local_bm25(raw_query, results)
                     )
                     if selective_bm25:
@@ -2661,7 +2859,7 @@ class Handler(BaseHTTPRequestHandler):
                                     [results, *lexical_rankings],
                                     limit,
                                 )
-                if native_failure and voyage_hot_path:
+                if native_failure and voyage_hot_path and not source_restore_error:
                     try:
                         source_rankings, session_fallback_rankings = (
                             _run_before_deadline(
@@ -2733,7 +2931,7 @@ class Handler(BaseHTTPRequestHandler):
                     "error": "",
                     "retrieval_backend": (
                         "bm25"
-                        if retrieval_degraded or not native_allowed
+                        if native_failure or not native_allowed
                         else f"{embedding_provider}_lance_bm25_rrf"
                     ),
                     "embedding_profile": profile,
@@ -2782,6 +2980,14 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 if not all(isinstance(doc, dict) for doc in docs):
                     self.send_json(400, {"error": "each document must be an object"})
+                    return
+                app = source_app()
+                if app is not None and (app.syncer.restoring or app.syncer.restore_failed):
+                    error = "restore_in_progress" if app.syncer.restoring else "restore_failed"
+                    self.send_json(
+                        503,
+                        {"ok": False, "durable": False, "error": error},
+                    )
                     return
                 prefer = self.headers.get("Prefer", "")
                 respond_async = any(

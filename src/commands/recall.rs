@@ -58,6 +58,13 @@ pub struct Hit {
     pub neighbors: Vec<Neighbor>,
 }
 
+/// One recall pipeline result carried to the MCP adapter as both the stable rendered text and the
+/// raw hits that produced it. CLI callers keep using [`recall_filtered`] and see only `text`.
+pub(crate) struct RecallResult {
+    pub text: String,
+    pub hits: Vec<(Hit, f64)>,
+}
+
 /// Matching blocks `scan` lists before it stops. What the cap dropped is always reported.
 const SCAN_HIT_CAP: usize = 200;
 
@@ -460,9 +467,28 @@ pub async fn recall_filtered(
     neighbors: i64,
     filter: FacetFilter,
 ) -> Result<String> {
+    Ok(
+        recall_filtered_result(memory, query, k, candidates, half_life, neighbors, filter)
+            .await?
+            .text,
+    )
+}
+
+/// Recall once while retaining the raw hits for protocol adapters that expose additive structured
+/// data alongside the byte-stable agent rendering.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn recall_filtered_result(
+    memory: Memory,
+    query: String,
+    k: usize,
+    candidates: usize,
+    half_life: f64,
+    neighbors: i64,
+    filter: FacetFilter,
+) -> Result<RecallResult> {
     let (note, memory_label, hits) =
         recall_hits_filtered(memory, query, k, candidates, half_life, neighbors, filter, &|_| ()).await?;
-    Ok(render_recall(note, memory_label, hits))
+    Ok(recall_result(note, memory_label, hits))
 }
 
 /// Recall against an already-opened immutable dataset. Only the MCP server's explicit opt-in
@@ -476,7 +502,7 @@ pub(crate) async fn recall_filtered_pinned(
     half_life: f64,
     neighbors: i64,
     filter: FacetFilter,
-) -> Result<String> {
+) -> Result<RecallResult> {
     let progress = &|_: &str| ();
     progress(&format!("searching {}…", pinned.requested_label));
     let (note, memory_label, hits) = recall_hits_filtered_read(
@@ -490,14 +516,16 @@ pub(crate) async fn recall_filtered_pinned(
         progress,
     )
     .await?;
-    Ok(render_recall(note, memory_label, hits))
+    Ok(recall_result(note, memory_label, hits))
 }
 
-fn render_recall(note: String, memory_label: Option<String>, hits: Vec<(Hit, f64)>) -> String {
-    if hits.is_empty() {
-        return format!("{note}no results");
-    }
-    crate::ui::render::recall_agent(&note, &memory_hint(memory_label.as_deref()), &hits)
+fn recall_result(note: String, memory_label: Option<String>, hits: Vec<(Hit, f64)>) -> RecallResult {
+    let text = if hits.is_empty() {
+        format!("{note}no results")
+    } else {
+        crate::ui::render::recall_agent(&note, &memory_hint(memory_label.as_deref()), &hits)
+    };
+    RecallResult { text, hits }
 }
 
 /// Run the recall pipeline over one memory: hybrid retrieval → rerank → recency reweight →

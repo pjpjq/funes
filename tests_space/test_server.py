@@ -245,6 +245,43 @@ def test_native_mcp_worker_reuses_child_and_passes_hf_environment(monkeypatch, t
     assert processes[0].messages[3]["params"]["name"] == "get"
 
 
+def test_native_mcp_worker_can_return_structured_recall_result(monkeypatch, tmp_path):
+    def responder(message, stdout):
+        if message.get("method") == "initialize":
+            _mcp_responder(message, stdout)
+            return
+        if message.get("method") == "tools/call":
+            stdout.push(
+                {
+                    "jsonrpc": "2.0",
+                    "id": message["id"],
+                    "result": {
+                        "content": [{"type": "text", "text": "agent rendering"}],
+                        "structuredContent": {
+                            "hits": [{"raw_text": "raw", "session_id": "s1"}]
+                        },
+                    },
+                }
+            )
+
+    monkeypatch.setattr(
+        bridge.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: _FakeProcess(responder),
+    )
+    worker = bridge.NativeMcpWorker(
+        "fake-funes", "owner/memory", tmp_path, timeout=1, handshake_timeout=1
+    )
+    try:
+        result = worker.recall_result("query", k=1)
+    finally:
+        worker.close()
+
+    assert result["structuredContent"]["hits"] == [
+        {"raw_text": "raw", "session_id": "s1"}
+    ]
+
+
 def test_native_mcp_worker_rejects_tool_error_text(monkeypatch, tmp_path):
     worker = bridge.NativeMcpWorker(
         "fake-funes", "owner/memory", tmp_path, timeout=1, handshake_timeout=1
@@ -901,6 +938,140 @@ def test_get_ready_returns_immediate_503_during_source_restore(monkeypatch):
     assert response.status == 503
     assert body["error"] == "restore_in_progress"
     assert body["source_store"]["restoring"] is True
+
+
+@pytest.mark.parametrize(
+    ("restoring", "restore_failed", "source_error"),
+    (
+        (True, False, "restore_in_progress"),
+        (False, True, "restore_failed"),
+    ),
+)
+def test_search_ready_stays_200_while_source_is_unavailable(
+    monkeypatch, restoring, restore_failed, source_error
+):
+    class Store:
+        def __getattribute__(self, name):
+            raise AssertionError(f"readiness must not access store.{name}")
+
+    app = SimpleNamespace(
+        store=Store(),
+        syncer=SimpleNamespace(restoring=restoring, restore_failed=restore_failed),
+        restore_result=0,
+    )
+    monkeypatch.setattr(bridge, "TOKEN", "test-token")
+    monkeypatch.setattr(bridge, "REMOTE", "owner/memory")
+    monkeypatch.setenv("FUNES_STORAGE_REPO", "owner/source")
+    monkeypatch.setattr(bridge, "SOURCE_APP", app)
+    monkeypatch.setattr(bridge, "warm_state", lambda: {"state": "ready"})
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        responses = {}
+        for path in ("/ready/search", "/ready/ingest", "/ready"):
+            conn = HTTPConnection(*server.server_address)
+            conn.request("GET", path, headers={"Authorization": "Bearer test-token"})
+            response = conn.getresponse()
+            responses[path] = response.status, json.loads(response.read())
+            conn.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert responses["/ready/search"][0] == 200
+    assert responses["/ready/search"][1]["ok"] is True
+    assert responses["/ready/ingest"][0] == 503
+    assert responses["/ready/ingest"][1]["error"] == source_error
+    assert responses["/ready"][0] == 503
+    assert responses["/ready"][1]["error"] == source_error
+
+
+def test_search_ready_requires_source_for_legacy_local_provider(monkeypatch):
+    app = SimpleNamespace(
+        syncer=SimpleNamespace(restoring=True, restore_failed=False),
+        restore_result=0,
+    )
+    monkeypatch.setattr(bridge, "REMOTE", "owner/memory")
+    monkeypatch.setattr(bridge, "SOURCE_APP", app)
+    monkeypatch.setenv("FUNES_STORAGE_REPO", "owner/source")
+    monkeypatch.setenv("FUNES_EMBEDDING_PROVIDER", "local")
+    monkeypatch.setattr(bridge, "warm_state", lambda: {"state": "ready"})
+
+    code, payload = bridge.search_ready_payload()
+
+    assert code == 503
+    assert payload["ok"] is False
+    assert payload["error"] == "restore_in_progress"
+
+
+@pytest.mark.parametrize(
+    ("path", "payload", "extra_headers"),
+    (
+        ("/sync", {}, {}),
+        ("/reindex", {"scope": "all"}, {}),
+        (
+            "/ingest",
+            {"documents": [{"raw_text": "must not be retained"}]},
+            {"Prefer": "respond-async"},
+        ),
+    ),
+)
+@pytest.mark.parametrize(
+    ("restoring", "restore_failed", "source_error"),
+    (
+        (True, False, "restore_in_progress"),
+        (False, True, "restore_failed"),
+    ),
+)
+def test_writes_fail_fast_while_source_is_restoring(
+    monkeypatch,
+    path,
+    payload,
+    extra_headers,
+    restoring,
+    restore_failed,
+    source_error,
+):
+    class Store:
+        def __getattribute__(self, name):
+            raise AssertionError(f"restore-gated write must not access store.{name}")
+
+    app = SimpleNamespace(
+        store=Store(),
+        syncer=SimpleNamespace(restoring=restoring, restore_failed=restore_failed),
+        restore_result=0,
+    )
+    monkeypatch.setattr(bridge, "TOKEN", "test-token")
+    monkeypatch.setattr(bridge, "REMOTE", "owner/memory")
+    monkeypatch.setattr(bridge, "SOURCE_APP", app)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    started = time.monotonic()
+    try:
+        conn = HTTPConnection(*server.server_address)
+        headers = {
+            "Authorization": "Bearer test-token",
+            "Content-Type": "application/json",
+            **extra_headers,
+        }
+        conn.request("POST", path, json.dumps(payload).encode(), headers)
+        response = conn.getresponse()
+        body = json.loads(response.read())
+        conn.close()
+        elapsed = time.monotonic() - started
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert elapsed < 0.25
+    assert response.status == 503
+    assert body["error"] == source_error
+    assert body["durable"] is False
 
 
 def test_get_sync_status_still_runs_full_native_status(monkeypatch):
@@ -2724,6 +2895,215 @@ def test_voyage_native_rank_maps_canonical_to_raw_without_sidecar_search(
     assert calls[0][1]["source_agent"] == "codex"
     assert calls[0][1]["source_type"] == "memory"
     assert calls[0][1]["source_missing"] is False
+
+
+@pytest.mark.parametrize(
+    ("restoring", "restore_failed", "degraded"),
+    (
+        (True, False, "source_restore_in_progress"),
+        (False, True, "source_restore_failed"),
+    ),
+)
+def test_voyage_native_search_uses_structured_hits_while_source_is_unavailable(
+    monkeypatch, restoring, restore_failed, degraded
+):
+    class Store:
+        def __getattribute__(self, name):
+            raise AssertionError(f"degraded native search must not access store.{name}")
+
+    calls = []
+
+    class FakeWorker:
+        def recall_result(self, query, **kwargs):
+            calls.append((query, kwargs))
+            return {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "agent text must never be parsed or returned",
+                    }
+                ],
+                "structuredContent": {
+                    "hits": [
+                        {
+                            "raw_text": "原始 native 正文",
+                            "session_id": "session-1",
+                            "seq": 7,
+                            "timestamp": "2026-09-14T00:00:00Z",
+                            "block_type": "response",
+                            "harness": "codex",
+                            "score": 0.91,
+                            "neighbors": [
+                                {
+                                    "raw_text": "相邻原文",
+                                    "seq": 6,
+                                    "role": "user",
+                                    "block_type": "prompt",
+                                    "retrieval_text": "NEIGHBOR SHADOW",
+                                }
+                            ],
+                            "retrieval_text": "DERIVED SECRET SHADOW",
+                            "secret": "must-not-leak",
+                        }
+                    ]
+                },
+            }
+
+    app = SimpleNamespace(
+        store=Store(),
+        syncer=SimpleNamespace(
+            restoring=restoring,
+            restore_failed=restore_failed,
+        ),
+        restore_result=0,
+    )
+    monkeypatch.setattr(bridge, "SOURCE_APP", app)
+    monkeypatch.setattr(bridge, "MCP_WORKER", FakeWorker())
+    monkeypatch.setattr(bridge, "TOKEN", "test-token")
+    monkeypatch.setattr(bridge, "REMOTE", "owner/memory")
+    monkeypatch.setattr(bridge, "warm_state", lambda: {"state": "ready"})
+    monkeypatch.setenv("FUNES_EMBEDDING_PROVIDER", "voyage")
+    monkeypatch.setattr(
+        bridge,
+        "search_source_bm25_rankings",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("restore degradation must disable all sidecar BM25")
+        ),
+    )
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        status, body = _post(
+            server,
+            "/search",
+            {"query": "cold restore query", "limit": 3, "repo": "owner/repo"},
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert status == 200
+    assert calls and calls[0][0] == "cold restore query"
+    assert body["retrieval_degraded"] == degraded
+    assert body["retrieval_backend"] == "voyage_lance_bm25_rrf"
+    assert body["results_text"] == "原始 native 正文"
+    assert body["results"] == [
+        {
+            "raw_text": "原始 native 正文",
+            "session_id": "session-1",
+            "seq": 7,
+            "timestamp": "2026-09-14T00:00:00Z",
+            "block_type": "response",
+            "harness": "codex",
+            "score": 0.91,
+            "neighbors": [
+                {
+                    "raw_text": "相邻原文",
+                    "seq": 6,
+                    "role": "user",
+                    "block_type": "prompt",
+                }
+            ],
+            "retrieval_backend": "native_funes",
+        }
+    ]
+    assert "agent text" not in json.dumps(body, ensure_ascii=False)
+    assert "DERIVED SECRET SHADOW" not in json.dumps(body, ensure_ascii=False)
+    assert "NEIGHBOR SHADOW" not in json.dumps(body, ensure_ascii=False)
+    assert "must-not-leak" not in json.dumps(body, ensure_ascii=False)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    (
+        {"query": "query", "role": "user"},
+        {"query": "query", "since": "2026-09-01"},
+        {"query": "query", "until": "2026-09-14"},
+    ),
+)
+def test_source_only_search_filters_fail_fast_during_restore(monkeypatch, payload):
+    class Store:
+        def __getattribute__(self, name):
+            raise AssertionError(f"restore gate must not access store.{name}")
+
+    class FakeWorker:
+        def recall_result(self, *_args, **_kwargs):
+            raise AssertionError("source-only filters must not call native")
+
+    app = SimpleNamespace(
+        store=Store(),
+        syncer=SimpleNamespace(restoring=True, restore_failed=False),
+        restore_result=0,
+    )
+    monkeypatch.setattr(bridge, "SOURCE_APP", app)
+    monkeypatch.setattr(bridge, "MCP_WORKER", FakeWorker())
+    monkeypatch.setattr(bridge, "TOKEN", "test-token")
+    monkeypatch.setattr(bridge, "REMOTE", "owner/memory")
+    monkeypatch.setenv("FUNES_EMBEDDING_PROVIDER", "voyage")
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    started = time.monotonic()
+    try:
+        status, body = _post(server, "/search", payload)
+        elapsed = time.monotonic() - started
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert elapsed < 0.25
+    assert status == 503
+    assert body["error"] == "restore_in_progress"
+
+
+def test_native_unavailable_during_restore_fails_without_sidecar_fallback(monkeypatch):
+    class Store:
+        def __getattribute__(self, name):
+            raise AssertionError(f"native failure must not access store.{name}")
+
+    class FakeWorker:
+        def recall_result(self, *_args, **_kwargs):
+            raise bridge.NativeMcpError("native unavailable")
+
+    app = SimpleNamespace(
+        store=Store(),
+        syncer=SimpleNamespace(restoring=True, restore_failed=False),
+        restore_result=0,
+    )
+    monkeypatch.setattr(bridge, "SOURCE_APP", app)
+    monkeypatch.setattr(bridge, "MCP_WORKER", FakeWorker())
+    monkeypatch.setattr(bridge, "TOKEN", "test-token")
+    monkeypatch.setattr(bridge, "REMOTE", "owner/memory")
+    monkeypatch.setattr(bridge, "warm_state", lambda: {"state": "ready"})
+    monkeypatch.setenv("FUNES_EMBEDDING_PROVIDER", "voyage")
+    monkeypatch.setattr(
+        bridge,
+        "search_source_bm25_rankings",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("native failure during restore must not fall back")
+        ),
+    )
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    started = time.monotonic()
+    try:
+        status, body = _post(server, "/search", {"query": "query"})
+        elapsed = time.monotonic() - started
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert elapsed < 0.25
+    assert status == 503
+    assert body["error"] == "native_mcp_unavailable"
 
 
 def test_sidecar_search_rrf_queries_raw_and_rewrite_with_filters(monkeypatch):

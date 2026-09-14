@@ -230,26 +230,17 @@ def _ready_value(value):
     """Reduce a readiness response to an internal poll state only."""
     if not isinstance(value, dict):
         return ""
-    # Legacy Spaces returned HTTP 200/ok while native warm or source restore
-    # was still in progress. Those gates must win over the top-level marker.
+    # Legacy Spaces returned HTTP 200/ok while native warm was still in
+    # progress. That search gate must win over the top-level marker.
     warm = value.get("native_warm")
     if isinstance(warm, dict) and warm.get("state") == "warming":
-        return "warming"
-    sources = value.get("source_store")
-    if (
-        isinstance(sources, dict)
-        and sources.get("configured")
-        and not sources.get("ready")
-    ):
-        # Restores and unavailable source indexes are retryable readiness
-        # gates, even when the native worker itself has already warmed.
         return "warming"
     return "ready" if value.get("ok") else ""
 
 
 def _ready_state(base, headers, timeout):
     """Read only a bounded readiness state, never exposing response data."""
-    req = request.Request(base + "/ready", headers=headers, method="GET")
+    req = request.Request(base + "/ready/search", headers=headers, method="GET")
     try:
         with _open_remote(req, timeout=timeout) as resp:
             value = json.loads(resp.read() or b"{}")
@@ -273,10 +264,10 @@ def _ready_state(base, headers, timeout):
     return _ready_value(value)
 
 
-def _wait_until_ready(base, headers, deadline):
+def _wait_until_ready(base, headers, deadline, default_timeout=8, default_polls=8):
     """Avoid sending a recall into the known cold/warming window."""
-    timeout = _float_env("FUNES_REMOTE_READY_TIMEOUT", 8, 1, 15)
-    polls = _int_env("FUNES_REMOTE_READY_POLLS", 8, 1, 30)
+    timeout = _float_env("FUNES_REMOTE_READY_TIMEOUT", default_timeout, 0.1, 15)
+    polls = _int_env("FUNES_REMOTE_READY_POLLS", default_polls, 1, 30)
     state = ""
     for _ in range(polls):
         remaining = deadline - time.monotonic()
@@ -284,6 +275,8 @@ def _wait_until_ready(base, headers, deadline):
             break
         state = _ready_state(base, headers, min(timeout, remaining))
         if state != "warming":
+            break
+        if _ + 1 >= polls:
             break
         time.sleep(min(2.0, max(0.0, deadline - time.monotonic())))
     return state
@@ -309,18 +302,23 @@ def _remote_call(path, payload):
         return None
     _validated_url(base)
     headers = _auth_headers(token, hub_token)
-    total = _float_env("FUNES_REMOTE_TIMEOUT", 180, 10, 300)
-    attempts = _int_env("FUNES_REMOTE_ATTEMPTS", 5, 1, 5)
-    attempt_timeout = _float_env("FUNES_REMOTE_ATTEMPT_TIMEOUT", 50, 5, 55)
+    recall = path in ("/search", "/recall")
+    total = _float_env("FUNES_REMOTE_TIMEOUT", 4 if recall else 180, 0.1, 300)
+    attempts = _int_env("FUNES_REMOTE_ATTEMPTS", 1 if recall else 5, 1, 5)
+    attempt_timeout = _float_env(
+        "FUNES_REMOTE_ATTEMPT_TIMEOUT", 4 if recall else 50, 0.1, 55
+    )
     deadline = time.monotonic() + total
 
     # The Space reports HTTP 200 while its native worker is warming.  Waiting
     # here is materially better than sending a request that sits behind the
     # warm lock until the HF front door closes the connection.
-    if path in ("/search", "/recall"):
-        state = _wait_until_ready(base, headers, deadline)
+    if recall:
+        state = _wait_until_ready(
+            base, headers, deadline, default_timeout=2, default_polls=1
+        )
         if state == "warming" and time.monotonic() >= deadline:
-            raise TimeoutError("remote native worker is still warming")
+            return None
 
     last = None
     for attempt in range(attempts):
@@ -351,6 +349,8 @@ def _remote_call(path, payload):
             delay = min(_retry_after(last, attempt), max(0.0, deadline - time.monotonic()))
             if delay:
                 time.sleep(delay)
+    if recall:
+        return None
     raise RuntimeError("remote request failed after retries") from last
 
 def serve(store=None):

@@ -90,7 +90,36 @@ const remoteAttemptTimeoutMs = bounded(
 const remoteReadyTimeoutMs = bounded((envNumber("FUNES_REMOTE_READY_TIMEOUT") ?? 8) * 1_000, 8_000, 1_000, 15_000);
 const remoteReadyPolls = Math.floor(bounded(envNumber("FUNES_REMOTE_READY_POLLS"), 8, 1, 30));
 
-type FetchResult = Awaited<ReturnType<typeof fetch>>;
+type FetchResponse = Awaited<ReturnType<typeof fetch>>;
+type FetchResult = {
+  response: FetchResponse;
+  value: unknown;
+  validJson: boolean;
+};
+
+type CallBudget = {
+  timeoutMs: number;
+  attempts: number;
+  attemptTimeoutMs: number;
+  readyTimeoutMs: number;
+  readyPolls: number;
+};
+
+const manualBudget: CallBudget = {
+  timeoutMs: remoteTimeoutMs,
+  attempts: remoteAttempts,
+  attemptTimeoutMs: remoteAttemptTimeoutMs,
+  readyTimeoutMs: remoteReadyTimeoutMs,
+  readyPolls: remoteReadyPolls,
+};
+
+const automaticRecallBudget: CallBudget = {
+  timeoutMs: 3_500,
+  attempts: 1,
+  attemptTimeoutMs: 3_500,
+  readyTimeoutMs: 1_750,
+  readyPolls: 1,
+};
 
 class RequestTimeoutError extends Error {
   constructor() {
@@ -106,7 +135,18 @@ function now(): number {
 async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<FetchResult> {
   const controller = new AbortController();
   let timer: ReturnType<typeof setTimeout> | undefined;
-  const request = fetch(url, { ...init, redirect: "manual", signal: controller.signal });
+  const request = fetch(url, { ...init, redirect: "manual", signal: controller.signal }).then(
+    async (response): Promise<FetchResult> => {
+      if (statusOfResponse(response) === 204) {
+        return { response, value: undefined, validJson: false };
+      }
+      try {
+        return { response, value: await response.json(), validJson: true };
+      } catch {
+        return { response, value: undefined, validJson: false };
+      }
+    },
+  );
   const timeout = new Promise<never>((_, reject) => {
     timer = setTimeout(() => {
       controller.abort();
@@ -121,6 +161,10 @@ async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: numbe
 }
 
 function statusOf(response: FetchResult): number {
+  return statusOfResponse(response.response);
+}
+
+function statusOfResponse(response: FetchResponse): number {
   const status = Number(response.status);
   if (Number.isFinite(status) && status > 0) return status;
   return response.ok ? 200 : 500;
@@ -128,7 +172,7 @@ function statusOf(response: FetchResult): number {
 
 function isSuccess(response: FetchResult): boolean {
   const status = statusOf(response);
-  return response.ok || (status >= 200 && status < 300);
+  return response.response.ok || (status >= 200 && status < 300);
 }
 
 function isRetryableStatus(status: number): boolean {
@@ -139,7 +183,7 @@ function isRetryableStatus(status: number): boolean {
 
 function retryDelay(response: FetchResult | undefined, attempt: number): number {
   const exponential = Math.min(30_000, 1_000 * 2 ** (attempt + 1));
-  const retryAfter = response?.headers?.get("retry-after");
+  const retryAfter = response?.response.headers?.get("retry-after");
   if (!retryAfter) return exponential;
   const seconds = Number(retryAfter);
   if (Number.isFinite(seconds) && seconds >= 0) return Math.max(exponential, Math.min(30_000, seconds * 1_000));
@@ -161,16 +205,12 @@ type ReadyState = "ready" | "warming" | "transient" | "unknown" | "permanent";
 
 async function probeReady(headers: Record<string, string>, timeoutMs: number): Promise<ReadyState> {
   try {
-    const response = await fetchWithTimeout(`${base}/ready`, { method: "GET", headers }, timeoutMs);
+    const response = await fetchWithTimeout(`${base}/ready/search`, { method: "GET", headers }, timeoutMs);
     const status = statusOf(response);
     if (!isSuccess(response)) return isRetryableStatus(status) ? "transient" : "permanent";
     if (status === 204) return "ready";
-    let value: unknown;
-    try {
-      value = await response.json();
-    } catch {
-      return "unknown";
-    }
+    if (!response.validJson) return "unknown";
+    const value = response.value;
     if (!value || typeof value !== "object") return "ready";
     const payload = value as Record<string, unknown>;
     const warm = payload.native_warm;
@@ -185,14 +225,14 @@ async function probeReady(headers: Record<string, string>, timeoutMs: number): P
   }
 }
 
-async function waitUntilReady(headers: Record<string, string>, deadline: number): Promise<ReadyState> {
+async function waitUntilReady(headers: Record<string, string>, deadline: number, budget: CallBudget): Promise<ReadyState> {
   let state: ReadyState = "transient";
-  for (let poll = 0; poll < remoteReadyPolls; poll += 1) {
+  for (let poll = 0; poll < budget.readyPolls; poll += 1) {
     const remaining = deadline - now();
     if (remaining <= 0) break;
-    state = await probeReady(headers, Math.min(remoteReadyTimeoutMs, remaining));
+    state = await probeReady(headers, Math.min(budget.readyTimeoutMs, remaining));
     if (state === "ready" || state === "unknown" || state === "permanent") return state;
-    if (poll + 1 >= remoteReadyPolls) break;
+    if (poll + 1 >= budget.readyPolls) break;
     // A warming response is expected during a cold Space start. Keep the poll
     // interval short, but let the shared deadline stop it deterministically.
     if (!(await sleepUntil(2_000, deadline))) break;
@@ -208,7 +248,7 @@ function shouldRecall(prompt: string): boolean {
   return /(之前|上次|历史|做过|决定|决策|测试结果|偏好|已有实现|为什么放弃|以前|回忆|prior|previous|history|earlier|last time|we decided|decision|past work|preference|already implemented|old bug|regression)/i.test(prompt);
 }
 
-async function call(path: string, body: Record<string, unknown>) {
+async function call(path: string, body: Record<string, unknown>, budget: CallBudget = manualBudget) {
   if (!base || !token) return null;
   let encodedBody: string;
   try {
@@ -225,9 +265,9 @@ async function call(path: string, body: Record<string, unknown>) {
     headers.Authorization = `Bearer ${token}`;
   }
 
-  const deadline = now() + remoteTimeoutMs;
+  const deadline = now() + budget.timeoutMs;
   if (path === "/search" || path === "/recall") {
-    const ready = await waitUntilReady(headers, deadline);
+    const ready = await waitUntilReady(headers, deadline, budget);
     // A permanent readiness response (most commonly 401/403) must not be
     // followed by a duplicate POST. A still-warming service can be queried if
     // the bounded poll count was reached before the overall deadline.
@@ -235,7 +275,7 @@ async function call(path: string, body: Record<string, unknown>) {
   }
 
   let lastResponse: FetchResult | undefined;
-  for (let attempt = 0; attempt < remoteAttempts; attempt += 1) {
+  for (let attempt = 0; attempt < budget.attempts; attempt += 1) {
     const remaining = deadline - now();
     if (remaining <= 0) break;
     lastResponse = undefined;
@@ -247,16 +287,13 @@ async function call(path: string, body: Record<string, unknown>) {
           headers,
           body: encodedBody,
         },
-        Math.min(remoteAttemptTimeoutMs, remaining),
+        Math.min(budget.attemptTimeoutMs, remaining),
       );
       const status = statusOf(response);
       if (isSuccess(response)) {
-        try {
-          return await response.json();
-        } catch {
-          // A truncated/invalid JSON body is transient; let the bounded retry
-          // loop recover without changing the response shape for valid calls.
-        }
+        if (response.validJson) return response.value;
+        // A truncated/invalid JSON body is transient; let the bounded retry
+        // loop recover without changing the response shape for valid calls.
       } else {
         // Never retry authentication or other caller errors.  Only provider /
         // gateway failures and explicit rate limits are transient here.
@@ -268,7 +305,7 @@ async function call(path: string, body: Record<string, unknown>) {
       // are bounded by the shared deadline and safe to retry.
     }
 
-    if (attempt + 1 >= remoteAttempts) break;
+    if (attempt + 1 >= budget.attempts) break;
     const remainingAfterAttempt = deadline - now();
     if (remainingAfterAttempt <= 0) break;
     if (!(await sleepUntil(retryDelay(lastResponse, attempt), deadline))) break;
@@ -294,7 +331,16 @@ export default function funesRemote(pi: ExtensionAPI) {
   pi.on("before_agent_start", async (event) => {
     const prompt = String(event.prompt || "").trim();
     if (!shouldRecall(prompt)) return;
-    const result: any = await call("/search", { query: prompt, limit: 5 });
+    let result: any;
+    try {
+      result = await call(
+        "/search",
+        { query: prompt, limit: 5 },
+        automaticRecallBudget,
+      );
+    } catch {
+      return;
+    }
     const hits = Array.isArray(result?.results) ? result.results : [];
     if (!hits.length) return;
     const context = hits.map((hit: any, i: number) => `${i + 1}. ${String(hit.raw_text || "").slice(0, 1200)}`).join("\n");

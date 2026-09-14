@@ -114,9 +114,9 @@ const manualBudget: CallBudget = {
 };
 
 const automaticRecallBudget: CallBudget = {
-  timeoutMs: 3_500,
+  timeoutMs: 4_250,
   attempts: 1,
-  attemptTimeoutMs: 3_500,
+  attemptTimeoutMs: 4_250,
   readyTimeoutMs: 1_750,
   readyPolls: 1,
 };
@@ -267,7 +267,7 @@ async function call(path: string, body: Record<string, unknown>, budget: CallBud
 
   const deadline = now() + budget.timeoutMs;
   // /search already owns its cold-restore/degraded behavior. Giving a
-  // readiness probe half of the automatic 3.5 second budget can suppress an
+  // readiness probe half of the automatic 4.25 second budget can suppress an
   // otherwise successful recall, so only the legacy /recall path preflights.
   if (path === "/recall") {
     const ready = await waitUntilReady(headers, deadline, budget);

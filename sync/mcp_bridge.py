@@ -1,7 +1,12 @@
 from __future__ import annotations
+import atexit
+import http.client
+import io
 import json,sys,os,time
 import subprocess
+import threading
 from urllib import error, request
+from urllib.parse import urlsplit, urlunsplit
 from .config import Config
 from .http import open_no_redirect
 from .store import Store
@@ -45,6 +50,180 @@ def _auth_headers(token, hub_token):
 
 
 _READY_ERROR_BODY_MAX = 16 * 1024
+_ERROR_BODY_MAX = _READY_ERROR_BODY_MAX
+_CONNECTIONS = {}
+_CONNECTIONS_LOCK = threading.Lock()
+_FALLBACK_TRANSPORT = object()
+
+
+class _BufferedResponse(io.BytesIO):
+    """Small urllib-compatible response returned after a reusable read."""
+
+    def __init__(self, body, status, headers):
+        super().__init__(body)
+        self.status = status
+        self.headers = headers
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.close()
+        return False
+
+
+class _ConnectionSlot:
+    """Serialize access because HTTPConnection cannot pipeline safely."""
+
+    __slots__ = ("plan", "lock", "connection")
+
+    def __init__(self, plan):
+        self.plan = plan
+        self.lock = threading.Lock()
+        self.connection = None
+
+
+def _validated_url(url):
+    try:
+        parsed = urlsplit(url)
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("remote URL is invalid") from exc
+    if parsed.scheme.lower() not in ("http", "https"):
+        raise ValueError("remote URL must use http or https")
+    if not parsed.hostname:
+        raise ValueError("remote URL must include a host")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("remote URL must not include userinfo")
+    return parsed, port
+
+
+def _connection_plan(parsed, explicit_port):
+    """Return a safe keep-alive plan, or request urllib proxy fallback."""
+    scheme = parsed.scheme.lower()
+    target_host = parsed.hostname
+    target_port = explicit_port or (443 if scheme == "https" else 80)
+    try:
+        proxies = request.getproxies()
+        bypass_proxy = request.proxy_bypass(parsed.netloc)
+    except (OSError, TypeError, ValueError):
+        return _FALLBACK_TRANSPORT
+    proxy_url = None if bypass_proxy else proxies.get(scheme)
+    if not proxy_url:
+        return ("direct", scheme, target_host, target_port)
+
+    # Safely support the common HTTPS-over-HTTP CONNECT case.  urllib remains
+    # responsible for authenticated, HTTPS, PAC/system, and other proxy forms.
+    if scheme != "https":
+        return _FALLBACK_TRANSPORT
+    try:
+        proxy = urlsplit(proxy_url)
+        proxy_port = proxy.port
+    except (TypeError, ValueError):
+        return _FALLBACK_TRANSPORT
+    if (
+        proxy.scheme.lower() != "http"
+        or not proxy.hostname
+        or proxy.username is not None
+        or proxy.password is not None
+        or proxy.query
+        or proxy.fragment
+        or proxy.path not in ("", "/")
+    ):
+        return _FALLBACK_TRANSPORT
+    return (
+        "http-connect",
+        scheme,
+        target_host,
+        target_port,
+        proxy.hostname,
+        proxy_port or 80,
+    )
+
+
+def _connection_slot(plan):
+    # The key deliberately contains endpoints only, never auth header values.
+    with _CONNECTIONS_LOCK:
+        slot = _CONNECTIONS.get(plan)
+        if slot is None:
+            slot = _ConnectionSlot(plan)
+            _CONNECTIONS[plan] = slot
+        return slot
+
+
+def _new_connection(plan, timeout):
+    if plan[0] == "direct":
+        _, scheme, host, port = plan
+        connection_type = (
+            http.client.HTTPSConnection if scheme == "https" else http.client.HTTPConnection
+        )
+        return connection_type(host, port, timeout=timeout)
+    _, _, target_host, target_port, proxy_host, proxy_port = plan
+    connection = http.client.HTTPSConnection(proxy_host, proxy_port, timeout=timeout)
+    # Application auth is intentionally not passed to CONNECT. HTTPSConnection
+    # also uses the tunnel host as TLS server_hostname after CONNECT succeeds.
+    connection.set_tunnel(target_host, target_port)
+    return connection
+
+
+def _discard_connection(slot):
+    connection, slot.connection = slot.connection, None
+    if connection is not None:
+        try:
+            connection.close()
+        except OSError:
+            pass
+
+
+def _close_connections():
+    with _CONNECTIONS_LOCK:
+        slots = list(_CONNECTIONS.values())
+        _CONNECTIONS.clear()
+    for slot in slots:
+        with slot.lock:
+            _discard_connection(slot)
+
+
+atexit.register(_close_connections)
+
+
+def _persistent_open(req, parsed, plan, timeout):
+    slot = _connection_slot(plan)
+    target = urlunsplit(("", "", parsed.path or "/", parsed.query, ""))
+    headers = dict(req.header_items())
+    with slot.lock:
+        if slot.connection is None:
+            slot.connection = _new_connection(plan, timeout)
+        connection = slot.connection
+        try:
+            connection.timeout = timeout
+            sock = getattr(connection, "sock", None)
+            if sock is not None:
+                sock.settimeout(timeout)
+            connection.request(req.get_method(), target, body=req.data, headers=headers)
+            response = connection.getresponse()
+            status = response.status
+            response_headers = response.headers
+            if 200 <= status < 300:
+                body = response.read()
+            else:
+                body = response.read(_ERROR_BODY_MAX + 1)
+            if response.will_close or len(body) > _ERROR_BODY_MAX and status >= 300:
+                _discard_connection(slot)
+        except (http.client.HTTPException, OSError) as exc:
+            _discard_connection(slot)
+            raise error.URLError(exc) from exc
+    if not 200 <= status < 300:
+        raise error.HTTPError(req.full_url, status, response.reason, response_headers, io.BytesIO(body))
+    return _BufferedResponse(body, status, response_headers)
+
+
+def _open_remote(req, timeout):
+    parsed, port = _validated_url(req.full_url)
+    plan = _connection_plan(parsed, port)
+    if plan is _FALLBACK_TRANSPORT:
+        return open_no_redirect(req, timeout=timeout)
+    return _persistent_open(req, parsed, plan, timeout)
 
 
 def _ready_value(value):
@@ -72,7 +251,7 @@ def _ready_state(base, headers, timeout):
     """Read only a bounded readiness state, never exposing response data."""
     req = request.Request(base + "/ready", headers=headers, method="GET")
     try:
-        with open_no_redirect(req, timeout=timeout) as resp:
+        with _open_remote(req, timeout=timeout) as resp:
             value = json.loads(resp.read() or b"{}")
     except error.HTTPError as exc:
         if exc.code != 503:
@@ -128,6 +307,7 @@ def _remote_call(path, payload):
     hub_token=os.environ.get("FUNES_HF_TOKEN", "") or os.environ.get("HF_TOKEN", "") or _keychain("funes-hf-token")
     if not base or not token:
         return None
+    _validated_url(base)
     headers = _auth_headers(token, hub_token)
     total = _float_env("FUNES_REMOTE_TIMEOUT", 180, 10, 300)
     attempts = _int_env("FUNES_REMOTE_ATTEMPTS", 5, 1, 5)
@@ -154,7 +334,7 @@ def _remote_call(path, payload):
             method="POST",
         )
         try:
-            with open_no_redirect(req, timeout=min(attempt_timeout, remaining)) as resp:
+            with _open_remote(req, timeout=min(attempt_timeout, remaining)) as resp:
                 raw = resp.read()
             if not raw:
                 raise RuntimeError("remote returned an empty response")

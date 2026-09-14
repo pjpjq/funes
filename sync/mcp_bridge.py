@@ -44,18 +44,54 @@ def _auth_headers(token, hub_token):
     return headers
 
 
+_READY_ERROR_BODY_MAX = 16 * 1024
+
+
+def _ready_value(value):
+    """Reduce a readiness response to an internal poll state only."""
+    if not isinstance(value, dict):
+        return ""
+    # Legacy Spaces returned HTTP 200/ok while native warm or source restore
+    # was still in progress. Those gates must win over the top-level marker.
+    warm = value.get("native_warm")
+    if isinstance(warm, dict) and warm.get("state") == "warming":
+        return "warming"
+    sources = value.get("source_store")
+    if (
+        isinstance(sources, dict)
+        and sources.get("configured")
+        and not sources.get("ready")
+    ):
+        # Restores and unavailable source indexes are retryable readiness
+        # gates, even when the native worker itself has already warmed.
+        return "warming"
+    return "ready" if value.get("ok") else ""
+
+
 def _ready_state(base, headers, timeout):
-    """Read the Space warm state without exposing its response body to callers."""
+    """Read only a bounded readiness state, never exposing response data."""
     req = request.Request(base + "/ready", headers=headers, method="GET")
     try:
         with open_no_redirect(req, timeout=timeout) as resp:
             value = json.loads(resp.read() or b"{}")
-    except (error.HTTPError, error.URLError, TimeoutError, OSError, ValueError):
+    except error.HTTPError as exc:
+        if exc.code != 503:
+            return ""
+        try:
+            raw = exc.read(_READY_ERROR_BODY_MAX + 1)
+            if len(raw) > _READY_ERROR_BODY_MAX:
+                return ""
+            value = json.loads(raw or b"{}")
+        except (OSError, TypeError, ValueError):
+            return ""
+        finally:
+            try:
+                exc.close()
+            except OSError:
+                pass
+    except (error.URLError, TimeoutError, OSError, ValueError):
         return ""
-    warm = value.get("native_warm") if isinstance(value, dict) else None
-    if isinstance(warm, dict):
-        return str(warm.get("state", ""))
-    return "ready" if isinstance(value, dict) and value.get("ok") else ""
+    return _ready_value(value)
 
 
 def _wait_until_ready(base, headers, deadline):

@@ -606,6 +606,201 @@ def test_sync_status_alias_returns_ready_payload(monkeypatch):
     assert "chunks: 12" in body["status"]
 
 
+def test_get_ready_is_lightweight_and_never_runs_native_status(monkeypatch):
+    monkeypatch.setattr(bridge, "TOKEN", "test-token")
+    monkeypatch.setattr(bridge, "REMOTE", "owner/memory")
+    monkeypatch.setattr(
+        bridge,
+        "source_state",
+        lambda: {"configured": True, "ready": True, "documents": 12},
+    )
+    monkeypatch.setattr(bridge, "warm_state", lambda: {"state": "ready"})
+    monkeypatch.setattr(
+        bridge,
+        "run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("GET /ready must not run native status")
+        ),
+    )
+    server = ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        conn = HTTPConnection(*server.server_address)
+        conn.request("GET", "/ready", headers={"Authorization": "Bearer test-token"})
+        response = conn.getresponse()
+        body = json.loads(response.read())
+        conn.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert response.status == 200
+    assert body["ok"] is True
+    assert body["remote"] == "owner/memory"
+    assert body["source_store"]["documents"] == 12
+    assert body["native_warm"]["state"] == "ready"
+    assert body["status"] == ""
+
+
+def test_ready_retries_failed_warm_without_sidecar_then_recovers(monkeypatch):
+    refreshes = []
+    queued_warms = []
+    monkeypatch.setattr(bridge, "TOKEN", "test-token")
+    monkeypatch.setattr(bridge, "REMOTE", "owner/memory")
+    monkeypatch.setattr(
+        bridge,
+        "_WARM_STATE",
+        {
+            "state": "not_started",
+            "started_at": None,
+            "finished_at": None,
+            "refresh_pending": False,
+        },
+    )
+    monkeypatch.setattr(
+        bridge,
+        "source_state",
+        lambda: {"configured": False, "ready": False, "documents": 0},
+    )
+    monkeypatch.setattr(
+        bridge,
+        "run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("GET /ready must stay lightweight")
+        ),
+    )
+
+    def first_refresh_fails():
+        refreshes.append("failed")
+        raise bridge.NativeMcpError("provider unavailable")
+
+    monkeypatch.setattr(bridge, "_refresh_native_worker", first_refresh_fails)
+    bridge._warm_native_memory()
+    assert bridge.warm_state()["state"] == "error"
+
+    def refreshed_worker_is_ready():
+        refreshes.append("ready")
+
+    monkeypatch.setattr(bridge, "_refresh_native_worker", refreshed_worker_is_ready)
+
+    class QueuedThread:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def start(self):
+            queued_warms.append(self)
+
+    # Do not patch the global Thread while a ThreadingHTTPServer is alive.
+    # The queued worker makes the retry/warming transition deterministic.
+    with monkeypatch.context() as context:
+        context.setattr(bridge.threading, "Thread", QueuedThread)
+        code, payload = bridge.ready_payload()
+        assert code == 503
+        assert payload["native_warm"]["state"] == "warming"
+        assert len(queued_warms) == 1
+        repeat_code, repeat = bridge.ready_payload()
+        assert repeat_code == 503
+        assert repeat["native_warm"]["state"] == "warming"
+        assert len(queued_warms) == 1
+        queued_warms[0].kwargs["target"](**queued_warms[0].kwargs["kwargs"])
+
+    assert refreshes == ["failed", "ready"]
+    assert bridge.warm_state()["state"] == "ready"
+    server = ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        conn = HTTPConnection(*server.server_address)
+        conn.request("GET", "/ready", headers={"Authorization": "Bearer test-token"})
+        response = conn.getresponse()
+        body = json.loads(response.read())
+        conn.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert response.status == 200
+    assert body["ok"] is True
+
+
+def test_get_ready_returns_immediate_503_during_source_restore(monkeypatch):
+    monkeypatch.setattr(bridge, "TOKEN", "test-token")
+    monkeypatch.setattr(bridge, "REMOTE", "owner/memory")
+    monkeypatch.setattr(
+        bridge,
+        "source_state",
+        lambda: {"configured": True, "ready": False, "restoring": True},
+    )
+    monkeypatch.setattr(bridge, "warm_state", lambda: {"state": "ready"})
+    monkeypatch.setattr(
+        bridge,
+        "run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("GET /ready must not run native status")
+        ),
+    )
+    server = ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    started = time.monotonic()
+    try:
+        conn = HTTPConnection(*server.server_address)
+        conn.request("GET", "/ready", headers={"Authorization": "Bearer test-token"})
+        response = conn.getresponse()
+        body = json.loads(response.read())
+        conn.close()
+        elapsed = time.monotonic() - started
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert elapsed < 0.25
+    assert response.status == 503
+    assert body["error"] == "restore_in_progress"
+    assert body["source_store"]["restoring"] is True
+
+
+def test_get_sync_status_still_runs_full_native_status(monkeypatch):
+    calls = []
+    monkeypatch.setattr(bridge, "TOKEN", "test-token")
+    monkeypatch.setattr(bridge, "REMOTE", "owner/memory")
+    monkeypatch.setattr(
+        bridge,
+        "source_state",
+        lambda: {"configured": True, "ready": True, "documents": 0},
+    )
+    monkeypatch.setattr(bridge, "warm_state", lambda: {"state": "ready"})
+
+    def fake_run(*args, **kwargs):
+        calls.append((args, kwargs))
+        return 0, "chunks: 12\n", ""
+
+    monkeypatch.setattr(bridge, "run", fake_run)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        conn = HTTPConnection(*server.server_address)
+        conn.request(
+            "GET", "/sync/status", headers={"Authorization": "Bearer test-token"}
+        )
+        response = conn.getresponse()
+        body = json.loads(response.read())
+        conn.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert response.status == 200
+    assert calls == [(("status", "owner/memory"), {"timeout": 30})]
+    assert body["status"] == "chunks: 12\n"
+
+
 def test_sync_checkpoint_acknowledges_existing_durable_push(monkeypatch):
     monkeypatch.setattr(bridge, "TOKEN", "test-token")
     monkeypatch.setattr(bridge, "REMOTE", "owner/memory")

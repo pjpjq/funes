@@ -2058,9 +2058,55 @@ def auth_ok(handler: BaseHTTPRequestHandler) -> bool:
 
 
 def ready_payload() -> tuple[int, dict[str, object]]:
-    """Return the authenticated readiness/status payload shared by both APIs."""
+    """Return the cheap authenticated readiness gate used by clients per call."""
+    sources = source_state()
+    warm = warm_state()
+    source_ok = not sources.get("configured") or bool(sources.get("ready"))
+    if (
+        REMOTE
+        and source_ok
+        and warm.get("state") in {"error", "not_started"}
+    ):
+        # A failed initial warm must not leave Codex/Pi polling a permanent
+        # 503. `request_warm` atomically reserves `warming`, so concurrent
+        # readiness probes do not start parallel workers.
+        warm = request_warm(force=True)
+    warm_ok = warm.get("state") == "ready"
     if not REMOTE:
-        return 503, {"ok": False, "error": "FUNES_MEMORY is not configured", "native_warm": warm_state()}
+        error = "FUNES_MEMORY is not configured"
+    elif not source_ok:
+        error = (
+            "restore_in_progress"
+            if sources.get("restoring")
+            else str(sources.get("error", "source_store_unavailable"))
+        )
+    elif not warm_ok:
+        error = "native_warm_" + str(warm.get("state", "unavailable"))
+    else:
+        error = ""
+    ok = bool(REMOTE) and source_ok and warm_ok
+    return (
+        200 if ok else 503,
+        {
+            "ok": ok,
+            "remote": REMOTE,
+            "status": "",
+            "error": error,
+            "native_warm": warm,
+            "source_store": sources,
+            "embedding_profile": embedding_profile(),
+        },
+    )
+
+
+def sync_status_payload() -> tuple[int, dict[str, object]]:
+    """Return the explicit, potentially expensive native status diagnostic."""
+    if not REMOTE:
+        return 503, {
+            "ok": False,
+            "error": "FUNES_MEMORY is not configured",
+            "native_warm": warm_state(),
+        }
     code, out, err = run("status", REMOTE, timeout=30)
     sources = source_state()
     source_ok = not sources.get("configured") or bool(sources.get("ready"))
@@ -2146,7 +2192,11 @@ class Handler(BaseHTTPRequestHandler):
             if not auth_ok(self):
                 self.send_json(401, {"error": "unauthorized"})
                 return
-            code, payload = ready_payload()
+            code, payload = (
+                ready_payload()
+                if self.path == "/ready"
+                else sync_status_payload()
+            )
             self.send_json(code, payload)
             return
         self.send_json(404, {"error": "not found"})
@@ -2158,7 +2208,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             obj = self.body()
             if self.path == "/sync/status":
-                code, payload = ready_payload()
+                code, payload = sync_status_payload()
                 self.send_json(code, payload)
                 return
             if self.path == "/sources/check":

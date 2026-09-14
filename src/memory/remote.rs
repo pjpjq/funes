@@ -139,6 +139,7 @@ pub(crate) async fn append(
         batches,
         schema,
         extra_files,
+        true,
     )
     .await
 }
@@ -154,6 +155,7 @@ async fn append_at(
     batches: Vec<RecordBatch>,
     schema: SchemaRef,
     extra_files: &BTreeMap<String, Bytes>,
+    measure_unindexed: bool,
 ) -> Result<Appended> {
     // Open the same immutable head guarded by the eventual Hub commit. Without
     // this pin a branch move between selection and open could duplicate rows.
@@ -186,9 +188,16 @@ async fn append_at(
         dataset::stamp_languages(&mut ds, languages).await?;
     }
 
+    // Snapshot the captured writes before optionally reading index stats: `index_statistics` can
+    // write a stats migration through the same wrapper, and that must not leak into the data commit.
     let mut files = captured_files(&wrapper);
-    let unindexed = dataset::max_unindexed_rows(&ds).await;
-    let text_indexed = dataset::sub_index_counts(&ds).await?.contains_key(dataset::FTS_INDEX);
+    // Canonical ingestion discards this result, so it skips the expensive statistics reads.
+    let unindexed = if measure_unindexed {
+        dataset::max_unindexed_rows(&ds).await
+    } else {
+        0
+    };
+    let text_indexed = measure_unindexed && dataset::sub_index_counts(&ds).await?.contains_key(dataset::FTS_INDEX);
     for (path, body) in extra_files {
         files.insert(path.clone(), body.clone());
     }
@@ -241,6 +250,7 @@ pub(crate) async fn append_documents(
         batches,
         schema,
         &extra_files,
+        false,
     )
     .await?
     {

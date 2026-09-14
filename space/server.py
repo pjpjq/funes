@@ -50,6 +50,12 @@ CANONICAL_INDEX_BATCH = max(1, int(os.getenv("FUNES_CANONICAL_INDEX_BATCH", "32"
 CANONICAL_INDEX_INTERVAL = max(0.01, float(os.getenv("FUNES_CANONICAL_INDEX_INTERVAL", "30")))
 CANONICAL_INDEX_TIMEOUT = max(1, int(os.getenv("FUNES_CANONICAL_INDEX_TIMEOUT", "900")))
 CANONICAL_OPTIMIZE_TIMEOUT = max(1, int(os.getenv("FUNES_CANONICAL_OPTIMIZE_TIMEOUT", "900")))
+try:
+    CANONICAL_REFRESH_COOLDOWN = max(
+        0.0, float(os.getenv("FUNES_CANONICAL_REFRESH_COOLDOWN", "300"))
+    )
+except ValueError:
+    CANONICAL_REFRESH_COOLDOWN = 300.0
 MCP_PROTOCOL_VERSION = "2024-11-05"
 MCP_TIMEOUT = float(os.getenv("FUNES_MCP_TIMEOUT", "180"))
 MCP_HANDSHAKE_TIMEOUT = float(os.getenv("FUNES_MCP_HANDSHAKE_TIMEOUT", "10"))
@@ -202,7 +208,7 @@ def native_environment(
     env["FUNES_EMBEDDING_SCHEMA_VERSION"] = str(profile["schema_version"])
     env["FUNES_RERANK_PROVIDER"] = os.getenv("FUNES_RERANK_PROVIDER", "none") or "none"
     env["FUNES_NATIVE_FALLBACK"] = os.getenv("FUNES_NATIVE_FALLBACK", "false") or "false"
-    # A Space refreshes the complete MCP child after every committed index revision.
+    # A Space refreshes the complete MCP child after committed index revisions.
     # Pin that child's immutable Dataset handle so recalls do not resolve/open the
     # same Hub revision again on every request. Ordinary MCP/CLI processes remain
     # fresh-by-default because the Rust optimization is explicitly opt-in.
@@ -1470,6 +1476,41 @@ def _initialize_canonical_reconcile_state(app) -> None:
         "last_progress_at": None,
         "consecutive_failures": 0,
     }
+    app._canonical_refresh_lock = threading.Lock()
+    app._canonical_refresh_state = {"last_requested_at": None, "dirty": False}
+
+
+def _canonical_refresh_control(app):
+    lock = getattr(app, "_canonical_refresh_lock", None)
+    state = getattr(app, "_canonical_refresh_state", None)
+    if lock is None or state is None:
+        lock = threading.Lock()
+        state = {"last_requested_at": None, "dirty": False}
+        app._canonical_refresh_lock = lock
+        app._canonical_refresh_state = state
+    return lock, state
+
+
+def _request_canonical_refresh(
+    app, *, force: bool = False, only_if_dirty: bool = False
+) -> bool:
+    """Refresh the active worker once per app cooldown, retaining trailing work."""
+    lock, state = _canonical_refresh_control(app)
+    with lock:
+        if only_if_dirty and not state["dirty"]:
+            return False
+        now = time.monotonic()
+        last_requested = state["last_requested_at"]
+        if (
+            not force
+            and last_requested is not None
+            and now - float(last_requested) < CANONICAL_REFRESH_COOLDOWN
+        ):
+            state["dirty"] = True
+            return False
+        request_warm(force=True)
+        state.update(last_requested_at=now, dirty=False)
+        return True
 
 
 def _set_canonical_reconcile_state(app, **changes: object) -> None:
@@ -1575,13 +1616,14 @@ def reconcile_canonical_index(app) -> dict[str, object]:
         if durable:
             _canonical_reconcile_phase(app, "optimizing")
             optimize_canonical_index(app, profile, memory)
+            _request_canonical_refresh(app, force=True, only_if_dirty=True)
         return {"attempted": 0, "indexed": 0, "held": 0, "durable": durable}
     if (
         committed
         and memory == REMOTE
         and profile["fingerprint"] == embedding_profile()["fingerprint"]
     ):
-        request_warm(force=True)
+        _request_canonical_refresh(app)
     _canonical_reconcile_phase(app, "validating_status")
     status_documents = []
     valid_updates = []
@@ -1702,7 +1744,7 @@ def optimize_canonical_index(
         and memory == REMOTE
         and profile["fingerprint"] == embedding_profile()["fingerprint"]
     ):
-        request_warm(force=True)
+        _request_canonical_refresh(app, force=True)
     return optimized
 
 
@@ -2298,18 +2340,42 @@ _MCP_WORKER_CONFIG = None
 _MCP_WORKER_LOCK = threading.Lock()
 
 
+def _native_worker_config() -> tuple[object, ...]:
+    return (
+        FUNES_BIN, REMOTE, str(HOME), MCP_TIMEOUT, MCP_HANDSHAKE_TIMEOUT,
+        embedding_profile()["fingerprint"],
+        os.getenv("FUNES_RERANK_PROVIDER", "none"),
+        os.getenv("FUNES_NATIVE_FALLBACK", "false"),
+    )
+
+
+def _native_search_serviceable(warm: dict[str, object]) -> bool:
+    """Return whether search can use the ready worker or a live replacement predecessor."""
+    if warm.get("state") == "ready":
+        return True
+    if warm.get("state") != "warming":
+        return False
+    expected = _native_worker_config()
+    with _MCP_WORKER_LOCK:
+        worker = MCP_WORKER
+        if worker is None or _MCP_WORKER_CONFIG != expected:
+            return False
+        process = getattr(worker, "process", None)
+        if process is None:
+            return False
+        try:
+            return process.poll() is None
+        except (AttributeError, OSError):
+            return False
+
+
 def native_worker() -> NativeMcpWorker:
     """Return the process singleton, rebuilding it only when runtime config changes."""
     global MCP_WORKER, _MCP_WORKER_CONFIG
     # Tests and embedders may supply a small fake directly; do not replace it.
     if MCP_WORKER is not None and not isinstance(MCP_WORKER, NativeMcpWorker):
         return MCP_WORKER
-    config = (
-        FUNES_BIN, REMOTE, str(HOME), MCP_TIMEOUT, MCP_HANDSHAKE_TIMEOUT,
-        embedding_profile()["fingerprint"],
-        os.getenv("FUNES_RERANK_PROVIDER", "none"),
-        os.getenv("FUNES_NATIVE_FALLBACK", "false"),
-    )
+    config = _native_worker_config()
     with _MCP_WORKER_LOCK:
         # During the initial background warm there is intentionally no active
         # worker yet.  Do not race it by spawning a second native MCP child;
@@ -2345,12 +2411,7 @@ def close_native_worker() -> None:
 def _refresh_native_worker() -> None:
     """Warm a replacement child and atomically swap it with the active one."""
     global MCP_WORKER, _MCP_WORKER_CONFIG
-    config = (
-        FUNES_BIN, REMOTE, str(HOME), MCP_TIMEOUT, MCP_HANDSHAKE_TIMEOUT,
-        embedding_profile()["fingerprint"],
-        os.getenv("FUNES_RERANK_PROVIDER", "none"),
-        os.getenv("FUNES_NATIVE_FALLBACK", "false"),
-    )
+    config = _native_worker_config()
     candidate = NativeMcpWorker(
         FUNES_BIN,
         REMOTE,
@@ -2537,7 +2598,9 @@ def auth_ok(handler: BaseHTTPRequestHandler) -> bool:
     return bool(TOKEN) and handler.headers.get("Authorization", "") == "Bearer " + TOKEN
 
 
-def _ready_payload(*, require_source: bool) -> tuple[int, dict[str, object]]:
+def _ready_payload(
+    *, require_source: bool, allow_active_search: bool = False
+) -> tuple[int, dict[str, object]]:
     """Return a cheap readiness snapshot without touching source/native data."""
     sources = source_readiness_state()
     warm = warm_state()
@@ -2551,7 +2614,11 @@ def _ready_payload(*, require_source: bool) -> tuple[int, dict[str, object]]:
         # 503. `request_warm` atomically reserves `warming`, so concurrent
         # readiness probes do not start parallel workers.
         warm = request_warm(force=True)
-    warm_ok = warm.get("state") == "ready"
+    warm_ok = (
+        _native_search_serviceable(warm)
+        if allow_active_search
+        else warm.get("state") == "ready"
+    )
     if not REMOTE:
         error = "FUNES_MEMORY is not configured"
     elif require_source and not source_ok:
@@ -2591,7 +2658,10 @@ def search_ready_payload() -> tuple[int, dict[str, object]]:
     encrypted source sidecar restores. The legacy local path still needs that
     sidecar for canonical result materialization, so it must remain closed.
     """
-    return _ready_payload(require_source=embedding_profile()["provider"] != "voyage")
+    return _ready_payload(
+        require_source=embedding_profile()["provider"] != "voyage",
+        allow_active_search=True,
+    )
 
 
 def sync_status_payload() -> tuple[int, dict[str, object]]:
@@ -2830,7 +2900,7 @@ class Handler(BaseHTTPRequestHandler):
                             },
                         )
                         return
-                    if warm_state().get("state") != "ready":
+                    if not _native_search_serviceable(warm_state()):
                         self.send_json(
                             503,
                             {

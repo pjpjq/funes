@@ -989,6 +989,46 @@ def test_search_ready_stays_200_while_source_is_unavailable(
     assert responses["/ready"][1]["error"] == source_error
 
 
+def test_search_ready_stays_200_during_active_worker_replacement(monkeypatch):
+    process = SimpleNamespace(poll=lambda: None)
+    monkeypatch.setattr(bridge, "REMOTE", "owner/memory")
+    monkeypatch.delenv("FUNES_STORAGE_REPO", raising=False)
+    monkeypatch.setattr(bridge, "SOURCE_APP", None)
+    monkeypatch.setattr(bridge, "MCP_WORKER", SimpleNamespace(process=process))
+    monkeypatch.setattr(bridge, "_MCP_WORKER_CONFIG", bridge._native_worker_config())
+    monkeypatch.setattr(bridge, "warm_state", lambda: {"state": "warming"})
+
+    search_code, search = bridge.search_ready_payload()
+    ingest_code, ingest = bridge.ready_payload()
+
+    assert search_code == 200
+    assert search["ok"] is True
+    assert search["error"] == ""
+    assert search["native_warm"]["state"] == "warming"
+    assert ingest_code == 503
+    assert ingest["error"] == "native_warm_warming"
+
+    monkeypatch.setattr(bridge, "_MCP_WORKER_CONFIG", ("stale",))
+    assert bridge.search_ready_payload()[0] == 503
+    monkeypatch.setattr(bridge, "_MCP_WORKER_CONFIG", bridge._native_worker_config())
+    process.poll = lambda: 1
+    assert bridge.search_ready_payload()[0] == 503
+
+
+def test_search_ready_stays_503_during_initial_warm_without_active_worker(monkeypatch):
+    monkeypatch.setattr(bridge, "REMOTE", "owner/memory")
+    monkeypatch.delenv("FUNES_STORAGE_REPO", raising=False)
+    monkeypatch.setattr(bridge, "SOURCE_APP", None)
+    monkeypatch.setattr(bridge, "MCP_WORKER", None)
+    monkeypatch.setattr(bridge, "warm_state", lambda: {"state": "warming"})
+
+    code, payload = bridge.search_ready_payload()
+
+    assert code == 503
+    assert payload["ok"] is False
+    assert payload["error"] == "native_warm_warming"
+
+
 def test_search_ready_requires_source_for_legacy_local_provider(monkeypatch):
     app = SimpleNamespace(
         syncer=SimpleNamespace(restoring=True, restore_failed=False),
@@ -2513,6 +2553,76 @@ def test_canonical_jsonl_sends_raw_and_profile_checkpoint_is_durable(monkeypatch
     assert warm == [{"force": True}]
 
 
+def test_canonical_commit_refresh_uses_app_scoped_cooldown(monkeypatch, tmp_path):
+    app = _source_app(tmp_path)
+    for identity in ("first", "second", "third"):
+        _canonical_source(app.store, identity)
+    clock = [100.0]
+    warm = []
+    monkeypatch.setattr(bridge, "REMOTE", "owner/memory")
+    monkeypatch.setattr(bridge, "INDEX_REMOTE", "")
+    monkeypatch.setattr(bridge, "CANONICAL_INDEX_BATCH", 1)
+    monkeypatch.setattr(bridge, "CANONICAL_REFRESH_COOLDOWN", 300.0)
+    monkeypatch.setattr(bridge.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(bridge, "request_warm", lambda **kwargs: warm.append(kwargs))
+    monkeypatch.setattr(
+        bridge,
+        "run",
+        lambda *_args, **_kwargs: (
+            0,
+            "ingested sources=1 chunks=1 unchanged=0 stale=0 held=0 commit=revision\n",
+            "",
+        ),
+    )
+    try:
+        assert bridge.reconcile_canonical_index(app)["indexed"] == 1
+        clock[0] = 101.0
+        assert bridge.reconcile_canonical_index(app)["indexed"] == 1
+        assert warm == [{"force": True}]
+
+        clock[0] = 401.0
+        assert bridge.reconcile_canonical_index(app)["indexed"] == 1
+        assert warm == [{"force": True}, {"force": True}]
+    finally:
+        app.store.close()
+
+
+def test_canonical_final_backlog_flushes_dirty_refresh_once(monkeypatch, tmp_path):
+    app = _source_app(tmp_path)
+    for identity in ("first", "second"):
+        _canonical_source(app.store, identity)
+    warm = []
+    monkeypatch.setattr(bridge, "REMOTE", "owner/memory")
+    monkeypatch.setattr(bridge, "INDEX_REMOTE", "")
+    monkeypatch.setattr(bridge, "CANONICAL_INDEX_BATCH", 1)
+    monkeypatch.setattr(bridge, "CANONICAL_REFRESH_COOLDOWN", 300.0)
+    monkeypatch.setattr(bridge.time, "monotonic", lambda: 100.0)
+    monkeypatch.setattr(bridge, "request_warm", lambda **kwargs: warm.append(kwargs))
+    # A failed optimize must not strand the final committed revision behind the
+    # cooldown; the trailing dirty flush is independent of optimize success.
+    monkeypatch.setattr(bridge, "optimize_native_index", lambda *_args: False)
+    monkeypatch.setattr(
+        bridge,
+        "run",
+        lambda *_args, **_kwargs: (
+            0,
+            "ingested sources=1 chunks=1 unchanged=0 stale=0 held=0 commit=revision\n",
+            "",
+        ),
+    )
+    try:
+        assert bridge.reconcile_canonical_index(app)["indexed"] == 1
+        assert bridge.reconcile_canonical_index(app)["indexed"] == 1
+        assert warm == [{"force": True}]
+
+        assert bridge.reconcile_canonical_index(app)["attempted"] == 0
+        assert warm == [{"force": True}, {"force": True}]
+        assert bridge.reconcile_canonical_index(app)["attempted"] == 0
+        assert warm == [{"force": True}, {"force": True}]
+    finally:
+        app.store.close()
+
+
 def test_profile_change_rebuilds_durable_session_without_client_reupload(monkeypatch, tmp_path):
     before = SourceStore(str(tmp_path / "before-profile-change"))
     session = _canonical_source(
@@ -2862,7 +2972,7 @@ def test_canonical_held_batch_uses_opaque_fast_path_and_source_revision_retries(
     assert second["attempted"] == 0
     assert third["indexed"] == 1
     assert revised["native_index_status"] == "indexed"
-    assert len(warm) == 2
+    assert len(warm) == 1
 
 
 @pytest.mark.parametrize(
@@ -3158,6 +3268,8 @@ def test_voyage_native_search_uses_structured_hits_while_source_is_unavailable(
     calls = []
 
     class FakeWorker:
+        process = SimpleNamespace(poll=lambda: None)
+
         def recall_result(self, query, **kwargs):
             calls.append((query, kwargs))
             return {
@@ -3205,8 +3317,9 @@ def test_voyage_native_search_uses_structured_hits_while_source_is_unavailable(
     monkeypatch.setattr(bridge, "MCP_WORKER", FakeWorker())
     monkeypatch.setattr(bridge, "TOKEN", "test-token")
     monkeypatch.setattr(bridge, "REMOTE", "owner/memory")
-    monkeypatch.setattr(bridge, "warm_state", lambda: {"state": "ready"})
     monkeypatch.setenv("FUNES_EMBEDDING_PROVIDER", "voyage")
+    monkeypatch.setattr(bridge, "_MCP_WORKER_CONFIG", bridge._native_worker_config())
+    monkeypatch.setattr(bridge, "warm_state", lambda: {"state": "warming"})
     monkeypatch.setattr(
         bridge,
         "search_source_bm25_rankings",

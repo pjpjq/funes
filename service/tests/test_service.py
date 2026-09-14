@@ -58,15 +58,42 @@ class ServiceTests(unittest.TestCase):
             "provider said private raw",
         ]
         with store.lock, store.conn:
-            for row, failure in zip(rows, failures, strict=True):
+            for row, failure in zip(rows[:-2], failures[:-2], strict=True):
                 store.conn.execute(
                     "UPDATE memories SET native_index_error=? WHERE source_identity=?",
                     (failure, row["source_identity"]),
                 )
+            store.conn.execute(
+                "UPDATE memories SET native_index_error=? WHERE source_identity=?",
+                (failures[-1], rows[-1]["source_identity"]),
+            )
+        waiting = store.get(rows[-2]["source_identity"])
+        store.update_native_index(
+            [
+                {
+                    "source_identity": waiting["source_identity"],
+                    "source_version": waiting["source_version"],
+                    "content_hash": waiting["content_hash"],
+                    "native_index_version": None,
+                    "native_index_status": "waiting_durability",
+                    "native_index_profile": None,
+                    "native_index_memory": None,
+                    "native_indexed_at": None,
+                    "native_index_error": "durability_pending",
+                    "native_generation": waiting["native_generation"],
+                }
+            ]
+        )
+        with store.lock:
+            pending = store.conn.execute(
+                "SELECT native_index_pending FROM memories WHERE source_identity=?",
+                (waiting["source_identity"],),
+            ).fetchone()[0]
         try:
             counts = store.native_index_failure_counts()
         finally:
             store.close()
+        self.assertEqual(pending, 0)
         self.assertEqual(
             counts,
             {

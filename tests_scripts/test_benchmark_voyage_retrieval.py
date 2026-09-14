@@ -11,8 +11,13 @@ from scripts import benchmark_voyage_retrieval as benchmark
 
 
 class Response:
-    def __init__(self, payload):
+    def __init__(self, payload, *, status=200):
         self.payload = payload
+        self.status = status
+        self.read_calls = 0
+        self.read_sizes = []
+        self.close_calls = 0
+        self.exhausted = False
 
     def __enter__(self):
         return self
@@ -20,8 +25,101 @@ class Response:
     def __exit__(self, *_args):
         return False
 
-    def read(self):
-        return json.dumps(self.payload).encode("utf-8")
+    def read(self, size=None):
+        self.read_calls += 1
+        self.read_sizes.append(size)
+        if isinstance(self.payload, bytes):
+            encoded = self.payload
+        else:
+            encoded = json.dumps(self.payload).encode("utf-8")
+        if size is None or len(encoded) <= size:
+            self.exhausted = True
+            return encoded
+        return encoded[:size]
+
+    def isclosed(self):
+        return self.exhausted or self.close_calls > 0
+
+    def close(self):
+        self.close_calls += 1
+
+
+class FakePersistentConnection:
+    def __init__(self, protocol, host, port, timeout, actions):
+        self.protocol = protocol
+        self.host = host
+        self.port = port
+        self.timeout = timeout
+        self.actions = actions
+        self.sock = None
+        self.connect_calls = 0
+        self.close_calls = 0
+        self.requests = []
+        self.tunnels = []
+
+    def set_tunnel(self, host, port=None, headers=None):
+        self.tunnels.append((host, port, dict(headers or {})))
+
+    def connect(self):
+        self.connect_calls += 1
+        self.sock = object()
+
+    def request(self, method, target, body=None, headers=None):
+        self.requests.append((method, target, body, dict(headers or {})))
+
+    def getresponse(self):
+        if not self.actions:
+            raise AssertionError("fake HTTP response queue exhausted")
+        action = self.actions.pop(0)
+        if isinstance(action, BaseException):
+            raise action
+        return action
+
+    def close(self):
+        self.close_calls += 1
+        self.sock = None
+
+
+@contextlib.contextmanager
+def fake_funes_http(actions, *, proxies=None, bypass=False):
+    actions = list(actions)
+    connections = []
+
+    def factory(protocol):
+        def create(host, port=None, timeout=None):
+            connection = FakePersistentConnection(
+                protocol,
+                host,
+                port,
+                timeout,
+                actions,
+            )
+            connections.append(connection)
+            return connection
+
+        return create
+
+    with mock.patch.object(
+        benchmark.http.client,
+        "HTTPConnection",
+        side_effect=factory("http"),
+    ), mock.patch.object(
+        benchmark.http.client,
+        "HTTPSConnection",
+        side_effect=factory("https"),
+    ), mock.patch.object(
+        benchmark.urllib.request,
+        "getproxies",
+        return_value={} if proxies is None else proxies,
+    ), mock.patch.object(
+        benchmark.urllib.request,
+        "proxy_bypass",
+        return_value=bypass,
+    ):
+        yield connections
+
+    if actions:
+        raise AssertionError(f"{len(actions)} fake HTTP responses were not consumed")
 
 
 class VoyageRetrievalBenchmarkTest(unittest.TestCase):
@@ -275,18 +373,13 @@ class VoyageRetrievalBenchmarkTest(unittest.TestCase):
             self.assertIn("p95", arm_result["end_to_end_latency_ms"])
 
     def test_http_latency_warms_then_measures_50_without_raw_output(self) -> None:
-        requests = []
-
-        def urlopen(request, timeout):
-            requests.append((request, timeout))
-            return Response(self._voyage_http_payload())
-
+        responses = [Response(self._voyage_http_payload()) for _ in range(51)]
         clock = iter(index / 1000 for index in range(500))
-        with mock.patch.object(
-            benchmark.urllib.request,
-            "urlopen",
-            side_effect=urlopen,
-        ), mock.patch.object(benchmark.time, "monotonic", side_effect=lambda: next(clock)):
+        with fake_funes_http(responses) as connections, mock.patch.object(
+            benchmark.time,
+            "monotonic",
+            side_effect=lambda: next(clock),
+        ):
             result = benchmark.run_http_latency(
                 remote_url="https://funes.example/base/",
                 token="funes-secret-must-not-leak",
@@ -295,11 +388,29 @@ class VoyageRetrievalBenchmarkTest(unittest.TestCase):
             )
 
         rendered = json.dumps(result, ensure_ascii=False)
-        self.assertEqual(len(requests), 51)
+        self.assertEqual(len(connections), 1)
+        connection = connections[0]
+        self.assertEqual(connection.connect_calls, 1)
+        self.assertEqual(len(connection.requests), 51)
+        self.assertTrue(all(response.read_calls == 1 for response in responses))
         self.assertEqual(result["requests"], 50)
         self.assertEqual(result["warmup_requests"], 1)
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["end_to_end_latency_ms"], result["latency_ms"])
+        self.assertIn("unmeasured warmup", result["latency_scope"])
+        self.assertEqual(result["transport"], "direct_https_keep_alive")
+        self.assertFalse(result["proxy_used"])
+        self.assertEqual(
+            result["connection_reuse"]["mode"],
+            "single_persistent_connection_with_bounded_reconnect",
+        )
+        self.assertEqual(result["connection_reuse"]["transport_connections_opened"], 1)
+        self.assertEqual(result["connection_reuse"]["request_attempts"], 51)
+        self.assertTrue(
+            result["connection_reuse"][
+                "single_transport_connection_for_warmup_and_measurements"
+            ]
+        )
         self.assertEqual(result["voyage_validation"]["verified_voyage_requests"], 50)
         self.assertEqual(result["voyage_validation"]["non_voyage_requests"], 0)
         self.assertEqual(
@@ -315,7 +426,15 @@ class VoyageRetrievalBenchmarkTest(unittest.TestCase):
             set(result["by_category"]),
             {"chinese", "english", "mixed", "semantic_paraphrase", "exact_identifier", "code_error"},
         )
-        self.assertTrue(all(request.full_url == "https://funes.example/base/recall" for request, _ in requests))
+        self.assertTrue(
+            all(
+                method == "POST"
+                and target == "/base/recall"
+                and headers["Authorization"] == "Bearer funes-secret-must-not-leak"
+                and headers["Connection"] == "keep-alive"
+                for method, target, _body, headers in connection.requests
+            )
+        )
         self.assertNotIn("funes-secret-must-not-leak", rendered)
         self.assertNotIn("raw query", rendered)
         self.assertNotIn("raw memory", rendered)
@@ -374,14 +493,11 @@ class VoyageRetrievalBenchmarkTest(unittest.TestCase):
         )
         for label, adversarial_payload, expected_failure in cases:
             with self.subTest(label=label):
-                responses = iter(
-                    [Response(self._voyage_http_payload()), Response(adversarial_payload)]
-                )
-                with mock.patch.object(
-                    benchmark.urllib.request,
-                    "urlopen",
-                    side_effect=lambda *_args, **_kwargs: next(responses),
-                ):
+                responses = [
+                    Response(self._voyage_http_payload()),
+                    Response(adversarial_payload),
+                ]
+                with fake_funes_http(responses):
                     result = benchmark.run_http_latency(
                         remote_url="https://funes.example",
                         token="secret",
@@ -394,6 +510,204 @@ class VoyageRetrievalBenchmarkTest(unittest.TestCase):
                 self.assertEqual(validation["verified_voyage_requests"], 0)
                 self.assertEqual(validation["non_voyage_requests"], 1)
                 self.assertEqual(validation["failure_counts"][expected_failure], 1)
+
+    def test_http_latency_reconnects_once_after_disconnect(self) -> None:
+        secret = "funes-secret-must-not-leak"
+        responses = [
+            Response(self._voyage_http_payload()),
+            benchmark.http.client.RemoteDisconnected("raw disconnect detail " + secret),
+            Response(self._voyage_http_payload()),
+        ]
+        with fake_funes_http(responses) as connections:
+            result = benchmark.run_http_latency(
+                remote_url="https://funes.example",
+                token=secret,
+                requests=1,
+                timeout=5.0,
+            )
+
+        rendered = json.dumps(result, ensure_ascii=False)
+        self.assertEqual(len(connections), 2)
+        self.assertEqual([connection.connect_calls for connection in connections], [1, 1])
+        self.assertEqual(sum(len(connection.requests) for connection in connections), 3)
+        self.assertEqual(result["connection_reuse"]["disconnect_retries"], 1)
+        self.assertEqual(result["connection_reuse"]["transport_connections_opened"], 2)
+        self.assertEqual(result["connection_reuse"]["transport_reconnections"], 1)
+        self.assertFalse(
+            result["connection_reuse"][
+                "single_transport_connection_for_warmup_and_measurements"
+            ]
+        )
+        self.assertNotIn(secret, rendered)
+        self.assertNotIn("raw disconnect detail", rendered)
+
+    def test_http_latency_stops_after_one_disconnect_retry(self) -> None:
+        secret = "funes-secret-must-not-leak"
+        responses = [
+            Response(self._voyage_http_payload()),
+            benchmark.http.client.RemoteDisconnected("first raw failure " + secret),
+            benchmark.http.client.RemoteDisconnected("second raw failure " + secret),
+        ]
+        with fake_funes_http(responses) as connections, self.assertRaises(
+            benchmark.BenchmarkError
+        ) as caught:
+            benchmark.run_http_latency(
+                remote_url="https://funes.example",
+                token=secret,
+                requests=1,
+                timeout=5.0,
+            )
+
+        message = str(caught.exception)
+        self.assertEqual(len(connections), 2)
+        self.assertEqual(sum(len(connection.requests) for connection in connections), 3)
+        self.assertIn("transport failure (RemoteDisconnected)", message)
+        self.assertNotIn(secret, message)
+        self.assertNotIn("raw failure", message)
+
+    def test_https_proxy_uses_connect_without_target_authorization(self) -> None:
+        secret = "funes-secret-must-not-leak"
+        responses = [
+            Response(self._voyage_http_payload()),
+            Response(self._voyage_http_payload()),
+        ]
+        with fake_funes_http(
+            responses,
+            proxies={"https": "http://127.0.0.1:6324"},
+        ) as connections:
+            result = benchmark.run_http_latency(
+                remote_url="https://funes.example/base",
+                token=secret,
+                requests=1,
+                timeout=5.0,
+            )
+
+        self.assertEqual(len(connections), 1)
+        connection = connections[0]
+        self.assertEqual(
+            (connection.protocol, connection.host, connection.port),
+            ("https", "127.0.0.1", 6324),
+        )
+        self.assertEqual(connection.tunnels, [("funes.example", 443, {})])
+        self.assertNotIn("Authorization", connection.tunnels[0][2])
+        self.assertTrue(
+            all(
+                target == "/base/recall"
+                and headers["Authorization"] == "Bearer " + secret
+                for _method, target, _body, headers in connection.requests
+            )
+        )
+        self.assertEqual(result["transport"], "https_over_http_connect_keep_alive")
+        self.assertTrue(result["proxy_used"])
+        self.assertNotIn(secret, json.dumps(result))
+        self.assertNotIn("127.0.0.1", json.dumps(result))
+
+    def test_no_proxy_bypasses_configured_proxy(self) -> None:
+        responses = [
+            Response(self._voyage_http_payload()),
+            Response(self._voyage_http_payload()),
+        ]
+        with fake_funes_http(
+            responses,
+            proxies={"https": "http://127.0.0.1:6324"},
+            bypass=True,
+        ) as connections:
+            result = benchmark.run_http_latency(
+                remote_url="https://funes.example",
+                token="secret",
+                requests=1,
+                timeout=5.0,
+            )
+
+        self.assertEqual((connections[0].host, connections[0].port), ("funes.example", 443))
+        self.assertEqual(connections[0].tunnels, [])
+        self.assertFalse(result["proxy_used"])
+        self.assertEqual(result["transport"], "direct_https_keep_alive")
+
+    def test_http_url_proxy_and_response_errors_are_sanitized(self) -> None:
+        invalid_urls = (
+            "https://user:password@funes.example",
+            "https://funes.example?token=raw-secret",
+            "https://funes.example#raw-secret",
+        )
+        for remote_url in invalid_urls:
+            with self.subTest(remote_url=remote_url), self.assertRaises(
+                benchmark.BenchmarkError
+            ) as caught:
+                benchmark.run_http_latency(
+                    remote_url=remote_url,
+                    token="funes-secret",
+                    requests=1,
+                    timeout=5.0,
+                )
+            self.assertNotIn("password", str(caught.exception))
+            self.assertNotIn("raw-secret", str(caught.exception))
+
+        with mock.patch.object(
+            benchmark.urllib.request,
+            "getproxies",
+            return_value={"https": "http://proxy-user:proxy-secret@127.0.0.1:6324"},
+        ), mock.patch.object(
+            benchmark.urllib.request,
+            "proxy_bypass",
+            return_value=False,
+        ), self.assertRaises(benchmark.BenchmarkError) as caught:
+            benchmark.run_http_latency(
+                remote_url="https://funes.example",
+                token="funes-secret",
+                requests=1,
+                timeout=5.0,
+            )
+        self.assertNotIn("proxy-user", str(caught.exception))
+        self.assertNotIn("proxy-secret", str(caught.exception))
+
+        error_response = Response(b"raw response funes-secret", status=302)
+        with fake_funes_http([error_response]), self.assertRaises(
+            benchmark.BenchmarkError
+        ) as caught:
+            benchmark.run_http_latency(
+                remote_url="https://funes.example",
+                token="funes-secret",
+                requests=1,
+                timeout=5.0,
+            )
+        self.assertEqual(error_response.read_calls, 1)
+        self.assertEqual(
+            error_response.read_sizes,
+            [benchmark.MAX_HTTP_ERROR_BODY_BYTES + 1],
+        )
+        self.assertEqual(str(caught.exception), "Funes recall HTTP 302")
+        self.assertNotIn("raw response", str(caught.exception))
+
+    def test_large_http_error_body_is_bounded_and_discards_connection(self) -> None:
+        secret = "funes-secret-must-not-leak"
+        marker = b"raw-large-error-body-must-not-leak"
+        error_response = Response(
+            marker + b"x" * (2 * 1024 * 1024),
+            status=503,
+        )
+        with fake_funes_http([error_response]) as connections:
+            client = benchmark._PersistentFunesHttpClient(
+                endpoint=benchmark._validate_remote_url("https://funes.example"),
+                token=secret,
+                timeout=5.0,
+            )
+            with self.assertRaises(benchmark.BenchmarkError) as caught:
+                client.post_recall("raw query must not leak")
+
+            self.assertIsNone(client._connection)
+
+        message = str(caught.exception)
+        self.assertEqual(message, "Funes recall HTTP 503")
+        self.assertEqual(error_response.read_calls, 1)
+        self.assertEqual(
+            error_response.read_sizes,
+            [benchmark.MAX_HTTP_ERROR_BODY_BYTES + 1],
+        )
+        self.assertEqual(connections[0].close_calls, 1)
+        self.assertNotIn(marker.decode(), message)
+        self.assertNotIn(secret, message)
+        self.assertNotIn(marker.decode(), repr(client.__dict__))
 
     def test_http_error_does_not_expose_key_or_response_body(self) -> None:
         secret = "voyage-secret-must-not-leak"

@@ -1,5 +1,8 @@
 import io
 import json
+import threading
+import time
+from http.client import RemoteDisconnected
 from types import SimpleNamespace
 from urllib.error import HTTPError
 
@@ -23,6 +26,61 @@ class _Response:
         return json.dumps(self.payload).encode()
 
 
+class _HTTPResponse:
+    def __init__(self, payload, status=200, headers=None, will_close=False):
+        body = payload if isinstance(payload, bytes) else json.dumps(payload).encode()
+        self._body = io.BytesIO(body)
+        self.status = status
+        self.reason = "test response"
+        self.headers = headers or {}
+        self.will_close = will_close
+        self.read_sizes = []
+
+    def read(self, amount=-1):
+        self.read_sizes.append(amount)
+        return self._body.read(amount)
+
+
+class _HTTPConnection:
+    instances = []
+    responses = []
+    fail_first_request = False
+
+    def __init__(self, host, port=None, timeout=None):
+        self.host = host
+        self.port = port
+        self.timeout = timeout
+        self.sock = None
+        self.requests = []
+        self.tunnel = None
+        self.closed = False
+        type(self).instances.append(self)
+
+    def set_tunnel(self, host, port=None, headers=None):
+        self.tunnel = (host, port, headers)
+
+    def request(self, method, target, body=None, headers=None):
+        self.requests.append((method, target, body, headers or {}))
+        if type(self).fail_first_request and len(type(self).instances) == 1:
+            raise RemoteDisconnected("server closed the connection")
+
+    def getresponse(self):
+        return type(self).responses.pop(0)
+
+    def close(self):
+        self.closed = True
+
+
+@pytest.fixture(autouse=True)
+def clear_connection_pool():
+    bridge._close_connections()
+    _HTTPConnection.instances = []
+    _HTTPConnection.responses = []
+    _HTTPConnection.fail_first_request = False
+    yield
+    bridge._close_connections()
+
+
 def test_remote_search_waits_for_ready_and_retries_transient(monkeypatch):
     monkeypatch.setenv("FUNES_REMOTE_URL", "https://memory.example")
     monkeypatch.setenv("FUNES_API_TOKEN", "api-token")
@@ -44,7 +102,7 @@ def test_remote_search_waits_for_ready_and_retries_transient(monkeypatch):
             raise OSError("connection reset")
         return _Response({"ok": True, "results": [{"raw_text": "原始中文"}]})
 
-    monkeypatch.setattr(bridge, "open_no_redirect", fake_urlopen)
+    monkeypatch.setattr(bridge, "_open_remote", fake_urlopen)
     result = bridge._remote_call("/search", {"query": "之前的决定"})
 
     assert result["ok"] is True
@@ -82,7 +140,7 @@ def test_remote_search_polls_retryable_ready_503_until_ready(monkeypatch, not_re
             return _Response({"ok": True, "native_warm": {"state": "ready"}})
         return _Response({"ok": True, "results": []})
 
-    monkeypatch.setattr(bridge, "open_no_redirect", fake_urlopen)
+    monkeypatch.setattr(bridge, "_open_remote", fake_urlopen)
     result = bridge._remote_call("/search", {"query": "previous decision"})
 
     assert result == {"ok": True, "results": []}
@@ -98,7 +156,7 @@ def test_remote_call_does_not_retry_auth_failure(monkeypatch):
         calls.append(req.full_url)
         raise HTTPError(req.full_url, 401, "unauthorized", {}, None)
 
-    monkeypatch.setattr(bridge, "open_no_redirect", fake_urlopen)
+    monkeypatch.setattr(bridge, "_open_remote", fake_urlopen)
     with pytest.raises(HTTPError):
         bridge._remote_call("/get", {"id": "record-1"})
     assert calls == ["https://memory.example/get"]
@@ -118,9 +176,189 @@ def test_remote_call_reads_url_from_config(monkeypatch):
         calls.append(req.full_url)
         return _Response({"ok": True})
 
-    monkeypatch.setattr(bridge, "open_no_redirect", fake_urlopen)
+    monkeypatch.setattr(bridge, "_open_remote", fake_urlopen)
     assert bridge._remote_call("/sync/status", {})["ok"] is True
     assert calls == ["https://configured-memory.example/sync/status"]
+
+
+def test_ready_search_and_consecutive_calls_reuse_one_connection(monkeypatch):
+    monkeypatch.setenv("FUNES_REMOTE_URL", "https://memory.example")
+    monkeypatch.setenv("FUNES_API_TOKEN", "api-token")
+    monkeypatch.setattr(bridge.request, "getproxies", lambda: {})
+    monkeypatch.setattr(bridge.request, "proxy_bypass", lambda _host: False)
+    monkeypatch.setattr(bridge.http.client, "HTTPSConnection", _HTTPConnection)
+    _HTTPConnection.responses = [
+        _HTTPResponse({"ok": True}),
+        _HTTPResponse({"ok": True, "results": [1]}),
+        _HTTPResponse({"ok": True}),
+        _HTTPResponse({"ok": True, "results": [2]}),
+    ]
+
+    first = bridge._remote_call("/search", {"query": "first"})
+    second = bridge._remote_call("/search", {"query": "second"})
+
+    assert first["results"] == [1]
+    assert second["results"] == [2]
+    assert len(_HTTPConnection.instances) == 1
+    assert [item[1] for item in _HTTPConnection.instances[0].requests] == [
+        "/ready",
+        "/search",
+        "/ready",
+        "/search",
+    ]
+
+
+def test_https_http_proxy_reuses_tunnel_without_auth_on_connect(monkeypatch):
+    monkeypatch.setenv("FUNES_REMOTE_URL", "https://memory.example")
+    monkeypatch.setenv("FUNES_API_TOKEN", "app-secret")
+    monkeypatch.setenv("FUNES_HF_TOKEN", "hub-secret")
+    monkeypatch.setattr(
+        bridge.request,
+        "getproxies",
+        lambda: {"https": "http://127.0.0.1:6324"},
+    )
+    monkeypatch.setattr(bridge.request, "proxy_bypass", lambda _host: False)
+    monkeypatch.setattr(bridge.http.client, "HTTPSConnection", _HTTPConnection)
+    _HTTPConnection.responses = [
+        _HTTPResponse({"ok": True}),
+        _HTTPResponse({"ok": True, "results": []}),
+        _HTTPResponse({"ok": True}),
+    ]
+
+    assert bridge._remote_call("/search", {"query": "safe"})["ok"] is True
+    assert bridge._remote_call("/get", {"source_identity": "one"})["ok"] is True
+
+    connection = _HTTPConnection.instances[0]
+    assert len(_HTTPConnection.instances) == 1
+    assert (connection.host, connection.port) == ("127.0.0.1", 6324)
+    assert connection.tunnel == ("memory.example", 443, None)
+    request_headers = {
+        key.lower(): value for key, value in connection.requests[-1][3].items()
+    }
+    assert request_headers["authorization"] == "Bearer hub-secret"
+    assert request_headers["x-funes-authorization"] == "Bearer app-secret"
+    assert "app-secret" not in repr(list(bridge._CONNECTIONS))
+    assert "hub-secret" not in repr(list(bridge._CONNECTIONS))
+
+
+def test_remote_disconnect_discards_connection_and_existing_retry_rebuilds(monkeypatch):
+    monkeypatch.setenv("FUNES_REMOTE_URL", "https://memory.example")
+    monkeypatch.setenv("FUNES_API_TOKEN", "api-token")
+    monkeypatch.setenv("FUNES_REMOTE_ATTEMPTS", "2")
+    monkeypatch.setattr(bridge.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(bridge.request, "getproxies", lambda: {})
+    monkeypatch.setattr(bridge.request, "proxy_bypass", lambda _host: False)
+    monkeypatch.setattr(bridge.http.client, "HTTPSConnection", _HTTPConnection)
+    _HTTPConnection.fail_first_request = True
+    _HTTPConnection.responses = [_HTTPResponse({"ok": True})]
+
+    assert bridge._remote_call("/get", {"source_identity": "one"}) == {"ok": True}
+    assert len(_HTTPConnection.instances) == 2
+    assert _HTTPConnection.instances[0].closed is True
+
+
+def test_connection_access_is_serialized_across_threads(monkeypatch):
+    class SerialConnection(_HTTPConnection):
+        active = 0
+        max_active = 0
+        metric_lock = threading.Lock()
+
+        def request(self, method, target, body=None, headers=None):
+            with self.metric_lock:
+                type(self).active += 1
+                type(self).max_active = max(type(self).max_active, type(self).active)
+            time.sleep(0.01)
+            try:
+                super().request(method, target, body, headers)
+            finally:
+                with self.metric_lock:
+                    type(self).active -= 1
+
+    SerialConnection.instances = []
+    SerialConnection.responses = [
+        _HTTPResponse({"worker": 1}),
+        _HTTPResponse({"worker": 2}),
+    ]
+    monkeypatch.setattr(bridge.request, "getproxies", lambda: {})
+    monkeypatch.setattr(bridge.request, "proxy_bypass", lambda _host: False)
+    monkeypatch.setattr(bridge.http.client, "HTTPSConnection", SerialConnection)
+    barrier = threading.Barrier(2)
+    results = []
+    failures = []
+
+    def invoke(worker):
+        try:
+            barrier.wait()
+            req = bridge.request.Request(
+                f"https://memory.example/get?worker={worker}", method="GET"
+            )
+            with bridge._open_remote(req, timeout=1) as response:
+                results.append(json.loads(response.read()))
+        except Exception as exc:  # pragma: no cover - asserted below
+            failures.append(exc)
+
+    threads = [threading.Thread(target=invoke, args=(worker,)) for worker in (1, 2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=1)
+
+    assert failures == []
+    assert len(results) == 2
+    assert len(SerialConnection.instances) == 1
+    assert SerialConnection.max_active == 1
+
+
+def test_persistent_error_body_is_bounded_and_connection_is_discarded(monkeypatch):
+    monkeypatch.setattr(bridge.request, "getproxies", lambda: {})
+    monkeypatch.setattr(bridge.request, "proxy_bypass", lambda _host: False)
+    monkeypatch.setattr(bridge.http.client, "HTTPSConnection", _HTTPConnection)
+    response = _HTTPResponse(b"x" * (bridge._ERROR_BODY_MAX + 100), status=503)
+    _HTTPConnection.responses = [response]
+    req = bridge.request.Request("https://memory.example/ready", method="GET")
+
+    with pytest.raises(HTTPError):
+        bridge._open_remote(req, timeout=1)
+
+    assert response.read_sizes == [bridge._ERROR_BODY_MAX + 1]
+    assert _HTTPConnection.instances[0].closed is True
+
+
+@pytest.mark.parametrize(
+    "proxy_url",
+    ("https://proxy.example:443", "http://user:password@proxy.example:8080"),
+)
+def test_complex_proxy_falls_back_to_existing_no_redirect(monkeypatch, proxy_url):
+    monkeypatch.setattr(
+        bridge.request, "getproxies", lambda: {"https": proxy_url}
+    )
+    monkeypatch.setattr(bridge.request, "proxy_bypass", lambda _host: False)
+    calls = []
+
+    def fallback(req, timeout):
+        calls.append((req.full_url, timeout))
+        return _Response({"ok": True})
+
+    monkeypatch.setattr(bridge, "open_no_redirect", fallback)
+    req = bridge.request.Request("https://memory.example/get", method="GET")
+
+    with bridge._open_remote(req, timeout=3) as response:
+        assert json.loads(response.read())["ok"] is True
+    assert calls == [("https://memory.example/get", 3)]
+    assert _HTTPConnection.instances == []
+
+
+@pytest.mark.parametrize(
+    "url",
+    ("ftp://memory.example", "https://user:secret@memory.example"),
+)
+def test_remote_url_rejects_non_http_and_userinfo(monkeypatch, url):
+    monkeypatch.setenv("FUNES_REMOTE_URL", url)
+    monkeypatch.setenv("FUNES_API_TOKEN", "api-token")
+
+    with pytest.raises(ValueError):
+        bridge._remote_call("/get", {})
+    assert bridge._CONNECTIONS == {}
 
 
 def test_mcp_get_uses_source_identity_and_recall_exposes_filters(monkeypatch):

@@ -14,6 +14,7 @@ import os
 import re
 import select
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -260,13 +261,26 @@ def source_state() -> dict[str, object]:
     if app is None:
         return {"configured": False, "ready": False, "documents": 0}
     if app.syncer.restoring:
-        return {"configured": True, "ready": False, "restoring": True, "documents": app.store.count()}
+        return {
+            "configured": True,
+            "ready": False,
+            "restoring": True,
+            "documents": app.store.count(),
+            "canonical_reconciler": canonical_reconcile_state(app),
+        }
     if app.syncer.restore_failed:
-        return {"configured": True, "ready": False, "error": "restore_failed", "documents": app.store.count()}
+        return {
+            "configured": True,
+            "ready": False,
+            "error": "restore_failed",
+            "documents": app.store.count(),
+            "canonical_reconciler": canonical_reconcile_state(app),
+        }
     active_profile = embedding_profile()
     build_profile = index_embedding_profile()
     build_memory = index_memory()
     checkpoint = app.store.native_index_checkpoint(build_profile, build_memory)
+    checkpoint["failures"] = app.store.native_index_failure_counts()
     optimize = app.store.native_optimize_checkpoint()
     checkpoint["optimize"] = optimize
     checkpoint["memory"] = build_memory
@@ -287,6 +301,7 @@ def source_state() -> dict[str, object]:
         "active_index": {"memory": REMOTE, "profile": active_profile},
         "build_index": {"memory": build_memory, "profile": build_profile},
         "canonical_index": checkpoint,
+        "canonical_reconciler": canonical_reconcile_state(app),
     }
 
 
@@ -1090,12 +1105,37 @@ def query_text(raw: str) -> str:
 
 def run(
     *args: str,
-    timeout: int = 180,
+    timeout: float = 180,
     profile: dict[str, object] | None = None,
 ) -> tuple[int, str, str]:
+    """Run native Funes with a total timeout and reap its whole process group."""
     env = native_environment(profile=profile)
-    p = subprocess.run([FUNES_BIN, *args], text=True, capture_output=True, timeout=timeout, env=env)
-    return p.returncode, p.stdout, p.stderr
+    argv = [FUNES_BIN, *args]
+    process = subprocess.Popen(
+        argv,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+        start_new_session=os.name == "posix",
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        if os.name == "posix":
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except OSError:
+                process.kill()
+        else:
+            process.kill()
+        process.communicate()
+        # Never retain stdout/stderr or caller arguments in the exception: a
+        # descendant may have emitted provider payloads, paths, or raw memory.
+        raise subprocess.TimeoutExpired([FUNES_BIN], timeout) from None
+    return process.returncode, stdout, stderr
 
 
 CANONICAL_FACETS = (
@@ -1411,6 +1451,65 @@ def _ingest_canonical_subset(
     return left + right, committed or left_commit or right_commit
 
 
+def _initialize_canonical_reconcile_state(app) -> None:
+    app.canonical_index_state_lock = threading.Lock()
+    app.canonical_index_state = {
+        "active": False,
+        "phase": "waiting_restore",
+        "phase_started_at": utc_now(),
+        "last_started_at": None,
+        "last_finished_at": None,
+        "last_duration_ms": None,
+        "last_result": None,
+        "last_error_class": None,
+        "consecutive_failures": 0,
+    }
+
+
+def _set_canonical_reconcile_state(app, **changes: object) -> None:
+    lock = getattr(app, "canonical_index_state_lock", None)
+    state = getattr(app, "canonical_index_state", None)
+    if lock is None or state is None:
+        return
+    with lock:
+        state.update(changes)
+
+
+def canonical_reconcile_state(app) -> dict[str, object]:
+    """Return bounded, raw-free reconciler diagnostics for authenticated status."""
+    lock = getattr(app, "canonical_index_state_lock", None)
+    state = getattr(app, "canonical_index_state", None)
+    if lock is None or state is None:
+        public: dict[str, object] = {
+            "active": False,
+            "phase": "not_started",
+            "phase_started_at": None,
+            "last_started_at": None,
+            "last_finished_at": None,
+            "last_duration_ms": None,
+            "last_result": None,
+            "last_error_class": None,
+            "consecutive_failures": 0,
+        }
+    else:
+        with lock:
+            public = {
+                key: value for key, value in state.items() if not key.startswith("_")
+            }
+    thread = getattr(app, "canonical_index_thread", None)
+    public.update(
+        thread_alive=bool(thread is not None and thread.is_alive()),
+        batch_size=CANONICAL_INDEX_BATCH,
+        timeout_seconds=CANONICAL_INDEX_TIMEOUT,
+        interval_seconds=CANONICAL_INDEX_INTERVAL,
+    )
+    return public
+
+
+def _canonical_reconcile_phase(app, phase: str) -> None:
+    _set_canonical_reconcile_state(app, phase=phase, phase_started_at=utc_now())
+
+
 def reconcile_canonical_index(app) -> dict[str, object]:
     """Index one restart-safe batch and persist only derived status in the sidecar."""
     memory = index_memory()
@@ -1422,6 +1521,7 @@ def reconcile_canonical_index(app) -> dict[str, object]:
     def select_and_ingest(directory: Path):
         if app.syncer.restoring or app.syncer.restore_failed:
             return [], [], False
+        _canonical_reconcile_phase(app, "selecting")
         rows = app.store.canonical_index_candidates(
             CANONICAL_INDEX_BATCH,
             str(profile["fingerprint"]),
@@ -1442,6 +1542,7 @@ def reconcile_canonical_index(app) -> dict[str, object]:
             selected.append((item, document))
         if not selected:
             return selected, [], False
+        _canonical_reconcile_phase(app, "native_ingest")
         updates, committed = _ingest_canonical_subset(
             selected,
             directory,
@@ -1451,17 +1552,21 @@ def reconcile_canonical_index(app) -> dict[str, object]:
         )
         return selected, updates, committed
 
+    _canonical_reconcile_phase(app, "preparing")
     with tempfile.TemporaryDirectory(prefix="funes-canonical-") as temporary:
+        _canonical_reconcile_phase(app, "waiting_write_lock")
         with WRITE_LOCK:
             translation_lock = getattr(app, "translation_lock", None)
             if translation_lock is None:
                 records, updates, committed = select_and_ingest(Path(temporary))
             else:
+                _canonical_reconcile_phase(app, "waiting_translation_lock")
                 with translation_lock:
                     records, updates, committed = select_and_ingest(Path(temporary))
     if not records:
         durable = not app.syncer.restoring and not app.syncer.restore_failed
         if durable:
+            _canonical_reconcile_phase(app, "optimizing")
             optimize_canonical_index(app, profile, memory)
         return {"attempted": 0, "indexed": 0, "held": 0, "durable": durable}
     if (
@@ -1470,6 +1575,7 @@ def reconcile_canonical_index(app) -> dict[str, object]:
         and profile["fingerprint"] == embedding_profile()["fingerprint"]
     ):
         request_warm(force=True)
+    _canonical_reconcile_phase(app, "validating_status")
     status_documents = []
     valid_updates = []
     for update in updates:
@@ -1491,9 +1597,11 @@ def reconcile_canonical_index(app) -> dict[str, object]:
         status_documents.append(pending_marker)
     if valid_updates:
         status_documents.append(app.store.native_index_state_record(valid_updates))
+    _canonical_reconcile_phase(app, "persisting_source_status")
     sync = app.syncer.upload(status_documents) if status_documents else {"durable": False}
     durable = bool(sync.get("durable"))
     if durable:
+        _canonical_reconcile_phase(app, "applying_checkpoint")
         app.store.update_native_index(valid_updates)
         if pending_marker is not None:
             app.store.set_native_optimize_checkpoint(pending_marker)
@@ -1594,12 +1702,53 @@ def optimize_canonical_index(
 def _canonical_reconcile_background(app) -> None:
     app.restore_done.wait()
     while not app.canonical_index_stop.is_set():
+        started = time.monotonic()
+        _set_canonical_reconcile_state(
+            app,
+            active=True,
+            phase="starting",
+            phase_started_at=utc_now(),
+            last_started_at=utc_now(),
+            _started_monotonic=started,
+        )
         try:
-            reconcile_canonical_index(app)
-        except Exception:
+            result = reconcile_canonical_index(app)
+        except Exception as exc:
+            state = canonical_reconcile_state(app)
+            failures = int(state.get("consecutive_failures") or 0) + 1
+            _set_canonical_reconcile_state(
+                app,
+                active=False,
+                phase="sleeping",
+                phase_started_at=utc_now(),
+                last_finished_at=utc_now(),
+                last_duration_ms=max(
+                    0, round((time.monotonic() - started) * 1000)
+                ),
+                last_result=None,
+                last_error_class=type(exc).__name__,
+                consecutive_failures=failures,
+            )
             # Retry state remains in the encrypted source store. Never log raw
-            # rows, subprocess output, provider payloads, or credentials.
-            pass
+            # rows, exception text, subprocess output, provider payloads, or credentials.
+        else:
+            safe_result = {
+                key: result.get(key)
+                for key in ("attempted", "indexed", "held", "durable")
+            }
+            _set_canonical_reconcile_state(
+                app,
+                active=False,
+                phase="sleeping",
+                phase_started_at=utc_now(),
+                last_finished_at=utc_now(),
+                last_duration_ms=max(
+                    0, round((time.monotonic() - started) * 1000)
+                ),
+                last_result=safe_result,
+                last_error_class=None,
+                consecutive_failures=0,
+            )
         if app.canonical_index_stop.wait(CANONICAL_INDEX_INTERVAL):
             break
 
@@ -1608,6 +1757,7 @@ def start_canonical_reconciler(app) -> None:
     if not index_memory() or getattr(app, "canonical_index_thread", None) is not None:
         return
     app.canonical_index_stop = threading.Event()
+    _initialize_canonical_reconcile_state(app)
     app.canonical_index_thread = threading.Thread(
         target=_canonical_reconcile_background,
         args=(app,),
@@ -2425,7 +2575,12 @@ def sync_status_payload() -> tuple[int, dict[str, object]]:
             "error": "FUNES_MEMORY is not configured",
             "native_warm": warm_state(),
         }
-    code, out, err = run("status", REMOTE, timeout=30)
+    try:
+        code, out, err = run("status", REMOTE, timeout=30)
+    except subprocess.TimeoutExpired:
+        code, out, err = 124, "", "native_status_timeout"
+    except (OSError, subprocess.SubprocessError):
+        code, out, err = 1, "", "native_status_unavailable"
     sources = source_state()
     source_ok = not sources.get("configured") or bool(sources.get("ready"))
     return (
@@ -3116,8 +3271,10 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(404, {"error": "not found"})
         except ValueError as exc:
             self.send_json(400, {"error": str(exc)})
-        except (OSError, subprocess.SubprocessError) as exc:
-            self.send_json(500, {"error": str(exc)})
+        except subprocess.TimeoutExpired:
+            self.send_json(504, {"error": "native_timeout"})
+        except (OSError, subprocess.SubprocessError):
+            self.send_json(500, {"error": "native_process_error"})
 
 
 def serve(host: str = "0.0.0.0", port: int = PORT) -> None:

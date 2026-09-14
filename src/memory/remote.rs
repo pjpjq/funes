@@ -119,6 +119,7 @@ pub(crate) async fn append(
         batches,
         schema,
         extra_files,
+        true,
     )
     .await
 }
@@ -134,6 +135,7 @@ async fn append_at(
     batches: Vec<RecordBatch>,
     schema: SchemaRef,
     extra_files: &BTreeMap<String, Bytes>,
+    measure_unindexed: bool,
 ) -> Result<Appended> {
     // Open the same immutable head guarded by the eventual Hub commit. Without
     // this pin a branch move between selection and open could duplicate rows.
@@ -154,10 +156,15 @@ async fn append_at(
         .await
         .context("appending to the remote dataset")?;
 
-    // Snapshot the captured writes before reading index stats: `index_statistics` can write a stats
-    // migration through the same wrapper, and that must not leak into the data commit.
+    // Snapshot the captured writes before optionally reading index stats: `index_statistics` can
+    // write a stats migration through the same wrapper, and that must not leak into the data commit.
     let mut files = captured_files(&wrapper);
-    let unindexed = max_unindexed_rows(&ds).await;
+    // Canonical ingestion discards this result, so it skips the expensive statistics reads.
+    let unindexed = if measure_unindexed {
+        max_unindexed_rows(&ds).await
+    } else {
+        0
+    };
     for (path, body) in extra_files {
         files.insert(path.clone(), body.clone());
     }
@@ -196,6 +203,7 @@ pub(crate) async fn append_documents(
         batches,
         schema,
         &extra_files,
+        false,
     )
     .await?
     {

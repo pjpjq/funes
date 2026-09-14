@@ -1131,8 +1131,7 @@ mod tests {
     #[test]
     fn append_only_requires_every_changed_source_to_be_absent() {
         let current: InputDocument =
-            serde_json::from_value(doc("v1", "2026-09-01T00:00:00Z", "current", serde_json::json!({})))
-                .unwrap();
+            serde_json::from_value(doc("v1", "2026-09-01T00:00:00Z", "current", serde_json::json!({}))).unwrap();
         let current = normalize(current).unwrap();
         let mut new_value = doc("v1", "2026-09-02T00:00:00Z", "new", serde_json::json!({}));
         new_value["source_identity"] = Value::String("new-source".to_string());
@@ -1144,8 +1143,7 @@ mod tests {
         assert!(!append_only(&new_selection, &stored, false));
 
         let update: InputDocument =
-            serde_json::from_value(doc("v2", "2026-09-03T00:00:00Z", "update", serde_json::json!({})))
-                .unwrap();
+            serde_json::from_value(doc("v2", "2026-09-03T00:00:00Z", "update", serde_json::json!({}))).unwrap();
         let update = normalize(update).unwrap();
         let mixed_docs = [new, update];
         let mixed = select_documents(&mixed_docs, &stored);
@@ -1178,8 +1176,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let memory = root.path().join("memory");
         let initial: InputDocument =
-            serde_json::from_value(doc("v1", "2026-09-01T00:00:00Z", "initial", serde_json::json!({})))
-                .unwrap();
+            serde_json::from_value(doc("v1", "2026-09-01T00:00:00Z", "initial", serde_json::json!({}))).unwrap();
         let initial = normalize(initial).unwrap();
         let profile = EmbeddingProfile::local();
         let mut embedder = FakeEmbedder;
@@ -1207,16 +1204,11 @@ mod tests {
         let mut ds = dataset::open(&uri, HashMap::new()).await.unwrap();
         let schema = Arc::new(Schema::from(ds.schema()));
         let batch = build_batch_for_schema(&chunks, &vectors, schema.clone()).unwrap();
-        ds.append(
-            RecordBatchIterator::new(vec![Ok(batch)], schema),
-            None,
-        )
-        .await
-        .unwrap();
-
-        let revisions = stored_revisions(&ds, std::slice::from_ref(&appended))
+        ds.append(RecordBatchIterator::new(vec![Ok(batch)], schema), None)
             .await
             .unwrap();
+
+        let revisions = stored_revisions(&ds, std::slice::from_ref(&appended)).await.unwrap();
         assert_eq!(
             revisions.get("appended-source").unwrap().source_version,
             appended.source_version

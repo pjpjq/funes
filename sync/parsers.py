@@ -682,30 +682,39 @@ def _parse_memory_native(source: Source) -> list[Chunk]:
         return []
     # Keep headings/paragraphs together and cap individual requests so a large
     # memory file never becomes one unbounded translation call.
-    pieces = [p.strip() for p in re.split(r"\n(?=\s*#{1,6}\s)", raw) if p.strip()]
-    if not pieces:
-        pieces = [raw]
+    sections = [p.strip() for p in re.split(r"\n(?=\s*#{1,6}\s)", raw) if p.strip()]
+    if not sections:
+        sections = [raw]
     out = []
-    for i, piece in enumerate(pieces):
-        if len(piece) > 6000:
-            pieces[i:i + 1] = [piece[j:j + 6000] for j in range(0, len(piece), 6000)]
     repo_identity, relative_path = _memory_identity_context(source)
     source_content_type = source.source_type if source.source_type in {"agents_md", "project_instruction"} else "memory"
-    for i, piece in enumerate(pieces):
+    ordinal = 0
+    section_occurrences: dict[str, int] = {}
+    for body in sections:
         # Memory identity is semantic rather than path/index based so copies of
         # the same repository memory converge across devices and mount points.
-        lines = piece.splitlines()
-        heading = lines[0].strip() if lines else ""
+        lines = body.splitlines()
+        heading = lines[0].strip() if lines and re.match(r"\s*#{1,6}\s", lines[0]) else ""
         # A heading is the durable section key: content may be edited in place,
         # while an absolute checkout path and byte/line position can change.
         section = heading or "__preamble__"
-        semantic_id = f"memory:{source.kind}:{repo_identity}:{relative_path}:{section}"
-        c = _chunk(source, ordinal=i, session="", message=semantic_id, role="system",
-                   text=piece, raw=piece, content_type=source_content_type,
-                   metadata={"source_file": str(source.path)}, record_type=source_content_type,
-                   fallback_key=heading)
-        if c:
-            out.append(c)
+        occurrence = section_occurrences.get(section, 0)
+        section_occurrences[section] = occurrence + 1
+        section_key = section if occurrence == 0 else f"{section}:occurrence:{occurrence}"
+        pieces = [body[i:i + 6000] for i in range(0, len(body), 6000)]
+        for part_index, piece in enumerate(pieces):
+            part = section_key if part_index == 0 else f"{section_key}:part:{part_index}"
+            semantic_id = f"memory:{source.kind}:{repo_identity}:{relative_path}:{part}"
+            metadata: dict[str, Any] = {"source_file": str(source.path)}
+            if len(pieces) > 1:
+                metadata.update({"chunk_index": part_index, "chunk_count": len(pieces)})
+            c = _chunk(source, ordinal=ordinal, session="", message=semantic_id, role="system",
+                       text=piece, raw=piece, content_type=source_content_type,
+                       metadata=metadata, record_type=source_content_type,
+                       fallback_key=heading)
+            if c:
+                out.append(c)
+            ordinal += 1
     return out
 
 

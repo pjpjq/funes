@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .config import Config
+from .config import Config, _restrict_owned_permissions
 from .discovery import Source
 from .parsers import Chunk
 
@@ -16,8 +17,25 @@ class Store:
     def __init__(self, path: Path|str|None=None, config: Config|None=None):
         self.config=config or Config.load(); self.config.ensure()
         self.path=Path(path or self.config.state_dir/"sync.db"); self.path.parent.mkdir(parents=True,exist_ok=True)
+        self._prepare_database_file()
+        self._restrict_sqlite_files()
         self.db=sqlite3.connect(self.path, timeout=30, check_same_thread=False)
         self.db.row_factory=sqlite3.Row; self.db.execute("PRAGMA journal_mode=WAL"); self._schema()
+        self._restrict_sqlite_files()
+    def _prepare_database_file(self):
+        """Create a new POSIX database privately before SQLite opens it."""
+        if os.name == "nt":
+            return
+        try:
+            descriptor=os.open(self.path, os.O_CREAT|os.O_EXCL|os.O_RDWR, 0o600)
+        except FileExistsError:
+            return
+        except OSError:
+            return
+        os.close(descriptor)
+    def _restrict_sqlite_files(self):
+        for path in (self.path, Path(f"{self.path}-wal"), Path(f"{self.path}-shm")):
+            _restrict_owned_permissions(path, 0o600)
     def _schema(self):
         self.db.executescript('''
         CREATE TABLE IF NOT EXISTS sources(source_key TEXT PRIMARY KEY,kind TEXT NOT NULL,path TEXT NOT NULL,device_id TEXT,project TEXT,active INTEGER DEFAULT 1,size INTEGER,mtime REAL,inode INTEGER,updated_at REAL);

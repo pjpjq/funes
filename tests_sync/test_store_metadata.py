@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
+import stat
 from datetime import datetime
-from pathlib import PureWindowsPath
+from pathlib import Path, PureWindowsPath
 from types import SimpleNamespace
 
 import pytest
@@ -434,3 +436,54 @@ def test_existing_database_gets_meta_migration_without_data_loss(tmp_path):
         assert {"records_source", "queue_failed", "queue_schedule", "sources_active_kind"}.issubset(indexes)
     finally:
         store.close()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits are not available on Windows")
+def test_new_store_restricts_state_directory_and_sqlite_files(tmp_path):
+    state = tmp_path / "custom-state"
+    state.mkdir(mode=0o755)
+    state.chmod(0o755)
+    cfg = Config(tmp_path, state, tmp_path / "config.toml")
+    database = state / "sync.db"
+    store = Store(config=cfg)
+    try:
+        store.set_meta("permission-test", "written")
+        sidecars = [Path(f"{database}-wal"), Path(f"{database}-shm")]
+        assert all(path.exists() for path in sidecars)
+        assert stat.S_IMODE(state.stat().st_mode) == 0o700
+        assert all(
+            stat.S_IMODE(path.stat().st_mode) == 0o600
+            for path in [database, *sidecars]
+        )
+    finally:
+        store.close()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits are not available on Windows")
+def test_existing_store_restricts_sqlite_files_without_data_loss(tmp_path):
+    state = tmp_path / "custom-state"
+    state.mkdir(mode=0o755)
+    database = state / "sync.db"
+    legacy = sqlite3.connect(database)
+    legacy.execute("PRAGMA journal_mode=WAL")
+    legacy.execute("CREATE TABLE retained(value TEXT NOT NULL)")
+    legacy.execute("INSERT INTO retained(value) VALUES('private payload')")
+    legacy.commit()
+    sidecars = [Path(f"{database}-wal"), Path(f"{database}-shm")]
+    assert all(path.exists() for path in sidecars)
+    state.chmod(0o755)
+    for path in [database, *sidecars]:
+        path.chmod(0o644)
+
+    cfg = Config(tmp_path, state, tmp_path / "config.toml")
+    store = Store(config=cfg)
+    try:
+        assert store.db.execute("SELECT value FROM retained").fetchone()[0] == "private payload"
+        assert stat.S_IMODE(state.stat().st_mode) == 0o700
+        assert all(
+            stat.S_IMODE(path.stat().st_mode) == 0o600
+            for path in [database, *sidecars]
+        )
+    finally:
+        store.close()
+        legacy.close()

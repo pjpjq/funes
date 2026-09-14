@@ -267,6 +267,7 @@ class Store:
                     snapshot_path TEXT, restored_at TEXT,
                     native_optimize_provider TEXT, native_optimize_model TEXT,
                     native_optimize_dimensions INTEGER, native_optimize_schema_version INTEGER,
+                    native_optimize_layout_version INTEGER NOT NULL DEFAULT 0,
                     native_optimize_memory TEXT,
                     native_optimize_fingerprint TEXT, native_optimize_index_fingerprint TEXT,
                     native_optimize_status TEXT, native_optimized_at TEXT,
@@ -335,6 +336,7 @@ class Store:
                 ("native_optimize_model", "TEXT"),
                 ("native_optimize_dimensions", "INTEGER"),
                 ("native_optimize_schema_version", "INTEGER"),
+                ("native_optimize_layout_version", "INTEGER NOT NULL DEFAULT 0"),
                 ("native_optimize_memory", "TEXT"),
                 ("native_optimize_fingerprint", "TEXT"),
                 ("native_optimize_index_fingerprint", "TEXT"),
@@ -1532,6 +1534,7 @@ class Store:
             "model": row["native_optimize_model"],
             "dimensions": row["native_optimize_dimensions"],
             "schema_version": row["native_optimize_schema_version"],
+            "index_layout_version": int(row["native_optimize_layout_version"] or 0),
             "memory": row["native_optimize_memory"],
             "fingerprint": row["native_optimize_fingerprint"],
             "index_fingerprint": row["native_optimize_index_fingerprint"],
@@ -1544,16 +1547,21 @@ class Store:
         """Apply a monotonic durable optimize marker restored from snapshots/deltas."""
         incoming_at = str(checkpoint.get("optimized_at") or "")
         incoming_revision = int(checkpoint.get("revision") or 0)
+        incoming_layout_version = int(checkpoint.get("index_layout_version") or 0)
         if not incoming_at or not checkpoint.get("fingerprint"):
             return False
         with self.lock, self.conn:
             current = self.conn.execute(
                 """SELECT native_optimized_at,native_optimize_revision,
                 native_optimize_status,native_optimize_memory,
-                native_optimize_fingerprint FROM sync_state WHERE id=1"""
+                native_optimize_fingerprint,native_optimize_layout_version
+                FROM sync_state WHERE id=1"""
             ).fetchone()
             if current:
                 current_revision = int(current["native_optimize_revision"] or 0)
+                current_layout_version = int(
+                    current["native_optimize_layout_version"] or 0
+                )
                 current_at = str(current["native_optimized_at"] or "")
                 current_namespace = (
                     str(current["native_optimize_memory"] or ""),
@@ -1563,6 +1571,8 @@ class Store:
                     str(checkpoint.get("memory") or ""),
                     str(checkpoint.get("fingerprint") or ""),
                 )
+                if incoming_layout_version < current_layout_version:
+                    return False
                 if current_namespace == incoming_namespace:
                     if incoming_revision < current_revision:
                         return False
@@ -1582,6 +1592,7 @@ class Store:
             self.conn.execute(
                 """UPDATE sync_state SET native_optimize_provider=?, native_optimize_model=?,
                 native_optimize_dimensions=?, native_optimize_schema_version=?,
+                native_optimize_layout_version=?,
                 native_optimize_memory=?,
                 native_optimize_fingerprint=?, native_optimize_index_fingerprint=?,
                 native_optimize_status=?, native_optimized_at=?,
@@ -1589,6 +1600,7 @@ class Store:
                 (
                     checkpoint.get("provider"), checkpoint.get("model"),
                     checkpoint.get("dimensions"), checkpoint.get("schema_version"),
+                    incoming_layout_version,
                     checkpoint.get("memory"),
                     checkpoint.get("fingerprint"), checkpoint.get("index_fingerprint"),
                     checkpoint.get("status"), incoming_at, incoming_revision,

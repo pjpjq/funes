@@ -142,7 +142,7 @@ struct Report {
 #[allow(dead_code)] // both variants exist only to hold their advisory lock until drop
 enum LocalWriteLock {
     Default(lock::MemoryLock),
-    Explicit(File),
+    Explicit(lock::FileLock),
 }
 
 fn acquire_local_lock(path: &Path) -> Result<LocalWriteLock> {

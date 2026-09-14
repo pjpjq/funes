@@ -112,8 +112,8 @@ fn http_client() -> Result<Client> {
 }
 
 /// Keep reqwest's blocking runtime entirely outside a Tokio worker. The inference traits are
-/// synchronous, so each provider call waits for a scoped OS thread; that thread owns client
-/// construction, the request, response decoding, and client destruction.
+/// synchronous, so provider construction and each request run on a scoped OS thread. The retained
+/// client owns its connection pool across calls instead of rebuilding TLS state for every request.
 fn run_blocking_http<T: Send>(operation: &str, work: impl FnOnce() -> Result<T> + Send) -> Result<T> {
     thread::scope(|scope| {
         scope
@@ -189,6 +189,7 @@ fn decode_embeddings(response: EmbeddingsResponse, expected: usize, dimensions: 
 
 /// Voyage embeddings with explicit document/query modes.
 pub struct VoyageEmbedder {
+    client: Client,
     api_key: String,
     endpoint: String,
     model: String,
@@ -233,7 +234,9 @@ impl VoyageEmbedder {
         if document_attempts == 0 {
             bail!("Voyage document attempts must be positive")
         }
+        let client = run_blocking_http("client setup", http_client)?;
         Ok(Self {
+            client,
             api_key,
             endpoint,
             model,
@@ -253,7 +256,6 @@ impl VoyageEmbedder {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
-        let client = http_client()?;
         let request = EmbeddingsRequest {
             input: texts.to_vec(),
             model: &self.model,
@@ -269,7 +271,8 @@ impl VoyageEmbedder {
         };
 
         for attempt in 0..attempts {
-            let response = client
+            let response = self
+                .client
                 .post(&self.endpoint)
                 .timeout(timeout)
                 .bearer_auth(&self.api_key)
@@ -350,6 +353,7 @@ fn decode_rerank(response: RerankResponse, expected: usize) -> Result<Vec<f32>> 
 
 /// Voyage `rerank-3-lite`, bounded to one query-time request.
 pub struct VoyageReranker {
+    client: Client,
     api_key: String,
     endpoint: String,
     model: String,
@@ -365,7 +369,9 @@ impl VoyageReranker {
         if model.trim().is_empty() {
             bail!("Voyage rerank model must not be empty")
         }
+        let client = run_blocking_http("client setup", http_client)?;
         Ok(Self {
+            client,
             api_key,
             endpoint,
             model,
@@ -389,7 +395,6 @@ impl VoyageReranker {
         if docs.is_empty() {
             return Ok(Vec::new());
         }
-        let client = http_client()?;
         let request = RerankRequest {
             query,
             documents: docs.to_vec(),
@@ -397,7 +402,8 @@ impl VoyageReranker {
             return_documents: false,
             truncation: false,
         };
-        let response = client
+        let response = self
+            .client
             .post(&self.endpoint)
             .timeout(self.query_timeout)
             .bearer_auth(&self.api_key)
@@ -572,8 +578,15 @@ mod tests {
         })
     }
 
+    #[test]
+    fn retained_clients_are_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<VoyageEmbedder>();
+        assert_send_sync::<VoyageReranker>();
+    }
+
     #[tokio::test]
-    async fn blocking_client_lifecycle_is_safe_inside_tokio() {
+    async fn retained_blocking_client_lifecycle_is_safe_inside_tokio() {
         let server = MockServer::start(vec![MockResponse::json(
             200,
             embedding_response(vec![(0, unit_vector(0))]),

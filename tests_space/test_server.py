@@ -1074,6 +1074,52 @@ def test_writes_fail_fast_while_source_is_restoring(
     assert body["durable"] is False
 
 
+def test_sync_status_native_timeout_keeps_sanitized_reconciler_state(monkeypatch):
+    monkeypatch.setattr(bridge, "REMOTE", "owner/private")
+    monkeypatch.setattr(
+        bridge,
+        "run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            bridge.subprocess.TimeoutExpired(
+                ["/private/path", "exception-only-private"],
+                30,
+                output="PRIVATE RAW SESSION",
+                stderr="SECRET PROVIDER PAYLOAD",
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        bridge,
+        "source_state",
+        lambda: {
+            "configured": True,
+            "ready": True,
+            "documents": 17,
+            "canonical_reconciler": {
+                "thread_alive": True,
+                "phase": "native_ingest",
+            },
+        },
+    )
+    monkeypatch.setattr(bridge, "warm_state", lambda: {"state": "ready"})
+
+    code, payload = bridge.sync_status_payload()
+
+    assert code == 503
+    assert payload["ok"] is False
+    assert payload["status"] == ""
+    assert payload["error"] == "native_status_timeout"
+    assert payload["source_store"]["canonical_reconciler"] == {
+        "thread_alive": True,
+        "phase": "native_ingest",
+    }
+    rendered = json.dumps(payload)
+    assert "exception-only-private" not in rendered
+    assert "/private/path" not in rendered
+    assert "PRIVATE RAW SESSION" not in rendered
+    assert "SECRET PROVIDER PAYLOAD" not in rendered
+
+
 def test_get_sync_status_still_runs_full_native_status(monkeypatch):
     calls = []
     monkeypatch.setattr(bridge, "TOKEN", "test-token")
@@ -2132,17 +2178,76 @@ def test_run_uses_explicit_build_profile_without_mutating_active_profile(
     build = bridge._embedding_profile("voyage", "voyage-4-lite", 1024, 2)
     captured = {}
 
-    def fake_subprocess_run(argv, **kwargs):
+    class FakeProcess:
+        pid = 123
+        returncode = 0
+
+        @staticmethod
+        def communicate(**kwargs):
+            captured["timeout"] = kwargs["timeout"]
+            return "ok", ""
+
+    def fake_popen(argv, **kwargs):
         captured["argv"] = argv
         captured["env"] = kwargs["env"]
-        return SimpleNamespace(returncode=0, stdout="ok", stderr="")
+        captured["start_new_session"] = kwargs["start_new_session"]
+        return FakeProcess()
 
     monkeypatch.setattr(bridge, "HOME", tmp_path)
-    monkeypatch.setattr(bridge.subprocess, "run", fake_subprocess_run)
+    monkeypatch.setattr(bridge.subprocess, "Popen", fake_popen)
     assert bridge.run("status", "owner/build", profile=build) == (0, "ok", "")
     assert captured["argv"] == [bridge.FUNES_BIN, "status", "owner/build"]
     assert captured["env"]["FUNES_EMBEDDING_PROVIDER"] == "voyage"
+    assert captured["timeout"] == 180
+    assert captured["start_new_session"] is (bridge.os.name == "posix")
     assert bridge.embedding_profile()["provider"] == "local"
+
+
+def test_run_timeout_reaps_process_group_and_discards_sensitive_output(
+    monkeypatch, tmp_path
+):
+    captured = {"calls": 0}
+
+    class TimedOutProcess:
+        pid = 456
+        returncode = None
+
+        def communicate(self, **kwargs):
+            captured["calls"] += 1
+            if captured["calls"] == 1:
+                raise bridge.subprocess.TimeoutExpired(
+                    ["PRIVATE PATH", "owner/private"],
+                    kwargs["timeout"],
+                    output="PRIVATE RAW SESSION",
+                    stderr="SECRET PROVIDER PAYLOAD",
+                )
+            assert kwargs == {}
+            self.returncode = -9
+            return "PRIVATE RAW SESSION", "SECRET PROVIDER PAYLOAD"
+
+        def kill(self):
+            captured["killed"] = True
+
+    monkeypatch.setattr(bridge, "HOME", tmp_path)
+    monkeypatch.setattr(bridge.subprocess, "Popen", lambda *_args, **_kwargs: TimedOutProcess())
+    monkeypatch.setattr(
+        bridge.os,
+        "killpg",
+        lambda pid, sig: captured.update(killpg=(pid, sig)),
+    )
+
+    with pytest.raises(bridge.subprocess.TimeoutExpired) as raised:
+        bridge.run("status", "owner/private", timeout=0.01)
+
+    assert captured["calls"] == 2
+    if bridge.os.name == "posix":
+        assert captured["killpg"] == (456, bridge.signal.SIGKILL)
+    else:
+        assert captured["killed"] is True
+    rendered = str(raised.value)
+    assert "owner/private" not in rendered
+    assert "PRIVATE RAW SESSION" not in rendered
+    assert "SECRET PROVIDER PAYLOAD" not in rendered
 
 
 def test_blue_green_reconcile_writes_only_build_target_and_does_not_warm_active(
@@ -2403,6 +2508,85 @@ def test_profile_change_rebuilds_durable_session_without_client_reupload(monkeyp
     assert captured[0]["source_identity"] == "durable-session"
     assert result["indexed"] == 1
     assert rebuilt["native_index_profile"] == bridge.embedding_profile()["fingerprint"]
+
+
+def test_canonical_phase_reports_write_lock_wait_without_row_data(monkeypatch):
+    class Store:
+        @staticmethod
+        def canonical_index_candidates(*_args):
+            return []
+
+    app = SimpleNamespace(
+        store=Store(),
+        syncer=SimpleNamespace(restoring=False, restore_failed=False),
+    )
+    bridge._initialize_canonical_reconcile_state(app)
+    monkeypatch.setattr(bridge, "REMOTE", "owner/memory")
+    monkeypatch.setattr(bridge, "INDEX_REMOTE", "")
+    monkeypatch.setattr(bridge, "optimize_canonical_index", lambda *_args: False)
+
+    bridge.WRITE_LOCK.acquire()
+    thread = threading.Thread(target=bridge.reconcile_canonical_index, args=(app,))
+    thread.start()
+    try:
+        deadline = time.monotonic() + 1
+        while (
+            bridge.canonical_reconcile_state(app)["phase"] != "waiting_write_lock"
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.005)
+        status = bridge.canonical_reconcile_state(app)
+        assert status["phase"] == "waiting_write_lock"
+        assert "owner/memory" not in json.dumps(status)
+    finally:
+        bridge.WRITE_LOCK.release()
+        thread.join(timeout=1)
+    assert not thread.is_alive()
+
+
+def test_source_state_reports_reconciler_while_restore_is_running(monkeypatch):
+    app = SimpleNamespace(
+        syncer=SimpleNamespace(restoring=True, restore_failed=False),
+        store=SimpleNamespace(count=lambda: 17),
+        restore_result=0,
+    )
+    bridge._initialize_canonical_reconcile_state(app)
+    monkeypatch.setattr(bridge, "SOURCE_APP", app)
+
+    status = bridge.source_state()
+
+    assert status["ready"] is False
+    assert status["restoring"] is True
+    assert status["documents"] == 17
+    assert status["canonical_reconciler"]["phase"] == "waiting_restore"
+
+
+def test_canonical_background_reports_only_exception_class(monkeypatch):
+    app = SimpleNamespace(
+        restore_done=threading.Event(),
+        canonical_index_stop=threading.Event(),
+    )
+    app.restore_done.set()
+    bridge._initialize_canonical_reconcile_state(app)
+
+    def explode(_app):
+        app.canonical_index_stop.set()
+        raise RuntimeError("PRIVATE RAW SESSION provider payload")
+
+    monkeypatch.setattr(bridge, "reconcile_canonical_index", explode)
+    bridge._canonical_reconcile_background(app)
+
+    status = bridge.canonical_reconcile_state(app)
+    assert status["active"] is False
+    assert status["phase"] == "sleeping"
+    assert status["last_error_class"] == "RuntimeError"
+    assert status["consecutive_failures"] == 1
+    assert status["last_result"] is None
+    assert status["last_duration_ms"] >= 0
+    assert status["batch_size"] == bridge.CANONICAL_INDEX_BATCH
+    assert status["timeout_seconds"] == bridge.CANONICAL_INDEX_TIMEOUT
+    assert "PRIVATE RAW SESSION" not in json.dumps(status)
+    assert "provider payload" not in json.dumps(status)
 
 
 def test_canonical_catchup_optimizes_once_and_restores_checkpoint(monkeypatch, tmp_path):

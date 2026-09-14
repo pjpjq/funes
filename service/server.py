@@ -1294,6 +1294,34 @@ class Store:
             ).fetchall()
             return [self._row(row) for row in rows]
 
+    def native_index_failure_counts(self) -> dict[str, int]:
+        """Return allowlisted retry diagnostics without exposing row data."""
+        counts = {
+            "timeout": 0,
+            "native_exit": 0,
+            "invalid_report": 0,
+            "stale": 0,
+            "durability_pending": 0,
+            "other": 0,
+        }
+        categories = {
+            "TimeoutExpired": "timeout",
+            "native_exit": "native_exit",
+            "invalid_report": "invalid_report",
+            "native_stale": "stale",
+            "durability_pending": "durability_pending",
+        }
+        with self.lock:
+            rows = self.conn.execute(
+                """SELECT native_index_error,count(*) AS amount FROM memories
+                WHERE native_index_pending=1 AND native_index_error IS NOT NULL
+                GROUP BY native_index_error"""
+            ).fetchall()
+        for row in rows:
+            category = categories.get(str(row["native_index_error"]), "other")
+            counts[category] += int(row["amount"])
+        return counts
+
     @staticmethod
     def _native_state_fingerprint(state: dict[str, Any]) -> str:
         profile_fingerprint = state.get("profile")

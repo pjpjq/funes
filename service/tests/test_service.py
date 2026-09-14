@@ -42,6 +42,44 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(store.get("a.md")["raw_text"], "hello revised")
         store.close()
 
+    def test_native_index_failure_counts_are_allowlisted(self):
+        store = Store(self.tmp.name)
+        rows = [
+            {"source_identity": f"failure-{index}", "raw_text": "private raw"}
+            for index in range(6)
+        ]
+        store.ingest(rows)
+        failures = [
+            "TimeoutExpired",
+            "native_exit",
+            "invalid_report",
+            "native_stale",
+            "durability_pending",
+            "provider said private raw",
+        ]
+        with store.lock, store.conn:
+            for row, failure in zip(rows, failures, strict=True):
+                store.conn.execute(
+                    "UPDATE memories SET native_index_error=? WHERE source_identity=?",
+                    (failure, row["source_identity"]),
+                )
+        try:
+            counts = store.native_index_failure_counts()
+        finally:
+            store.close()
+        self.assertEqual(
+            counts,
+            {
+                "timeout": 1,
+                "native_exit": 1,
+                "invalid_report": 1,
+                "stale": 1,
+                "durability_pending": 1,
+                "other": 1,
+            },
+        )
+        self.assertNotIn("private raw", json.dumps(counts))
+
     def test_legacy_retrieval_only_fts_migrates_to_raw_primary_once(self):
         store = Store(self.tmp.name)
         store.ingest(

@@ -50,6 +50,9 @@ CANONICAL_INDEX_BATCH = max(1, int(os.getenv("FUNES_CANONICAL_INDEX_BATCH", "32"
 CANONICAL_INDEX_INTERVAL = max(0.01, float(os.getenv("FUNES_CANONICAL_INDEX_INTERVAL", "30")))
 CANONICAL_INDEX_TIMEOUT = max(1, int(os.getenv("FUNES_CANONICAL_INDEX_TIMEOUT", "900")))
 CANONICAL_OPTIMIZE_TIMEOUT = max(1, int(os.getenv("FUNES_CANONICAL_OPTIMIZE_TIMEOUT", "900")))
+# Bump when a deployed native index needs one-time structural maintenance even
+# though its source/profile checkpoint is already complete.
+CANONICAL_INDEX_LAYOUT_VERSION = 1
 try:
     CANONICAL_REFRESH_COOLDOWN = max(
         0.0, float(os.getenv("FUNES_CANONICAL_REFRESH_COOLDOWN", "300"))
@@ -297,6 +300,7 @@ def source_state() -> dict[str, object]:
         and optimize.get("fingerprint") == build_profile["fingerprint"]
         and optimize.get("memory") == build_memory
         and optimize.get("index_fingerprint") == checkpoint.get("index_fingerprint")
+        and optimize.get("index_layout_version") == CANONICAL_INDEX_LAYOUT_VERSION
     )
     return {
         "configured": True,
@@ -687,15 +691,15 @@ def _partition_source_rankings(
         for item in hits:
             public_item = _public_source_item(item)
             is_session = str(item.get("source_type", "")).lower() in NATIVE_SESSION_TYPES
+            source_agent = _normalized_harness_agent(item.get("source_agent"))
+            if harness and (
+                not fallback_enabled or source_agent != expected_agent
+            ):
+                continue
             if is_session:
-                source_agent = _normalized_harness_agent(item.get("source_agent"))
                 # The native index cannot authoritatively apply role/date
-                # filters, so the sidecar must also honor harness when it
-                # returns session rows for those requests.
-                if harness and (
-                    not fallback_enabled or source_agent != expected_agent
-                ):
-                    continue
+                # filters, so these rows remain available as a sidecar-only
+                # fallback after every requested provenance facet is applied.
                 eligible_hits.append(public_item)
                 if native_filterable:
                     fallback_hits.append(public_item)
@@ -1701,6 +1705,7 @@ def native_optimize_marker(
         **profile,
         "memory": memory or index_memory(),
         "index_fingerprint": index_fingerprint,
+        "index_layout_version": CANONICAL_INDEX_LAYOUT_VERSION,
         "status": status,
         "optimized_at": utc_now(),
         "revision": int(previous.get("revision") or 0) + 1,
@@ -1721,6 +1726,8 @@ def optimize_canonical_index(
             previous.get("status") == "optimized"
             and previous.get("fingerprint") == profile["fingerprint"]
             and previous.get("memory") == memory
+            and previous.get("index_layout_version")
+            == CANONICAL_INDEX_LAYOUT_VERSION
             and int(previous.get("revision") or 0) > 0
         ):
             return False
@@ -2497,8 +2504,8 @@ _DEADLINE_RUN_LOCK = threading.Lock()
 _DEADLINE_RUNS: dict[str, tuple[threading.Event, dict[str, object]]] = {}
 
 
-def _start_before_deadline(invoke, deadline: float, *, thread_name: str):
-    """Start a blocking dependency behind a caller-owned monotonic deadline.
+def _run_before_deadline(invoke, deadline: float, *, thread_name: str):
+    """Run a blocking dependency behind a caller-owned monotonic deadline.
 
     At most one ignored-timeout call may survive for each dependency name.
     Later callers fail fast rather than creating unbounded daemon threads or
@@ -2532,20 +2539,7 @@ def _start_before_deadline(invoke, deadline: float, *, thread_name: str):
         # NativeMcpWorker receives the same deadline and terminates its
         # subprocess on timeout. This is the final HTTP safeguard for a
         # wedged Python call or dependency that ignores its timeout.
-        thread = threading.Thread(target=runner, name=thread_name, daemon=True)
-        try:
-            thread.start()
-        except Exception:
-            if _DEADLINE_RUNS.get(thread_name) is state:
-                _DEADLINE_RUNS.pop(thread_name, None)
-            raise
-    return state
-
-
-def _await_before_deadline(
-    state: tuple[threading.Event, dict[str, object]], deadline: float
-):
-    """Await one previously started deadline run without starting it again."""
+        threading.Thread(target=runner, name=thread_name, daemon=True).start()
     done, outcome = state
     if not done.wait(max(0.0, deadline - time.monotonic())):
         raise TimeoutError("operation deadline exhausted")
@@ -2553,16 +2547,6 @@ def _await_before_deadline(
     if error is not None:
         raise error
     return outcome.get("value")
-
-
-def _run_before_deadline(invoke, deadline: float, *, thread_name: str):
-    """Start and await a dependency, preserving the original helper contract."""
-    state = _start_before_deadline(
-        invoke,
-        deadline,
-        thread_name=thread_name,
-    )
-    return _await_before_deadline(state, deadline)
 
 
 def _http_native_results(
@@ -2975,43 +2959,6 @@ class Handler(BaseHTTPRequestHandler):
                         search_source_rankings(raw_query, limit, filters, harness)
                     )
                 sidecar_results = stable_rrf(source_rankings, limit)
-                bm25_hedge_state = None
-                bm25_hedge_attempted = False
-
-                def start_bm25_hedge():
-                    nonlocal bm25_hedge_attempted, bm25_hedge_state
-                    if bm25_hedge_attempted:
-                        return bm25_hedge_state
-                    bm25_hedge_attempted = True
-                    bm25_hedge_state = _start_before_deadline(
-                        lambda: search_source_bm25_rankings(
-                            raw_query, limit, filters, harness
-                        ),
-                        voyage_deadline,
-                        thread_name="funes-http-sidecar-bm25",
-                    )
-                    return bm25_hedge_state
-
-                def await_bm25_hedge():
-                    state = start_bm25_hedge()
-                    if state is None:
-                        raise _DeadlineRunBusyError("sidecar BM25 hedge unavailable")
-                    return _await_before_deadline(state, voyage_deadline)
-
-                hedge_filtered_voyage = (
-                    voyage_hot_path
-                    and not source_restore_error
-                    and bool(filters or harness)
-                )
-                if hedge_filtered_voyage:
-                    try:
-                        # Filtered native recalls are more exposed to provider
-                        # tail latency. Start one raw lexical lookup now, but do
-                        # not put it on the successful native response path.
-                        start_bm25_hedge()
-                    except Exception:
-                        # Native remains authoritative while it is healthy.
-                        pass
                 has_cjk = (
                     LANGUAGE_MODE == "auto"
                     and any("\u4e00" <= char <= "\u9fff" for char in raw_query)
@@ -3152,7 +3099,13 @@ class Handler(BaseHTTPRequestHandler):
                             # Search with the caller's raw query and share the
                             # original Voyage HTTP deadline.
                             lexical_rankings, _session_fallback = (
-                                await_bm25_hedge()
+                                _run_before_deadline(
+                                    lambda: search_source_bm25_rankings(
+                                        raw_query, limit, filters, harness
+                                    ),
+                                    voyage_deadline,
+                                    thread_name="funes-http-sidecar-bm25",
+                                )
                             )
                         except Exception:
                             # Optional local augmentation cannot downgrade a
@@ -3168,7 +3121,13 @@ class Handler(BaseHTTPRequestHandler):
                 if native_failure and voyage_hot_path and not source_restore_error:
                     try:
                         source_rankings, session_fallback_rankings = (
-                            await_bm25_hedge()
+                            _run_before_deadline(
+                                lambda: search_source_bm25_rankings(
+                                    raw_query, limit, filters, harness
+                                ),
+                                voyage_deadline,
+                                thread_name="funes-http-sidecar-bm25",
+                            )
                         )
                     except Exception:
                         # A degraded lookup must not turn a provider outage

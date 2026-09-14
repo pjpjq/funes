@@ -1434,6 +1434,112 @@ class ServiceTests(unittest.TestCase):
         finally:
             store.close()
 
+    def test_native_optimize_layout_version_migrates_legacy_sync_state(self):
+        store = Store(self.tmp.name)
+        marker = {
+            "fingerprint": "legacy-profile",
+            "status": "optimized",
+            "optimized_at": "2026-09-13T02:00:00Z",
+            "revision": 1,
+        }
+        self.assertTrue(store.set_native_optimize_checkpoint(marker))
+        store.close()
+
+        connection = sqlite3.connect(Path(self.tmp.name) / "funes.sqlite3")
+        with connection:
+            connection.execute(
+                "ALTER TABLE sync_state DROP COLUMN native_optimize_layout_version"
+            )
+        connection.close()
+
+        migrated = Store(self.tmp.name)
+        try:
+            columns = {
+                row[1]: row
+                for row in migrated.conn.execute("PRAGMA table_info(sync_state)")
+            }
+            self.assertIn("native_optimize_layout_version", columns)
+            self.assertEqual(columns["native_optimize_layout_version"][3], 1)
+            self.assertEqual(columns["native_optimize_layout_version"][4], "0")
+            checkpoint = migrated.native_optimize_checkpoint()
+            self.assertEqual(checkpoint["fingerprint"], "legacy-profile")
+            self.assertEqual(checkpoint["index_layout_version"], 0)
+        finally:
+            migrated.close()
+
+    def test_native_optimize_layout_version_snapshot_roundtrip(self):
+        source = Store(self.tmp.name)
+        marker = {
+            "fingerprint": "profile-v2",
+            "index_fingerprint": "index-v2",
+            "index_layout_version": 2,
+            "status": "optimized",
+            "optimized_at": "2026-09-13T02:00:00Z",
+            "revision": 4,
+        }
+        snapshot = Path(self.tmp.name) / "layout-version.jsonl.gz"
+        target_dir = tempfile.TemporaryDirectory()
+        target = Store(target_dir.name)
+        try:
+            self.assertTrue(source.set_native_optimize_checkpoint(marker))
+            source.snapshot(snapshot)
+            self.assertEqual(target.restore(snapshot), 0)
+            self.assertEqual(
+                target.native_optimize_checkpoint()["index_layout_version"], 2
+            )
+            with gzip.open(snapshot, "rt", encoding="utf-8") as stream:
+                optimize = next(
+                    json.loads(line)
+                    for line in stream
+                    if '"_funes_record": "native_optimize_checkpoint"' in line
+                )
+            self.assertEqual(optimize["index_layout_version"], 2)
+        finally:
+            source.close()
+            target.close()
+            target_dir.cleanup()
+
+    def test_native_optimize_old_marker_cannot_regress_layout_version(self):
+        store = Store(self.tmp.name)
+        current = {
+            "fingerprint": "profile",
+            "index_layout_version": 2,
+            "status": "optimized",
+            "optimized_at": "2026-09-13T02:00:00Z",
+            "revision": 1,
+        }
+        old_snapshot_marker = {
+            "fingerprint": "profile",
+            "status": "optimized",
+            "optimized_at": "2026-09-13T03:00:00Z",
+            "revision": 2,
+        }
+        legacy_dir = tempfile.TemporaryDirectory()
+        legacy = Store(legacy_dir.name)
+        try:
+            self.assertTrue(store.set_native_optimize_checkpoint(current))
+            self.assertEqual(
+                store.native_optimize_checkpoint()["index_layout_version"], 2
+            )
+            self.assertFalse(
+                store.set_native_optimize_checkpoint(old_snapshot_marker)
+            )
+            self.assertEqual(
+                store.native_optimize_checkpoint()["index_layout_version"], 2
+            )
+            self.assertEqual(store.native_optimize_checkpoint()["revision"], 1)
+
+            legacy.restore_documents(
+                [{**old_snapshot_marker, "_funes_record": "native_optimize_checkpoint"}]
+            )
+            self.assertEqual(
+                legacy.native_optimize_checkpoint()["index_layout_version"], 0
+            )
+        finally:
+            store.close()
+            legacy.close()
+            legacy_dir.cleanup()
+
     def test_http_never_returns_retrieval_text_even_when_legacy_flag_is_set(self):
         os.environ["RETURN_RETRIEVAL_TEXT"] = "true"
         server = self._server()

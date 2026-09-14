@@ -65,6 +65,13 @@ pub struct Hit {
     pub fused: f32,
 }
 
+/// One recall pipeline result carried to the MCP adapter as both the stable rendered text and the
+/// raw hits that produced it. CLI callers keep using [`recall`] and see only `text`.
+pub(crate) struct RecallResult {
+    pub text: String,
+    pub hits: Vec<(Hit, f64)>,
+}
+
 /// Matching blocks `scan` lists before it stops. What the cap dropped is always reported.
 const SCAN_HIT_CAP: usize = 200;
 
@@ -482,6 +489,25 @@ pub async fn recall_with_progress(
     Ok(crate::ui::render::recall_reply(&note, &hits, languages.as_deref()))
 }
 
+/// Recall once while retaining the raw hits for protocol adapters that expose additive structured
+/// data alongside the byte-stable agent rendering.
+pub(crate) async fn recall_filtered_result(
+    target: impl Into<Target>,
+    query: String,
+    k: usize,
+    candidates: usize,
+    neighbors: i64,
+    filter: RecallFilter,
+) -> Result<RecallResult> {
+    let (note, hits) = recall_hits(target, query, k, candidates, neighbors, filter, &|_| ()).await?;
+    Ok(recall_result(note, hits))
+}
+
+fn recall_result(note: String, hits: Vec<(Hit, f64)>) -> RecallResult {
+    let text = rendered(&note, &hits);
+    RecallResult { text, hits }
+}
+
 /// Recall against an already-opened immutable dataset. Only the MCP server's explicit opt-in
 /// default-memory path calls this; call-level overrides and every ordinary read open afresh.
 pub(crate) async fn recall_filtered_pinned(
@@ -491,7 +517,7 @@ pub(crate) async fn recall_filtered_pinned(
     candidates: usize,
     neighbors: i64,
     filter: RecallFilter,
-) -> Result<String> {
+) -> Result<RecallResult> {
     let progress = &|_: &str| ();
     let search = Search::new(query, candidates, filter)?;
     let mut pool = search
@@ -501,7 +527,7 @@ pub(crate) async fn recall_filtered_pinned(
         pool.hint(memory);
     }
     let (note, hits) = search.rank(vec![pool], k, neighbors, progress).await?;
-    Ok(rendered(&note, &hits))
+    Ok(recall_result(note, hits))
 }
 
 /// Run the recall pipeline over what `target` reads: hybrid retrieval, pooled with this host's

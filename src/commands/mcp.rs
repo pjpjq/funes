@@ -8,11 +8,70 @@ use crate::agents;
 use anyhow::Result;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{Implementation, ServerCapabilities, ServerConfig};
+use rmcp::model::{CallToolResult, Content, Implementation, ServerCapabilities, ServerConfig};
 use rmcp::transport::stdio;
 use rmcp::{schemars, tool, tool_handler, tool_router, ServerHandler, ServiceExt};
 use std::sync::Arc;
 use tokio::sync::OnceCell;
+
+#[derive(serde::Serialize)]
+struct StructuredRecall {
+    hits: Vec<StructuredHit>,
+}
+
+#[derive(serde::Serialize)]
+struct StructuredHit {
+    raw_text: String,
+    session_id: String,
+    seq: i64,
+    timestamp: String,
+    block_type: String,
+    harness: String,
+    score: f64,
+    neighbors: Vec<StructuredNeighbor>,
+}
+
+#[derive(serde::Serialize)]
+struct StructuredNeighbor {
+    raw_text: String,
+    seq: i64,
+    role: String,
+    block_type: String,
+}
+
+fn recall_tool_result(result: recall::RecallResult) -> CallToolResult {
+    let hits = result
+        .hits
+        .into_iter()
+        .map(|(hit, score)| StructuredHit {
+            raw_text: hit.text,
+            session_id: hit.session_id,
+            seq: hit.seq,
+            timestamp: hit.ts,
+            block_type: hit.block_type,
+            harness: hit.harness,
+            score,
+            neighbors: hit
+                .neighbors
+                .into_iter()
+                .map(|neighbor| StructuredNeighbor {
+                    raw_text: neighbor.text,
+                    seq: neighbor.seq,
+                    role: neighbor.role,
+                    block_type: neighbor.block_type,
+                })
+                .collect(),
+        })
+        .collect();
+    let mut response = CallToolResult::success(vec![Content::text(result.text)]);
+    response.structured_content =
+        Some(serde_json::to_value(StructuredRecall { hits }).expect("recall hits contain only JSON-compatible values"));
+    response
+}
+
+fn text_tool_result(text: String) -> CallToolResult {
+    CallToolResult::success(vec![Content::text(text)])
+}
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct RecallRequest {
@@ -243,7 +302,7 @@ impl Funes {
         candidates: usize,
         neighbors: i64,
         filter: recall::RecallFilter,
-    ) -> Result<String> {
+    ) -> Result<recall::RecallResult> {
         if self.pins_recall(&memory) {
             let cache = self
                 .pinned_recall
@@ -254,7 +313,7 @@ impl Funes {
             let pinned = cache.get_or_try_init(|| recall::pin_read(server_memory)).await?;
             recall::recall_filtered_pinned(pinned, query, k, candidates, neighbors, filter).await
         } else {
-            recall::recall(self.target(memory)?, query, k, candidates, neighbors, filter).await
+            recall::recall_filtered_result(self.target(memory)?, query, k, candidates, neighbors, filter).await
         }
     }
 
@@ -286,43 +345,41 @@ impl Funes {
             source_missing,
             memory,
         }): Parameters<RecallRequest>,
-    ) -> String {
-        noted(
-            match async {
-                self.recall_with_memory(
-                    memory,
-                    query,
-                    k.unwrap_or(recall::DEFAULT_K),
-                    candidates.unwrap_or(recall::DEFAULT_CANDIDATES),
-                    neighbors.unwrap_or(recall::DEFAULT_NEIGHBORS),
-                    recall::RecallFilter {
-                        block_type,
-                        role,
-                        harness,
-                        repo,
-                        since,
-                        until,
-                        source_identity,
-                        source_version,
-                        content_hash,
-                        updated_at,
-                        source_agent,
-                        source_type,
-                        project,
-                        device_id,
-                        content_type,
-                        source_missing,
-                    },
-                )
-                .await
-            }
+    ) -> CallToolResult {
+        match self
+            .recall_with_memory(
+                memory,
+                query,
+                k.unwrap_or(recall::DEFAULT_K),
+                candidates.unwrap_or(recall::DEFAULT_CANDIDATES),
+                neighbors.unwrap_or(recall::DEFAULT_NEIGHBORS),
+                recall::RecallFilter {
+                    block_type,
+                    role,
+                    since,
+                    until,
+                    harness,
+                    source_identity,
+                    source_version,
+                    content_hash,
+                    updated_at,
+                    source_agent,
+                    source_type,
+                    project,
+                    repo,
+                    device_id,
+                    content_type,
+                    source_missing,
+                },
+            )
             .await
-            {
-                Ok(s) if !s.is_empty() => s,
-                Ok(_) => "no results".to_string(),
-                Err(e) => format!("recall error: {e}"),
-            },
-        )
+        {
+            Ok(mut result) => {
+                result.text = noted(result.text);
+                recall_tool_result(result)
+            }
+            Err(e) => text_tool_result(noted(format!("recall error: {e}"))),
+        }
     }
 
     #[tool(
@@ -531,8 +588,11 @@ mod tests {
         );
         let first = first.unwrap();
         let concurrent = concurrent.unwrap();
-        assert_eq!(first, recall::rendered("", &[]));
-        assert_eq!(concurrent, first);
+        assert_eq!(first.text, recall::rendered("", &[]));
+        assert_eq!(concurrent.text, recall::rendered("", &[]));
+        let pinned_json = serde_json::to_value(recall_tool_result(first)).unwrap();
+        assert_eq!(pinned_json["content"][0]["text"], recall::rendered("", &[]));
+        assert_eq!(pinned_json["structuredContent"]["hits"], serde_json::json!([]));
 
         // Make a second Dataset::open impossible. The same server still recalls from its cached
         // handle, while an explicit call-level override must take the ordinary fresh-open path.
@@ -541,12 +601,13 @@ mod tests {
             .recall_with_memory(None, "unused".to_string(), 1, 1, 0, absent_facet())
             .await
             .unwrap();
-        assert_eq!(second, first);
+        assert_eq!(second.text, recall::rendered("", &[]));
 
         let override_error = server
             .recall_with_memory(Some(spec.clone()), "unused".to_string(), 1, 1, 0, absent_facet())
             .await
-            .unwrap_err();
+            .err()
+            .expect("an explicit override must open afresh");
         assert_eq!(
             override_error.to_string(),
             crate::memory::Memory::parse(&spec).empty_error().to_string()
@@ -576,5 +637,67 @@ mod tests {
         for value in [Some("1"), Some(" true "), Some("YES"), Some("on")] {
             assert!(pin_memory_value(value));
         }
+    }
+
+    #[test]
+    fn structured_recall_adds_raw_hits_without_changing_text_content() {
+        let hit = recall::Hit {
+            id: "raw-hit".into(),
+            memory: String::new(),
+            fused: 0.875,
+            text: "complete raw hit\nwith a second line".to_string(),
+            session_id: "session-123".to_string(),
+            workdir: "/tmp/project".to_string(),
+            turn_uuid: "turn-1".to_string(),
+            seq: 17,
+            ts: "2026-09-14T01:02:03Z".to_string(),
+            block_type: "text".to_string(),
+            harness: "codex".to_string(),
+            neighbors: vec![recall::Neighbor {
+                seq: 16,
+                role: "user".to_string(),
+                block_type: "text".to_string(),
+                text: "raw neighboring turn".to_string(),
+            }],
+        };
+        let hits = vec![(hit, 0.875)];
+        let text = recall::rendered("", &hits);
+
+        let response = recall_tool_result(recall::RecallResult {
+            text: text.clone(),
+            hits,
+        });
+        let json = serde_json::to_value(response).unwrap();
+
+        assert_eq!(json["content"][0]["text"], text);
+        assert_eq!(
+            json["structuredContent"]["hits"][0]["raw_text"],
+            "complete raw hit\nwith a second line"
+        );
+        assert_eq!(json["structuredContent"]["hits"][0]["session_id"], "session-123");
+        assert_eq!(json["structuredContent"]["hits"][0]["seq"], 17);
+        assert_eq!(
+            json["structuredContent"]["hits"][0]["timestamp"],
+            "2026-09-14T01:02:03Z"
+        );
+        assert_eq!(json["structuredContent"]["hits"][0]["block_type"], "text");
+        assert_eq!(json["structuredContent"]["hits"][0]["harness"], "codex");
+        assert_eq!(json["structuredContent"]["hits"][0]["score"], 0.875);
+        assert_eq!(
+            json["structuredContent"]["hits"][0]["neighbors"][0],
+            serde_json::json!({
+                "raw_text": "raw neighboring turn",
+                "seq": 16,
+                "role": "user",
+                "block_type": "text"
+            })
+        );
+    }
+
+    #[test]
+    fn recall_errors_keep_text_and_omit_structured_content() {
+        let json = serde_json::to_value(text_tool_result("recall error: broken".to_string())).unwrap();
+        assert_eq!(json["content"][0]["text"], "recall error: broken");
+        assert!(json.get("structuredContent").is_none());
     }
 }

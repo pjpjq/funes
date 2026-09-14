@@ -17,7 +17,7 @@ use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::{BatchUDF, Dataset, NewColumnTransform};
 use lance::index::vector::VectorIndexParams;
 use lance::index::DatasetIndexExt;
-use lance_index::scalar::{InvertedIndexParams, ScalarIndexParams};
+use lance_index::scalar::{BuiltinIndexType, InvertedIndexParams, ScalarIndexParams};
 use lance_index::vector::ivf::IvfBuildParams;
 use lance_index::vector::pq::PQBuildParams;
 use lance_index::IndexType;
@@ -143,6 +143,7 @@ const VECTOR_INDEX_MIN_ROWS: usize = 256;
 const TEXT_INDEX_NAME: &str = "text_idx";
 const VECTOR_INDEX_NAME: &str = "vector_idx";
 const SOURCE_IDENTITY_INDEX_NAME: &str = "source_identity_idx";
+const SOURCE_AGENT_INDEX_NAME: &str = "source_agent_idx";
 
 /// Build the FTS index on `text` and, once it has enough rows to train, the IVF_PQ index on
 /// `vector`. A small corpus falls back to brute-force vector recall until it reaches Lance's
@@ -217,6 +218,21 @@ async fn maintain_required_indexes(ds: &mut Dataset, on_phase: impl Fn(&str), re
         .context("creating source identity index")?;
         created = true;
     }
+    if Schema::from(ds.schema()).column_with_name("source_agent").is_some()
+        && (replace_existing || !existing.contains(SOURCE_AGENT_INDEX_NAME))
+    {
+        on_phase("source agent index");
+        ds.create_index(
+            &["source_agent"],
+            IndexType::Bitmap,
+            Some(SOURCE_AGENT_INDEX_NAME.to_string()),
+            &ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap),
+            replace_existing,
+        )
+        .await
+        .context("creating source agent index")?;
+        created = true;
+    }
     Ok(created)
 }
 
@@ -235,6 +251,9 @@ pub(crate) async fn indexes_need_rebuild(ds: &Dataset) -> Result<bool> {
     }
     if Schema::from(ds.schema()).column_with_name("source_identity").is_some() {
         required.push(SOURCE_IDENTITY_INDEX_NAME);
+    }
+    if Schema::from(ds.schema()).column_with_name("source_agent").is_some() {
+        required.push(SOURCE_AGENT_INDEX_NAME);
     }
     for name in required {
         if !indexes.iter().any(|index| index.name == name) {
@@ -475,7 +494,7 @@ pub(crate) fn build_batch_for_schema(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::RecordBatchIterator;
+    use arrow_array::{Float32Array, RecordBatchIterator};
     use lance::dataset::WriteParams;
     use lance_index::optimize::OptimizeOptions;
 
@@ -496,6 +515,7 @@ mod tests {
                 false,
             ),
             Field::new("source_identity", DataType::Utf8, true),
+            Field::new("source_agent", DataType::Utf8, true),
         ]))
     }
 
@@ -506,6 +526,9 @@ mod tests {
             .collect::<Vec<_>>();
         let identities = (start..start + rows)
             .map(|row| Some(format!("source-{row}")))
+            .collect::<Vec<_>>();
+        let agents = (start..start + rows)
+            .map(|row| Some(if row % 2 == 0 { "codex" } else { "pi" }))
             .collect::<Vec<_>>();
         let vectors = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
             (start..start + rows).map(|row| {
@@ -523,6 +546,7 @@ mod tests {
                 Arc::new(StringArray::from(texts)),
                 Arc::new(vectors),
                 Arc::new(StringArray::from(identities)),
+                Arc::new(StringArray::from(agents)),
             ],
         )
         .unwrap()
@@ -633,7 +657,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn index_maintenance_adds_vector_and_source_identity_indexes_after_growth() {
+    async fn index_maintenance_adds_vector_and_canonical_filter_indexes_after_growth() {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().join("chunks.lance");
         let first = indexable_batch(0, VECTOR_INDEX_MIN_ROWS - 1);
@@ -655,7 +679,19 @@ mod tests {
             .collect::<HashSet<_>>();
         assert!(initial.contains(TEXT_INDEX_NAME));
         assert!(initial.contains(SOURCE_IDENTITY_INDEX_NAME));
+        assert!(initial.contains(SOURCE_AGENT_INDEX_NAME));
         assert!(!initial.contains(VECTOR_INDEX_NAME));
+        let mut filtered = ds.scan();
+        filtered
+            .nearest("vector", &Float32Array::from(vec![0.0; 16]), 3)
+            .unwrap();
+        filtered.prefilter(true);
+        filtered.filter("source_agent = 'pi'").unwrap();
+        let plan = filtered.explain_plan(false).await.unwrap();
+        assert!(
+            plan.contains("ScalarIndexQuery"),
+            "source_agent prefilter must use source_agent_idx: {plan}"
+        );
 
         let appended = indexable_batch(VECTOR_INDEX_MIN_ROWS - 1, 77);
         ds.append(

@@ -91,6 +91,11 @@ except ValueError:
     VOYAGE_HTTP_TIMEOUT = 4.5
 PROMPT_VERSION = "funes-retrieval-v1"
 LANGUAGE_MODE = os.getenv("FUNES_RETRIEVAL_LANGUAGE_MODE", "raw").lower()
+SELECTIVE_BM25_RESULT_WINDOW = 6
+SELECTIVE_BM25_MAX_IDENTIFIER_CANDIDATES = 32
+SELECTIVE_BM25_MAX_IDENTIFIER_CHARS = 48
+SELECTIVE_BM25_MAX_RAW_QUERY_CHARS = 160
+SELECTIVE_BM25_MAX_RESULT_TEXT_CHARS = 8000
 INDEX_LOCK = threading.Lock()
 # Writes use the native memory lock inside the `funes` process.  Keep their
 # Python-level serialization separate from reads so a background ingest/push
@@ -932,6 +937,130 @@ def sidecar_has_exact_entities(query: str, results: list[dict]) -> bool:
         )
         for item in results[:3]
     )
+
+
+SELECTIVE_BM25_IDENTIFIER_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(?:"
+    r"[A-Za-z][A-Za-z0-9]{1,23}(?:[_-][A-Za-z0-9*]{1,24})+"
+    r"|[A-Za-z]{2,16}[0-9][A-Za-z0-9]{1,15}"
+    r")(?![A-Za-z0-9_])"
+)
+SELECTIVE_BM25_SENSITIVE_PARTS = frozenset(
+    {
+        "bearer",
+        "cookie",
+        "credential",
+        "credentials",
+        "key",
+        "passwd",
+        "password",
+        "secret",
+        "token",
+    }
+)
+SELECTIVE_BM25_SENSITIVE_PREFIXES = frozenset(
+    {"ghp", "githubpat", "sk", "xoxb", "xoxp"}
+)
+
+
+def _retrieval_source_group(item: dict) -> str | None:
+    """Return a non-secret source/session key used only for local grouping."""
+    metadata = item.get("metadata")
+    metadata = metadata if isinstance(metadata, dict) else {}
+    for name in ("session_id", "parent_session_id", "source_path"):
+        value = str(item.get(name) or metadata.get(name) or "").strip()
+        if value:
+            return f"{name}:{value}"
+    return None
+
+
+def _safe_selective_bm25_identifier(value: str) -> bool:
+    if not 3 <= len(value) <= SELECTIVE_BM25_MAX_IDENTIFIER_CHARS:
+        return False
+    parts = tuple(
+        part.casefold() for part in re.split(r"[_-]", value) if part
+    )
+    if (
+        any(part in SELECTIVE_BM25_SENSITIVE_PARTS for part in parts)
+        or (parts and parts[0] in SELECTIVE_BM25_SENSITIVE_PREFIXES)
+    ):
+        return False
+    # Long opaque components are much more likely to be credentials than API
+    # names. Word-like identifiers such as ``previous_response_id`` stay well
+    # below this bound component-by-component.
+    return all(len(part) <= 24 for part in parts)
+
+
+def should_augment_with_local_bm25(raw_query: str, results: list[dict]) -> bool:
+    """Select a local lexical pass without exposing or querying by hit text."""
+    if (
+        not any("\u4e00" <= char <= "\u9fff" for char in raw_query)
+        or cjk_ratio(raw_query) < TRANSLATION_THRESHOLD
+        or len(raw_query) > SELECTIVE_BM25_MAX_RAW_QUERY_CHARS
+        or SELECTIVE_BM25_IDENTIFIER_RE.search(raw_query) is not None
+    ):
+        return False
+    window = results[:SELECTIVE_BM25_RESULT_WINDOW]
+    if len(window) < 2:
+        return False
+    group_counts: dict[str, int] = {}
+    for item in window:
+        group = _retrieval_source_group(item)
+        if group is not None:
+            group_counts[group] = group_counts.get(group, 0) + 1
+    if not any(count >= 2 for count in group_counts.values()):
+        return False
+
+    occurrences: dict[str, int] = {}
+    candidates = set()
+    for item in window:
+        seen_in_result = set()
+        text = str(item.get("raw_text", ""))[
+            :SELECTIVE_BM25_MAX_RESULT_TEXT_CHARS
+        ]
+        for match in SELECTIVE_BM25_IDENTIFIER_RE.finditer(text):
+            candidate = match.group(0)
+            normalized = candidate.casefold()
+            if (
+                normalized in seen_in_result
+                or not _safe_selective_bm25_identifier(candidate)
+            ):
+                continue
+            if (
+                normalized not in candidates
+                and len(candidates)
+                >= SELECTIVE_BM25_MAX_IDENTIFIER_CANDIDATES
+            ):
+                continue
+            candidates.add(normalized)
+            seen_in_result.add(normalized)
+        for normalized in seen_in_result:
+            occurrences[normalized] = occurrences.get(normalized, 0) + 1
+            if occurrences[normalized] >= 2:
+                return True
+    return False
+
+
+def _fuse_diverse_rankings(
+    rankings: list[list[dict]], limit: int
+) -> list[dict]:
+    """Fuse the full union, then softly defer a third same-source result."""
+    fused = stable_rrf(
+        rankings,
+        max(1, sum(len(ranking) for ranking in rankings)),
+    )
+    diverse = []
+    deferred = []
+    group_counts: dict[str, int] = {}
+    for item in fused:
+        group = _retrieval_source_group(item)
+        if group is not None and group_counts.get(group, 0) >= 2:
+            deferred.append(item)
+            continue
+        diverse.append(item)
+        if group is not None:
+            group_counts[group] = group_counts.get(group, 0) + 1
+    return (diverse + deferred)[:limit]
 
 
 def query_text(raw: str) -> str:
@@ -2503,6 +2632,35 @@ class Handler(BaseHTTPRequestHandler):
                     )
                 else:
                     retrieval_degraded = ""
+                    selective_bm25 = (
+                        voyage_hot_path
+                        and should_augment_with_local_bm25(raw_query, results)
+                    )
+                    if selective_bm25:
+                        try:
+                            # The identifier is only a local ambiguity signal.
+                            # Search with the caller's raw query and share the
+                            # original Voyage HTTP deadline.
+                            lexical_rankings, _session_fallback = (
+                                _run_before_deadline(
+                                    lambda: search_source_bm25_rankings(
+                                        raw_query, limit, filters, harness
+                                    ),
+                                    voyage_deadline,
+                                    thread_name="funes-http-sidecar-bm25",
+                                )
+                            )
+                        except Exception:
+                            # Optional local augmentation cannot downgrade a
+                            # successful native result or expose dependency
+                            # details in the response/logs.
+                            pass
+                        else:
+                            if any(lexical_rankings):
+                                results = _fuse_diverse_rankings(
+                                    [results, *lexical_rankings],
+                                    limit,
+                                )
                 if native_failure and voyage_hot_path:
                     try:
                         source_rankings, session_fallback_rankings = (

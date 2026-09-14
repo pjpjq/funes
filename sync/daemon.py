@@ -3,11 +3,21 @@ import hashlib, logging, os, signal, threading, time
 from pathlib import Path
 from .config import Config
 from .discovery import _project_roots, discover_sources
-from .parsers import parse_file
+from .parsers import complete_line_offset, parse_file
 from .store import Store
 from .client import SyncClient
 from .native import NativeFunes
 log=logging.getLogger("funes.sync")
+
+
+def _is_appendable_source(source) -> bool:
+    return source.kind in {
+        "codex", "pi", "claude", "codex_session", "pi_session", "claude_session",
+    } or source.kind.endswith("session")
+
+
+def _cursor_offset(source, size: int) -> int:
+    return complete_line_offset(source.path, size) if _is_appendable_source(source) else size
 
 class SyncDaemon:
     def __init__(self, config=None, store=None, client=None):
@@ -78,10 +88,11 @@ class SyncDaemon:
             for source in sources:
                 try:
                     stat = source.path.stat()
+                    offset = _cursor_offset(source, stat.st_size)
                 except OSError:
                     continue
                 self.store.register_source(source, stat)
-                self.store.set_cursor(source.source_key, stat.st_size, stat.st_ino, stat.st_size)
+                self.store.set_cursor(source.source_key, offset, stat.st_ino, stat.st_size)
             self._backfill_marker.parent.mkdir(parents=True, exist_ok=True)
             self._backfill_marker.write_text(str(time.time()), encoding="utf-8")
             self._source_schema_marker.write_text(str(time.time()), encoding="utf-8")
@@ -105,14 +116,25 @@ class SyncDaemon:
             # No full reparse for unchanged files; append-only growth resumes at the byte cursor.
             if not refresh_source_schema and not repair_zero_record and not repair_automation and old and old[0] == st.st_size and old[1] == st.st_mtime and old[2] == st.st_ino:
                 continue
-            appendable = s.kind in {"codex", "pi", "claude", "codex_session", "pi_session", "claude_session"} or s.kind.endswith("session")
-            if not refresh_source_schema and not repair_zero_record and not repair_automation and has_records and appendable and cur and cur.get("inode")==st.st_ino and st.st_size>=cur.get("size",0):
-                start=cur.get("offset",0)
+            appendable = _is_appendable_source(s)
+            try:
+                offset = _cursor_offset(s, st.st_size)
+                can_append = not refresh_source_schema and not repair_zero_record and not repair_automation and (has_records or seeded_without_backfill) and appendable and cur and cur.get("inode")==st.st_ino and st.st_size>=cur.get("size",0)
+                if can_append:
+                    candidate = int(cur.get("offset", 0))
+                    # Legacy versions advanced cursors past an unterminated
+                    # JSONL record. A valid cursor normally returns after one
+                    # byte of look-behind; only a legacy mid-line cursor scans
+                    # backward and triggers this one-time full reconciliation.
+                    if complete_line_offset(s.path, candidate) == candidate:
+                        start = candidate
+            except OSError:
+                continue
             chunks=parse_file(s,start)
             total += self.store.upsert_chunks(chunks)
             if start == 0:
                 self.store.reconcile_source(s.source_key, {c.record_id for c in chunks})
-            self.store.set_cursor(s.source_key,st.st_size,st.st_ino,st.st_size)
+            self.store.set_cursor(s.source_key,offset,st.st_ino,st.st_size)
         if (self.config.initial_backfill or refresh_source_schema) and not self._backfill_marker.exists():
             self._backfill_marker.parent.mkdir(parents=True, exist_ok=True)
             self._backfill_marker.write_text(str(time.time()), encoding="utf-8")

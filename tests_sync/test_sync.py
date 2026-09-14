@@ -366,6 +366,194 @@ def test_fresh_install_without_initial_backfill_seeds_eof(tmp_path, monkeypatch)
     s.close()
 
 
+def test_appendable_cursor_waits_at_last_complete_newline(tmp_path, monkeypatch):
+    from sync.discovery import Source
+
+    c = cfg(tmp_path)
+    p = tmp_path / "rollout.jsonl"
+    header = json.dumps(
+        {"type": "session_meta", "payload": {"id": "cursor-session"}}
+    ) + "\n"
+    first = json.dumps(
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "id": "first",
+                "role": "user",
+                "content": "first complete turn",
+            },
+        }
+    ) + "\n"
+    partial = json.dumps(
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "id": "second",
+                "role": "assistant",
+                "content": "等待换行",
+            },
+        },
+        ensure_ascii=False,
+    )
+    p.write_text(header + first + partial, encoding="utf-8")
+    source = Source("codex:~/sessions/cursor.jsonl", "codex", p, c.device_id)
+    monkeypatch.setattr("sync.daemon.discover_sources", lambda _config: [source])
+    s = Store(config=c)
+    daemon = SyncDaemon(c, s, type("Client", (), {})())
+
+    assert daemon.scan_once() == 1
+
+    cursor = s.cursor(source.source_key)
+    complete_offset = len((header + first).encode("utf-8"))
+    assert cursor["offset"] == complete_offset
+    assert cursor["size"] == p.stat().st_size
+
+    with p.open("a", encoding="utf-8") as handle:
+        handle.write("\n")
+
+    assert daemon.scan_once() == 1
+    assert s.stats()["records"] == 2
+    s.close()
+
+
+def test_no_backfill_seed_preserves_unterminated_append(tmp_path, monkeypatch):
+    from sync.discovery import Source
+
+    c = cfg(tmp_path)
+    c.initial_backfill = False
+    p = tmp_path / "seed-rollout.jsonl"
+    header = json.dumps(
+        {"type": "session_meta", "payload": {"id": "seed-session"}}
+    ) + "\n"
+    historical = json.dumps(
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "id": "historical",
+                "role": "user",
+                "content": "must remain skipped",
+            },
+        }
+    ) + "\n"
+    partial = json.dumps(
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "id": "after-install",
+                "role": "user",
+                "content": "安装时尚未换行",
+            },
+        },
+        ensure_ascii=False,
+    )
+    p.write_text(header + historical + partial, encoding="utf-8")
+    source = Source("codex:~/sessions/seed.jsonl", "codex", p, c.device_id)
+    monkeypatch.setattr("sync.daemon.discover_sources", lambda _config: [source])
+    starts = []
+    real_parse = parse_file
+
+    def tracked_parse(item, start=0):
+        starts.append(start)
+        return real_parse(item, start)
+
+    monkeypatch.setattr("sync.daemon.parse_file", tracked_parse)
+    s = Store(config=c)
+    daemon = SyncDaemon(c, s, type("Client", (), {})())
+
+    assert daemon.scan_once() == 0
+
+    cursor = s.cursor(source.source_key)
+    complete_offset = len((header + historical).encode("utf-8"))
+    assert cursor["offset"] == complete_offset
+    assert cursor["size"] == p.stat().st_size
+
+    with p.open("a", encoding="utf-8") as handle:
+        handle.write("\n")
+
+    assert daemon.scan_once() == 1
+    assert starts == [complete_offset]
+    assert s.stats()["records"] == 1
+    s.close()
+
+
+def test_legacy_mid_line_cursor_forces_full_reconcile(tmp_path, monkeypatch):
+    from sync.discovery import Source
+
+    c = cfg(tmp_path)
+    p = tmp_path / "legacy-rollout.jsonl"
+    header = json.dumps(
+        {"type": "session_meta", "payload": {"id": "legacy-session"}}
+    ) + "\n"
+    stale_line = json.dumps(
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "id": "legacy-fragment",
+                "role": "assistant",
+                "content": "stale fragment",
+            },
+        }
+    ) + "\n"
+    p.write_text(header + stale_line, encoding="utf-8")
+    source = Source("codex:~/sessions/legacy.jsonl", "codex", p, c.device_id)
+    stale = parse_file(source)[0]
+    current_line = json.dumps(
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "id": "current",
+                "role": "assistant",
+                "content": "completed after upgrade",
+            },
+        }
+    )
+    p.write_text(header + current_line, encoding="utf-8")
+    before_append = p.stat()
+    legacy_offset = len(header.encode("utf-8")) + len(current_line.encode("utf-8")) // 2
+    monkeypatch.setattr("sync.daemon.discover_sources", lambda _config: [source])
+    starts = []
+    real_parse = parse_file
+
+    def tracked_parse(item, start=0):
+        starts.append(start)
+        return real_parse(item, start)
+
+    monkeypatch.setattr("sync.daemon.parse_file", tracked_parse)
+    s = Store(config=c)
+    s.register_source(source, before_append)
+    s.upsert_chunks([stale])
+    s.set_cursor(
+        source.source_key,
+        legacy_offset,
+        before_append.st_ino,
+        before_append.st_size,
+    )
+    for marker in (
+        "initial-backfill.complete",
+        "source-schema-v2.complete",
+        "zero-record-repair-v1.complete",
+    ):
+        (c.state_dir / marker).write_text("legacy", encoding="utf-8")
+    daemon = SyncDaemon(c, s, type("Client", (), {})())
+
+    with p.open("a", encoding="utf-8") as handle:
+        handle.write("\n")
+
+    assert daemon.scan_once() == 1
+    assert starts == [0]
+    assert s.get(stale.record_id)["source_missing"] is True
+    cursor = s.cursor(source.source_key)
+    assert cursor["offset"] == p.stat().st_size
+    assert cursor["size"] == p.stat().st_size
+    s.close()
+
+
 def test_empty_remote_ack_is_not_durable(tmp_path, monkeypatch):
     class EmptyResponse:
         status = 204

@@ -3666,6 +3666,24 @@ def test_deadline_runner_rejects_foreign_invocation_without_sharing_result():
     assert first_result == ["sentinel A"]
 
 
+def test_deadline_runner_start_failure_does_not_leave_busy_registry(monkeypatch):
+    thread_name = "test-funes-start-failure"
+
+    def fail_start(_thread):
+        raise RuntimeError("thread start failed")
+
+    monkeypatch.setattr(bridge.threading.Thread, "start", fail_start)
+
+    with pytest.raises(RuntimeError, match="thread start failed"):
+        bridge._start_before_deadline(
+            lambda: None,
+            time.monotonic() + 1,
+            thread_name=thread_name,
+        )
+
+    assert thread_name not in bridge._DEADLINE_RUNS
+
+
 @pytest.mark.parametrize(
     "filters",
     (
@@ -4046,6 +4064,148 @@ def test_http_selective_bm25_non_trigger_never_opens_sqlite(monkeypatch):
     assert status == 200
     assert recall_calls == ["why was context lost?"]
     assert body["results"] == first_results
+
+
+@pytest.mark.parametrize(
+    ("path", "request_scope", "expected_filters", "expected_harness"),
+    (
+        ("/search", {"repo": "owner/repo"}, {"repo": "owner/repo"}, None),
+        ("/recall", {"harness": "codex"}, {}, "codex"),
+    ),
+)
+def test_http_filtered_voyage_timeout_reuses_bm25_hedge_within_shared_deadline(
+    monkeypatch, path, request_scope, expected_filters, expected_harness
+):
+    raw_query = "hedged raw query"
+    hit = {
+        "source_identity": "bm25-hit",
+        "raw_text": "raw BM25 source of truth",
+    }
+    release_native = threading.Event()
+    native_finished = threading.Event()
+    native_started = threading.Event()
+    bm25_calls = []
+
+    def blocked_native(query, **_kwargs):
+        assert query == raw_query
+        native_started.set()
+        try:
+            release_native.wait(40)
+        finally:
+            native_finished.set()
+
+    def bounded_bm25(query, limit, filters, harness):
+        bm25_calls.append((query, limit, filters, harness))
+        assert native_started.wait(1)
+        time.sleep(0.22)
+        return [[hit]], []
+
+    app = SimpleNamespace(
+        store=SimpleNamespace(),
+        syncer=SimpleNamespace(restoring=False, restore_failed=False),
+    )
+    monkeypatch.setattr(bridge, "SOURCE_APP", app)
+    monkeypatch.setattr(bridge, "TOKEN", "test-token")
+    monkeypatch.setenv("FUNES_EMBEDDING_PROVIDER", "voyage")
+    monkeypatch.setattr(bridge, "VOYAGE_HTTP_TIMEOUT", 0.3)
+    monkeypatch.setattr(bridge, "VOYAGE_NATIVE_TIMEOUT", 0.12)
+    monkeypatch.setattr(bridge, "recall", blocked_native)
+    monkeypatch.setattr(bridge, "search_source_bm25_rankings", bounded_bm25)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    started = time.monotonic()
+    try:
+        status, body = _post(
+            server,
+            path,
+            {"query": raw_query, "limit": 3, **request_scope},
+        )
+        elapsed = time.monotonic() - started
+    finally:
+        release_native.set()
+        native_finished.wait(1)
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert elapsed < 0.3
+    assert status == 200
+    assert bm25_calls == [
+        (raw_query, 3, expected_filters, expected_harness)
+    ]
+    assert body["results"] == [hit]
+    assert body["results_text"] == hit["raw_text"]
+    assert body["retrieval_backend"] == "bm25"
+    assert body["retrieval_degraded"] == "voyage_unavailable"
+
+
+def test_http_filtered_voyage_success_does_not_wait_for_blocked_bm25(monkeypatch):
+    raw_query = "ordinary filtered query"
+    native_results = [
+        {"source_identity": "native-hit", "raw_text": "native raw result"}
+    ]
+    bm25_started = threading.Event()
+    release_bm25 = threading.Event()
+    bm25_finished = threading.Event()
+    bm25_calls = []
+
+    def native_recall(query, **_kwargs):
+        assert query == raw_query
+        assert bm25_started.wait(1)
+        return "native pass"
+
+    def blocked_bm25(query, limit, filters, harness):
+        bm25_calls.append((query, limit, filters, harness))
+        bm25_started.set()
+        try:
+            release_bm25.wait(40)
+            return [], []
+        finally:
+            bm25_finished.set()
+
+    app = SimpleNamespace(
+        store=SimpleNamespace(),
+        syncer=SimpleNamespace(restoring=False, restore_failed=False),
+    )
+    monkeypatch.setattr(bridge, "SOURCE_APP", app)
+    monkeypatch.setattr(bridge, "TOKEN", "test-token")
+    monkeypatch.setenv("FUNES_EMBEDDING_PROVIDER", "voyage")
+    monkeypatch.setattr(bridge, "VOYAGE_HTTP_TIMEOUT", 0.4)
+    monkeypatch.setattr(bridge, "VOYAGE_NATIVE_TIMEOUT", 0.2)
+    monkeypatch.setattr(bridge, "recall", native_recall)
+    monkeypatch.setattr(
+        bridge,
+        "materialize_native_results",
+        lambda output, *_args, **_kwargs: native_results
+        if output == "native pass"
+        else [],
+    )
+    monkeypatch.setattr(bridge, "search_source_bm25_rankings", blocked_bm25)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    started = time.monotonic()
+    try:
+        status, body = _post(
+            server,
+            "/search",
+            {"query": raw_query, "limit": 3, "repo": "owner/repo"},
+        )
+        elapsed = time.monotonic() - started
+    finally:
+        release_bm25.set()
+        bm25_finished.wait(1)
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert elapsed < 0.2
+    assert status == 200
+    assert bm25_calls == [(raw_query, 3, {"repo": "owner/repo"}, None)]
+    assert body["results"] == native_results
+    assert body["retrieval_backend"] == "voyage_lance_bm25_rrf"
+    assert "retrieval_degraded" not in body
 
 
 def test_http_selective_bm25_timeout_returns_first_pass_within_shared_deadline(

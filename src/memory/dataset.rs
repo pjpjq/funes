@@ -29,7 +29,7 @@ use lance::dataset::{
 use lance::index::vector::VectorIndexParams;
 use lance::index::{DatasetIndexExt, DatasetIndexInternalExt};
 use lance_index::optimize::OptimizeOptions;
-use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams};
+use lance_index::scalar::{BuiltinIndexType, FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams};
 use lance_index::vector::ivf::IvfBuildParams;
 use lance_index::vector::pq::PQBuildParams;
 use lance_index::{IndexParams, IndexType};
@@ -764,6 +764,10 @@ pub async fn build_indexes(ds: &mut Dataset, on_event: impl Fn(IndexBuildEvent))
         )
         .await?;
     }
+    if has_column(ds, "source_agent") {
+        refresh_or_build(ds, &SOURCE_AGENT, &existing,
+            &ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap), &on_event).await?;
+    }
     Ok(())
 }
 
@@ -781,8 +785,10 @@ pub(crate) async fn indexes_need_rebuild(ds: &Dataset) -> Result<bool> {
     if fts_needs_refresh(ds).await? {
         return Ok(true);
     }
-    if has_column(ds, "source_identity") && !ds.unindexed_fragments(SOURCE_IDENTITY_INDEX_NAME).await?.is_empty() {
-        return Ok(true);
+    for (column, index) in [("source_identity", SOURCE_IDENTITY_INDEX_NAME), ("source_agent", SOURCE_AGENT_INDEX_NAME)] {
+        if has_column(ds, column) && !ds.unindexed_fragments(index).await?.is_empty() {
+            return Ok(true);
+        }
     }
     if ivf_pq_params(ds).is_none()
         || ds
@@ -837,6 +843,14 @@ const SOURCE_IDENTITY: IndexSpec = IndexSpec {
     column: "source_identity",
     index_type: IndexType::BTree,
     label: "source identity index",
+};
+
+const SOURCE_AGENT_INDEX_NAME: &str = "source_agent_idx";
+const SOURCE_AGENT: IndexSpec = IndexSpec {
+    name: SOURCE_AGENT_INDEX_NAME,
+    column: "source_agent",
+    index_type: IndexType::Bitmap,
+    label: "source agent index",
 };
 
 /// Refresh `index` if `existing` lists it, else build it whole with `params`. A refresh that fails
@@ -1489,7 +1503,8 @@ mod tests {
             events.borrow().as_slice(),
             [
                 IndexBuildEvent::Building("text search index"),
-                IndexBuildEvent::Building("source identity index")
+                IndexBuildEvent::Building("source identity index"),
+                IndexBuildEvent::Building("source agent index")
             ]
         ));
         let indexes = sub_index_counts(&ds).await.unwrap();
@@ -2103,6 +2118,7 @@ mod tests {
                 false,
             ),
             Field::new("source_identity", DataType::Utf8, true),
+            Field::new("source_agent", DataType::Utf8, true),
         ]))
     }
 
@@ -2113,6 +2129,9 @@ mod tests {
             .collect::<Vec<_>>();
         let identities = (start..start + rows)
             .map(|row| Some(format!("source-{row}")))
+            .collect::<Vec<_>>();
+        let agents = (start..start + rows)
+            .map(|row| Some(if row % 2 == 0 { "codex" } else { "pi" }))
             .collect::<Vec<_>>();
         let vectors = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
             (start..start + rows).map(|row| {
@@ -2130,6 +2149,7 @@ mod tests {
                 Arc::new(StringArray::from(texts)),
                 Arc::new(vectors),
                 Arc::new(StringArray::from(identities)),
+                Arc::new(StringArray::from(agents)),
             ],
         )
         .unwrap()
@@ -2221,6 +2241,7 @@ mod tests {
         optimize_index(&mut ds, SOURCE_IDENTITY_INDEX_NAME, 1, |_| {})
             .await
             .unwrap();
+        optimize_index(&mut ds, SOURCE_AGENT_INDEX_NAME, 1, |_| {}).await.unwrap();
         assert!(!ds.unindexed_fragments(VECTOR_INDEX).await.unwrap().is_empty());
         assert!(!indexes_need_rebuild(&ds).await.unwrap());
         let vector = vectors(1).pop().unwrap();
@@ -2263,7 +2284,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn index_maintenance_adds_vector_and_source_identity_indexes_after_growth() {
+    async fn index_maintenance_adds_vector_and_canonical_filter_indexes_after_growth() {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().join("chunks.lance");
         let first = indexable_batch(0, 255);
@@ -2285,7 +2306,19 @@ mod tests {
             .collect::<HashSet<_>>();
         assert!(initial.contains(FTS_INDEX));
         assert!(initial.contains(SOURCE_IDENTITY_INDEX_NAME));
+        assert!(initial.contains(SOURCE_AGENT_INDEX_NAME));
         assert!(!initial.contains(VECTOR_INDEX));
+        let mut filtered = ds.scan();
+        filtered
+            .nearest("vector", &Float32Array::from(vec![0.0; DIM as usize]), 3)
+            .unwrap();
+        filtered.prefilter(true);
+        filtered.filter("source_agent = 'pi'").unwrap();
+        let plan = filtered.explain_plan(false).await.unwrap();
+        assert!(
+            plan.contains("ScalarIndexQuery"),
+            "source_agent prefilter must use source_agent_idx: {plan}"
+        );
 
         let appended = indexable_batch(255, 77);
         ds.append(

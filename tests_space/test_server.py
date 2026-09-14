@@ -606,13 +606,33 @@ def test_sync_status_alias_returns_ready_payload(monkeypatch):
     assert "chunks: 12" in body["status"]
 
 
-def test_get_ready_is_lightweight_and_never_runs_native_status(monkeypatch):
+def test_get_ready_is_constant_time_and_never_touches_storage(monkeypatch):
+    class Store:
+        def __getattribute__(self, name):
+            raise AssertionError(f"GET /ready must not access store.{name}")
+
+    app = SimpleNamespace(
+        store=Store(),
+        syncer=SimpleNamespace(restoring=False, restore_failed=False),
+        restore_result=12,
+    )
     monkeypatch.setattr(bridge, "TOKEN", "test-token")
     monkeypatch.setattr(bridge, "REMOTE", "owner/memory")
+    monkeypatch.setenv("FUNES_STORAGE_REPO", "owner/source")
+    monkeypatch.setattr(bridge, "SOURCE_APP", app)
     monkeypatch.setattr(
         bridge,
         "source_state",
-        lambda: {"configured": True, "ready": True, "documents": 12},
+        lambda: (_ for _ in ()).throw(
+            AssertionError("GET /ready must not build full source status")
+        ),
+    )
+    monkeypatch.setattr(
+        bridge,
+        "source_app",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("GET /ready must not initialize the source app")
+        ),
     )
     monkeypatch.setattr(bridge, "warm_state", lambda: {"state": "ready"})
     monkeypatch.setattr(
@@ -639,7 +659,12 @@ def test_get_ready_is_lightweight_and_never_runs_native_status(monkeypatch):
     assert response.status == 200
     assert body["ok"] is True
     assert body["remote"] == "owner/memory"
-    assert body["source_store"]["documents"] == 12
+    assert body["source_store"] == {
+        "configured": True,
+        "ready": True,
+        "restoring": False,
+        "restored": 12,
+    }
     assert body["native_warm"]["state"] == "ready"
     assert body["status"] == ""
 
@@ -649,6 +674,8 @@ def test_ready_retries_failed_warm_without_sidecar_then_recovers(monkeypatch):
     queued_warms = []
     monkeypatch.setattr(bridge, "TOKEN", "test-token")
     monkeypatch.setattr(bridge, "REMOTE", "owner/memory")
+    monkeypatch.delenv("FUNES_STORAGE_REPO", raising=False)
+    monkeypatch.setattr(bridge, "SOURCE_APP", None)
     monkeypatch.setattr(
         bridge,
         "_WARM_STATE",
@@ -662,7 +689,9 @@ def test_ready_retries_failed_warm_without_sidecar_then_recovers(monkeypatch):
     monkeypatch.setattr(
         bridge,
         "source_state",
-        lambda: {"configured": False, "ready": False, "documents": 0},
+        lambda: (_ for _ in ()).throw(
+            AssertionError("GET /ready must not build full source status")
+        ),
     )
     monkeypatch.setattr(
         bridge,
@@ -727,12 +756,25 @@ def test_ready_retries_failed_warm_without_sidecar_then_recovers(monkeypatch):
 
 
 def test_get_ready_returns_immediate_503_during_source_restore(monkeypatch):
+    class Store:
+        def __getattribute__(self, name):
+            raise AssertionError(f"GET /ready must not access store.{name}")
+
+    app = SimpleNamespace(
+        store=Store(),
+        syncer=SimpleNamespace(restoring=True, restore_failed=False),
+        restore_result=0,
+    )
     monkeypatch.setattr(bridge, "TOKEN", "test-token")
     monkeypatch.setattr(bridge, "REMOTE", "owner/memory")
+    monkeypatch.setenv("FUNES_STORAGE_REPO", "owner/source")
+    monkeypatch.setattr(bridge, "SOURCE_APP", app)
     monkeypatch.setattr(
         bridge,
         "source_state",
-        lambda: {"configured": True, "ready": False, "restoring": True},
+        lambda: (_ for _ in ()).throw(
+            AssertionError("GET /ready must not build full source status")
+        ),
     )
     monkeypatch.setattr(bridge, "warm_state", lambda: {"state": "ready"})
     monkeypatch.setattr(
@@ -1769,6 +1811,7 @@ def test_native_environment_uses_safe_production_defaults(monkeypatch, tmp_path)
     assert env["FUNES_EMBEDDING_SCHEMA_VERSION"] == "2"
     assert env["FUNES_RERANK_PROVIDER"] == "none"
     assert env["FUNES_NATIVE_FALLBACK"] == "false"
+    assert env["FUNES_MCP_PIN_MEMORY"] == "true"
     assert env["FUNES_RETRIEVAL_LANGUAGE_MODE"] == "raw"
 
 

@@ -269,6 +269,7 @@ fn rerank_relevance(kind: RerankScoreKind, score: f32) -> f64 {
 }
 
 /// A dataset opened for reading.
+#[derive(Clone)]
 struct Read {
     ds: Dataset,
     /// A degradation note to prepend to the command's output (e.g. the remote was unreachable);
@@ -277,6 +278,14 @@ struct Read {
     /// Label of the memory the dataset actually came from (the requested one, or the local memory
     /// after an offline degrade).
     memory_label: Option<String>,
+}
+
+/// One immutable dataset opened for a long-lived MCP server. The dataset stays opaque here so the
+/// caller cannot bypass the recall pipeline's profile checks, filtering, neighbor expansion, or
+/// rendering contract.
+pub(crate) struct PinnedRead {
+    read: Read,
+    requested_label: String,
 }
 
 /// What a read verb does about the memory's state: query it, degrade to the local index, or point a
@@ -337,6 +346,15 @@ async fn open_read(memory: &Memory) -> Result<Read> {
         )),
         ReadOutcome::NoIndex => Err(no_index_error()),
     }
+}
+
+/// Open the server's default memory once for immutable, process-lifetime recall. This is an
+/// explicit MCP-only optimization; normal CLI and MCP reads continue through [`open_read`] for
+/// every call and therefore resolve a remote's current head.
+pub(crate) async fn pin_read(memory: Memory) -> Result<PinnedRead> {
+    let requested_label = memory.label();
+    let read = open_read(&memory).await?;
+    Ok(PinnedRead { read, requested_label })
 }
 
 fn native_fallback_enabled() -> bool {
@@ -462,6 +480,28 @@ pub async fn recall_with_progress(
     let languages = rephrase_languages(pools.iter().map(|pool| &pool.ds));
     let (note, hits) = search.rank(pools, k, neighbors, progress).await?;
     Ok(crate::ui::render::recall_reply(&note, &hits, languages.as_deref()))
+}
+
+/// Recall against an already-opened immutable dataset. Only the MCP server's explicit opt-in
+/// default-memory path calls this; call-level overrides and every ordinary read open afresh.
+pub(crate) async fn recall_filtered_pinned(
+    pinned: &PinnedRead,
+    query: String,
+    k: usize,
+    candidates: usize,
+    neighbors: i64,
+    filter: RecallFilter,
+) -> Result<String> {
+    let progress = &|_: &str| ();
+    let search = Search::new(query, candidates, filter)?;
+    let mut pool = search
+        .candidates_read(pinned.read.clone(), &pinned.requested_label, progress)
+        .await?;
+    if let Some(memory) = pinned.read.memory_label.as_deref() {
+        pool.hint(memory);
+    }
+    let (note, hits) = search.rank(vec![pool], k, neighbors, progress).await?;
+    Ok(rendered(&note, &hits))
 }
 
 /// Run the recall pipeline over what `target` reads: hybrid retrieval, pooled with this host's
@@ -620,6 +660,10 @@ impl Search {
     pub async fn candidates(&self, memory: &Memory, progress: &(dyn Fn(&str) + Sync)) -> Result<Candidates> {
         progress(&format!("searching {}…", memory.label()));
         let read = open_read(memory).await?;
+        self.candidates_read(read, &memory.label(), progress).await
+    }
+
+    async fn candidates_read(&self, read: Read, label: &str, progress: &(dyn Fn(&str) + Sync)) -> Result<Candidates> {
         // An older transcript memory has no canonical provenance to match.
         if self
             .canonical_columns
@@ -654,10 +698,10 @@ impl Search {
         if embedded_by != &profile.fingerprint {
             bail!(
                 "{} and the other memory of this search use different embedding profiles",
-                memory.label()
+                label
             );
         }
-        progress(&format!("searching {}…", memory.label()));
+        progress(&format!("searching {label}…"));
         let hits = hybrid_candidates(&read.ds, qv, &self.query, self.candidates, self.where_clause.as_deref()).await?;
         Ok(Candidates {
             ds: read.ds,

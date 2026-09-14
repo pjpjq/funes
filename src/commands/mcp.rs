@@ -11,6 +11,8 @@ use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{Implementation, ServerCapabilities, ServerConfig};
 use rmcp::transport::stdio;
 use rmcp::{schemars, tool, tool_handler, tool_router, ServerHandler, ServiceExt};
+use std::sync::Arc;
+use tokio::sync::OnceCell;
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct RecallRequest {
@@ -176,11 +178,26 @@ fn noted(text: String) -> String {
     }
 }
 
+fn pin_memory_enabled() -> bool {
+    let value = std::env::var("FUNES_MCP_PIN_MEMORY").ok();
+    pin_memory_value(value.as_deref())
+}
+
+fn pin_memory_value(value: Option<&str>) -> bool {
+    matches!(
+        value.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
+}
+
 #[derive(Clone)]
 pub(crate) struct Funes {
     /// The memory the server was started on (`funes mcp <memory>`), read by every call naming
     /// none; `None` leaves those calls to the host's binding, as on the CLI.
     memory: Option<String>,
+    /// Set only for an explicit server memory plus `FUNES_MCP_PIN_MEMORY=true`. Tool-call memory
+    /// overrides never touch this cache and retain the normal resolve-current-head behavior.
+    pinned_recall: Option<Arc<OnceCell<recall::PinnedRead>>>,
     #[allow(dead_code)]
     tool_router: ToolRouter<Funes>,
 }
@@ -188,7 +205,15 @@ pub(crate) struct Funes {
 #[tool_router]
 impl Funes {
     fn new(memory: Option<String>) -> Self {
+        Self::new_with_pin(memory, pin_memory_enabled())
+    }
+
+    fn new_with_pin(memory: Option<String>, pin_memory: bool) -> Self {
+        let memory = memory
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
         Self {
+            pinned_recall: (pin_memory && memory.is_some()).then(|| Arc::new(OnceCell::new())),
             memory,
             tool_router: Self::tool_router(),
         }
@@ -199,6 +224,37 @@ impl Funes {
         match spec.filter(|s| !s.trim().is_empty()) {
             Some(spec) => Target::resolve(Some(&spec)),
             None => Target::served(self.memory.as_deref()),
+        }
+    }
+
+    /// Only an omitted (or blank) call-level memory is the server default. Even an override that
+    /// names the same URI deliberately takes the fresh path: spelling an override is an explicit
+    /// request to retain ordinary per-call resolution semantics.
+    fn pins_recall(&self, spec: &Option<String>) -> bool {
+        self.pinned_recall.is_some() && spec.as_deref().is_none_or(|value| value.trim().is_empty())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn recall_with_memory(
+        &self,
+        memory: Option<String>,
+        query: String,
+        k: usize,
+        candidates: usize,
+        neighbors: i64,
+        filter: recall::RecallFilter,
+    ) -> Result<String> {
+        if self.pins_recall(&memory) {
+            let cache = self
+                .pinned_recall
+                .as_ref()
+                .expect("pins_recall requires a configured cache");
+            let server_memory =
+                crate::memory::Memory::parse(self.memory.as_deref().expect("pinned memory is explicit"));
+            let pinned = cache.get_or_try_init(|| recall::pin_read(server_memory)).await?;
+            recall::recall_filtered_pinned(pinned, query, k, candidates, neighbors, filter).await
+        } else {
+            recall::recall(self.target(memory)?, query, k, candidates, neighbors, filter).await
         }
     }
 
@@ -233,8 +289,8 @@ impl Funes {
     ) -> String {
         noted(
             match async {
-                recall::recall(
-                    self.target(memory)?,
+                self.recall_with_memory(
+                    memory,
                     query,
                     k.unwrap_or(recall::DEFAULT_K),
                     candidates.unwrap_or(recall::DEFAULT_CANDIDATES),
@@ -420,4 +476,105 @@ pub async fn run(memory: Option<String>) -> Result<()> {
     let service = Funes::new(memory).serve(stdio()).await?;
     service.waiting().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_array::types::Float32Type;
+    use arrow_array::{ArrayRef, FixedSizeListArray, RecordBatch, RecordBatchIterator};
+    use arrow_schema::{DataType, Field, Schema};
+    use lance::dataset::Dataset;
+
+    async fn legacy_memory() -> tempfile::TempDir {
+        let memory = tempfile::tempdir().unwrap();
+        let dimension = crate::memory::dataset::DIM;
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "vector",
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), dimension),
+            true,
+        )]));
+        let vectors: ArrayRef = Arc::new(FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
+            [Some(vec![Some(0.0); dimension as usize])],
+            dimension,
+        ));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![vectors]).unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let dataset = Dataset::write(
+            reader,
+            crate::memory::dataset::table_uri(memory.path().to_str().unwrap()).as_str(),
+            None,
+        )
+        .await
+        .unwrap();
+        drop(dataset);
+        memory
+    }
+
+    fn absent_facet() -> recall::RecallFilter {
+        recall::RecallFilter {
+            source_identity: Some("not-in-legacy-schema".to_string()),
+            ..recall::RecallFilter::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_and_sequential_default_recalls_open_once_but_an_override_opens_fresh() {
+        let memory = legacy_memory().await;
+        let spec = memory.path().to_string_lossy().into_owned();
+        let server = Funes::new_with_pin(Some(spec.clone()), true);
+        let clone = server.clone();
+
+        let (first, concurrent) = tokio::join!(
+            server.recall_with_memory(None, "unused".to_string(), 1, 1, 0, absent_facet()),
+            clone.recall_with_memory(None, "unused".to_string(), 1, 1, 0, absent_facet())
+        );
+        let first = first.unwrap();
+        let concurrent = concurrent.unwrap();
+        assert_eq!(first, recall::rendered("", &[]));
+        assert_eq!(concurrent, first);
+
+        // Make a second Dataset::open impossible. The same server still recalls from its cached
+        // handle, while an explicit call-level override must take the ordinary fresh-open path.
+        std::fs::remove_dir_all(memory.path().join("chunks.lance")).unwrap();
+        let second = server
+            .recall_with_memory(None, "unused".to_string(), 1, 1, 0, absent_facet())
+            .await
+            .unwrap();
+        assert_eq!(second, first);
+
+        let override_error = server
+            .recall_with_memory(Some(spec.clone()), "unused".to_string(), 1, 1, 0, absent_facet())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            override_error.to_string(),
+            crate::memory::Memory::parse(&spec).empty_error().to_string()
+        );
+    }
+
+    #[test]
+    fn pin_is_opt_in_and_only_for_the_server_default_memory() {
+        let pinned = Funes::new_with_pin(Some("acme/memory".to_string()), true);
+        assert!(pinned.pins_recall(&None));
+        assert!(pinned.pins_recall(&Some("  ".to_string())));
+        assert!(!pinned.pins_recall(&Some("acme/memory".to_string())));
+        assert!(!pinned.pins_recall(&Some("local".to_string())));
+
+        let opted_out = Funes::new_with_pin(Some("acme/memory".to_string()), false);
+        assert!(!opted_out.pins_recall(&None));
+
+        let no_explicit_server_memory = Funes::new_with_pin(None, true);
+        assert!(!no_explicit_server_memory.pins_recall(&None));
+    }
+
+    #[test]
+    fn pin_env_requires_an_explicit_truthy_value() {
+        for value in [None, Some(""), Some("0"), Some("false"), Some("maybe")] {
+            assert!(!pin_memory_value(value));
+        }
+        for value in [Some("1"), Some(" true "), Some("YES"), Some("on")] {
+            assert!(pin_memory_value(value));
+        }
+    }
 }

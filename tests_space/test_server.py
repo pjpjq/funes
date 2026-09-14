@@ -120,6 +120,103 @@ def test_query_text_is_deterministic_and_never_calls_provider(monkeypatch):
     assert bridge.query_text("中文 CPA 问题") == "CPA"
 
 
+def test_selective_bm25_trigger_accepts_repeated_groups_two_two_one():
+    raw_query = "CPA 第二轮为什么丢上下文？"
+    results = [
+        {
+            "source_identity": "a-1",
+            "session_id": "session-a",
+            "raw_text": "Northflank 调用 previous_response_id 后继续执行。",
+        },
+        {
+            "source_identity": "a-2",
+            "session_id": "session-a",
+            "raw_text": "同一 session 的普通记录。",
+        },
+        {
+            "source_identity": "b-1",
+            "session_id": "session-b",
+            "raw_text": "previous_response_id 与下一轮上下文有关。",
+        },
+        {
+            "source_identity": "b-2",
+            "session_id": "session-b",
+            "raw_text": "另一个重复 session 的普通记录。",
+        },
+        {
+            "source_identity": "c-1",
+            "session_id": "session-c",
+            "raw_text": "单独的 session。",
+        },
+    ]
+
+    assert bridge.should_augment_with_local_bm25(raw_query, results) is True
+
+
+@pytest.mark.parametrize(
+    ("query", "results"),
+    (
+        (
+            "why was context lost?",
+            [
+                {"session_id": "same", "raw_text": "retry_state"},
+                {"session_id": "same", "raw_text": "retry_state"},
+                {"session_id": "same", "raw_text": "retry_state"},
+            ],
+        ),
+        (
+            "please investigate the context loss 的",
+            [
+                {"session_id": "same", "raw_text": "retry_state"},
+                {"session_id": "same", "raw_text": "retry_state"},
+                {"session_id": "same", "raw_text": "retry_state"},
+            ],
+        ),
+        (
+            "为什么丢上下文？",
+            [
+                {"session_id": "one", "raw_text": "retry_state"},
+                {"session_id": "two", "raw_text": "retry_state"},
+                {"session_id": "three", "raw_text": "retry_state"},
+            ],
+        ),
+        (
+            "为什么丢上下文？",
+            [
+                {"session_id": "same", "raw_text": "retry_state"},
+                {"session_id": "same", "raw_text": "no identifier here"},
+                {"session_id": "same", "raw_text": "another note"},
+            ],
+        ),
+        (
+            "retry_state 为什么丢上下文？",
+            [
+                {"session_id": "same", "raw_text": "retry_state"},
+                {"session_id": "same", "raw_text": "retry_state"},
+                {"session_id": "same", "raw_text": "retry_state"},
+            ],
+        ),
+    ),
+)
+def test_selective_bm25_trigger_keeps_ordinary_requests_one_pass(query, results):
+    assert bridge.should_augment_with_local_bm25(query, results) is False
+
+
+def test_selective_bm25_trigger_rejects_secret_and_unstructured_terms():
+    unsafe = "ghp_" + "x" * 36
+    rows = [
+        {
+            "session_id": "same",
+            "raw_text": (
+                f"Northflank access_token {unsafe}"
+            ),
+        }
+        for _ in range(3)
+    ]
+
+    assert bridge.should_augment_with_local_bm25("这个问题为什么失败？", rows) is False
+
+
 def test_native_mcp_worker_reuses_child_and_passes_hf_environment(monkeypatch, tmp_path):
     processes = []
 
@@ -3053,6 +3150,286 @@ def test_http_voyage_uses_native_rrf_order_and_keeps_sidecar_raw(monkeypatch, tm
     ]
     assert body["results_text"] == "native raw\n\ndual raw"
     assert "ENGLISH SHADOW" not in json.dumps(body["results"], ensure_ascii=False)
+
+
+def test_http_selective_bm25_fuses_full_raw_union_with_filters(monkeypatch):
+    raw_query = "CPA 第二轮为什么丢上下文？"
+    first_results = [
+        {
+            "source_identity": "dominant-1",
+            "session_id": "session-a",
+            "raw_text": "Northflank previous_response_id 第一条原文",
+        },
+        {
+            "source_identity": "dominant-2",
+            "session_id": "session-a",
+            "raw_text": "previous_response_id 第二条原文",
+        },
+        {
+            "source_identity": "dominant-3",
+            "session_id": "session-a",
+            "raw_text": "previous_response_id 第三条原文",
+        },
+    ]
+    recovered = {
+        "source_identity": "recovered-history",
+        "session_id": "session-c",
+        "raw_text": "历史原文：CPA Northflank previous_response_id",
+    }
+    recall_calls = []
+    bm25_calls = []
+
+    class Store:
+        def search(self, query, limit, *, filters, allow_broad_scan):
+            assert query == raw_query
+            assert limit == 9
+            assert filters == {"repo": "owner/repo"}
+            assert allow_broad_scan is False
+            return [
+                {**item, "source_type": "session", "source_agent": "codex", "retrieval_text": "DERIVED"}
+                for item in [*first_results, recovered]
+            ]
+
+    app = SimpleNamespace(
+        store=Store(),
+        syncer=SimpleNamespace(restoring=False, restore_failed=False),
+    )
+    real_bm25 = bridge.search_source_bm25_rankings
+
+    def tracked_bm25(query, limit, filters, harness):
+        bm25_calls.append((query, limit, filters, harness))
+        return real_bm25(query, limit, filters, harness)
+
+    monkeypatch.setattr(bridge, "SOURCE_APP", app)
+    monkeypatch.setattr(bridge, "TOKEN", "test-token")
+    monkeypatch.setenv("FUNES_EMBEDDING_PROVIDER", "voyage")
+    monkeypatch.setattr(
+        bridge,
+        "recall",
+        lambda query, **_kwargs: recall_calls.append(query) or "first pass",
+    )
+    monkeypatch.setattr(
+        bridge,
+        "materialize_native_results",
+        lambda *_args, **_kwargs: first_results,
+    )
+    monkeypatch.setattr(bridge, "search_source_bm25_rankings", tracked_bm25)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        status, body = _post(
+            server,
+            "/search",
+            {
+                "query": raw_query,
+                "limit": 3,
+                "repo": "owner/repo",
+                "harness": "codex",
+            },
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert status == 200
+    assert recall_calls == [raw_query]
+    assert bm25_calls == [
+        (raw_query, 3, {"repo": "owner/repo"}, "codex")
+    ]
+    assert body["query"] == raw_query
+    assert body["retrieval_query"] == raw_query
+    recovered_result = next(
+        item
+        for item in body["results"]
+        if item["source_identity"] == recovered["source_identity"]
+    )
+    assert recovered_result["raw_text"] == recovered["raw_text"]
+    assert body["results_text"].split("\n\n") == [
+        item["raw_text"] for item in body["results"]
+    ]
+    assert "DERIVED" not in json.dumps(body, ensure_ascii=False)
+    assert not any(
+        word in key.lower()
+        for key in body
+        for word in ("feedback", "identifier", "expanded")
+    )
+    assert sum(
+        item.get("session_id") == "session-a" for item in body["results"][:3]
+    ) <= 2
+
+
+def test_http_selective_bm25_non_trigger_never_opens_sqlite(monkeypatch):
+    first_results = [
+        {
+            "source_identity": f"dominant-{index}",
+            "session_id": "session-a",
+            "raw_text": f"retry_state raw {index}",
+        }
+        for index in range(3)
+    ]
+    recall_calls = []
+    app = SimpleNamespace(
+        store=SimpleNamespace(),
+        syncer=SimpleNamespace(restoring=False, restore_failed=False),
+    )
+    monkeypatch.setattr(bridge, "SOURCE_APP", app)
+    monkeypatch.setattr(bridge, "TOKEN", "test-token")
+    monkeypatch.setenv("FUNES_EMBEDDING_PROVIDER", "voyage")
+    monkeypatch.setattr(
+        bridge,
+        "recall",
+        lambda query, **_kwargs: recall_calls.append(query) or "first pass",
+    )
+    monkeypatch.setattr(
+        bridge,
+        "materialize_native_results",
+        lambda *_args, **_kwargs: first_results,
+    )
+    monkeypatch.setattr(
+        bridge,
+        "search_source_bm25_rankings",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("ordinary requests must not open SQLite")
+        ),
+    )
+    server = ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        status, body = _post(
+            server, "/search", {"query": "why was context lost?", "limit": 3}
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert status == 200
+    assert recall_calls == ["why was context lost?"]
+    assert body["results"] == first_results
+
+
+def test_http_selective_bm25_timeout_returns_first_pass_within_shared_deadline(
+    monkeypatch,
+):
+    raw_query = "为什么第二轮丢上下文？"
+    first_results = [
+        {
+            "source_identity": f"dominant-{index}",
+            "session_id": "session-a",
+            "raw_text": f"retry_state 原始记录 {index}",
+        }
+        for index in range(3)
+    ]
+    release = threading.Event()
+    finished = threading.Event()
+    recall_calls = []
+    bm25_calls = []
+
+    def native_recall(query, **_kwargs):
+        recall_calls.append(query)
+        return "first pass"
+
+    def blocked_bm25(query, limit, filters, harness):
+        bm25_calls.append((query, limit, filters, harness))
+        try:
+            release.wait(40)
+            return [], []
+        finally:
+            finished.set()
+
+    app = SimpleNamespace(
+        store=SimpleNamespace(),
+        syncer=SimpleNamespace(restoring=False, restore_failed=False),
+    )
+    monkeypatch.setattr(bridge, "SOURCE_APP", app)
+    monkeypatch.setattr(bridge, "TOKEN", "test-token")
+    monkeypatch.setenv("FUNES_EMBEDDING_PROVIDER", "voyage")
+    monkeypatch.setattr(bridge, "VOYAGE_HTTP_TIMEOUT", 0.12)
+    monkeypatch.setattr(bridge, "VOYAGE_NATIVE_TIMEOUT", 0.08)
+    monkeypatch.setattr(bridge, "recall", native_recall)
+    monkeypatch.setattr(
+        bridge,
+        "materialize_native_results",
+        lambda output, *_args, **_kwargs: first_results if output == "first pass" else [],
+    )
+    monkeypatch.setattr(bridge, "search_source_bm25_rankings", blocked_bm25)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    started = time.monotonic()
+    try:
+        status, body = _post(server, "/search", {"query": raw_query, "limit": 3})
+        elapsed = time.monotonic() - started
+    finally:
+        release.set()
+        finished.wait(1)
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert elapsed < 1
+    assert status == 200
+    assert recall_calls == [raw_query]
+    assert bm25_calls == [(raw_query, 3, {}, None)]
+    assert body["results"] == first_results
+    assert body["retrieval_query"] == raw_query
+    assert "retrieval_degraded" not in body
+
+
+def test_http_selective_bm25_failure_keeps_first_pass_and_hides_error(monkeypatch):
+    raw_query = "为什么第二轮丢上下文？"
+    first_results = [
+        {
+            "source_identity": f"dominant-{index}",
+            "session_id": "session-a",
+            "raw_text": f"retry_state 原始记录 {index}",
+        }
+        for index in range(3)
+    ]
+    recall_calls = []
+
+    app = SimpleNamespace(
+        store=SimpleNamespace(),
+        syncer=SimpleNamespace(restoring=False, restore_failed=False),
+    )
+    monkeypatch.setattr(bridge, "SOURCE_APP", app)
+    monkeypatch.setattr(bridge, "TOKEN", "test-token")
+    monkeypatch.setenv("FUNES_EMBEDDING_PROVIDER", "voyage")
+    monkeypatch.setattr(
+        bridge,
+        "recall",
+        lambda query, **_kwargs: recall_calls.append(query) or "first pass",
+    )
+    monkeypatch.setattr(
+        bridge,
+        "materialize_native_results",
+        lambda *_args, **_kwargs: first_results,
+    )
+    monkeypatch.setattr(
+        bridge,
+        "search_source_bm25_rankings",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("sidecar-secret-detail")
+        ),
+    )
+    server = ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        status, body = _post(server, "/search", {"query": raw_query, "limit": 3})
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    encoded = json.dumps(body, ensure_ascii=False)
+    assert status == 200
+    assert recall_calls == [raw_query]
+    assert body["results"] == first_results
+    assert "sidecar-secret-detail" not in encoded
 
 
 def test_http_native_bm25_keeps_exact_identifier_without_sidecar_fts(monkeypatch):

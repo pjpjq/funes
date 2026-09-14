@@ -264,6 +264,14 @@ struct Read {
     memory_label: Option<String>,
 }
 
+/// One immutable dataset opened for a long-lived MCP server. The dataset stays opaque here so the
+/// caller cannot bypass the recall pipeline's profile checks, filtering, neighbor expansion, or
+/// rendering contract.
+pub(crate) struct PinnedRead {
+    read: Read,
+    requested_label: String,
+}
+
 /// What a read verb does about the memory's state: query it, degrade to the local index, or point a
 /// fresh install at onboarding. The states a verb can't act on are already errors by the time this
 /// is built.
@@ -325,6 +333,15 @@ async fn open_read(memory: &Memory) -> Result<Read> {
         )),
         ReadOutcome::NoIndex => Err(no_index_error()),
     }
+}
+
+/// Open the server's default memory once for immutable, process-lifetime recall. This is an
+/// explicit MCP-only optimization; normal CLI and MCP reads continue through [`open_read`] for
+/// every call and therefore resolve a remote's current head.
+pub(crate) async fn pin_read(memory: Memory) -> Result<PinnedRead> {
+    let requested_label = memory.label();
+    let read = open_read(&memory).await?;
+    Ok(PinnedRead { read, requested_label })
 }
 
 fn native_fallback_enabled() -> bool {
@@ -445,14 +462,42 @@ pub async fn recall_filtered(
 ) -> Result<String> {
     let (note, memory_label, hits) =
         recall_hits_filtered(memory, query, k, candidates, half_life, neighbors, filter, &|_| ()).await?;
+    Ok(render_recall(note, memory_label, hits))
+}
+
+/// Recall against an already-opened immutable dataset. Only the MCP server's explicit opt-in
+/// default-memory path calls this; call-level overrides and every ordinary read open afresh.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn recall_filtered_pinned(
+    pinned: &PinnedRead,
+    query: String,
+    k: usize,
+    candidates: usize,
+    half_life: f64,
+    neighbors: i64,
+    filter: FacetFilter,
+) -> Result<String> {
+    let progress = &|_: &str| ();
+    progress(&format!("searching {}…", pinned.requested_label));
+    let (note, memory_label, hits) = recall_hits_filtered_read(
+        &pinned.read,
+        query,
+        k,
+        candidates,
+        half_life,
+        neighbors,
+        filter,
+        progress,
+    )
+    .await?;
+    Ok(render_recall(note, memory_label, hits))
+}
+
+fn render_recall(note: String, memory_label: Option<String>, hits: Vec<(Hit, f64)>) -> String {
     if hits.is_empty() {
-        return Ok(format!("{note}no results"));
+        return format!("{note}no results");
     }
-    Ok(crate::ui::render::recall_agent(
-        &note,
-        &memory_hint(memory_label.as_deref()),
-        &hits,
-    ))
+    crate::ui::render::recall_agent(&note, &memory_hint(memory_label.as_deref()), &hits)
 }
 
 /// Run the recall pipeline over one memory: hybrid retrieval → rerank → recency reweight →
@@ -498,6 +543,22 @@ pub async fn recall_hits_filtered(
     candidates: usize,
     half_life: f64,
     neighbors: i64,
+    filter: FacetFilter,
+    progress: &(dyn Fn(&str) + Sync),
+) -> Result<(String, Option<String>, Vec<(Hit, f64)>)> {
+    progress(&format!("searching {}…", memory.label()));
+    let read = open_read(&memory).await?;
+    recall_hits_filtered_read(&read, query, k, candidates, half_life, neighbors, filter, progress).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn recall_hits_filtered_read(
+    read: &Read,
+    query: String,
+    k: usize,
+    candidates: usize,
+    half_life: f64,
+    neighbors: i64,
     mut filter: FacetFilter,
     progress: &(dyn Fn(&str) + Sync),
 ) -> Result<(String, Option<String>, Vec<(Hit, f64)>)> {
@@ -511,10 +572,13 @@ pub async fn recall_hits_filtered(
         .transpose()?
         .map(|h| h.as_str().to_string());
 
-    progress(&format!("searching {}…", memory.label()));
-    let read = open_read(&memory).await?;
     let note = read.note.clone().unwrap_or_default();
     let ds = &read.ds;
+    // Memory::open validates this for ordinary reads. A pinned dataset skips that open on later
+    // calls, so repeat the cheap schema/profile check against the current process environment.
+    // Do it before any early filter return so no pinned call can bypass the embedding contract.
+    let profile = inference::embedding_profile()?;
+    crate::memory::check_compat_with_profile(ds, &profile)?;
     // A `--harness` filter needs the column; on an un-migrated memory it would fail deep inside Lance
     // with an opaque schema error, so refuse with a clear message instead.
     if filter.harness.is_some() && !has_harness_col(ds) {
@@ -527,9 +591,8 @@ pub async fn recall_hits_filtered(
     }
     let where_clause = build_facet_where(&filter);
 
-    // Open and validate the memory before loading/calling any provider. This both fails fast on a
-    // profile mismatch and ensures a Voyage query vector is never sent to a local-BGE memory.
-    let profile = inference::embedding_profile()?;
+    // Validate the memory before loading/calling any provider. This both fails fast on a profile
+    // mismatch and ensures a Voyage query vector is never sent to a local-BGE memory.
     progress("loading embedding provider…");
     let mut guard = models(&profile).await?.lock().await;
     if guard.profile_fingerprint != profile.fingerprint {
@@ -537,9 +600,7 @@ pub async fn recall_hits_filtered(
             "embedding profile changed while the process was running; restart before recalling"
         ));
     }
-    let Models {
-        embedder, reranker, ..
-    } = &mut *guard;
+    let Models { embedder, reranker, .. } = &mut *guard;
     let qv = embedder.embed_query(query.as_str())?;
 
     // Hybrid retrieval: a vector ANN scan and a BM25 scan, fused by reciprocal rank. The FTS index

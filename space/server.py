@@ -196,6 +196,11 @@ def native_environment(
     env["FUNES_EMBEDDING_SCHEMA_VERSION"] = str(profile["schema_version"])
     env["FUNES_RERANK_PROVIDER"] = os.getenv("FUNES_RERANK_PROVIDER", "none") or "none"
     env["FUNES_NATIVE_FALLBACK"] = os.getenv("FUNES_NATIVE_FALLBACK", "false") or "false"
+    # A Space refreshes the complete MCP child after every committed index revision.
+    # Pin that child's immutable Dataset handle so recalls do not resolve/open the
+    # same Hub revision again on every request. Ordinary MCP/CLI processes remain
+    # fresh-by-default because the Rust optimization is explicitly opt-in.
+    env["FUNES_MCP_PIN_MEMORY"] = "true"
     env["FUNES_RETRIEVAL_LANGUAGE_MODE"] = (
         os.getenv("FUNES_RETRIEVAL_LANGUAGE_MODE", "raw") or "raw"
     )
@@ -217,6 +222,32 @@ def source_app():
             SOURCE_APP = SourceApp()
             start_canonical_reconciler(SOURCE_APP)
     return SOURCE_APP
+
+
+def source_readiness_state() -> dict[str, object]:
+    """Snapshot source readiness without initializing or querying the store."""
+    app = SOURCE_APP
+    configured = app is not None or bool(os.getenv("FUNES_STORAGE_REPO"))
+    if not configured:
+        return {"configured": False, "ready": False, "restoring": False}
+    if app is None:
+        return {
+            "configured": True,
+            "ready": False,
+            "restoring": False,
+            "error": "source_store_unavailable",
+        }
+    restoring = bool(app.syncer.restoring)
+    restore_failed = bool(app.syncer.restore_failed)
+    state: dict[str, object] = {
+        "configured": True,
+        "ready": not restoring and not restore_failed,
+        "restoring": restoring,
+        "restored": app.restore_result,
+    }
+    if restore_failed:
+        state["error"] = "restore_failed"
+    return state
 
 
 def source_state() -> dict[str, object]:
@@ -2059,7 +2090,7 @@ def auth_ok(handler: BaseHTTPRequestHandler) -> bool:
 
 def ready_payload() -> tuple[int, dict[str, object]]:
     """Return the cheap authenticated readiness gate used by clients per call."""
-    sources = source_state()
+    sources = source_readiness_state()
     warm = warm_state()
     source_ok = not sources.get("configured") or bool(sources.get("ready"))
     if (

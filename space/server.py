@@ -72,12 +72,23 @@ try:
 except ValueError:
     CJK_NATIVE_TIMEOUT = min(HTTP_NATIVE_TIMEOUT, 5.0)
 try:
+    # Leave enough of the Space ingress window for a raw BM25 fallback.  This
+    # is a hard cap: an operator may lower it, but cannot accidentally restore
+    # an unbounded provider wait by raising an environment value.
     VOYAGE_NATIVE_TIMEOUT = min(
+        3.0,
         HTTP_NATIVE_TIMEOUT,
-        max(0.1, float(os.getenv("FUNES_VOYAGE_NATIVE_TIMEOUT", "4"))),
+        max(0.1, float(os.getenv("FUNES_VOYAGE_NATIVE_TIMEOUT", "3"))),
     )
 except ValueError:
-    VOYAGE_NATIVE_TIMEOUT = min(HTTP_NATIVE_TIMEOUT, 4.0)
+    VOYAGE_NATIVE_TIMEOUT = min(HTTP_NATIVE_TIMEOUT, 3.0)
+try:
+    VOYAGE_HTTP_TIMEOUT = min(
+        4.5,
+        max(0.2, float(os.getenv("FUNES_VOYAGE_HTTP_TIMEOUT", "4.5"))),
+    )
+except ValueError:
+    VOYAGE_HTTP_TIMEOUT = 4.5
 PROMPT_VERSION = "funes-retrieval-v1"
 LANGUAGE_MODE = os.getenv("FUNES_RETRIEVAL_LANGUAGE_MODE", "raw").lower()
 INDEX_LOCK = threading.Lock()
@@ -602,6 +613,46 @@ def _normalized_harness_agent(value: object) -> str | None:
     return normalized if normalized in {"codex", "pi", "claude", "hermes"} else None
 
 
+def _partition_source_rankings(
+    hit_rankings: tuple[list[dict], ...],
+    filters: dict[str, object],
+    harness: str | None,
+) -> tuple[list[list[dict]], list[list[dict]]]:
+    """Keep raw public rows while preserving source-store rank order."""
+    native_filterable = set(filters).issubset({"source_agent", "repo"})
+    expected_agent = _normalized_harness_agent(harness) if harness else None
+    fallback_enabled = not harness or expected_agent is not None
+    source_rankings = []
+    session_fallback_rankings = []
+    for hits in hit_rankings:
+        eligible_hits = []
+        fallback_hits = []
+        for item in hits:
+            public_item = _public_source_item(item)
+            is_session = str(item.get("source_type", "")).lower() in NATIVE_SESSION_TYPES
+            if is_session:
+                source_agent = _normalized_harness_agent(item.get("source_agent"))
+                # The native index cannot authoritatively apply role/date
+                # filters, so the sidecar must also honor harness when it
+                # returns session rows for those requests.
+                if harness and (
+                    not fallback_enabled or source_agent != expected_agent
+                ):
+                    continue
+                eligible_hits.append(public_item)
+                if native_filterable:
+                    fallback_hits.append(public_item)
+                continue
+            eligible_hits.append(public_item)
+        if eligible_hits:
+            # This single sequence preserves both the source store's cross-type
+            # ranks and raw-query-before-rewrite ordering for hybrid fusion.
+            source_rankings.append(eligible_hits)
+        if fallback_hits:
+            session_fallback_rankings.append(fallback_hits)
+    return source_rankings, session_fallback_rankings
+
+
 def search_source_rankings(
     query: str,
     limit: int,
@@ -630,34 +681,29 @@ def search_source_rankings(
         if rewritten != query
         else []
     )
-    native_filterable = set(filters).issubset({"source_agent", "repo"})
-    expected_agent = _normalized_harness_agent(harness) if harness else None
-    fallback_enabled = not harness or expected_agent is not None
-    source_rankings = []
-    session_fallback_rankings = []
-    for hits in (raw_hits, rewritten_hits):
-        eligible_hits = []
-        fallback_hits = []
-        for item in hits:
-            public_item = dict(item)
-            public_item.pop("retrieval_text", None)
-            is_session = str(item.get("source_type", "")).lower() in NATIVE_SESSION_TYPES
-            if native_filterable and is_session:
-                source_agent = _normalized_harness_agent(item.get("source_agent"))
-                if fallback_enabled and (
-                    expected_agent is None or source_agent == expected_agent
-                ):
-                    eligible_hits.append(public_item)
-                    fallback_hits.append(public_item)
-                continue
-            eligible_hits.append(public_item)
-        if eligible_hits:
-            # This single sequence preserves both the source store's cross-type
-            # ranks and raw-query-before-rewrite ordering for hybrid fusion.
-            source_rankings.append(eligible_hits)
-        if fallback_hits:
-            session_fallback_rankings.append(fallback_hits)
+    source_rankings, session_fallback_rankings = _partition_source_rankings(
+        (raw_hits, rewritten_hits), filters, harness
+    )
     return rewritten, source_rankings, session_fallback_rankings
+
+
+def search_source_bm25_rankings(
+    query: str,
+    limit: int,
+    filters: dict[str, object],
+    harness: str | None = None,
+) -> tuple[list[list[dict]], list[list[dict]]]:
+    """Run one syntax-safe raw BM25 lookup for a degraded Voyage request."""
+    app = source_app()
+    if app is None or app.syncer.restoring or app.syncer.restore_failed:
+        return [], []
+    raw_hits = app.store.search(
+        query,
+        expanded_candidate_limit(limit),
+        filters=filters,
+        allow_broad_scan=False,
+    )
+    return _partition_source_rankings((raw_hits,), filters, harness)
 
 
 def search_source_documents(query: str, limit: int, filters: dict[str, object]) -> tuple[str, list[dict]]:
@@ -1915,6 +1961,92 @@ def get(session_id: str, *, timeout: float | None = None, **kwargs) -> str:
     )
 
 
+class _DeadlineRunBusyError(RuntimeError):
+    """A deadline runner is occupied by a different request."""
+
+
+_DEADLINE_RUN_LOCK = threading.Lock()
+_DEADLINE_RUNS: dict[str, tuple[threading.Event, dict[str, object]]] = {}
+
+
+def _run_before_deadline(invoke, deadline: float, *, thread_name: str):
+    """Run a blocking dependency behind a caller-owned monotonic deadline.
+
+    At most one ignored-timeout call may survive for each dependency name.
+    Later callers fail fast rather than creating unbounded daemon threads or
+    receiving another request's result while an upstream dependency is wedged.
+    """
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("operation deadline exhausted")
+    with _DEADLINE_RUN_LOCK:
+        state = _DEADLINE_RUNS.get(thread_name)
+        if state is not None:
+            # Names identify a dependency, not a request. Waiting here could
+            # return the first request's result to a later, different query.
+            raise _DeadlineRunBusyError("operation already in progress")
+        done: threading.Event = threading.Event()
+        outcome: dict[str, object] = {}
+        state = done, outcome
+        _DEADLINE_RUNS[thread_name] = state
+
+        def runner() -> None:
+            try:
+                outcome["value"] = invoke()
+            except Exception as exc:
+                outcome["error"] = exc
+            finally:
+                done.set()
+                with _DEADLINE_RUN_LOCK:
+                    if _DEADLINE_RUNS.get(thread_name) is state:
+                        _DEADLINE_RUNS.pop(thread_name, None)
+
+        # NativeMcpWorker receives the same deadline and terminates its
+        # subprocess on timeout. This is the final HTTP safeguard for a
+        # wedged Python call or dependency that ignores its timeout.
+        threading.Thread(target=runner, name=thread_name, daemon=True).start()
+    done, outcome = state
+    if not done.wait(max(0.0, deadline - time.monotonic())):
+        raise TimeoutError("operation deadline exhausted")
+    error = outcome.get("error")
+    if error is not None:
+        raise error
+    return outcome.get("value")
+
+
+def _http_native_results(
+    query: str,
+    app,
+    limit: int,
+    tuning: dict[str, object],
+    deadline: float,
+) -> list[dict]:
+    """Recall and materialize raw text within one hard HTTP deadline."""
+
+    def invoke() -> list[dict]:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise NativeMcpTimeoutError("native MCP request timed out")
+        output = recall(query, k=limit, timeout=remaining, **tuning)
+        return (
+            materialize_native_results(output, app, limit, deadline=deadline)
+            if output
+            else []
+        )
+
+    try:
+        result = _run_before_deadline(
+            invoke,
+            deadline,
+            thread_name="funes-http-native-recall",
+        )
+    except _DeadlineRunBusyError as exc:
+        raise NativeMcpBusyError("native MCP busy") from exc
+    except TimeoutError as exc:
+        raise NativeMcpTimeoutError("native MCP request timed out") from exc
+    return list(result or [])
+
+
 def auth_ok(handler: BaseHTTPRequestHandler) -> bool:
     supplied = handler.headers.get("X-Funes-Authorization", "") or handler.headers.get("X-Funes-Token", "")
     if supplied:
@@ -2123,9 +2255,48 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json(503, {"ok": False, "results": [], "results_text": "", "error": error})
                     return
                 harness = str(obj.get("harness", "")).strip() or None
-                source_query, source_rankings, session_fallback_rankings = (
-                    search_source_rankings(raw_query, limit, filters, harness)
+                profile = embedding_profile()
+                embedding_provider = str(profile["provider"])
+                sidecar_authoritative = any(
+                    key in filters for key in ("role", "since", "until")
                 )
+                voyage_hot_path = (
+                    embedding_provider == "voyage" and not sidecar_authoritative
+                )
+                voyage_deadline = (
+                    time.monotonic() + VOYAGE_HTTP_TIMEOUT
+                    if embedding_provider == "voyage"
+                    else None
+                )
+                if voyage_hot_path:
+                    # Native Voyage recall already fuses its vector and Lance
+                    # FTS/BM25 rankings. Do not duplicate that work in SQLite
+                    # unless the provider/native worker actually fails.
+                    source_query = raw_query
+                    source_rankings = []
+                    session_fallback_rankings = []
+                elif embedding_provider == "voyage" and sidecar_authoritative:
+                    # Role and date filters are sidecar-only. Keep this one
+                    # raw BM25 lookup bounded by the same Voyage HTTP budget;
+                    # a query translator/rewrite can otherwise consume it.
+                    source_query = raw_query
+                    try:
+                        source_rankings, session_fallback_rankings = (
+                            _run_before_deadline(
+                                lambda: search_source_bm25_rankings(
+                                    raw_query, limit, filters, harness
+                                ),
+                                voyage_deadline,
+                                thread_name="funes-http-sidecar-bm25",
+                            )
+                        )
+                    except Exception:
+                        source_rankings = []
+                        session_fallback_rankings = []
+                else:
+                    source_query, source_rankings, session_fallback_rankings = (
+                        search_source_rankings(raw_query, limit, filters, harness)
+                    )
                 sidecar_results = stable_rrf(source_rankings, limit)
                 has_cjk = (
                     LANGUAGE_MODE == "auto"
@@ -2139,7 +2310,6 @@ class Handler(BaseHTTPRequestHandler):
                     len(sidecar_results) >= min(limit, 3)
                     and sidecar_has_exact_entities(raw_query, sidecar_results)
                 )
-                embedding_provider = str(embedding_profile()["provider"])
                 # Voyage is multilingual: embed the user's original query.
                 # Query shadows remain available only to legacy local mode and
                 # never replace the returned or vectorized raw text.
@@ -2184,7 +2354,13 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 if embedding_provider == "voyage":
                     native_budget = min(native_budget, VOYAGE_NATIVE_TIMEOUT)
+                if voyage_deadline is not None:
+                    native_budget = min(
+                        native_budget,
+                        max(0.001, voyage_deadline - time.monotonic()),
+                    )
                 native_deadline = time.monotonic() + native_budget
+                native_failure = ""
                 try:
                     # The native CLI defaults to 30 fused candidates, recency
                     # weighting, and neighbor expansion. Those defaults are
@@ -2196,39 +2372,90 @@ class Handler(BaseHTTPRequestHandler):
                     tuning["candidates"] = min(HTTP_MAX_CANDIDATES, requested_candidates)
                     tuning.setdefault("neighbors", 0)
                     tuning.setdefault("half_life", 0)
-                    out = (
-                        recall(
+                    if native_allowed and voyage_hot_path:
+                        results = _http_native_results(
                             query,
-                            k=limit,
-                            timeout=max(0.001, native_deadline - time.monotonic()),
-                            **tuning,
-                        )
-                        if native_allowed
-                        else ""
-                    )
-                    results = (
-                        materialize_native_results(
-                            out,
                             app,
                             limit,
-                            deadline=native_deadline,
+                            tuning,
+                            native_deadline,
                         )
-                        if out
-                        else []
-                    )
+                    else:
+                        out = (
+                            recall(
+                                query,
+                                k=limit,
+                                timeout=max(
+                                    0.001,
+                                    native_deadline - time.monotonic(),
+                                ),
+                                **tuning,
+                            )
+                            if native_allowed
+                            else ""
+                        )
+                        results = (
+                            materialize_native_results(
+                                out,
+                                app,
+                                limit,
+                                deadline=native_deadline,
+                            )
+                            if out
+                            else []
+                        )
                 except NativeMcpBusyError:
-                    if not any(source_rankings) and not any(session_fallback_rankings):
-                        self.send_json(429, {"ok": False, "results": [], "results_text": "", "error": "native_mcp_busy", "retry_after": 3}, {"Retry-After": "3"})
-                        return
                     results = []
-                    retrieval_degraded = "native_mcp_busy"
+                    native_failure = "busy"
+                    retrieval_degraded = (
+                        "voyage_unavailable"
+                        if embedding_provider == "voyage"
+                        else "native_mcp_busy"
+                    )
                 except NativeMcpError:
-                    if not any(source_rankings) and not any(session_fallback_rankings):
-                        unavailable = (
-                            "voyage_unavailable"
-                            if embedding_provider == "voyage"
-                            else "native_mcp_unavailable"
+                    results = []
+                    native_failure = "unavailable"
+                    retrieval_degraded = (
+                        "voyage_unavailable"
+                        if embedding_provider == "voyage"
+                        else "native_mcp_unavailable"
+                    )
+                else:
+                    retrieval_degraded = ""
+                if native_failure and voyage_hot_path:
+                    try:
+                        source_rankings, session_fallback_rankings = (
+                            _run_before_deadline(
+                                lambda: search_source_bm25_rankings(
+                                    raw_query, limit, filters, harness
+                                ),
+                                voyage_deadline,
+                                thread_name="funes-http-sidecar-bm25",
+                            )
                         )
+                    except Exception:
+                        # A degraded lookup must not turn a provider outage
+                        # into an unbounded or disconnected HTTP request.
+                        source_rankings = []
+                        session_fallback_rankings = []
+                    sidecar_results = stable_rrf(source_rankings, limit)
+                if native_failure == "busy":
+                    if not any(source_rankings) and not any(session_fallback_rankings):
+                        self.send_json(
+                            429,
+                            {
+                                "ok": False,
+                                "results": [],
+                                "results_text": "",
+                                "error": "native_mcp_busy",
+                                "retry_after": 3,
+                            },
+                            {"Retry-After": "3"},
+                        )
+                        return
+                elif native_failure == "unavailable":
+                    if not any(source_rankings) and not any(session_fallback_rankings):
+                        unavailable = retrieval_degraded
                         self.send_json(
                             503,
                             {
@@ -2238,26 +2465,21 @@ class Handler(BaseHTTPRequestHandler):
                                 "error": "native_mcp_unavailable",
                                 "retrieval_degraded": unavailable,
                                 "retrieval_backend": "unavailable",
-                                "embedding_profile": embedding_profile(),
+                                "embedding_profile": profile,
                             },
                         )
                         return
-                    results = []
-                    retrieval_degraded = (
-                        "voyage_unavailable"
-                        if embedding_provider == "voyage"
-                        else "native_mcp_unavailable"
+                if native_failure:
+                    results = sidecar_results
+                elif not voyage_hot_path:
+                    # Legacy/local mode still fuses the sidecar rankings with
+                    # native semantic hits. Voyage already performs this RRF
+                    # internally and must not pay for duplicate Python FTS.
+                    results = (
+                        stable_rrf([*source_rankings, results], limit)
+                        if results
+                        else sidecar_results
                     )
-                else:
-                    retrieval_degraded = ""
-                # Source rankings already preserve raw/rewrite and cross-type
-                # order. Always fuse them with native semantic hits so exact
-                # identifiers are not hidden by merely related passages.
-                results = (
-                    stable_rrf([*source_rankings, results], limit)
-                    if results
-                    else sidecar_results
-                )
                 results_text = "\n\n".join(
                     str(item.get("raw_text", ""))
                     for item in results
@@ -2275,7 +2497,7 @@ class Handler(BaseHTTPRequestHandler):
                         if retrieval_degraded or not native_allowed
                         else f"{embedding_provider}_lance_bm25_rrf"
                     ),
-                    "embedding_profile": embedding_profile(),
+                    "embedding_profile": profile,
                 }
                 if retrieval_degraded:
                     response["retrieval_degraded"] = retrieval_degraded

@@ -109,6 +109,36 @@ pub(crate) async fn append(
     extra_files: &BTreeMap<String, Bytes>,
 ) -> Result<Appended> {
     let parent = head_oid(repo, rev).await?;
+    append_at(
+        repo,
+        dataset_uri,
+        storage_options,
+        parent,
+        rev,
+        message,
+        batches,
+        schema,
+        extra_files,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)] // Shared CAS append boundary for push and canonical ingestion.
+async fn append_at(
+    repo: &HFRepository<RepoTypeDataset>,
+    dataset_uri: &str,
+    mut storage_options: HashMap<String, String>,
+    parent: String,
+    rev: &str,
+    message: String,
+    batches: Vec<RecordBatch>,
+    schema: SchemaRef,
+    extra_files: &BTreeMap<String, Bytes>,
+) -> Result<Appended> {
+    // Open the same immutable head guarded by the eventual Hub commit. Without
+    // this pin a branch move between selection and open could duplicate rows.
+    storage_options.insert("revision".to_string(), parent.clone());
+    storage_options.insert("hf_revision".to_string(), parent.clone());
     let (mut ds, wrapper) = open_capturing(dataset_uri, storage_options).await?;
     if schema.column_with_name("source_identity").is_some() {
         dataset::ensure_canonical_columns(&mut ds).await?;
@@ -140,6 +170,37 @@ pub(crate) async fn append(
         }),
         Err(e) if head_moved(&e) => Ok(Appended::Conflict),
         Err(e) => Err(anyhow::Error::new(e).context("data commit failed")),
+    }
+}
+
+/// Append canonical rows known to be absent at `expected_parent` without a full merge scan.
+#[allow(clippy::too_many_arguments)] // Keep the selected snapshot and CAS target explicit.
+pub(crate) async fn append_documents(
+    repo: &HFRepository<RepoTypeDataset>,
+    dataset_uri: &str,
+    storage_options: HashMap<String, String>,
+    expected_parent: &str,
+    rev: &str,
+    message: String,
+    batches: Vec<RecordBatch>,
+    schema: SchemaRef,
+) -> Result<Replaced> {
+    let extra_files = BTreeMap::new();
+    match append_at(
+        repo,
+        dataset_uri,
+        storage_options,
+        expected_parent.to_string(),
+        rev,
+        message,
+        batches,
+        schema,
+        &extra_files,
+    )
+    .await?
+    {
+        Appended::Committed { oid, .. } => Ok(Replaced::Committed(oid)),
+        Appended::Conflict => Ok(Replaced::Conflict),
     }
 }
 

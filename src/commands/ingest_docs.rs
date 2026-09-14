@@ -26,6 +26,13 @@ use std::sync::Arc;
 
 const MAX_COMMIT_RETRIES: u32 = 10;
 const HELD_SOURCE_ID_DOMAIN: &[u8] = b"funes-held-source-v1\0";
+const STORED_REVISION_COLUMNS: [&str; 5] = [
+    "source_identity",
+    "source_version",
+    "updated_at",
+    "content_hash",
+    "metadata_json",
+];
 
 #[derive(Clone, Debug, Deserialize)]
 struct InputDocument {
@@ -427,18 +434,32 @@ fn select_documents<'a>(docs: &'a [Document], stored: &HashMap<String, StoredRev
     selection
 }
 
+fn append_schema_allows_fast_path(schema: &Schema) -> bool {
+    schema.column_with_name("source_identity").is_none()
+        || STORED_REVISION_COLUMNS
+            .iter()
+            .all(|name| schema.column_with_name(name).is_some())
+}
+
+fn append_only(
+    selection: &Selection<'_>,
+    stored: &HashMap<String, StoredRevision>,
+    schema_allows_fast_path: bool,
+) -> bool {
+    schema_allows_fast_path
+        && !selection.changed.is_empty()
+        && selection
+            .changed
+            .iter()
+            .all(|doc| !stored.contains_key(&doc.source_identity))
+}
+
 async fn stored_revisions(ds: &Dataset, docs: &[Document]) -> Result<HashMap<String, StoredRevision>> {
     if docs.is_empty() {
         return Ok(HashMap::new());
     }
     let arrow = Schema::from(ds.schema());
-    for name in [
-        "source_identity",
-        "source_version",
-        "updated_at",
-        "content_hash",
-        "metadata_json",
-    ] {
+    for name in STORED_REVISION_COLUMNS {
         if arrow.column_with_name(name).is_none() {
             return Ok(HashMap::new());
         }
@@ -731,9 +752,16 @@ async fn ingest_remote(
     let mut embedding_cache = HashMap::new();
     loop {
         let expected_parent = remote::head_oid(&repo, &rev).await?;
-        let (stored, first) = match memory.open_remote_revision(&expected_parent).await {
-            Ok(ds) => (stored_revisions(&ds, docs).await?, false),
-            Err(error) if crate::memory::dataset_absent(&error) => (HashMap::new(), true),
+        let (stored, first, schema_allows_append) = match memory.open_remote_revision(&expected_parent).await {
+            Ok(ds) => {
+                let arrow = Schema::from(ds.schema());
+                (
+                    stored_revisions(&ds, docs).await?,
+                    false,
+                    append_schema_allows_fast_path(&arrow),
+                )
+            }
+            Err(error) if crate::memory::dataset_absent(&error) => (HashMap::new(), true, true),
             Err(error) => {
                 return Err(error.context(format!(
                     "{} exists but cannot be read; refusing to replace canonical sources",
@@ -764,6 +792,18 @@ async fn ingest_remote(
                 &expected_parent,
                 &rev,
                 message,
+            )
+            .await?
+        } else if append_only(&selection, &stored, schema_allows_append) {
+            remote::append_documents(
+                &repo,
+                &dataset_uri,
+                opts.clone(),
+                &expected_parent,
+                &rev,
+                message,
+                vec![batch],
+                target_schema,
             )
             .await?
         } else {
@@ -1086,6 +1126,104 @@ mod tests {
             .unwrap();
         assert_eq!(held_report.held_source_ids.len(), 1);
         assert_eq!(texts(&rows(&memory).await), vec!["short replacement"]);
+    }
+
+    #[test]
+    fn append_only_requires_every_changed_source_to_be_absent() {
+        let current: InputDocument =
+            serde_json::from_value(doc("v1", "2026-09-01T00:00:00Z", "current", serde_json::json!({})))
+                .unwrap();
+        let current = normalize(current).unwrap();
+        let mut new_value = doc("v1", "2026-09-02T00:00:00Z", "new", serde_json::json!({}));
+        new_value["source_identity"] = Value::String("new-source".to_string());
+        let new = normalize(serde_json::from_value(new_value).unwrap()).unwrap();
+        let stored = HashMap::from([(current.source_identity.clone(), stored(&current))]);
+
+        let new_selection = select_documents(std::slice::from_ref(&new), &stored);
+        assert!(append_only(&new_selection, &stored, true));
+        assert!(!append_only(&new_selection, &stored, false));
+
+        let update: InputDocument =
+            serde_json::from_value(doc("v2", "2026-09-03T00:00:00Z", "update", serde_json::json!({})))
+                .unwrap();
+        let update = normalize(update).unwrap();
+        let mixed_docs = [new, update];
+        let mixed = select_documents(&mixed_docs, &stored);
+        assert!(!append_only(&mixed, &stored, true));
+
+        let complete = schema_for(&EmbeddingProfile::local());
+        assert!(append_schema_allows_fast_path(complete.as_ref()));
+        let partial = Schema::new(
+            complete
+                .fields()
+                .iter()
+                .filter(|field| field.name() != "metadata_json")
+                .cloned()
+                .collect::<Vec<_>>(),
+        );
+        assert!(!append_schema_allows_fast_path(&partial));
+        let legacy = Schema::new(
+            complete
+                .fields()
+                .iter()
+                .filter(|field| field.name() != "source_identity")
+                .cloned()
+                .collect::<Vec<_>>(),
+        );
+        assert!(append_schema_allows_fast_path(&legacy));
+    }
+
+    #[tokio::test]
+    async fn unindexed_append_is_visible_to_revision_lookup() {
+        let root = tempfile::tempdir().unwrap();
+        let memory = root.path().join("memory");
+        let initial: InputDocument =
+            serde_json::from_value(doc("v1", "2026-09-01T00:00:00Z", "initial", serde_json::json!({})))
+                .unwrap();
+        let initial = normalize(initial).unwrap();
+        let profile = EmbeddingProfile::local();
+        let mut embedder = FakeEmbedder;
+        ingest_local(
+            memory.clone(),
+            std::slice::from_ref(&initial),
+            &[],
+            &mut embedder,
+            &profile,
+        )
+        .await
+        .unwrap();
+
+        let mut appended_value = doc(
+            "v1",
+            "2026-09-02T00:00:00Z",
+            "unindexed appended row",
+            serde_json::json!({}),
+        );
+        appended_value["source_identity"] = Value::String("appended-source".to_string());
+        let appended = normalize(serde_json::from_value(appended_value).unwrap()).unwrap();
+        let chunks = document_chunks(&appended);
+        let vectors = vec![vec![0.0; DIM as usize]; chunks.len()];
+        let uri = dataset::table_uri(&memory.to_string_lossy());
+        let mut ds = dataset::open(&uri, HashMap::new()).await.unwrap();
+        let schema = Arc::new(Schema::from(ds.schema()));
+        let batch = build_batch_for_schema(&chunks, &vectors, schema.clone()).unwrap();
+        ds.append(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let revisions = stored_revisions(&ds, std::slice::from_ref(&appended))
+            .await
+            .unwrap();
+        assert_eq!(
+            revisions.get("appended-source").unwrap().source_version,
+            appended.source_version
+        );
+        let selection = select_documents(std::slice::from_ref(&appended), &revisions);
+        assert_eq!(selection.unchanged, 1);
+        assert!(selection.changed.is_empty());
     }
 
     #[test]

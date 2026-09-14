@@ -76,12 +76,12 @@ try:
     # is a hard cap: an operator may lower it, but cannot accidentally restore
     # an unbounded provider wait by raising an environment value.
     VOYAGE_NATIVE_TIMEOUT = min(
-        3.0,
+        4.0,
         HTTP_NATIVE_TIMEOUT,
-        max(0.1, float(os.getenv("FUNES_VOYAGE_NATIVE_TIMEOUT", "3"))),
+        max(0.1, float(os.getenv("FUNES_VOYAGE_NATIVE_TIMEOUT", "4"))),
     )
 except ValueError:
-    VOYAGE_NATIVE_TIMEOUT = min(HTTP_NATIVE_TIMEOUT, 3.0)
+    VOYAGE_NATIVE_TIMEOUT = min(HTTP_NATIVE_TIMEOUT, 4.0)
 try:
     VOYAGE_HTTP_TIMEOUT = min(
         4.5,

@@ -266,7 +266,10 @@ async function call(path: string, body: Record<string, unknown>, budget: CallBud
   }
 
   const deadline = now() + budget.timeoutMs;
-  if (path === "/search" || path === "/recall") {
+  // /search already owns its cold-restore/degraded behavior. Giving a
+  // readiness probe half of the automatic 3.5 second budget can suppress an
+  // otherwise successful recall, so only the legacy /recall path preflights.
+  if (path === "/recall") {
     const ready = await waitUntilReady(headers, deadline, budget);
     // A permanent readiness response (most commonly 401/403) must not be
     // followed by a duplicate POST. A still-warming service can be queried if

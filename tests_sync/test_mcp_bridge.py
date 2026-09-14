@@ -81,7 +81,7 @@ def clear_connection_pool():
     bridge._close_connections()
 
 
-def test_remote_search_waits_for_ready_and_retries_transient(monkeypatch):
+def test_remote_search_skips_ready_probe_and_retries_transient(monkeypatch):
     monkeypatch.setenv("FUNES_REMOTE_URL", "https://memory.example")
     monkeypatch.setenv("FUNES_API_TOKEN", "api-token")
     monkeypatch.setenv("FUNES_HF_TOKEN", "hub-token")
@@ -91,14 +91,10 @@ def test_remote_search_waits_for_ready_and_retries_transient(monkeypatch):
     monkeypatch.setenv("FUNES_REMOTE_ATTEMPTS", "2")
     monkeypatch.setattr(bridge.time, "sleep", lambda _seconds: None)
     calls = []
-    ready_states = iter(("warming", "ready"))
-
     def fake_urlopen(req, timeout):
         calls.append((req.full_url, req.method, timeout))
         if req.full_url.endswith("/ready/search"):
-            return _Response(
-                {"ok": True, "native_warm": {"state": next(ready_states)}}
-            )
+            raise AssertionError("search must not spend its deadline on readiness")
         if len([call for call in calls if call[1] == "POST"]) == 1:
             raise OSError("connection reset")
         return _Response({"ok": True, "results": [{"raw_text": "原始中文"}]})
@@ -107,11 +103,11 @@ def test_remote_search_waits_for_ready_and_retries_transient(monkeypatch):
     result = bridge._remote_call("/search", {"query": "之前的决定"})
 
     assert result["ok"] is True
-    assert [method for _, method, _ in calls] == ["GET", "GET", "POST", "POST"]
+    assert [method for _, method, _ in calls] == ["POST", "POST"]
     assert all(timeout <= 50 for _, _, timeout in calls)
 
 
-def test_remote_search_polls_retryable_ready_503_until_ready(monkeypatch):
+def test_remote_recall_polls_retryable_ready_503_until_ready(monkeypatch):
     monkeypatch.setenv("FUNES_REMOTE_URL", "https://memory.example")
     monkeypatch.setenv("FUNES_API_TOKEN", "api-token")
     monkeypatch.setenv("FUNES_REMOTE_READY_TIMEOUT", "1")
@@ -134,13 +130,14 @@ def test_remote_search_polls_retryable_ready_503_until_ready(monkeypatch):
         return _Response({"ok": True, "results": []})
 
     monkeypatch.setattr(bridge, "_open_remote", fake_urlopen)
-    result = bridge._remote_call("/search", {"query": "previous decision"})
+    result = bridge._remote_call("/recall", {"query": "previous decision"})
 
     assert result == {"ok": True, "results": []}
     assert [method for _, method, _ in calls] == ["GET", "GET", "POST"]
+    assert calls[-1][0] == "https://memory.example/recall"
 
 
-def test_remote_search_does_not_poll_while_source_store_restores(monkeypatch):
+def test_remote_search_does_not_probe_while_source_store_restores(monkeypatch):
     monkeypatch.setenv("FUNES_REMOTE_URL", "https://memory.example")
     monkeypatch.setenv("FUNES_API_TOKEN", "api-token")
     calls = []
@@ -167,13 +164,10 @@ def test_remote_search_does_not_poll_while_source_store_restores(monkeypatch):
         "ok": True,
         "results": [],
     }
-    assert [url for url, _, _ in calls] == [
-        "https://memory.example/ready/search",
-        "https://memory.example/search",
-    ]
+    assert [url for url, _, _ in calls] == ["https://memory.example/search"]
 
 
-def test_remote_search_default_budget_is_one_probe_and_one_attempt(monkeypatch):
+def test_remote_search_default_budget_is_one_attempt(monkeypatch):
     monkeypatch.setenv("FUNES_REMOTE_URL", "https://memory.example")
     monkeypatch.setenv("FUNES_API_TOKEN", "api-token")
     for name in (
@@ -195,7 +189,6 @@ def test_remote_search_default_budget_is_one_probe_and_one_attempt(monkeypatch):
 
     assert bridge._remote_call("/search", {"query": "previous"}) is None
     assert [(url, method) for url, method, _ in calls] == [
-        ("https://memory.example/ready/search", "GET"),
         ("https://memory.example/search", "POST"),
     ]
     assert all(0 < timeout <= 4 for _, _, timeout in calls)
@@ -280,16 +273,14 @@ def test_remote_call_reads_url_from_config(monkeypatch):
     assert calls == ["https://configured-memory.example/sync/status"]
 
 
-def test_ready_search_and_consecutive_calls_reuse_one_connection(monkeypatch):
+def test_consecutive_search_calls_reuse_one_connection(monkeypatch):
     monkeypatch.setenv("FUNES_REMOTE_URL", "https://memory.example")
     monkeypatch.setenv("FUNES_API_TOKEN", "api-token")
     monkeypatch.setattr(bridge.request, "getproxies", lambda: {})
     monkeypatch.setattr(bridge.request, "proxy_bypass", lambda _host: False)
     monkeypatch.setattr(bridge.http.client, "HTTPSConnection", _HTTPConnection)
     _HTTPConnection.responses = [
-        _HTTPResponse({"ok": True}),
         _HTTPResponse({"ok": True, "results": [1]}),
-        _HTTPResponse({"ok": True}),
         _HTTPResponse({"ok": True, "results": [2]}),
     ]
 
@@ -300,9 +291,7 @@ def test_ready_search_and_consecutive_calls_reuse_one_connection(monkeypatch):
     assert second["results"] == [2]
     assert len(_HTTPConnection.instances) == 1
     assert [item[1] for item in _HTTPConnection.instances[0].requests] == [
-        "/ready/search",
         "/search",
-        "/ready/search",
         "/search",
     ]
 
@@ -319,7 +308,6 @@ def test_https_http_proxy_reuses_tunnel_without_auth_on_connect(monkeypatch):
     monkeypatch.setattr(bridge.request, "proxy_bypass", lambda _host: False)
     monkeypatch.setattr(bridge.http.client, "HTTPSConnection", _HTTPConnection)
     _HTTPConnection.responses = [
-        _HTTPResponse({"ok": True}),
         _HTTPResponse({"ok": True, "results": []}),
         _HTTPResponse({"ok": True}),
     ]

@@ -214,6 +214,58 @@ def test_pi_does_not_follow_or_retry_redirect(tmp_path):
 
 
 @pytest.mark.skipif(NODE is None, reason="node is unavailable")
+def test_pi_before_agent_start_allows_slow_search_within_automatic_budget(tmp_path):
+    requests = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            requests.append(self.path)
+            time.sleep(4.6)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(
+                b'{"ok":true,"results":[{"raw_text":"remembered decision"}]}'
+            )
+
+        def log_message(self, format, *args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server.daemon_threads = True
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        body = (
+            "let beforeAgentStart;\n"
+            "const pi = {registerTool() {}, on(name, handler) { "
+            "if (name === 'before_agent_start') beforeAgentStart = handler; }};\n"
+            "extension(pi);\n"
+            "const result = await beforeAgentStart({"
+            "prompt: 'What did we decide previously about the remote memory?', "
+            "systemPrompt: 'base'});\n"
+            "console.log(JSON.stringify(result ?? null));\n"
+        )
+        started = time.monotonic()
+        result = run_harness(
+            tmp_path,
+            f'[remote]\nurl = "http://127.0.0.1:{server.server_port}"\n',
+            body,
+        )
+        elapsed = time.monotonic() - started
+
+        assert result.returncode == 0, result.stderr
+        assert json.loads(result.stdout) == {
+            "systemPrompt": "base\n\n## Funes unified memory\n1. remembered decision"
+        }
+        assert requests == ["/search"]
+        assert 4.25 < elapsed < 6.5
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+@pytest.mark.skipif(NODE is None, reason="node is unavailable")
 @pytest.mark.parametrize("failure", ("hang", "503"))
 def test_pi_before_agent_start_fails_open_with_automatic_budget(tmp_path, failure):
     requests = []
@@ -272,7 +324,7 @@ def test_pi_before_agent_start_fails_open_with_automatic_budget(tmp_path, failur
         assert result.returncode == 0, result.stderr
         assert result.stdout.strip() == "null"
         assert requests == ["/search"]
-        assert elapsed < 5
+        assert elapsed < (7.5 if failure == "hang" else 5)
     finally:
         server.shutdown()
         server.server_close()

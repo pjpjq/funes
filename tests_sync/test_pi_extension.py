@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -61,6 +62,88 @@ def test_pi_reads_current_and_legacy_remote_config(tmp_path, source, expected):
     result = run_harness(tmp_path, source, "console.log(configuredRemoteUrl());\n")
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == expected
+
+
+@pytest.mark.skipif(
+    NODE is None or sys.platform != "linux", reason="Linux secret-file fallback is required"
+)
+def test_pi_reads_tokens_from_private_env_file(tmp_path):
+    requests = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            requests.append(dict(self.headers.items()))
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"ok":true,"results":[]}')
+
+        def log_message(self, format, *args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        env_file = tmp_path / "funes.env"
+        env_file.write_text(
+            "FUNES_API_TOKEN=from-private-file\nFUNES_HF_TOKEN=hf-from-private-file\n",
+            encoding="utf-8",
+        )
+        env_file.chmod(0o600)
+        body = (
+            "const tools = {};\n"
+            "const pi = {registerTool(tool) { tools[tool.name] = tool; }, on() {}};\n"
+            "extension(pi);\n"
+            "await tools.funes_recall.execute('test', {query: 'history'});\n"
+        )
+        result = run_harness(
+            tmp_path,
+            f'[remote]\nurl = "http://127.0.0.1:{server.server_port}"\n',
+            body,
+            {
+                "FUNES_API_TOKEN": "",
+                "FUNES_HF_TOKEN": "",
+                "HF_TOKEN": "",
+                "FUNES_ENV_FILE": str(env_file),
+            },
+        )
+        assert result.returncode == 0, result.stderr
+        assert len(requests) == 1
+        assert requests[0]["Authorization"] == "Bearer hf-from-private-file"
+        assert requests[0]["X-Funes-Authorization"] == "Bearer from-private-file"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+@pytest.mark.skipif(
+    NODE is None or sys.platform != "linux", reason="Linux secret-file fallback is required"
+)
+def test_pi_rejects_public_env_file(tmp_path):
+    env_file = tmp_path / "funes.env"
+    env_file.write_text("FUNES_API_TOKEN=public-token\n", encoding="utf-8")
+    env_file.chmod(0o644)
+    body = (
+        "const tools = {};\n"
+        "const pi = {registerTool(tool) { tools[tool.name] = tool; }, on() {}};\n"
+        "extension(pi);\n"
+        "const result = await tools.funes_recall.execute('test', {query: 'history'});\n"
+        "console.log(result.content[0].text);\n"
+    )
+    result = run_harness(
+        tmp_path,
+        '[remote]\nurl = "http://127.0.0.1:1"\n',
+        body,
+        {
+            "FUNES_API_TOKEN": "",
+            "FUNES_HF_TOKEN": "",
+            "HF_TOKEN": "",
+            "FUNES_ENV_FILE": str(env_file),
+        },
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "null"
 
 
 @pytest.mark.skipif(NODE is None, reason="node is unavailable")

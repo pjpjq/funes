@@ -1,6 +1,10 @@
 import gzip
 import hashlib
 import json
+import os
+import socket
+import subprocess
+import sys
 import threading
 import time
 from collections import deque
@@ -1338,6 +1342,119 @@ def _post_with_headers(server, path, payload, token="test-token"):
     headers = dict(response.getheaders())
     conn.close()
     return response.status, body, headers
+
+
+def test_server_script_entry_can_filter_warm_memory(tmp_path):
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+
+    env = os.environ.copy()
+    for name in ("FUNES_STORAGE_REPO", "FUNES_INDEX_MEMORY"):
+        env.pop(name, None)
+    env.update(
+        {
+            "FUNES_API_TOKEN": "test-token",
+            "FUNES_BIN": "/usr/bin/false",
+            "FUNES_HOME": str(tmp_path),
+            "FUNES_MEMORY": "owner/canonical-memory",
+            "PYTHONPATH": str(Path(bridge.__file__).parents[1]),
+            "PORT": str(port),
+        }
+    )
+    process = subprocess.Popen(
+        [sys.executable, str(Path(bridge.__file__))],
+        cwd=Path(bridge.__file__).parents[1],
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    server = SimpleNamespace(server_address=("127.0.0.1", port))
+    deadline = time.monotonic() + 60
+    try:
+        while True:
+            if process.poll() is not None:
+                pytest.fail(f"server exited early: {(process.stderr.read() or '')[-1000:]}")
+            try:
+                status, body = _post(
+                    server, "/warm", {"memory": "owner/legacy-memory"}
+                )
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    pytest.fail("server did not accept warm requests within 60 seconds")
+                time.sleep(0.05)
+        assert status == 200
+        assert body["skipped"] is True
+        assert body["reason"] == "memory_mismatch"
+    finally:
+        process.terminate()
+        try:
+            process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=3)
+
+
+def test_warm_skips_mismatched_memory_without_breaking_existing_callers(monkeypatch):
+    calls = []
+    monkeypatch.setattr(bridge, "TOKEN", "test-token")
+    monkeypatch.setattr(bridge, "REMOTE", "owner/canonical-memory")
+    monkeypatch.setattr(bridge, "warm_state", lambda: {"state": "ready"})
+    monkeypatch.setattr(
+        bridge,
+        "request_warm",
+        lambda **kwargs: calls.append(kwargs) or {"state": "warming"},
+    )
+    server = ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        status, mismatch = _post(
+            server, "/warm", {"memory": "owner/legacy-memory"}
+        )
+        uri_status, uri_matching = _post(
+            server,
+            "/warm",
+            {"memory": "hf://datasets/owner/canonical-memory"},
+        )
+        matching_status, matching = _post(
+            server, "/warm", {"memory": "owner/canonical-memory"}
+        )
+        monkeypatch.setattr(
+            bridge, "REMOTE", "hf://datasets/owner/canonical-memory"
+        )
+        shorthand_status, shorthand_matching = _post(
+            server, "/warm", {"memory": "owner/canonical-memory"}
+        )
+        legacy_status, legacy = _post(server, "/warm", {})
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert status == 200
+    assert mismatch == {
+        "ok": True,
+        "skipped": True,
+        "reason": "memory_mismatch",
+        "native_warm": {"state": "ready"},
+    }
+    assert matching_status == 202
+    assert matching["native_warm"]["state"] == "warming"
+    assert uri_status == 202
+    assert uri_matching["native_warm"]["state"] == "warming"
+    assert shorthand_status == 202
+    assert shorthand_matching["native_warm"]["state"] == "warming"
+    assert legacy_status == 202
+    assert legacy["native_warm"]["state"] == "warming"
+    assert calls == [
+        {"force": True},
+        {"force": True},
+        {"force": True},
+        {"force": True},
+    ]
 
 
 def test_sources_check_requires_auth_and_returns_no_raw_payload(monkeypatch, tmp_path):

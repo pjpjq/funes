@@ -53,6 +53,14 @@ CANONICAL_OPTIMIZE_TIMEOUT = max(1, int(os.getenv("FUNES_CANONICAL_OPTIMIZE_TIME
 # Bump when a deployed native index needs one-time structural maintenance even
 # though its source/profile checkpoint is already complete.
 CANONICAL_INDEX_LAYOUT_VERSION = 1
+
+
+def canonical_memory_ref(value: str) -> str:
+    memory = str(value or "").strip().rstrip("/")
+    prefix = "hf://datasets/"
+    return memory[len(prefix) :] if memory.startswith(prefix) else memory
+
+
 try:
     CANONICAL_REFRESH_COOLDOWN = max(
         0.0, float(os.getenv("FUNES_CANONICAL_REFRESH_COOLDOWN", "300"))
@@ -2856,6 +2864,20 @@ class Handler(BaseHTTPRequestHandler):
             if self.path == "/warm":
                 if not REMOTE:
                     self.send_json(503, {"ok": False, "error": "FUNES_MEMORY is not configured"})
+                    return
+                requested_memory = str(obj.get("memory", "")).strip()
+                if requested_memory and canonical_memory_ref(
+                    requested_memory
+                ) != canonical_memory_ref(REMOTE):
+                    self.send_json(
+                        200,
+                        {
+                            "ok": True,
+                            "skipped": True,
+                            "reason": "memory_mismatch",
+                            "native_warm": warm_state(),
+                        },
+                    )
                     return
                 self.send_json(202, {"ok": True, "native_warm": request_warm(force=True)})
                 return

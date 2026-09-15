@@ -240,14 +240,18 @@ class ServiceTests(unittest.TestCase):
         finally:
             store.close()
 
-    def test_prepare_ingest_reads_reindex_generation_once_per_batch(self):
+    def test_prepare_ingest_reads_reindex_generations_once_per_batch(self):
         app = App()
         try:
             with mock.patch.object(
                 app.store,
                 "latest_reindex_generation",
                 wraps=app.store.latest_reindex_generation,
-            ) as latest:
+            ) as latest, mock.patch.object(
+                app.store,
+                "latest_embedding_generation",
+                wraps=app.store.latest_embedding_generation,
+            ) as latest_embedding:
                 prepared = prepare_ingest_documents(
                     app,
                     [
@@ -256,6 +260,7 @@ class ServiceTests(unittest.TestCase):
                     ],
                 )
             self.assertEqual(latest.call_count, 1)
+            self.assertEqual(latest_embedding.call_count, 1)
             self.assertEqual(
                 {item["retrieval_generation"] for item in prepared},
                 {app.store.latest_reindex_generation()},
@@ -1045,7 +1050,7 @@ class ServiceTests(unittest.TestCase):
                 if '"_funes_record": "native_index_state"' in line
             ]
         self.assertEqual(len(state_lines), 1)
-        self.assertEqual(state_lines[0]["state_version"], 1)
+        self.assertEqual(state_lines[0]["state_version"], 2)
         self.assertNotIn("raw_text", state_lines[0])
         after = target.native_index_checkpoint(profile, "memory-v1")
         self.assertEqual(after["revision"], before["revision"])
@@ -1142,6 +1147,44 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(checkpoint["pending"], 2)
             self.assertFalse(checkpoint["complete"])
             self.assertEqual(checkpoint["memory"], "new-memory")
+        finally:
+            store.close()
+
+    def test_legacy_codex_automation_output_is_retained_but_not_indexed(self):
+        store = Store(self.tmp.name)
+        store.ingest(
+            [
+                {
+                    "source_identity": "legacy-automation-run",
+                    "source_agent": "codex",
+                    "source_type": "memory",
+                    "source_path": "~/.codex/automations/daily/runs/run.jsonl",
+                    "content_type": "memory",
+                    "raw_text": "retained automation output",
+                },
+                {
+                    "source_identity": "automation-instructions",
+                    "source_agent": "codex",
+                    "source_type": "memory",
+                    "source_path": "~/.codex/automations/daily/automation.toml",
+                    "content_type": "memory",
+                    "raw_text": "retained automation instructions",
+                },
+            ]
+        )
+        try:
+            legacy = store.get("legacy-automation-run")
+            self.assertEqual(legacy["raw_text"], "retained automation output")
+            self.assertEqual(legacy["content_type"], "progress")
+            self.assertEqual(
+                {
+                    item["source_identity"]
+                    for item in store.canonical_index_candidates(
+                        10, "profile", "memory-a"
+                    )
+                },
+                {"automation-instructions"},
+            )
         finally:
             store.close()
 
@@ -1279,7 +1322,7 @@ class ServiceTests(unittest.TestCase):
             migrated.conn.execute(
                 "SELECT native_checkpoint_state_version FROM sync_state WHERE id=1"
             ).fetchone()[0],
-            1,
+            2,
         )
         self.assertEqual(
             migrated.conn.execute(
@@ -1291,6 +1334,81 @@ class ServiceTests(unittest.TestCase):
         reopened = Store(self.tmp.name)
         self.assertEqual(reopened.conn.total_changes, 0)
         reopened.close()
+
+    def test_embedding_generation_migration_is_additive_and_defaults_to_zero(self):
+        store = Store(self.tmp.name)
+        store.ingest([{"source_identity": "legacy", "raw_text": "raw"}])
+        store.close()
+        connection = sqlite3.connect(Path(self.tmp.name) / "funes.sqlite3")
+        with connection:
+            connection.execute("DROP TRIGGER memories_native_au")
+            connection.execute("ALTER TABLE memories DROP COLUMN embedding_generation")
+        connection.close()
+
+        migrated = Store(self.tmp.name)
+        try:
+            columns = {
+                row[1] for row in migrated.conn.execute("PRAGMA table_info(memories)")
+            }
+            self.assertIn("embedding_generation", columns)
+            self.assertEqual(migrated.get("legacy")["embedding_generation"], 0)
+        finally:
+            migrated.close()
+
+    def test_native_state_v2_retires_legacy_automation_output_without_pending(self):
+        store = Store(self.tmp.name)
+        store.ingest(
+            [
+                {
+                    "source_identity": "legacy-automation-run",
+                    "source_agent": "codex",
+                    "source_type": "memory",
+                    "source_path": "~/.codex/automations/daily/runs/run.jsonl",
+                    "content_type": "memory",
+                    "raw_text": "retained automation output",
+                }
+            ]
+        )
+        with store.lock, store.conn:
+            # Recreate the durable shape written before automation outputs
+            # were removed from discovery and classified as low-value.
+            store.conn.execute(
+                """UPDATE memories SET content_type='memory',
+                native_index_status='indexed',native_index_version='v1',
+                native_index_profile='profile',native_index_memory='memory-a',
+                native_indexed_at='2026-09-15T00:00:00Z'"""
+            )
+            store.conn.execute(
+                """UPDATE sync_state SET native_checkpoint_profile='profile',
+                native_checkpoint_memory='memory-a',
+                native_checkpoint_state_version=1"""
+            )
+        store.close()
+
+        migrated = Store(self.tmp.name)
+        try:
+            self.assertEqual(
+                migrated.get("legacy-automation-run")["content_type"], "progress"
+            )
+            self.assertEqual(
+                migrated.canonical_index_candidates(10, "profile", "memory-a"),
+                [],
+            )
+            checkpoint = migrated.native_index_checkpoint(
+                {"fingerprint": "profile"}, "memory-a"
+            )
+            self.assertEqual(
+                migrated.conn.execute(
+                    """SELECT native_checkpoint_state_version
+                    FROM sync_state WHERE id=1"""
+                ).fetchone()[0],
+                2,
+            )
+            self.assertEqual(checkpoint["eligible"], 0)
+            self.assertEqual(checkpoint["indexed"], 0)
+            self.assertEqual(checkpoint["pending"], 0)
+        finally:
+            migrated.close()
 
     def test_held_invalid_is_terminal_and_does_not_regress(self):
         store = Store(self.tmp.name)
@@ -1619,6 +1737,7 @@ class ServiceTests(unittest.TestCase):
         self.assertIsNone(provider["native_index_status"])
         self.assertEqual(provider["retrieval_generation"], 2)
         self.assertEqual(provider["native_generation"], 2)
+        self.assertEqual(provider["embedding_generation"], 0)
         english = store.get("english-row")
         self.assertEqual(english["translation_status"], "pending_provider")
         self.assertIsNone(english["native_index_status"])
@@ -1639,12 +1758,40 @@ class ServiceTests(unittest.TestCase):
 
         # An older all-control arriving after generation 2 still clears the
         # independent native generation of canonical-eligible English rows.
+        provider = store.get("provider-row")
+        self.assertEqual(
+            store.update_native_index(
+                [
+                    {
+                        "source_identity": provider["source_identity"],
+                        "source_version": provider["source_version"],
+                        "content_hash": provider["content_hash"],
+                        "native_generation": provider["native_generation"],
+                        "native_index_version": "indexed-after-retrieval",
+                        "native_index_status": "indexed",
+                        "native_index_profile": "profile",
+                        "native_index_memory": "memory",
+                        "native_indexed_at": "2026-09-13T00:00:03Z",
+                    }
+                ]
+            ),
+            1,
+        )
         store.record_reindex_control(
             {"generation": 1, "scope": "all", "created_at": "2026-09-13T00:00:01Z"}
         )
         store.drain_reindex_controls(1)
         self.assertIsNone(store.get("english-row")["native_index_status"])
+        self.assertIsNone(store.get("provider-row")["native_index_status"])
         self.assertEqual(store.get("waiting-row")["native_index_status"], "waiting_durability")
+        self.assertEqual(store.get("provider-row")["embedding_generation"], 1)
+
+        # Rows first seen after an all-control inherit that embedding epoch,
+        # while legacy/incoming generation zero cannot regress an existing row.
+        store.ingest([{"source_identity": "new-after-all", "raw_text": "new"}])
+        self.assertEqual(store.get("new-after-all")["embedding_generation"], 1)
+        store.ingest([{**original, "embedding_generation": 0}])
+        self.assertEqual(store.get("provider-row")["embedding_generation"], 1)
         store.close()
 
     def test_reindex_row_cursor_is_bounded_and_survives_restart(self):
@@ -1845,7 +1992,17 @@ class ServiceTests(unittest.TestCase):
             [(4, "all"), (5, "retrieval_text")],
         )
         self.assertEqual(first["scanned"], 40)
-        self.assertEqual(first["updated"], 20)
+        # The newest retrieval control advances retrieval/native state first;
+        # the retained older all-control then advances the independent
+        # embedding epoch for every row.
+        self.assertEqual(first["updated"], 40)
+        self.assertEqual(
+            {
+                store.get(f"compact-row-{index}")["embedding_generation"]
+                for index in range(20)
+            },
+            {4},
+        )
 
         store.compact_reindex_controls(replay=True)
         replay = store.drain_reindex_controls(7)

@@ -9,7 +9,7 @@ use crate::memory::remote::{self, Replaced};
 use crate::memory::{lock, Memory, Reachability};
 use crate::scan::{self, SecretScanner};
 use anyhow::{bail, Context, Result};
-use arrow_array::{Array, RecordBatch, RecordBatchIterator, StringArray};
+use arrow_array::{Array, FixedSizeListArray, Float32Array, RecordBatch, RecordBatchIterator, StringArray};
 use arrow_schema::Schema;
 use chrono::DateTime;
 use futures::TryStreamExt;
@@ -26,6 +26,7 @@ use std::sync::Arc;
 
 const MAX_COMMIT_RETRIES: u32 = 10;
 const HELD_SOURCE_ID_DOMAIN: &[u8] = b"funes-held-source-v1\0";
+const EMBEDDING_GENERATION_PREFIX: &str = "~funes-eg-v1:";
 const STORED_REVISION_COLUMNS: [&str; 5] = [
     "source_identity",
     "source_version",
@@ -118,15 +119,10 @@ struct Selection<'a> {
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct EmbeddingCacheKey {
-    source_identity: String,
     profile_fingerprint: String,
-    source_version: String,
-    content_hash: String,
-}
-
-struct CachedSourceEmbedding {
-    chunks: Vec<Chunk>,
-    vectors: Vec<Vec<f32>>,
+    embedding_generation: u64,
+    chunk_id: String,
+    text: String,
 }
 
 #[derive(Default, Debug)]
@@ -238,6 +234,7 @@ fn normalize(input: InputDocument) -> Result<Document> {
             bail!("{name} must not contain NUL");
         }
     }
+    embedding_generation(&input.source_version)?;
     // `raw_text` is the canonical source.  Accept the legacy `retrieval_text`
     // envelope only so an interrupted rollout can replay an older queued
     // batch; new producers always send raw text.
@@ -316,6 +313,21 @@ fn sort_and_strip(value: Value) -> Value {
 
 fn clean_opt(value: Option<String>) -> Option<String> {
     value.filter(|value| !value.trim().is_empty())
+}
+
+fn embedding_generation(source_version: &str) -> Result<u64> {
+    let Some(encoded) = source_version.strip_prefix(EMBEDDING_GENERATION_PREFIX) else {
+        return Ok(0);
+    };
+    let (generation, revision) = encoded
+        .split_once(':')
+        .context("reserved embedding generation source_version is malformed")?;
+    if generation.len() != 20 || !generation.bytes().all(|byte| byte.is_ascii_digit()) || revision.is_empty() {
+        bail!("reserved embedding generation source_version is malformed");
+    }
+    generation
+        .parse()
+        .context("reserved embedding generation source_version is out of range")
 }
 
 fn timestamp_key(value: &str) -> Result<i128> {
@@ -582,34 +594,90 @@ fn embed_chunks(chunks: &[Chunk], embedder: &mut dyn Embedder) -> Result<Vec<Vec
     embed_batched(embedder, &texts, |_| {})
 }
 
-fn embedding_cache_key(doc: &Document, profile: &EmbeddingProfile) -> EmbeddingCacheKey {
+fn embedding_cache_key(chunk: &Chunk, profile: &EmbeddingProfile) -> EmbeddingCacheKey {
     EmbeddingCacheKey {
-        source_identity: doc.source_identity.clone(),
         profile_fingerprint: profile.fingerprint.clone(),
-        source_version: doc.source_version.clone(),
-        content_hash: doc.content_hash.clone(),
+        embedding_generation: embedding_generation(chunk.source_version.as_deref().unwrap_or_default())
+            .expect("canonical source versions are validated before chunking"),
+        chunk_id: chunk.id.clone(),
+        text: chunk.text.clone(),
     }
+}
+
+async fn seed_stored_embeddings(
+    ds: &Dataset,
+    selection: &[&Document],
+    profile: &EmbeddingProfile,
+    cache: &mut HashMap<EmbeddingCacheKey, Vec<f32>>,
+) -> Result<()> {
+    if selection.is_empty() {
+        return Ok(());
+    }
+    let schema = Schema::from(ds.schema());
+    if ["source_identity", "source_version", "id", "text", "vector"]
+        .iter()
+        .any(|name| schema.column_with_name(name).is_none())
+    {
+        return Ok(());
+    }
+    let filter = delete_filter(selection);
+    for batch in dataset::scan_rows(ds, &["id", "text", "source_version", "vector"], Some(&filter), None).await? {
+        let ids = string_col(&batch, "id")?;
+        let texts = string_col(&batch, "text")?;
+        let source_versions = string_col(&batch, "source_version")?;
+        let vectors = batch
+            .column_by_name("vector")
+            .and_then(|column| column.as_any().downcast_ref::<FixedSizeListArray>())
+            .context("memory column \"vector\" is not a fixed-size list")?;
+        for row in 0..batch.num_rows() {
+            if ids.is_null(row) || texts.is_null(row) || source_versions.is_null(row) || vectors.is_null(row) {
+                continue;
+            }
+            let Ok(embedding_generation) = embedding_generation(source_versions.value(row)) else {
+                continue;
+            };
+            let values = vectors.value(row);
+            let Some(values) = values.as_any().downcast_ref::<Float32Array>() else {
+                continue;
+            };
+            if values.len() != profile.dimensions || values.null_count() > 0 {
+                continue;
+            }
+            let vector = (0..values.len()).map(|index| values.value(index)).collect::<Vec<_>>();
+            if vector.iter().any(|value| !value.is_finite()) {
+                continue;
+            }
+            cache.insert(
+                EmbeddingCacheKey {
+                    profile_fingerprint: profile.fingerprint.clone(),
+                    embedding_generation,
+                    chunk_id: ids.value(row).to_string(),
+                    text: texts.value(row).to_string(),
+                },
+                vector,
+            );
+        }
+    }
+    Ok(())
 }
 
 fn cached_selection_embeddings(
     selection: &[&Document],
     profile: &EmbeddingProfile,
     embedder: &mut dyn Embedder,
-    cache: &mut HashMap<EmbeddingCacheKey, CachedSourceEmbedding>,
+    cache: &mut HashMap<EmbeddingCacheKey, Vec<f32>>,
 ) -> Result<(Vec<Chunk>, Vec<Vec<f32>>)> {
+    let chunks = build_chunks(selection);
     let mut scheduled = HashSet::new();
     let mut missing = Vec::new();
-    for doc in selection {
-        let key = embedding_cache_key(doc, profile);
+    for chunk in &chunks {
+        let key = embedding_cache_key(chunk, profile);
         if !cache.contains_key(&key) && scheduled.insert(key.clone()) {
-            missing.push((key, document_chunks(doc)));
+            missing.push((key, chunk.clone()));
         }
     }
 
-    let missing_chunks = missing
-        .iter()
-        .flat_map(|(_, chunks)| chunks.iter().cloned())
-        .collect::<Vec<_>>();
+    let missing_chunks = missing.iter().map(|(_, chunk)| chunk.clone()).collect::<Vec<_>>();
     let missing_vectors = embed_chunks(&missing_chunks, embedder)?;
     if missing_vectors.len() != missing_chunks.len() {
         bail!(
@@ -618,36 +686,19 @@ fn cached_selection_embeddings(
             missing_chunks.len()
         );
     }
-    let mut offset = 0;
-    for (key, chunks) in missing {
-        let end = offset + chunks.len();
-        cache.insert(
-            key,
-            CachedSourceEmbedding {
-                chunks,
-                vectors: missing_vectors[offset..end].to_vec(),
-            },
-        );
-        offset = end;
+    for ((key, _), vector) in missing.into_iter().zip(missing_vectors) {
+        cache.insert(key, vector);
     }
 
-    let chunk_count = selection
+    let vectors = chunks
         .iter()
-        .map(|doc| {
+        .map(|chunk| {
             cache
-                .get(&embedding_cache_key(doc, profile))
-                .map(|entry| entry.chunks.len())
-                .unwrap_or_default()
+                .get(&embedding_cache_key(chunk, profile))
+                .cloned()
+                .context("embedding cache omitted a selected chunk")
         })
-        .sum();
-    let mut chunks = Vec::with_capacity(chunk_count);
-    let mut vectors = Vec::with_capacity(chunk_count);
-    for doc in selection {
-        let key = embedding_cache_key(doc, profile);
-        let cached = cache.get(&key).context("embedding cache omitted a selected source")?;
-        chunks.extend(cached.chunks.iter().cloned());
-        vectors.extend(cached.vectors.iter().cloned());
-    }
+        .collect::<Result<Vec<_>>>()?;
     Ok((chunks, vectors))
 }
 
@@ -688,8 +739,11 @@ async fn ingest_local(
         });
     }
 
-    let chunks = build_chunks(&selection.changed);
-    let vectors = embed_chunks(&chunks, embedder)?;
+    let mut embedding_cache = HashMap::new();
+    if let Some(current) = &ds {
+        seed_stored_embeddings(current, &selection.changed, profile, &mut embedding_cache).await?;
+    }
+    let (chunks, vectors) = cached_selection_embeddings(&selection.changed, profile, embedder, &mut embedding_cache)?;
     if let Some(current) = &mut ds {
         dataset::ensure_canonical_columns(current).await?;
         let target_schema = Arc::new(Schema::from(current.schema()));
@@ -752,22 +806,23 @@ async fn ingest_remote(
     let mut embedding_cache = HashMap::new();
     loop {
         let expected_parent = remote::head_oid(&repo, &rev).await?;
-        let (stored, first, schema_allows_append) = match memory.open_remote_revision(&expected_parent).await {
+        let (current, first, schema_allows_append) = match memory.open_remote_revision(&expected_parent).await {
             Ok(ds) => {
                 let arrow = Schema::from(ds.schema());
-                (
-                    stored_revisions(&ds, docs).await?,
-                    false,
-                    append_schema_allows_fast_path(&arrow),
-                )
+                let schema_allows_append = append_schema_allows_fast_path(&arrow);
+                (Some(ds), false, schema_allows_append)
             }
-            Err(error) if crate::memory::dataset_absent(&error) => (HashMap::new(), true, true),
+            Err(error) if crate::memory::dataset_absent(&error) => (None, true, true),
             Err(error) => {
                 return Err(error.context(format!(
                     "{} exists but cannot be read; refusing to replace canonical sources",
                     memory.label()
                 )))
             }
+        };
+        let stored = match &current {
+            Some(ds) => stored_revisions(ds, docs).await?,
+            None => HashMap::new(),
         };
         let selection = select_documents(docs, &stored);
         if selection.changed.is_empty() {
@@ -777,6 +832,9 @@ async fn ingest_remote(
                 held_source_ids: held_source_ids.to_vec(),
                 ..Report::default()
             });
+        }
+        if let Some(ds) = &current {
+            seed_stored_embeddings(ds, &selection.changed, profile, &mut embedding_cache).await?;
         }
         let (chunks, vectors) =
             cached_selection_embeddings(&selection.changed, profile, embedder, &mut embedding_cache)?;
@@ -993,7 +1051,7 @@ mod tests {
         let memory = root.path().join("memory");
         let input = root.path().join("docs.jsonl");
         let clean = Clean;
-        let mut embedder = FakeEmbedder;
+        let mut embedder = CountingEmbedder::default();
         let profile = EmbeddingProfile::local();
 
         let long = format!("{} old-tail", "long source text ".repeat(180));
@@ -1053,6 +1111,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(second.sources, 1);
+        let embedded_before_metadata_only = embedder.texts;
         let stored = rows(&memory).await;
         assert_eq!(texts(&stored), vec!["short replacement"]);
         assert_eq!(strings(&stored, "source_version"), vec![Some("v2".to_string())]);
@@ -1080,6 +1139,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(third.sources, 1);
+        assert_eq!(
+            embedder.texts, embedded_before_metadata_only,
+            "metadata-only revisions must reuse the stored vector"
+        );
         assert_eq!(
             strings(&rows(&memory).await, "metadata_json"),
             vec![Some(r#"{"label":"metadata-only"}"#.to_string())]
@@ -1126,6 +1189,156 @@ mod tests {
             .unwrap();
         assert_eq!(held_report.held_source_ids.len(), 1);
         assert_eq!(texts(&rows(&memory).await), vec!["short replacement"]);
+    }
+
+    #[tokio::test]
+    async fn local_ingest_reuses_matching_chunks_and_embeds_only_changed_chunks() {
+        let root = tempfile::tempdir().unwrap();
+        let memory = root.path().join("memory");
+        let profile = EmbeddingProfile::local();
+        let mut embedder = CountingEmbedder::default();
+        let first_text = format!("{}\n{}", "A".repeat(800), "B".repeat(600));
+        let first: InputDocument = serde_json::from_value(doc(
+            "v1",
+            "2026-09-01T00:00:00Z",
+            &first_text,
+            serde_json::json!({"label":"first"}),
+        ))
+        .unwrap();
+        let first = normalize(first).unwrap();
+        assert_eq!(document_chunks(&first).len(), 2);
+        ingest_local(
+            memory.clone(),
+            std::slice::from_ref(&first),
+            &[],
+            &mut embedder,
+            &profile,
+        )
+        .await
+        .unwrap();
+        assert_eq!(embedder.texts, 2);
+
+        let second: InputDocument = serde_json::from_value(doc(
+            "v2",
+            "2026-09-02T00:00:00Z",
+            &first_text,
+            serde_json::json!({"label":"metadata-only"}),
+        ))
+        .unwrap();
+        let second = normalize(second).unwrap();
+        ingest_local(
+            memory.clone(),
+            std::slice::from_ref(&second),
+            &[],
+            &mut embedder,
+            &profile,
+        )
+        .await
+        .unwrap();
+        assert_eq!(embedder.texts, 2);
+        assert_eq!(
+            strings(&rows(&memory).await, "source_version"),
+            vec![Some("v2".to_string()), Some("v2".to_string())]
+        );
+
+        let changed_text = format!("{}\n{}", "A".repeat(800), "C".repeat(600));
+        let third: InputDocument = serde_json::from_value(doc(
+            "v3",
+            "2026-09-03T00:00:00Z",
+            &changed_text,
+            serde_json::json!({"label":"one-chunk-changed"}),
+        ))
+        .unwrap();
+        let third = normalize(third).unwrap();
+        ingest_local(
+            memory.clone(),
+            std::slice::from_ref(&third),
+            &[],
+            &mut embedder,
+            &profile,
+        )
+        .await
+        .unwrap();
+        assert_eq!(embedder.texts, 3);
+        assert_eq!(
+            texts(&rows(&memory).await),
+            document_chunks(&third)
+                .into_iter()
+                .map(|chunk| chunk.text)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_embedding_generation_reembeds_unchanged_text_once() {
+        let root = tempfile::tempdir().unwrap();
+        let memory = root.path().join("memory");
+        let profile = EmbeddingProfile::local();
+        let mut embedder = CountingEmbedder::default();
+        let text = "same canonical source text";
+
+        let mut initial = doc(
+            "0a-initial",
+            "2026-09-01T00:00:00Z",
+            text,
+            serde_json::json!({"label":"initial"}),
+        );
+        initial["content_hash"] = Value::String("stable-content-hash".to_string());
+        let initial = normalize(serde_json::from_value(initial).unwrap()).unwrap();
+        ingest_local(
+            memory.clone(),
+            std::slice::from_ref(&initial),
+            &[],
+            &mut embedder,
+            &profile,
+        )
+        .await
+        .unwrap();
+        assert_eq!(embedder.texts, 1);
+
+        let mut forced = doc(
+            "~funes-eg-v1:00000000000000000001:forced",
+            "2026-09-01T00:00:00Z",
+            text,
+            serde_json::json!({"label":"forced"}),
+        );
+        forced["content_hash"] = Value::String("stable-content-hash".to_string());
+        let forced = normalize(serde_json::from_value(forced).unwrap()).unwrap();
+        ingest_local(
+            memory.clone(),
+            std::slice::from_ref(&forced),
+            &[],
+            &mut embedder,
+            &profile,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            embedder.texts, 2,
+            "a new explicit embedding generation must not reuse the old vector"
+        );
+
+        let mut metadata_only = doc(
+            "~funes-eg-v1:00000000000000000001:metadata-only",
+            "2026-09-02T00:00:00Z",
+            text,
+            serde_json::json!({"label":"metadata-only"}),
+        );
+        metadata_only["content_hash"] = Value::String("stable-content-hash".to_string());
+        let metadata_only = normalize(serde_json::from_value(metadata_only).unwrap()).unwrap();
+        ingest_local(
+            memory.clone(),
+            std::slice::from_ref(&metadata_only),
+            &[],
+            &mut embedder,
+            &profile,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            embedder.texts, 2,
+            "metadata-only revisions inside one generation must reuse the vector"
+        );
     }
 
     #[test]
@@ -1241,6 +1454,17 @@ mod tests {
         value["retrieval_text"] = Value::String("legacy queued text".to_string());
         let input: InputDocument = serde_json::from_value(value).unwrap();
         assert_eq!(normalize(input).unwrap().raw_text, "legacy queued text");
+    }
+
+    #[test]
+    fn embedding_generation_prefix_is_explicit_and_strict() {
+        assert_eq!(embedding_generation("legacy-source-version").unwrap(), 0);
+        assert_eq!(
+            embedding_generation("~funes-eg-v1:00000000000000000042:revision").unwrap(),
+            42
+        );
+        assert!(embedding_generation("~funes-eg-v1:42:revision").is_err());
+        assert!(embedding_generation("~funes-eg-v1:00000000000000000042:").is_err());
     }
 
     #[test]

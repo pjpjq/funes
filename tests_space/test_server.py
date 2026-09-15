@@ -2230,6 +2230,61 @@ def test_canonical_source_version_has_unambiguous_field_boundaries():
     assert bridge.canonical_source_version(
         {**base, "native_generation": 1}
     ) != bridge.canonical_source_version({**base, "native_generation": 2})
+    assert bridge.canonical_source_version(
+        {**base, "embedding_generation": 1}
+    ) != bridge.canonical_source_version({**base, "embedding_generation": 2})
+
+
+def test_canonical_source_version_generation_zero_preserves_legacy_hash():
+    item = {
+        "source_version": "raw-v1",
+        "content_hash": "hash",
+        "translation_hash": "translation-hash",
+        "translation_version": "translation-version",
+        "retrieval_text": "english retrieval",
+        "source_missing": False,
+        "native_generation": 3,
+        "embedding_generation": 0,
+    }
+    assert bridge.canonical_source_version(
+        item, {"fingerprint": "fixed-profile"}
+    ) == "a16edaffcadde01adc63c9e51e346fc10dc3bbe77c6276582e268f6370421ea5"
+    assert bridge.canonical_source_version(
+        {**item, "embedding_generation": 7}, {"fingerprint": "fixed-profile"}
+    ) == (
+        "~funes-eg-v1:00000000000000000007:"
+        "a16edaffcadde01adc63c9e51e346fc10dc3bbe77c6276582e268f6370421ea5"
+    )
+
+
+def test_canonical_source_version_keeps_epoch_prefix_across_shadow_changes():
+    base = {
+        "source_version": "raw-v1",
+        "content_hash": "hash",
+        "embedding_generation": 7,
+    }
+    left = bridge.canonical_source_version(
+        {**base, "retrieval_text": "first"}, {"fingerprint": "fixed-profile"}
+    )
+    right = bridge.canonical_source_version(
+        {**base, "retrieval_text": "second"}, {"fingerprint": "fixed-profile"}
+    )
+    assert left != right
+    assert left.startswith("~funes-eg-v1:00000000000000000007:")
+    assert right.startswith("~funes-eg-v1:00000000000000000007:")
+
+
+def test_canonical_document_carries_embedding_generation():
+    item = {
+        "source_identity": "memory-section",
+        "source_version": "raw-v1",
+        "raw_text": "raw",
+        "retrieval_text": "retrieval",
+        "content_hash": "hash",
+        "updated_at": "2026-09-15T00:00:00Z",
+        "embedding_generation": 7,
+    }
+    assert bridge.canonical_document(item)["embedding_generation"] == 7
 
 
 def test_opaque_source_id_matches_native_domain_separated_contract():

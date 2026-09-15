@@ -23,6 +23,7 @@ import time
 import urllib.error
 import urllib.request
 import zlib
+from collections.abc import Mapping
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -48,7 +49,22 @@ TRANSLATION_THRESHOLD = float(os.getenv("TRANSLATE_CHINESE_THRESHOLD", "0.15"))
 INGEST_INDEX_TIMEOUT = int(os.getenv("FUNES_INGEST_INDEX_TIMEOUT", "900"))
 INGEST_PUSH_TIMEOUT = int(os.getenv("FUNES_INGEST_PUSH_TIMEOUT", "1800"))
 CANONICAL_INDEX_BATCH = max(1, int(os.getenv("FUNES_CANONICAL_INDEX_BATCH", "32")))
-CANONICAL_INDEX_INTERVAL = max(0.01, float(os.getenv("FUNES_CANONICAL_INDEX_INTERVAL", "30")))
+
+
+def _canonical_index_intervals(
+    environ: Mapping[str, str] | None = None,
+) -> tuple[float, float]:
+    """Return active/idle waits while preserving the legacy single interval."""
+    environ = os.environ if environ is None else environ
+    legacy = environ.get("FUNES_CANONICAL_INDEX_INTERVAL")
+    active = environ.get("FUNES_CANONICAL_INDEX_ACTIVE_INTERVAL", legacy or "1")
+    idle = environ.get("FUNES_CANONICAL_INDEX_IDLE_INTERVAL", legacy or "30")
+    return max(0.01, float(active)), max(0.01, float(idle))
+
+
+CANONICAL_INDEX_ACTIVE_INTERVAL, CANONICAL_INDEX_INTERVAL = (
+    _canonical_index_intervals()
+)
 CANONICAL_INDEX_TIMEOUT = max(1, int(os.getenv("FUNES_CANONICAL_INDEX_TIMEOUT", "900")))
 CANONICAL_OPTIMIZE_TIMEOUT = max(1, int(os.getenv("FUNES_CANONICAL_OPTIMIZE_TIMEOUT", "900")))
 # Bump when a deployed native index needs one-time structural maintenance even
@@ -1510,6 +1526,7 @@ def _initialize_canonical_reconcile_state(app) -> None:
         "last_error": None,
         "last_progress_at": None,
         "consecutive_failures": 0,
+        "wait_seconds": CANONICAL_INDEX_INTERVAL,
     }
     app._canonical_refresh_lock = threading.Lock()
     app._canonical_refresh_state = {"last_requested_at": None, "dirty": False}
@@ -1573,6 +1590,7 @@ def canonical_reconcile_state(app) -> dict[str, object]:
             "last_error": None,
             "last_progress_at": None,
             "consecutive_failures": 0,
+            "wait_seconds": CANONICAL_INDEX_INTERVAL,
         }
     else:
         with lock:
@@ -1585,6 +1603,8 @@ def canonical_reconcile_state(app) -> dict[str, object]:
         batch_size=CANONICAL_INDEX_BATCH,
         timeout_seconds=CANONICAL_INDEX_TIMEOUT,
         interval_seconds=CANONICAL_INDEX_INTERVAL,
+        active_interval_seconds=CANONICAL_INDEX_ACTIVE_INTERVAL,
+        idle_interval_seconds=CANONICAL_INDEX_INTERVAL,
     )
     return public
 
@@ -1809,6 +1829,7 @@ def _canonical_reconcile_background(app) -> None:
         try:
             result = reconcile_canonical_index(app)
         except Exception as exc:
+            wait_seconds = CANONICAL_INDEX_INTERVAL
             state = canonical_reconcile_state(app)
             failures = int(state.get("consecutive_failures") or 0) + 1
             _set_canonical_reconcile_state(
@@ -1823,6 +1844,7 @@ def _canonical_reconcile_background(app) -> None:
                 last_result=None,
                 last_error=_canonical_error_code(exc),
                 consecutive_failures=failures,
+                wait_seconds=wait_seconds,
             )
             # Retry state remains in the encrypted source store. Never log raw
             # rows, exception text, subprocess output, provider payloads, or credentials.
@@ -1833,6 +1855,14 @@ def _canonical_reconcile_background(app) -> None:
             }
             state = canonical_reconcile_state(app)
             durable = bool(result.get("durable"))
+            made_progress = int(result.get("indexed") or 0) > 0 or int(
+                result.get("held") or 0
+            ) > 0
+            wait_seconds = (
+                CANONICAL_INDEX_ACTIVE_INTERVAL
+                if durable and made_progress
+                else CANONICAL_INDEX_INTERVAL
+            )
             failures = (
                 0
                 if durable
@@ -1849,6 +1879,7 @@ def _canonical_reconcile_background(app) -> None:
                 "last_result": safe_result,
                 "last_error": None if durable else "status_not_durable",
                 "consecutive_failures": failures,
+                "wait_seconds": wait_seconds,
             }
             if durable and (
                 int(result.get("indexed") or 0) > 0
@@ -1856,7 +1887,7 @@ def _canonical_reconcile_background(app) -> None:
             ):
                 changes["last_progress_at"] = utc_now()
             _set_canonical_reconcile_state(app, **changes)
-        if app.canonical_index_stop.wait(CANONICAL_INDEX_INTERVAL):
+        if app.canonical_index_stop.wait(wait_seconds):
             break
 
 

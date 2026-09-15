@@ -1240,7 +1240,11 @@ def canonical_source_version(item: dict, profile: dict[str, object] | None = Non
         str(profile["fingerprint"]),
     ]
     encoded = json.dumps(parts, ensure_ascii=False, separators=(",", ":")).encode()
-    return hashlib.sha256(encoded).hexdigest()
+    digest = hashlib.sha256(encoded).hexdigest()
+    embedding_generation = int(item.get("embedding_generation") or 0)
+    if embedding_generation <= 0:
+        return digest
+    return f"~funes-eg-v1:{embedding_generation:020d}:{digest}"
 
 
 def canonical_document(
@@ -1259,6 +1263,7 @@ def canonical_document(
         "retrieval_text": str(item["retrieval_text"]),
         "content_hash": str(item["content_hash"]),
         "updated_at": str(item.get("retrieval_updated_at") or item.get("updated_at")),
+        "embedding_generation": int(item.get("embedding_generation") or 0),
         "metadata": metadata,
     }
     for name in CANONICAL_FACETS:

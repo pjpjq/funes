@@ -291,6 +291,45 @@ def test_record_inventory_cursor_and_missing_queue_are_restart_safe(tmp_path):
         reopened.close()
 
 
+def test_retired_sources_never_reenter_remote_inventory(tmp_path):
+    cfg = Config(tmp_path, tmp_path / ".state", tmp_path / "config.toml")
+    store = Store(config=cfg)
+    active = Source("active", "codex", tmp_path / "active.jsonl", "device")
+    retired = Source(
+        "retired",
+        "codex_memory",
+        tmp_path / ".codex" / "automations" / "job" / "runs" / "run.jsonl",
+        "device",
+    )
+    try:
+        for source in (active, retired):
+            store.register_source(source)
+            store.upsert_chunks(
+                [
+                    Chunk(
+                        record_id=f"record:{source.source_key}",
+                        source_key=source.source_key,
+                        kind=source.kind,
+                        path=str(source.path),
+                        session_id=source.source_key,
+                        ordinal=0,
+                        role="user",
+                        text="raw",
+                        raw_text="raw",
+                    )
+                ]
+            )
+        store.ack(["record:active", "record:retired"])
+        store.db.execute("UPDATE sources SET retired=1 WHERE source_key='retired'")
+        store.db.commit()
+
+        assert store.record_ids_after("", 10) == ["record:active"]
+        assert store.enqueue_records(["record:retired", "record:active"]) == 1
+        assert [row["record_id"] for row in store.pending(10)] == ["record:active"]
+    finally:
+        store.close()
+
+
 def test_source_and_upload_counts_are_exact(tmp_path):
     cfg = Config(tmp_path, tmp_path / ".state", tmp_path / "config.toml")
     store = Store(config=cfg)
@@ -417,6 +456,18 @@ def test_existing_database_gets_meta_migration_without_data_loss(tmp_path):
         CREATE TABLE queue(record_id TEXT PRIMARY KEY,attempts INTEGER DEFAULT 0,next_at REAL DEFAULT 0,last_error TEXT,queued_at REAL);
         CREATE TABLE cursors(source_key TEXT PRIMARY KEY,offset INTEGER DEFAULT 0,inode INTEGER,size INTEGER,updated_at REAL);
         INSERT INTO queue(record_id,attempts,next_at,last_error,queued_at) VALUES('pending',0,0,NULL,1);
+        INSERT INTO sources(
+            source_key,kind,path,device_id,project,active,size,mtime,inode,updated_at
+        ) VALUES(
+            'legacy-run','codex_memory',
+            '/Users/test/.codex/automations/job/runs/run.jsonl',
+            'device','',1,42,1,1,1
+        );
+        INSERT INTO records(
+            record_id,source_key,content_hash,version,payload,updated_at
+        ) VALUES('legacy-record','legacy-run','hash',1,'{"raw_text":"retained"}',1);
+        INSERT INTO queue(record_id,attempts,next_at,last_error,queued_at)
+        VALUES('legacy-record',0,0,NULL,1);
         """
     )
     connection.commit()
@@ -426,6 +477,13 @@ def test_existing_database_gets_meta_migration_without_data_loss(tmp_path):
     store = Store(config=cfg)
     try:
         assert store.pending_count() == 1
+        retired = store.db.execute(
+            "SELECT active,retired FROM sources WHERE source_key='legacy-run'"
+        ).fetchone()
+        assert tuple(retired) == (0, 1)
+        assert store.get("legacy-record")["raw_text"] == "retained"
+        assert "legacy-record" not in store.record_ids_after("", 10)
+        assert store.meta_value("legacy_automation_retirement_v1")
         assert store.meta_value("last_successful_sync") is None
         indexes = {
             row[0]

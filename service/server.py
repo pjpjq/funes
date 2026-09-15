@@ -41,7 +41,7 @@ FIELDS = (
     "retrieval_updated_at", "native_index_version", "native_index_status",
     "native_index_profile", "native_index_memory", "native_indexed_at",
     "native_index_error", "retrieval_generation",
-    "native_generation",
+    "native_generation", "embedding_generation",
 )
 CJK_RE = re.compile(r"[\u3400-\u9fff\uf900-\ufaff]")
 PROMPT_VERSION = "funes-retrieval-v2"
@@ -56,8 +56,23 @@ NATIVE_SESSION_TYPES = {
 }
 LOW_VALUE_CONTENT_TYPES = {"tool_call", "tool_result", "shell_output", "progress"}
 NATIVE_TERMINAL_STATUSES = {"indexed", "held_secret", "held_invalid"}
-NATIVE_CHECKPOINT_STATE_VERSION = 1
+NATIVE_CHECKPOINT_STATE_VERSION = 2
 FTS_SCHEMA_VERSION = 3
+
+
+def _is_legacy_codex_automation_output(
+    source_agent: object, source_type: object, source_path: object
+) -> bool:
+    """Identify old automation run output that was once imported as memory."""
+    path = str(source_path or "").replace("\\", "/").lower()
+    return (
+        str(source_agent or "").lower() == "codex"
+        and str(source_type or "").lower() == "memory"
+        and "/.codex/automations/" in path
+        and not path.endswith((".md", ".toml"))
+    )
+
+
 RETRIEVAL_PROMPT = """You are a retrieval normalization engine.
 Convert the natural-language Chinese portions of the input into concise English optimized for semantic retrieval.
 Rules:
@@ -252,6 +267,7 @@ class Store:
                     native_index_pending INTEGER NOT NULL DEFAULT 1,
                     retrieval_generation INTEGER NOT NULL DEFAULT 0,
                     native_generation INTEGER NOT NULL DEFAULT 0,
+                    embedding_generation INTEGER NOT NULL DEFAULT 0,
                     UNIQUE(source_identity)
                 );
                 CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
@@ -321,7 +337,11 @@ class Store:
                 self.conn.execute(
                     "ALTER TABLE memories ADD COLUMN native_index_pending INTEGER NOT NULL DEFAULT 1"
                 )
-            for name in ("retrieval_generation", "native_generation"):
+            for name in (
+                "retrieval_generation",
+                "native_generation",
+                "embedding_generation",
+            ):
                 if name not in columns:
                     self.conn.execute(
                         f"ALTER TABLE memories ADD COLUMN {name} INTEGER NOT NULL DEFAULT 0"
@@ -408,6 +428,22 @@ class Store:
             )
             if native_state_version < NATIVE_CHECKPOINT_STATE_VERSION:
                 self._drop_native_state_triggers_locked()
+                # Early unified-memory builds imported every Codex automation
+                # run/evaluation file as durable memory. Discovery has since
+                # been narrowed to instructions and explicit memory files, but
+                # restored source snapshots can still contain those large
+                # legacy rows. Keep their raw text and lexical availability;
+                # classify them as existing low-value progress so checkpoint
+                # rebuilds never send them through a paid embedder again.
+                self.conn.execute(
+                    """UPDATE memories SET content_type='progress'
+                    WHERE lower(COALESCE(source_agent,''))='codex'
+                    AND lower(COALESCE(source_type,''))='memory'
+                    AND replace(lower(COALESCE(source_path,'')),char(92),'/')
+                        LIKE '%/.codex/automations/%'
+                    AND lower(COALESCE(source_path,'')) NOT LIKE '%.md'
+                    AND lower(COALESCE(source_path,'')) NOT LIKE '%.toml'"""
+                )
                 state = self.conn.execute(
                     """SELECT native_checkpoint_profile,native_checkpoint_memory,
                     native_optimize_fingerprint,native_optimize_memory
@@ -574,7 +610,7 @@ class Store:
                 content_hash,content_type,source_missing,translation_hash,
                 translation_version,native_index_version,native_index_status,
                 native_index_profile,native_index_memory,native_indexed_at,
-                native_generation ON memories
+                native_generation,embedding_generation ON memories
             WHEN (old.source_identity IS NOT new.source_identity
                 OR old.source_version IS NOT new.source_version
                 OR old.raw_text IS NOT new.raw_text
@@ -589,7 +625,8 @@ class Store:
                 OR old.native_index_profile IS NOT new.native_index_profile
                 OR old.native_index_memory IS NOT new.native_index_memory
                 OR old.native_indexed_at IS NOT new.native_indexed_at
-                OR old.native_generation IS NOT new.native_generation)
+                OR old.native_generation IS NOT new.native_generation
+                OR old.embedding_generation IS NOT new.embedding_generation)
             BEGIN
             UPDATE sync_state SET
                 native_index_revision=native_index_revision+
@@ -704,6 +741,7 @@ class Store:
         created = updated = deduped = 0
         results = []
         with self.lock, self.conn:
+            default_embedding_generation = self._latest_embedding_generation_locked()
             for doc in docs:
                 raw = str(doc.get("raw_text", doc.get("text", "")))
                 if not raw:
@@ -722,16 +760,44 @@ class Store:
                     retrieval_updated_at, native_index_version, native_index_status,
                     native_index_profile, native_index_memory, native_indexed_at,
                     native_index_error, source_missing,
-                    retrieval_generation, native_generation
+                    retrieval_generation, native_generation, embedding_generation
                     FROM memories WHERE source_identity=?""",
                     (source_identity,),
                 ).fetchone()
                 values = {k: doc.get(k, metadata.get(k)) for k in FIELDS if k not in ("content_hash", "ingested_at", "updated_at")}
+                if _is_legacy_codex_automation_output(
+                    values.get("source_agent"),
+                    values.get("source_type"),
+                    values.get("source_path"),
+                ):
+                    # Pre-filter releases briefly discovered automation run
+                    # logs as persistent memory. Retain their raw source while
+                    # keeping operational output out of paid embeddings.
+                    values["content_type"] = "progress"
                 values["source_missing"] = int(bool(values.get("source_missing", False)))
                 values["retrieval_generation"] = int(values.get("retrieval_generation") or 0)
                 values["native_generation"] = int(values.get("native_generation") or 0)
+                embedding_generation_supplied = (
+                    "embedding_generation" in doc
+                    or "embedding_generation" in metadata
+                )
+                incoming_embedding_generation = int(
+                    values.get("embedding_generation") or 0
+                )
+                if row is not None:
+                    incoming_embedding_generation = max(
+                        incoming_embedding_generation
+                        if embedding_generation_supplied
+                        else int(row["embedding_generation"] or 0),
+                        int(row["embedding_generation"] or 0),
+                    )
+                else:
+                    incoming_embedding_generation = max(
+                        incoming_embedding_generation, default_embedding_generation
+                    )
+                values["embedding_generation"] = incoming_embedding_generation
                 if row and row["content_hash"] == content_hash and row["source_version"] == source_version:
-                    derived_supplied = any(
+                    derived_supplied = embedding_generation_supplied or any(
                         name in doc
                         for name in (
                             "retrieval_text",
@@ -873,6 +939,7 @@ class Store:
                         incoming_source_missing,
                         *incoming_native,
                         incoming_native_generation,
+                        incoming_embedding_generation,
                     )
                     current_derived = (
                         row["retrieval_text"],
@@ -889,6 +956,7 @@ class Store:
                         row["native_indexed_at"],
                         row["native_index_error"],
                         row["native_generation"],
+                        row["embedding_generation"],
                     )
                     if derived_supplied and not would_regress and incoming_derived != current_derived:
                         # Raw revisions and derived retrieval shadows have separate
@@ -902,7 +970,8 @@ class Store:
                             source_missing=?,
                             native_index_version=?, native_index_status=?, native_index_profile=?,
                             native_index_memory=?, native_indexed_at=?,
-                            native_index_error=?, native_generation=? WHERE id=?""",
+                            native_index_error=?, native_generation=?,
+                            embedding_generation=? WHERE id=?""",
                             (
                                 incoming_derived[0],
                                 technical_index_text(raw, incoming_derived[0]),
@@ -931,7 +1000,8 @@ class Store:
                         source_missing=?, agent_type=?, parent_session_id=?, agent_id=?, translation_hash=?, translation_version=?, translation_status=?,
                         native_index_version=?, native_index_status=?, native_index_profile=?,
                         native_index_memory=?, native_indexed_at=?, native_index_error=?,
-                        retrieval_generation=?, native_generation=? WHERE id=?""",
+                        retrieval_generation=?, native_generation=?,
+                        embedding_generation=? WHERE id=?""",
                         (source_version, raw, retrieval, search_identifiers, json.dumps(metadata, ensure_ascii=False),
                          values.get("source_agent"), values.get("source_type"), values.get("device_id"),
                          values.get("project"), values.get("repo"), values.get("worktree"), values.get("session_id"),
@@ -939,7 +1009,8 @@ class Store:
                          content_hash, incoming_updated, values.get("retrieval_updated_at"), values.get("content_type"), values["source_missing"], values.get("agent_type"),
                          values.get("parent_session_id"), values.get("agent_id"), values.get("translation_hash"), values.get("translation_version"), values.get("translation_status"),
                          values.get("native_index_version"), values.get("native_index_status"), values.get("native_index_profile"), values.get("native_index_memory"), values.get("native_indexed_at"), values.get("native_index_error"),
-                         values["retrieval_generation"], values["native_generation"], row["id"]),
+                         values["retrieval_generation"], values["native_generation"],
+                         values["embedding_generation"], row["id"]),
                     )
                     updated += 1
                     results.append({"id": row["id"], "status": "updated", "source_identity": source_identity})
@@ -949,8 +1020,8 @@ class Store:
                         source_agent,source_type,device_id,project,repo,worktree,session_id,message_id,role,timestamp,
                         source_path,content_hash,ingested_at,updated_at,retrieval_updated_at,content_type,source_missing,agent_type,parent_session_id,agent_id,translation_hash,translation_version,translation_status,
                         native_index_version,native_index_status,native_index_profile,native_index_memory,native_indexed_at,native_index_error,
-                        retrieval_generation,native_generation)
-                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        retrieval_generation,native_generation,embedding_generation)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                         (source_identity, source_version, raw, retrieval, search_identifiers, json.dumps(metadata, ensure_ascii=False),
                          values.get("source_agent"), values.get("source_type"), values.get("device_id"), values.get("project"),
                          values.get("repo"), values.get("worktree"), values.get("session_id"), values.get("message_id"),
@@ -958,7 +1029,8 @@ class Store:
                          values.get("content_type"), values["source_missing"], values.get("agent_type"),
                          values.get("parent_session_id"), values.get("agent_id"), values.get("translation_hash"), values.get("translation_version"), values.get("translation_status"),
                          values.get("native_index_version"), values.get("native_index_status"), values.get("native_index_profile"), values.get("native_index_memory"), values.get("native_indexed_at"), values.get("native_index_error"),
-                         values["retrieval_generation"], values["native_generation"]),
+                         values["retrieval_generation"], values["native_generation"],
+                         values["embedding_generation"]),
                     )
                     created += 1
                     results.append({"id": cur.lastrowid, "status": "created", "source_identity": source_identity})
@@ -1085,9 +1157,26 @@ class Store:
                     SELECT COALESCE(max(generation), 0) AS value FROM reindex_controls
                     UNION ALL SELECT COALESCE(max(retrieval_generation), 0) FROM memories
                     UNION ALL SELECT COALESCE(max(native_generation), 0) FROM memories
+                    UNION ALL SELECT COALESCE(max(embedding_generation), 0) FROM memories
                     )"""
                 ).fetchone()[0]
             )
+
+    def _latest_embedding_generation_locked(self) -> int:
+        return int(
+            self.conn.execute(
+                """SELECT max(value) FROM (
+                SELECT COALESCE(max(generation), 0) AS value
+                FROM reindex_controls WHERE scope='all'
+                UNION ALL
+                SELECT COALESCE(max(embedding_generation), 0) FROM memories
+                )"""
+            ).fetchone()[0]
+        )
+
+    def latest_embedding_generation(self) -> int:
+        with self.lock:
+            return self._latest_embedding_generation_locked()
 
     def next_reindex_control(self, scope: str) -> dict[str, Any]:
         if scope not in REINDEX_SCOPES:
@@ -1154,6 +1243,7 @@ class Store:
                 item = dict(row)
                 retrieval_generation = int(item.get("retrieval_generation") or 0)
                 native_generation = int(item.get("native_generation") or 0)
+                embedding_generation = int(item.get("embedding_generation") or 0)
                 retrieval_values = (
                     item.get("retrieval_text"), item.get("translation_hash"),
                     item.get("translation_version"), item.get("translation_status"),
@@ -1167,7 +1257,7 @@ class Store:
                 )
                 current_values = (
                     *retrieval_values, retrieval_generation, *native_values,
-                    native_generation,
+                    native_generation, embedding_generation,
                 )
                 if generation > retrieval_generation:
                     retrieval_generation = generation
@@ -1190,9 +1280,18 @@ class Store:
                     ):
                         native_values = (None, None, None, None, None, None)
                         native_reset += 1
+                if scope == "all" and generation > embedding_generation:
+                    embedding_generation = generation
+                    if (
+                        self._canonical_reindex_eligible(item)
+                        and item.get("native_index_status") != "waiting_durability"
+                        and any(value is not None for value in native_values)
+                    ):
+                        native_values = (None, None, None, None, None, None)
+                        native_reset += 1
                 next_values = (
                     *retrieval_values, retrieval_generation, *native_values,
-                    native_generation,
+                    native_generation, embedding_generation,
                 )
                 if next_values != current_values:
                     self.conn.execute(
@@ -1201,7 +1300,8 @@ class Store:
                         translation_version=?, translation_status=?, retrieval_updated_at=?,
                         retrieval_generation=?, native_index_version=?, native_index_status=?,
                         native_index_profile=?, native_index_memory=?, native_indexed_at=?,
-                        native_index_error=?, native_generation=?
+                        native_index_error=?, native_generation=?,
+                        embedding_generation=?
                         WHERE id=?""",
                         (
                             next_values[0],
@@ -2534,6 +2634,7 @@ def prepare_ingest_documents(app: Any, docs: list[dict[str, Any]]) -> list[dict[
     # once: each lookup computes MAX values over the current source table, so a
     # per-document lookup turns a historical backfill into O(batch * rows).
     generation = app.store.latest_reindex_generation()
+    embedding_generation = app.store.latest_embedding_generation()
     for doc in docs:
         if not isinstance(doc, dict):
             raise ValueError("each document must be an object")
@@ -2548,6 +2649,7 @@ def prepare_ingest_documents(app: Any, docs: list[dict[str, Any]]) -> list[dict[
         item["source_identity"] = identity
         item["retrieval_generation"] = generation
         item["native_generation"] = generation
+        item["embedding_generation"] = embedding_generation
         source_version = str(item.get("source_version", metadata.get("source_version", "")))
         content_hash = hashlib.sha256(raw.encode("utf-8")).hexdigest()
         existing = app.store.get(identity)

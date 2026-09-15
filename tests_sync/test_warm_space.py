@@ -41,6 +41,57 @@ class WarmSpaceTest(unittest.TestCase):
         ):
             self.assertEqual(WARM_SPACE.warm_interval(), 300.0)
 
+    def test_warm_request_names_pushed_memory_and_scopes_stamp(self) -> None:
+        bodies = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:
+                length = int(self.headers.get("Content-Length", "0"))
+                bodies.append(self.rfile.read(length))
+                self.send_response(202)
+                self.end_headers()
+
+            def log_message(self, format, *args) -> None:
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with TemporaryDirectory() as directory, mock.patch.dict(
+                os.environ,
+                {
+                    "FUNES_REMOTE_URL": f"http://127.0.0.1:{server.server_port}",
+                    "FUNES_API_TOKEN": "synthetic-api-token",
+                    "HF_TOKEN": "synthetic-hf-token",
+                    "FUNES_NATIVE_MEMORY": "owner/legacy-memory",
+                    "FUNES_SYNC_STATE_DIR": directory,
+                    "FUNES_NATIVE_WARM_MIN_INTERVAL": "0",
+                },
+                clear=False,
+            ):
+                WARM_SPACE.main()
+                self.assertEqual(
+                    bodies, [b'{"memory":"owner/legacy-memory"}']
+                )
+                memory_stamp = WARM_SPACE.stamp_path(
+                    os.environ["FUNES_REMOTE_URL"], "owner/legacy-memory"
+                )
+                other_stamp = WARM_SPACE.stamp_path(
+                    os.environ["FUNES_REMOTE_URL"], "owner/canonical-memory"
+                )
+                uri_stamp = WARM_SPACE.stamp_path(
+                    os.environ["FUNES_REMOTE_URL"],
+                    "hf://datasets/owner/legacy-memory",
+                )
+                self.assertTrue(memory_stamp.exists())
+                self.assertNotEqual(memory_stamp, other_stamp)
+                self.assertEqual(memory_stamp, uri_stamp)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
     def test_zshrc_env_rejects_unknown_variable(self) -> None:
         with mock.patch.object(WARM_SPACE.subprocess, "run") as run:
             self.assertEqual(WARM_SPACE.zshrc_env("UNTRUSTED"), "")

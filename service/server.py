@@ -1946,29 +1946,28 @@ class Store:
 
     def snapshot(self, path: Path) -> None:
         with self.lock:
-            rows = self.conn.execute("SELECT * FROM memories ORDER BY id").fetchall()
-            cache = self.conn.execute(
-                "SELECT query,rewritten,created_at,translation_hash,translation_version,translation_status "
-                "FROM translation_cache ORDER BY query"
-            ).fetchall()
-            controls = self.conn.execute(
-                """SELECT generation,scope,created_at FROM reindex_controls
-                ORDER BY generation"""
-            ).fetchall()
             optimize = self.native_optimize_checkpoint()
             native_state = self.native_index_state_record()
             path.parent.mkdir(parents=True, exist_ok=True)
             opener = gzip.open if path.name.endswith(".gz") else open
             with opener(path, "wt", encoding="utf-8") as f:
-                for row in rows:
+                for row in self.conn.execute(
+                    "SELECT * FROM memories ORDER BY id"
+                ):
                     d = self._row(row)
                     d["_funes_record"] = "memory"
                     f.write(json.dumps(d, ensure_ascii=False) + "\n")
-                for row in cache:
+                for row in self.conn.execute(
+                    "SELECT query,rewritten,created_at,translation_hash,translation_version,translation_status "
+                    "FROM translation_cache ORDER BY query"
+                ):
                     d = dict(row)
                     d["_funes_record"] = "translation_cache"
                     f.write(json.dumps(d, ensure_ascii=False) + "\n")
-                for row in controls:
+                for row in self.conn.execute(
+                    """SELECT generation,scope,created_at FROM reindex_controls
+                    ORDER BY generation"""
+                ):
                     d = dict(row)
                     d["_funes_record"] = "reindex_control"
                     f.write(json.dumps(d, ensure_ascii=False) + "\n")
@@ -2260,13 +2259,16 @@ class SnapshotSync:
         # Snapshot creation and Hub upload must be one serialized operation.
         # Without this lock, concurrent /sync requests can upload an older
         # snapshot after a newer one and roll the durable dataset backwards.
-        self.upload_lock = threading.Lock()
+        self.upload_lock = threading.RLock()
         self.repo = os.getenv("FUNES_STORAGE_REPO") or os.getenv("FUNES_MEMORY", "")
         self.token = os.getenv("HF_TOKEN", "")
         self.filename = os.getenv("FUNES_SNAPSHOT_FILE", "funes-snapshot.jsonl.gz")
         self.prefix = os.getenv("FUNES_SNAPSHOT_PREFIX", "funes-snapshot-")
         self.delta_prefix = os.getenv("FUNES_DELTA_PREFIX", "funes-delta-")
         self.control_prefix = os.getenv("FUNES_REINDEX_PREFIX", "funes-reindex-")
+        self.manifest_filename = os.getenv(
+            "FUNES_RESTORE_MANIFEST_FILE", "funes-restore-manifest-v1.json"
+        )
         self.restore_batch = max(50, int(os.getenv("FUNES_RESTORE_BATCH", "500")))
         try:
             restore_download_workers = int(
@@ -2276,6 +2278,8 @@ class SnapshotSync:
             restore_download_workers = 16
         self.restore_download_workers = max(1, min(restore_download_workers, 32))
         self._restore_prefetch_root: Path | None = None
+        self._restore_revision: str | None = None
+        self.covered_revision: str | None = None
         self.restore_failed = False
         self.restore_error = None
         self.restored = False
@@ -2301,21 +2305,334 @@ class SnapshotSync:
     def snapshot_path(self) -> Path:
         return self.store.data_dir / self.filename
 
+    @staticmethod
+    def _safe_repo_filename(value: Any) -> bool:
+        return (
+            isinstance(value, str)
+            and value not in {".", ".."}
+            and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,254}", value)
+            is not None
+        )
+
+    def _validate_restore_manifest(
+        self, value: Any, repo_files: set[str]
+    ) -> dict[str, Any]:
+        if not isinstance(value, dict) or set(value) != {
+            "version",
+            "snapshot",
+            "deltas",
+            "controls",
+        }:
+            raise ValueError("invalid restore manifest schema")
+        if type(value["version"]) is not int or value["version"] != 1:
+            raise ValueError("unsupported restore manifest version")
+        snapshot = value["snapshot"]
+        deltas = value["deltas"]
+        controls = value["controls"]
+        if not isinstance(deltas, list) or not isinstance(controls, list):
+            raise ValueError("invalid restore manifest entries")
+        encrypted_suffixes = (".jsonl.enc", ".jsonl.gz.enc")
+        if not (
+            self._safe_repo_filename(snapshot)
+            and snapshot.endswith(encrypted_suffixes)
+            and (
+                snapshot == self.filename + ".enc"
+                or (bool(self.prefix) and snapshot.startswith(self.prefix))
+            )
+        ):
+            raise ValueError("invalid restore manifest snapshot")
+        for names, prefix, kind in (
+            (deltas, self.delta_prefix, "delta"),
+            (controls, self.control_prefix, "control"),
+        ):
+            if any(
+                not self._safe_repo_filename(name)
+                or not prefix
+                or not name.startswith(prefix)
+                or not name.endswith(encrypted_suffixes)
+                for name in names
+            ):
+                raise ValueError(f"invalid restore manifest {kind}")
+            if len(names) != len(set(names)):
+                raise ValueError(f"duplicate restore manifest {kind}")
+        referenced = [snapshot, *deltas, *controls]
+        if len(referenced) != len(set(referenced)):
+            raise ValueError("duplicate restore manifest entry")
+        if any(name not in repo_files for name in referenced):
+            raise FileNotFoundError("restore manifest references missing object")
+        return {
+            "version": 1,
+            "snapshot": snapshot,
+            "deltas": list(deltas),
+            "controls": list(controls),
+        }
+
+    def _download_restore_manifest(
+        self, repo_files: set[str], revision: str
+    ) -> dict[str, Any]:
+        from huggingface_hub import hf_hub_download
+
+        downloaded = hf_hub_download(
+            repo_id=self.repo,
+            repo_type="dataset",
+            filename=self.manifest_filename,
+            revision=revision,
+            token=self.token,
+            local_dir=str(self.store.data_dir / "remote"),
+        )
+        path = Path(downloaded)
+        if not path.is_file() or path.stat().st_size > 16 * 1024 * 1024:
+            raise ValueError("invalid restore manifest file")
+        return self._validate_restore_manifest(
+            json.loads(path.read_text(encoding="utf-8")), repo_files
+        )
+
+    def _manifest_bytes(self, manifest: dict[str, Any]) -> bytes:
+        if not self._safe_repo_filename(self.manifest_filename):
+            raise ValueError("invalid restore manifest filename")
+        references = {
+            manifest["snapshot"],
+            *manifest["deltas"],
+            *manifest["controls"],
+        }
+        validated = self._validate_restore_manifest(manifest, references)
+        return (
+            json.dumps(
+                validated,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode("utf-8")
+
+    def _commit_with_manifest(
+        self,
+        api: Any,
+        encrypted: Path,
+        target: str,
+        manifest: dict[str, Any],
+        commit_message: str,
+        parent_commit: str,
+    ) -> Any:
+        from huggingface_hub import CommitOperationAdd
+
+        return api.create_commit(
+            repo_id=self.repo,
+            repo_type="dataset",
+            operations=[
+                CommitOperationAdd(
+                    path_in_repo=target, path_or_fileobj=str(encrypted)
+                ),
+                CommitOperationAdd(
+                    path_in_repo=self.manifest_filename,
+                    path_or_fileobj=self._manifest_bytes(manifest),
+                ),
+            ],
+            commit_message=commit_message,
+            parent_commit=parent_commit,
+        )
+
+    @staticmethod
+    def _commit_oid(result: Any) -> str | None:
+        oid = getattr(result, "oid", "")
+        return oid if isinstance(oid, str) and oid else None
+
+    def _source_artifact_names(self, repo_files: set[str]) -> set[str]:
+        encrypted_suffixes = (".jsonl.enc", ".jsonl.gz.enc")
+        return {
+            name
+            for name in repo_files
+            if name.endswith(encrypted_suffixes)
+            and (
+                name == self.filename + ".enc"
+                or (bool(self.prefix) and name.startswith(self.prefix))
+                or (bool(self.delta_prefix) and name.startswith(self.delta_prefix))
+                or (bool(self.control_prefix) and name.startswith(self.control_prefix))
+            )
+        }
+
+    def _advance_coverage(
+        self, state: dict[str, Any], commit_result: Any
+    ) -> None:
+        oid = self._commit_oid(commit_result)
+        if oid and (
+            self.covered_revision == state["head"]
+            or not self._source_artifact_names(state["repo_files"])
+        ):
+            self.covered_revision = oid
+
+    def _repo_tree_files(
+        self, api: Any, revision: str
+    ) -> tuple[set[str], dict[str, str]]:
+        repo_files = set()
+        blob_ids = {}
+        for item in api.list_repo_tree(
+            self.repo,
+            repo_type="dataset",
+            recursive=True,
+            revision=revision,
+            token=self.token,
+        ):
+            name = getattr(item, "path", "")
+            if isinstance(name, str):
+                repo_files.add(name)
+                blob_id = getattr(item, "blob_id", "")
+                if isinstance(blob_id, str) and blob_id:
+                    blob_ids[name] = blob_id
+        return repo_files, blob_ids
+
+    def _remote_restore_state(self, api: Any) -> dict[str, Any]:
+        info = api.repo_info(
+            repo_id=self.repo,
+            repo_type="dataset",
+            token=self.token,
+        )
+        head = getattr(info, "sha", "")
+        if not isinstance(head, str) or not head:
+            raise RuntimeError("Hub repository head is unavailable")
+        repo_files, blob_ids = self._repo_tree_files(api, head)
+        manifest = None
+        if self.manifest_filename in repo_files:
+            manifest = self._download_restore_manifest(repo_files, head)
+        return {
+            "head": head,
+            "manifest": manifest,
+            "repo_files": repo_files,
+            "blob_ids": blob_ids,
+        }
+
+    def _commit_manifest_append(
+        self,
+        api: Any,
+        encrypted: Path,
+        target: str,
+        field: str,
+        commit_message: str,
+        state: dict[str, Any],
+    ) -> tuple[bool, bool]:
+        last_error = None
+        for _ in range(3):
+            manifest = state["manifest"]
+            if manifest is None:
+                raise RuntimeError("active restore manifest disappeared")
+            if target in manifest[field]:
+                return False, True
+            updated_manifest = {
+                **manifest,
+                field: [*manifest[field], target],
+            }
+            try:
+                commit_result = self._commit_with_manifest(
+                    api,
+                    encrypted,
+                    target,
+                    updated_manifest,
+                    commit_message,
+                    state["head"],
+                )
+                self._advance_coverage(state, commit_result)
+                return True, False
+            except Exception as exc:
+                last_error = exc
+                latest = self._remote_restore_state(api)
+                if latest["head"] == state["head"]:
+                    raise
+                state = latest
+        manifest = state["manifest"]
+        if manifest is not None and target in manifest[field]:
+            return False, True
+        raise RuntimeError("restore manifest changed repeatedly") from last_error
+
+    @staticmethod
+    def _manifest_suffix(base: list[str], current: list[str]) -> list[str]:
+        if current[: len(base)] != base:
+            raise RuntimeError("restore manifest history is not append-only")
+        return current[len(base) :]
+
+    def _commit_compact_snapshot(
+        self,
+        api: Any,
+        encrypted: Path,
+        target: str,
+        commit_message: str,
+        base_state: dict[str, Any],
+    ) -> tuple[Any, bool]:
+        base_manifest = base_state["manifest"]
+        base_snapshot_blob = None
+        if base_manifest is not None:
+            base_snapshot_blob = base_state["blob_ids"].get(
+                base_manifest["snapshot"]
+            )
+        state = base_state
+        desired_manifest = {
+            "version": 1,
+            "snapshot": target,
+            "deltas": [],
+            "controls": [],
+        }
+        last_error = None
+        for _ in range(3):
+            try:
+                commit_result = self._commit_with_manifest(
+                    api,
+                    encrypted,
+                    target,
+                    desired_manifest,
+                    commit_message,
+                    state["head"],
+                )
+                retained_suffix = bool(
+                    desired_manifest["deltas"] or desired_manifest["controls"]
+                )
+                return commit_result, retained_suffix
+            except Exception as exc:
+                last_error = exc
+                latest = self._remote_restore_state(api)
+                if latest["head"] == state["head"]:
+                    raise
+                latest_manifest = latest["manifest"]
+                if base_manifest is None or latest_manifest is None:
+                    raise RuntimeError(
+                        "cannot safely merge concurrent snapshot compaction"
+                    ) from exc
+                latest_snapshot_blob = latest["blob_ids"].get(
+                    latest_manifest["snapshot"]
+                )
+                if (
+                    latest_manifest["snapshot"] != base_manifest["snapshot"]
+                    or not base_snapshot_blob
+                    or latest_snapshot_blob != base_snapshot_blob
+                ):
+                    raise RuntimeError("concurrent snapshot compaction won") from exc
+                desired_manifest = {
+                    "version": 1,
+                    "snapshot": target,
+                    "deltas": self._manifest_suffix(
+                        base_manifest["deltas"], latest_manifest["deltas"]
+                    ),
+                    "controls": self._manifest_suffix(
+                        base_manifest["controls"], latest_manifest["controls"]
+                    ),
+                }
+                state = latest
+        raise RuntimeError("snapshot compaction changed repeatedly") from last_error
+
     def _repo_files(self) -> list[str]:
         """List snapshot and delta objects without exposing repository contents."""
         from huggingface_hub import HfApi
         api = HfApi(token=self.token)
-        files = []
-        for item in api.list_repo_tree(self.repo, repo_type="dataset", recursive=True, token=self.token):
-            name = getattr(item, "path", "")
-            if (
-                name == self.filename + ".enc"
-                or name.startswith(self.prefix)
-                or name.startswith(self.delta_prefix)
-                or name.startswith(self.control_prefix)
-            ):
-                if name.endswith((".jsonl.enc", ".jsonl.gz.enc")):
-                    files.append(name)
+        state = self._remote_restore_state(api)
+        self._restore_revision = state["head"]
+        manifest = state["manifest"]
+        repo_files = state["repo_files"]
+        if manifest is not None:
+            return [
+                manifest["snapshot"],
+                *manifest["deltas"],
+                *manifest["controls"],
+            ]
+        files = list(self._source_artifact_names(repo_files))
         snapshots = sorted(name for name in files if name == self.filename + ".enc" or name.startswith(self.prefix))
         deltas = sorted(name for name in files if name.startswith(self.delta_prefix))
         controls = sorted(name for name in files if name.startswith(self.control_prefix))
@@ -2341,6 +2658,7 @@ class SnapshotSync:
                 repo_id=self.repo,
                 repo_type="dataset",
                 filename=filename,
+                revision=self._restore_revision,
                 token=self.token,
                 local_dir=str(self.store.data_dir / "remote"),
             )
@@ -2370,6 +2688,7 @@ class SnapshotSync:
                 repo_type="dataset",
                 token=self.token,
                 allow_patterns=filenames,
+                revision=self._restore_revision,
                 local_dir=str(self.store.data_dir / "remote"),
                 max_workers=self.restore_download_workers,
             )
@@ -2390,9 +2709,13 @@ class SnapshotSync:
     def restore(self) -> int:
         if self.repo and self.token:
             try:
+                self._restore_revision = None
+                self.covered_revision = None
+                restored_revision = None
                 self.store.begin_bulk_restore()
                 try:
                     files = self._repo_files()
+                    restored_revision = self._restore_revision
                     if not files:
                         # Backwards-compatible single-file snapshot lookup.
                         files = [self.filename + ".enc"]
@@ -2410,9 +2733,12 @@ class SnapshotSync:
                     self.store.drain_reindex_controls(self.restore_batch)
                 finally:
                     self.store.finish_bulk_restore()
+                self.covered_revision = restored_revision
+                self._restore_revision = None
                 self.restored = True
                 return restored
             except Exception as exc:  # optional recovery must never stop serving
+                self._restore_revision = None
                 status = getattr(getattr(exc, "response", None), "status_code", None)
                 if status == 404 and self._truth("FUNES_ALLOW_EMPTY_REMOTE"):
                     self.restored = True
@@ -2568,13 +2894,50 @@ class SnapshotSync:
                     }
                 try:
                     from huggingface_hub import HfApi
-                    HfApi(token=self.token).upload_file(
-                        path_or_fileobj=str(encrypted),
-                        path_in_repo=name,
-                        repo_id=self.repo,
-                        repo_type="dataset",
-                        commit_message="funes encrypted reindex control",
-                    )
+                    api = HfApi(token=self.token)
+                    state = self._remote_restore_state(api)
+                    manifest = state["manifest"]
+                    if manifest is not None:
+                        _, already_uploaded = self._commit_manifest_append(
+                            api,
+                            encrypted,
+                            name,
+                            "controls",
+                            "funes encrypted reindex control",
+                            state,
+                        )
+                        if already_uploaded:
+                            self.store.set_sync(
+                                last_sync=utc_now(),
+                                snapshot_path=str(encrypted),
+                                last_error=None,
+                            )
+                            return {
+                                "uploaded": False,
+                                "durable": True,
+                                "already_uploaded": True,
+                                "generation": generation,
+                                "scope": scope,
+                            }
+                    else:
+                        commit_result = api.upload_file(
+                            path_or_fileobj=str(encrypted),
+                            path_in_repo=name,
+                            repo_id=self.repo,
+                            repo_type="dataset",
+                            commit_message="funes encrypted reindex control",
+                        )
+                        self._advance_coverage(state, commit_result)
+                        latest = self._remote_restore_state(api)
+                        if latest["manifest"] is not None:
+                            self._commit_manifest_append(
+                                api,
+                                encrypted,
+                                name,
+                                "controls",
+                                "funes encrypted reindex control",
+                                latest,
+                            )
                 except Exception as exc:
                     reason = type(exc).__name__
                     self.store.set_sync(last_error=reason)
@@ -2595,6 +2958,8 @@ class SnapshotSync:
             # avoids rewriting a multi-gigabyte snapshot for every new turn and
             # makes retries idempotent.  `/sync` without documents still emits a
             # compact full snapshot for operators.
+            api = None
+            state = None
             if docs is not None:
                 durable_docs = list(docs)
                 if not any(
@@ -2610,24 +2975,80 @@ class SnapshotSync:
                 self._write_jsonl_gzip(durable_docs, path)
             else:
                 path = self.snapshot_path()
+                if self.repo and self.token:
+                    try:
+                        self._encryption_key()
+                        from huggingface_hub import HfApi
+                        api = HfApi(token=self.token)
+                        state = self._remote_restore_state(api)
+                        if (
+                            self._source_artifact_names(state["repo_files"])
+                            and self.covered_revision != state["head"]
+                        ):
+                            reason = "remote_history_not_restored"
+                            self.store.set_sync(
+                                last_error=reason, snapshot_path=str(path)
+                            )
+                            return {
+                                "uploaded": False,
+                                "durable": False,
+                                "path": str(path),
+                                "reason": reason,
+                            }
+                    except Exception as exc:
+                        reason = type(exc).__name__
+                        self.store.set_sync(
+                            last_error=reason, snapshot_path=str(path)
+                        )
+                        return {
+                            "uploaded": False,
+                            "durable": False,
+                            "path": str(path),
+                            "reason": reason,
+                        }
                 self.store.snapshot(path)
             if not self.repo or not self.token:
                 self.store.set_sync(last_sync=utc_now(), snapshot_path=str(path), last_error=None)
                 if self.repo or self._truth("FUNES_REQUIRE_DURABLE_ACK"):
                     return {"uploaded": False, "durable": False, "path": str(path), "reason": "HF storage not configured"}
                 return {"uploaded": False, "durable": True, "path": str(path), "reason": "local durable store"}
+            if docs is not None:
+                try:
+                    self._encryption_key()
+                except Exception as exc:
+                    reason = type(exc).__name__
+                    self.store.set_sync(last_error=reason, snapshot_path=str(path))
+                    return {
+                        "uploaded": False,
+                        "durable": False,
+                        "path": str(path),
+                        "reason": reason,
+                    }
             target = (path.name if docs is not None else self.filename) + ".enc"
-            api = None
+            manifest = None
             if docs is not None:
                 try:
                     from huggingface_hub import HfApi
                     api = HfApi(token=self.token)
-                    if api.file_exists(
-                        repo_id=self.repo,
-                        filename=target,
-                        repo_type="dataset",
-                        token=self.token,
-                    ):
+                    state = self._remote_restore_state(api)
+                    manifest = state["manifest"]
+                    if manifest is not None:
+                        already_durable = target in manifest["deltas"]
+                    else:
+                        already_durable = api.file_exists(
+                            repo_id=self.repo,
+                            filename=target,
+                            repo_type="dataset",
+                            revision=state["head"],
+                            token=self.token,
+                        )
+                        if already_durable:
+                            latest = self._remote_restore_state(api)
+                            if latest["manifest"] is not None:
+                                state = latest
+                                manifest = latest["manifest"]
+                                already_durable = target in manifest["deltas"]
+                    if already_durable:
                         path.unlink(missing_ok=True)
                         self.store.set_sync(last_sync=utc_now(), snapshot_path=str(path), last_error=None)
                         return {
@@ -2636,11 +3057,15 @@ class SnapshotSync:
                             "path": str(path),
                             "already_uploaded": True,
                         }
-                except Exception:
-                    # Existence probing is only an idempotency optimization. A
-                    # transient read failure must not prevent the authoritative
-                    # upload attempt below.
-                    api = None
+                except Exception as exc:
+                    reason = type(exc).__name__
+                    self.store.set_sync(last_error=reason, snapshot_path=str(path))
+                    return {
+                        "uploaded": False,
+                        "durable": False,
+                        "path": str(path),
+                        "reason": reason,
+                    }
             try:
                 encrypted = path.with_name(path.name + ".enc")
                 self._encrypt_file(path, encrypted)
@@ -2652,7 +3077,64 @@ class SnapshotSync:
                 if api is None:
                     from huggingface_hub import HfApi
                     api = HfApi(token=self.token)
-                api.upload_file(path_or_fileobj=str(encrypted), path_in_repo=target, repo_id=self.repo, repo_type="dataset", commit_message="funes encrypted source delta" if docs is not None else "funes encrypted source snapshot")
+                commit_message = (
+                    "funes encrypted source delta"
+                    if docs is not None
+                    else "funes encrypted source snapshot"
+                )
+                if docs is None:
+                    commit_result, retained_suffix = self._commit_compact_snapshot(
+                        api,
+                        encrypted,
+                        target,
+                        commit_message,
+                        state,
+                    )
+                    oid = self._commit_oid(commit_result)
+                    if oid and not retained_suffix:
+                        self.covered_revision = oid
+                elif manifest is not None:
+                    _, already_uploaded = self._commit_manifest_append(
+                        api,
+                        encrypted,
+                        target,
+                        "deltas",
+                        commit_message,
+                        state,
+                    )
+                    if already_uploaded:
+                        path.unlink(missing_ok=True)
+                        encrypted.unlink(missing_ok=True)
+                        self.store.set_sync(
+                            last_sync=utc_now(),
+                            snapshot_path=str(path),
+                            last_error=None,
+                        )
+                        return {
+                            "uploaded": False,
+                            "durable": True,
+                            "path": str(path),
+                            "already_uploaded": True,
+                        }
+                else:
+                    commit_result = api.upload_file(
+                        path_or_fileobj=str(encrypted),
+                        path_in_repo=target,
+                        repo_id=self.repo,
+                        repo_type="dataset",
+                        commit_message=commit_message,
+                    )
+                    self._advance_coverage(state, commit_result)
+                    latest = self._remote_restore_state(api)
+                    if latest["manifest"] is not None:
+                        self._commit_manifest_append(
+                            api,
+                            encrypted,
+                            target,
+                            "deltas",
+                            commit_message,
+                            latest,
+                        )
                 if docs is not None:
                     path.unlink(missing_ok=True)
                 encrypted.unlink(missing_ok=True)
@@ -2911,25 +3393,27 @@ def queue_reindex(app: Any, scope: str) -> dict[str, Any]:
                 "error": "restore_in_progress" if app.syncer.restoring else "restore_failed",
             }
         control = app.store.next_reindex_control(scope)
-        sync = app.syncer.upload_reindex_control(control)
-        if not sync.get("durable"):
+        upload_lock = getattr(app.syncer, "upload_lock", None) or threading.RLock()
+        with upload_lock:
+            sync = app.syncer.upload_reindex_control(control)
+            if not sync.get("durable"):
+                return {
+                    "queued": False,
+                    "durable": False,
+                    "scope": scope,
+                    "error": str(sync.get("reason") or "durability_pending"),
+                }
+            app.store.record_reindex_control(control)
+            app.store.compact_reindex_controls()
+            wake = getattr(app, "reindex_wake", None)
+            if wake is not None:
+                wake.set()
             return {
-                "queued": False,
-                "durable": False,
+                "queued": True,
+                "durable": True,
                 "scope": scope,
-                "error": str(sync.get("reason") or "durability_pending"),
+                "generation": int(control["generation"]),
             }
-        app.store.record_reindex_control(control)
-        app.store.compact_reindex_controls()
-        wake = getattr(app, "reindex_wake", None)
-        if wake is not None:
-            wake.set()
-        return {
-            "queued": True,
-            "durable": True,
-            "scope": scope,
-            "generation": int(control["generation"]),
-        }
     lock = getattr(app, "reindex_lock", None) or threading.Lock()
     with lock:
         return persist_control()

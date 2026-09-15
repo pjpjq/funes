@@ -2886,6 +2886,117 @@ def test_source_state_reports_reconciler_while_restore_is_running(monkeypatch):
     assert status["canonical_reconciler"]["phase"] == "waiting_restore"
 
 
+class _RecordingCanonicalStop:
+    def __init__(self, stop_after=1):
+        self.stop_after = stop_after
+        self.waits = []
+
+    def is_set(self):
+        return False
+
+    def wait(self, timeout):
+        self.waits.append(timeout)
+        return len(self.waits) >= self.stop_after
+
+
+@pytest.mark.parametrize(
+    ("environ", "expected"),
+    [
+        ({}, (1.0, 30.0)),
+        ({"FUNES_CANONICAL_INDEX_INTERVAL": "86400"}, (86400.0, 86400.0)),
+        (
+            {
+                "FUNES_CANONICAL_INDEX_INTERVAL": "86400",
+                "FUNES_CANONICAL_INDEX_ACTIVE_INTERVAL": "1",
+                "FUNES_CANONICAL_INDEX_IDLE_INTERVAL": "300",
+            },
+            (1.0, 300.0),
+        ),
+    ],
+)
+def test_canonical_index_intervals_preserve_legacy_override(environ, expected):
+    assert bridge._canonical_index_intervals(environ) == expected
+
+
+def test_canonical_background_uses_active_wait_for_consecutive_work(monkeypatch):
+    stop = _RecordingCanonicalStop(stop_after=2)
+    app = SimpleNamespace(
+        restore_done=threading.Event(),
+        canonical_index_stop=stop,
+    )
+    app.restore_done.set()
+    monkeypatch.setattr(bridge, "CANONICAL_INDEX_ACTIVE_INTERVAL", 0.25)
+    monkeypatch.setattr(bridge, "CANONICAL_INDEX_INTERVAL", 9.0)
+    bridge._initialize_canonical_reconcile_state(app)
+    results = iter(
+        [
+            {"attempted": 2, "indexed": 2, "held": 0, "durable": True},
+            {"attempted": 1, "indexed": 1, "held": 0, "durable": True},
+        ]
+    )
+    monkeypatch.setattr(bridge, "reconcile_canonical_index", lambda _app: next(results))
+
+    bridge._canonical_reconcile_background(app)
+
+    status = bridge.canonical_reconcile_state(app)
+    assert stop.waits == [0.25, 0.25]
+    assert status["wait_seconds"] == 0.25
+    assert status["active_interval_seconds"] == 0.25
+    assert status["idle_interval_seconds"] == 9.0
+    assert status["interval_seconds"] == 9.0
+    assert status["consecutive_failures"] == 0
+
+
+def test_canonical_background_uses_idle_wait_when_no_work(monkeypatch):
+    stop = _RecordingCanonicalStop()
+    app = SimpleNamespace(
+        restore_done=threading.Event(),
+        canonical_index_stop=stop,
+    )
+    app.restore_done.set()
+    monkeypatch.setattr(bridge, "CANONICAL_INDEX_ACTIVE_INTERVAL", 0.25)
+    monkeypatch.setattr(bridge, "CANONICAL_INDEX_INTERVAL", 9.0)
+    bridge._initialize_canonical_reconcile_state(app)
+    monkeypatch.setattr(
+        bridge,
+        "reconcile_canonical_index",
+        lambda _app: {"attempted": 0, "indexed": 0, "held": 0, "durable": True},
+    )
+
+    bridge._canonical_reconcile_background(app)
+
+    status = bridge.canonical_reconcile_state(app)
+    assert stop.waits == [9.0]
+    assert status["wait_seconds"] == 9.0
+    assert status["last_error"] is None
+
+
+def test_canonical_background_uses_idle_wait_when_attempt_makes_no_progress(
+    monkeypatch,
+):
+    stop = _RecordingCanonicalStop()
+    app = SimpleNamespace(
+        restore_done=threading.Event(),
+        canonical_index_stop=stop,
+    )
+    app.restore_done.set()
+    monkeypatch.setattr(bridge, "CANONICAL_INDEX_ACTIVE_INTERVAL", 0.25)
+    monkeypatch.setattr(bridge, "CANONICAL_INDEX_INTERVAL", 9.0)
+    bridge._initialize_canonical_reconcile_state(app)
+    monkeypatch.setattr(
+        bridge,
+        "reconcile_canonical_index",
+        lambda _app: {"attempted": 2, "indexed": 0, "held": 0, "durable": True},
+    )
+
+    bridge._canonical_reconcile_background(app)
+
+    status = bridge.canonical_reconcile_state(app)
+    assert stop.waits == [9.0]
+    assert status["wait_seconds"] == 9.0
+    assert status["consecutive_failures"] == 0
+
+
 def test_canonical_background_marks_non_durable_result_as_failure(monkeypatch):
     app = SimpleNamespace(
         restore_done=threading.Event(),
@@ -2908,15 +3019,17 @@ def test_canonical_background_marks_non_durable_result_as_failure(monkeypatch):
 
 
 def test_canonical_background_reports_only_allowlisted_error(monkeypatch):
+    stop = _RecordingCanonicalStop()
     app = SimpleNamespace(
         restore_done=threading.Event(),
-        canonical_index_stop=threading.Event(),
+        canonical_index_stop=stop,
     )
     app.restore_done.set()
+    monkeypatch.setattr(bridge, "CANONICAL_INDEX_ACTIVE_INTERVAL", 0.25)
+    monkeypatch.setattr(bridge, "CANONICAL_INDEX_INTERVAL", 9.0)
     bridge._initialize_canonical_reconcile_state(app)
 
     def explode(_app):
-        app.canonical_index_stop.set()
         raise RuntimeError("PRIVATE RAW SESSION provider payload")
 
     monkeypatch.setattr(bridge, "reconcile_canonical_index", explode)
@@ -2931,6 +3044,8 @@ def test_canonical_background_reports_only_allowlisted_error(monkeypatch):
     assert status["last_duration_ms"] >= 0
     assert status["batch_size"] == bridge.CANONICAL_INDEX_BATCH
     assert status["timeout_seconds"] == bridge.CANONICAL_INDEX_TIMEOUT
+    assert stop.waits == [9.0]
+    assert status["wait_seconds"] == 9.0
     assert "PRIVATE RAW SESSION" not in json.dumps(status)
     assert "provider payload" not in json.dumps(status)
 

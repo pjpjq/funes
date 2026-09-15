@@ -1955,6 +1955,59 @@ class ServiceTests(unittest.TestCase):
         self.assertIsNotNone(state["applied_at"])
         store.close()
 
+    def test_full_hub_restore_prefetches_remote_files_before_replay(self):
+        from service.server import SnapshotSync
+
+        store = Store(self.tmp.name)
+        syncer = SnapshotSync(store)
+        syncer.repo = "owner/private"
+        syncer.token = "test-token"
+        syncer.restore_download_workers = 16
+        files = ["funes-snapshot.jsonl.gz.enc", "funes-delta-a.jsonl.gz.enc"]
+        events = []
+
+        def prefetch(**kwargs):
+            events.append(("prefetch", kwargs))
+            return str(Path(self.tmp.name) / "remote")
+
+        def restore_file(filename):
+            events.append(("restore", filename))
+            return 1
+
+        with mock.patch.object(syncer, "_repo_files", return_value=files), mock.patch(
+            "huggingface_hub.snapshot_download", side_effect=prefetch
+        ), mock.patch.object(syncer, "_restore_file", side_effect=restore_file):
+            self.assertEqual(syncer.restore(), 2)
+
+        self.assertEqual([event[0] for event in events], ["prefetch", "restore", "restore"])
+        prefetch_kwargs = events[0][1]
+        self.assertEqual(prefetch_kwargs["repo_id"], "owner/private")
+        self.assertEqual(prefetch_kwargs["repo_type"], "dataset")
+        self.assertEqual(prefetch_kwargs["allow_patterns"], files)
+        self.assertEqual(prefetch_kwargs["max_workers"], 16)
+        self.assertEqual(prefetch_kwargs["token"], "test-token")
+        self.assertIsNone(syncer._restore_prefetch_root)
+        store.close()
+
+    def test_full_hub_restore_falls_back_when_prefetch_fails(self):
+        from service.server import SnapshotSync
+
+        store = Store(self.tmp.name)
+        syncer = SnapshotSync(store)
+        syncer.repo = "owner/private"
+        syncer.token = "test-token"
+        files = ["funes-snapshot.jsonl.gz.enc", "funes-delta-a.jsonl.gz.enc"]
+        with mock.patch.object(syncer, "_repo_files", return_value=files), mock.patch(
+            "huggingface_hub.snapshot_download", side_effect=OSError("offline")
+        ), mock.patch.object(syncer, "_restore_file", return_value=1) as restore_file:
+            self.assertEqual(syncer.restore(), 2)
+        self.assertEqual(
+            restore_file.call_args_list,
+            [mock.call(files[0]), mock.call(files[1])],
+        )
+        self.assertIsNone(syncer._restore_prefetch_root)
+        store.close()
+
     def test_restore_compacts_history_and_skips_satisfied_updates(self):
         store = Store(self.tmp.name)
         store.ingest(
@@ -2145,8 +2198,14 @@ class ServiceTests(unittest.TestCase):
         target_dir = tempfile.TemporaryDirectory()
         target = Store(target_dir.name)
         reader = SnapshotSync(target)
+        prefetch = target.data_dir / "remote"
+        prefetch.mkdir(parents=True)
+        prefetched_encrypted = prefetch / encrypted.name
+        prefetched_encrypted.write_bytes(encrypted.read_bytes())
+        reader._restore_prefetch_root = prefetch
         with mock.patch(
-            "huggingface_hub.hf_hub_download", return_value=str(encrypted)
+            "huggingface_hub.hf_hub_download",
+            side_effect=AssertionError("prefetched restore must not download twice"),
         ):
             self.assertEqual(reader._restore_file(encrypted.name), 1)
         self.assertEqual(target.get("restore-one")["raw_text"], "encrypted restore")

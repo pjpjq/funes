@@ -2268,6 +2268,14 @@ class SnapshotSync:
         self.delta_prefix = os.getenv("FUNES_DELTA_PREFIX", "funes-delta-")
         self.control_prefix = os.getenv("FUNES_REINDEX_PREFIX", "funes-reindex-")
         self.restore_batch = max(50, int(os.getenv("FUNES_RESTORE_BATCH", "500")))
+        try:
+            restore_download_workers = int(
+                os.getenv("FUNES_RESTORE_DOWNLOAD_WORKERS", "16")
+            )
+        except ValueError:
+            restore_download_workers = 16
+        self.restore_download_workers = max(1, min(restore_download_workers, 32))
+        self._restore_prefetch_root: Path | None = None
         self.restore_failed = False
         self.restore_error = None
         self.restored = False
@@ -2316,15 +2324,27 @@ class SnapshotSync:
         return snapshots + deltas + controls
 
     def _restore_file(self, filename: str) -> int:
-        from huggingface_hub import hf_hub_download
-        downloaded = hf_hub_download(
-            repo_id=self.repo,
-            repo_type="dataset",
-            filename=filename,
-            token=self.token,
-            local_dir=str(self.store.data_dir / "remote"),
-        )
-        encrypted = Path(downloaded)
+        encrypted = None
+        if self._restore_prefetch_root is not None:
+            relative = Path(filename)
+            candidate = self._restore_prefetch_root / relative
+            if (
+                not relative.is_absolute()
+                and ".." not in relative.parts
+                and candidate.is_file()
+            ):
+                encrypted = candidate
+        if encrypted is None:
+            from huggingface_hub import hf_hub_download
+
+            downloaded = hf_hub_download(
+                repo_id=self.repo,
+                repo_type="dataset",
+                filename=filename,
+                token=self.token,
+                local_dir=str(self.store.data_dir / "remote"),
+            )
+            encrypted = Path(downloaded)
         if not filename.endswith(".enc"):
             if not self._truth("FUNES_ALLOW_PLAINTEXT_SOURCE_RESTORE"):
                 raise RuntimeError("plaintext source snapshot restore is disabled")
@@ -2337,6 +2357,27 @@ class SnapshotSync:
             return self.store.restore_documents(
                 self._iter_file(plaintext), self.restore_batch, apply_controls=False
             )
+
+    def _prefetch_restore_files(self, filenames: list[str]) -> Path | None:
+        """Download immutable restore inputs concurrently, with serial fallback."""
+        if len(filenames) < 2 or self.restore_download_workers <= 1:
+            return None
+        try:
+            from huggingface_hub import snapshot_download
+
+            root = snapshot_download(
+                repo_id=self.repo,
+                repo_type="dataset",
+                token=self.token,
+                allow_patterns=filenames,
+                local_dir=str(self.store.data_dir / "remote"),
+                max_workers=self.restore_download_workers,
+            )
+        except Exception:
+            # Prefetch is only a latency optimization. The ordered per-file
+            # path below remains authoritative and preserves fail-closed restore.
+            return None
+        return Path(root)
 
     @staticmethod
     def _iter_file(path: Path):
@@ -2356,8 +2397,12 @@ class SnapshotSync:
                         # Backwards-compatible single-file snapshot lookup.
                         files = [self.filename + ".enc"]
                     restored = 0
-                    for filename in files:
-                        restored += self._restore_file(filename)
+                    self._restore_prefetch_root = self._prefetch_restore_files(files)
+                    try:
+                        for filename in files:
+                            restored += self._restore_file(filename)
+                    finally:
+                        self._restore_prefetch_root = None
                     # A complete Hub restore can replay an old generation-zero
                     # revision into an id below a partially persisted row cursor.
                     # Rewind only here; ordinary local restarts keep their cursor.

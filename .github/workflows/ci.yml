@@ -32,13 +32,9 @@ jobs:
   lint-test:
     permissions:
       contents: read
-    name: Lint & Unit Tests (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-15]
+    name: Lint & Unit Tests
+    runs-on: ubicloud-standard-2
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -141,13 +137,10 @@ jobs:
   integration-test:
     permissions:
       contents: read
-    name: Integration Test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-15]
+    name: Integration Test (real embedder)
+    runs-on: ubicloud-standard-2
+    needs: lint-test
+    timeout-minutes: 45
     env:
       # The push round-trip test awaits one large combined future (embed + Xet upload + lance);
       # it overflows the default ~2 MB test-thread stack under the CI toolchain. Give it headroom.
@@ -222,7 +215,7 @@ jobs:
       contents: read
     name: ONNX Variant (merge only)
     if: github.event_name == 'push'
-    runs-on: ubuntu-latest
+    runs-on: ubicloud-standard-2
     needs: lint-test
     timeout-minutes: 45
     env:

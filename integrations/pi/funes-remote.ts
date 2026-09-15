@@ -2,7 +2,7 @@
 // machine-specific value; settings come from env/config/Keychain at runtime.
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { execFileSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 
 export function configuredRemoteUrl(): string {
@@ -58,8 +58,35 @@ function zshrcEnv(name: "FUNES_API_TOKEN" | "FUNES_HF_TOKEN" | "HF_TOKEN"): stri
   } catch { return ""; }
 }
 
-const token = process.env.FUNES_API_TOKEN || keychain("funes-api-token") || zshrcEnv("FUNES_API_TOKEN");
-const hubToken = process.env.FUNES_HF_TOKEN || process.env.HF_TOKEN || keychain("funes-hf-token") || zshrcEnv("FUNES_HF_TOKEN") || zshrcEnv("HF_TOKEN");
+function secretFileEnv(name: "FUNES_API_TOKEN" | "FUNES_HF_TOKEN" | "HF_TOKEN"): string {
+  if (process.platform !== "linux") return "";
+  const path = process.env.FUNES_ENV_FILE || `${process.env.HOME || homedir()}/.config/funes/env`;
+  try {
+    // This file is a process-environment fallback, not general shell syntax.
+    // Reject group/world-readable files and only accept literal assignments so
+    // starting pi can never evaluate commands from it.
+    const stat = statSync(path);
+    if (!stat.isFile()) return "";
+    if ((stat.mode & 0o077) !== 0) return "";
+    if (typeof process.getuid === "function" && stat.uid !== process.getuid()) return "";
+    for (const sourceLine of readFileSync(path, "utf8").split(/\r?\n/)) {
+      const line = sourceLine.trim().replace(/^export\s+/, "");
+      const value = line.match(/^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
+      if (!value || value[1] !== name) continue;
+      const raw = value[2].trim();
+      if (
+        raw.length >= 2
+        && ((raw.startsWith("'") && raw.endsWith("'"))
+          || (raw.startsWith('"') && raw.endsWith('"')))
+      ) return raw.slice(1, -1);
+      return raw;
+    }
+  } catch {}
+  return "";
+}
+
+const token = process.env.FUNES_API_TOKEN || secretFileEnv("FUNES_API_TOKEN") || keychain("funes-api-token") || zshrcEnv("FUNES_API_TOKEN");
+const hubToken = process.env.FUNES_HF_TOKEN || process.env.HF_TOKEN || secretFileEnv("FUNES_HF_TOKEN") || secretFileEnv("HF_TOKEN") || keychain("funes-hf-token") || zshrcEnv("FUNES_HF_TOKEN") || zshrcEnv("HF_TOKEN");
 
 function envNumber(name: string): number | undefined {
   const raw = process.env[name];

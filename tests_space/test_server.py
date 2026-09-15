@@ -2024,6 +2024,7 @@ def test_source_sidecar_updates_in_place_and_returns_only_raw_text(monkeypatch, 
             {"query": "新的中文正文", "source_type": "memory", "limit": 3},
         )
         get_status, item = _post(server, "/get", {"id": "memory-section"})
+        stored = app.store.get("memory-section")
         count = app.store.count()
     finally:
         server.shutdown()
@@ -2038,7 +2039,10 @@ def test_source_sidecar_updates_in_place_and_returns_only_raw_text(monkeypatch, 
     assert app.syncer.uploads[-1][0]["raw_text"] == "新的中文正文"
     assert found["results"][0]["raw_text"] == "新的中文正文"
     assert "retrieval_text" not in found["results"][0]
+    assert "_source_metadata_clocks" in stored
+    assert "_source_metadata_clocks" not in found["results"][0]
     assert item["result"]["raw_text"] == "新的中文正文"
+    assert "_source_metadata_clocks" not in item["result"]
     assert count == 1
 
 

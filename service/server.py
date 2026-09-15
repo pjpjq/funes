@@ -43,6 +43,41 @@ FIELDS = (
     "native_index_error", "retrieval_generation",
     "native_generation", "embedding_generation",
 )
+SOURCE_METADATA_FIELDS = (
+    "device_id",
+    "project",
+    "repo",
+    "worktree",
+    "source_agent",
+    "source_type",
+    "session_id",
+    "message_id",
+    "role",
+    "timestamp",
+    "source_path",
+    "agent_type",
+    "parent_session_id",
+    "agent_id",
+)
+SOURCE_METADATA_CLOCK_FIELDS = (*SOURCE_METADATA_FIELDS, "metadata_json")
+SOURCE_METADATA_CLOCK_KEY = "_source_metadata_clocks"
+DERIVED_INPUT_FIELDS = (
+    "retrieval_text",
+    "translation_hash",
+    "translation_version",
+    "translation_status",
+    "retrieval_updated_at",
+    "native_index_version",
+    "native_index_status",
+    "native_index_profile",
+    "native_index_memory",
+    "native_indexed_at",
+    "native_index_error",
+    "retrieval_generation",
+    "native_generation",
+    "embedding_generation",
+    "source_missing",
+)
 CJK_RE = re.compile(r"[\u3400-\u9fff\uf900-\ufaff]")
 PROMPT_VERSION = "funes-retrieval-v2"
 QUERY_PROMPT_VERSION = "funes-query-retrieval-v1"
@@ -253,6 +288,7 @@ class Store:
                     retrieval_text TEXT NOT NULL,
                     search_identifiers TEXT NOT NULL DEFAULT '',
                     metadata_json TEXT NOT NULL DEFAULT '{}',
+                    source_metadata_clock_json TEXT NOT NULL DEFAULT '{}',
                     source_agent TEXT, source_type TEXT, device_id TEXT, project TEXT,
                     repo TEXT, worktree TEXT, session_id TEXT, message_id TEXT, role TEXT,
                     timestamp TEXT, source_path TEXT, content_hash TEXT NOT NULL,
@@ -332,6 +368,11 @@ class Store:
             if "search_identifiers" not in columns:
                 self.conn.execute(
                     "ALTER TABLE memories ADD COLUMN search_identifiers TEXT NOT NULL DEFAULT ''"
+                )
+            if "source_metadata_clock_json" not in columns:
+                self.conn.execute(
+                    """ALTER TABLE memories ADD COLUMN source_metadata_clock_json
+                    TEXT NOT NULL DEFAULT '{}'"""
                 )
             if "native_index_pending" not in columns:
                 self.conn.execute(
@@ -749,13 +790,38 @@ class Store:
                 retrieval = str(doc.get("retrieval_text") or normalize_text(raw))
                 search_identifiers = technical_index_text(raw, retrieval)
                 metadata = dict(doc.get("metadata") or {})
+
+                def supplied(name: str) -> bool:
+                    return name in doc or name in metadata
+
+                def incoming(name: str) -> Any:
+                    return doc[name] if name in doc else metadata.get(name)
+
                 source_identity = str(doc.get("source_identity") or self._identity(doc, metadata, raw))
                 source_version = str(doc.get("source_version", metadata.get("source_version", "")))
                 content_hash = hashlib.sha256(raw.encode("utf-8")).hexdigest()
                 now = utc_now()
+                incoming_updated_explicit = (
+                    "updated_at" in doc or "updated_at" in metadata
+                )
+                incoming_metadata_clocks_explicit = (
+                    SOURCE_METADATA_CLOCK_KEY in doc
+                )
                 incoming_updated = doc.get("updated_at", metadata.get("updated_at")) or now
+                incoming_metadata_clocks = self._incoming_source_metadata_clocks(
+                    doc.get(SOURCE_METADATA_CLOCK_KEY), incoming_updated
+                )
+                incoming_metadata_clock_json = (
+                    self._serialize_source_metadata_clocks(
+                        incoming_metadata_clocks
+                    )
+                )
                 row = self.conn.execute(
                     """SELECT id, content_hash, source_version, updated_at, retrieval_text,
+                    metadata_json, source_metadata_clock_json,
+                    device_id, project, repo, worktree, source_agent,
+                    source_type, session_id, message_id, role, timestamp, source_path,
+                    agent_type, parent_session_id, agent_id,
                     translation_hash, translation_version, translation_status,
                     retrieval_updated_at, native_index_version, native_index_status,
                     native_index_profile, native_index_memory, native_indexed_at,
@@ -778,8 +844,7 @@ class Store:
                 values["retrieval_generation"] = int(values.get("retrieval_generation") or 0)
                 values["native_generation"] = int(values.get("native_generation") or 0)
                 embedding_generation_supplied = (
-                    "embedding_generation" in doc
-                    or "embedding_generation" in metadata
+                    supplied("embedding_generation")
                 )
                 incoming_embedding_generation = int(
                     values.get("embedding_generation") or 0
@@ -797,26 +862,14 @@ class Store:
                     )
                 values["embedding_generation"] = incoming_embedding_generation
                 if row and row["content_hash"] == content_hash and row["source_version"] == source_version:
-                    derived_supplied = embedding_generation_supplied or any(
-                        name in doc
-                        for name in (
-                            "retrieval_text",
-                            "translation_hash",
-                            "translation_version",
-                            "translation_status",
-                            "retrieval_updated_at",
-                            "native_index_version",
-                            "native_index_status",
-                            "native_index_profile",
-                            "native_index_memory",
-                            "native_indexed_at",
-                            "native_index_error",
-                            "retrieval_generation",
-                            "native_generation",
-                            "source_missing",
-                        )
+                    derived_supplied = any(
+                        supplied(name) for name in DERIVED_INPUT_FIELDS
                     )
-                    incoming_status = values.get("translation_status") if "translation_status" in doc else row["translation_status"]
+                    incoming_status = (
+                        incoming("translation_status")
+                        if supplied("translation_status")
+                        else row["translation_status"]
+                    )
                     current_status = row["translation_status"]
                     retryable = {"pending_provider", "fallback_provider_error", "fallback_no_provider"}
                     final = {
@@ -827,12 +880,24 @@ class Store:
                         "skipped_low_value",
                     }
                     would_regress = current_status in final and incoming_status in retryable
-                    incoming_retrieval = retrieval if "retrieval_text" in doc else row["retrieval_text"]
-                    incoming_translation_hash = values.get("translation_hash") if "translation_hash" in doc else row["translation_hash"]
-                    incoming_translation_version = values.get("translation_version") if "translation_version" in doc else row["translation_version"]
+                    incoming_retrieval = (
+                        str(incoming("retrieval_text") or normalize_text(raw))
+                        if supplied("retrieval_text")
+                        else row["retrieval_text"]
+                    )
+                    incoming_translation_hash = (
+                        incoming("translation_hash")
+                        if supplied("translation_hash")
+                        else row["translation_hash"]
+                    )
+                    incoming_translation_version = (
+                        incoming("translation_version")
+                        if supplied("translation_version")
+                        else row["translation_version"]
+                    )
                     incoming_retrieval_updated_at = (
-                        values.get("retrieval_updated_at")
-                        if "retrieval_updated_at" in doc
+                        incoming("retrieval_updated_at")
+                        if supplied("retrieval_updated_at")
                         else row["retrieval_updated_at"]
                     )
                     # Legacy deltas have no generation and therefore belong to
@@ -862,17 +927,17 @@ class Store:
                     )
                     incoming_source_missing = (
                         values["source_missing"]
-                        if "source_missing" in doc
+                        if supplied("source_missing")
                         else row["source_missing"]
                     )
                     source_missing_changed = incoming_source_missing != row["source_missing"]
                     incoming_native = (
-                        values.get("native_index_version") if "native_index_version" in doc else row["native_index_version"],
-                        values.get("native_index_status") if "native_index_status" in doc else row["native_index_status"],
-                        values.get("native_index_profile") if "native_index_profile" in doc else row["native_index_profile"],
-                        values.get("native_index_memory") if "native_index_memory" in doc else row["native_index_memory"],
-                        values.get("native_indexed_at") if "native_indexed_at" in doc else row["native_indexed_at"],
-                        values.get("native_index_error") if "native_index_error" in doc else row["native_index_error"],
+                        incoming("native_index_version") if supplied("native_index_version") else row["native_index_version"],
+                        incoming("native_index_status") if supplied("native_index_status") else row["native_index_status"],
+                        incoming("native_index_profile") if supplied("native_index_profile") else row["native_index_profile"],
+                        incoming("native_index_memory") if supplied("native_index_memory") else row["native_index_memory"],
+                        incoming("native_indexed_at") if supplied("native_indexed_at") else row["native_indexed_at"],
+                        incoming("native_index_error") if supplied("native_index_error") else row["native_index_error"],
                     )
                     incoming_native_generation = values["native_generation"]
                     if incoming_native_generation < row["native_generation"]:
@@ -887,6 +952,7 @@ class Store:
                         incoming_native_generation = row["native_generation"]
                     if source_missing_changed and not any(
                         name in doc
+                        or name in metadata
                         for name in (
                             "native_index_version",
                             "native_index_status",
@@ -958,6 +1024,103 @@ class Store:
                         row["native_generation"],
                         row["embedding_generation"],
                     )
+
+                    def source_metadata_value(name: str) -> str | None:
+                        value = incoming(name) if supplied(name) else row[name]
+                        return None if value is None else str(value)
+
+                    candidate_metadata_values = tuple(
+                        source_metadata_value(name) for name in SOURCE_METADATA_FIELDS
+                    )
+                    current_metadata_values = tuple(
+                        row[name] for name in SOURCE_METADATA_FIELDS
+                    )
+                    current_metadata_json = self._canonical_metadata_json(
+                        row["metadata_json"]
+                    )
+                    candidate_metadata_json = (
+                        self._canonical_metadata_json(metadata)
+                        if "metadata" in doc
+                        else current_metadata_json
+                    )
+                    metadata_values = current_metadata_values
+                    metadata_json = current_metadata_json
+                    current_metadata_clocks = self._source_metadata_clocks(
+                        row["source_metadata_clock_json"], row["updated_at"]
+                    )
+                    metadata_clocks = dict(current_metadata_clocks)
+                    joined_values = list(current_metadata_values)
+                    for index, (name, current, candidate) in enumerate(
+                        zip(
+                            SOURCE_METADATA_FIELDS,
+                            current_metadata_values,
+                            candidate_metadata_values,
+                            strict=True,
+                        )
+                    ):
+                        if not supplied(name):
+                            continue
+                        if (
+                            not incoming_updated_explicit
+                            and not incoming_metadata_clocks_explicit
+                            and candidate == current
+                        ):
+                            continue
+                        incoming_clock = incoming_metadata_clocks[name]
+                        clock_order = self._updated_at_key(incoming_clock)
+                        current_clock = current_metadata_clocks[name]
+                        current_clock_order = self._updated_at_key(current_clock)
+                        if clock_order > current_clock_order:
+                            joined_values[index] = candidate
+                            metadata_clocks[name] = incoming_clock
+                        elif clock_order == current_clock_order:
+                            joined_values[index] = self._source_metadata_join(
+                                current, candidate
+                            )
+                            metadata_clocks[name] = max(
+                                current_clock, incoming_clock
+                            )
+                    metadata_values = tuple(joined_values)
+                    if "metadata" in doc:
+                        implicit_unchanged_metadata = (
+                            not incoming_updated_explicit
+                            and not incoming_metadata_clocks_explicit
+                            and candidate_metadata_json == current_metadata_json
+                        )
+                        incoming_clock = incoming_metadata_clocks["metadata_json"]
+                        clock_order = self._updated_at_key(incoming_clock)
+                        current_clock = current_metadata_clocks["metadata_json"]
+                        current_clock_order = self._updated_at_key(current_clock)
+                        if implicit_unchanged_metadata:
+                            pass
+                        elif clock_order > current_clock_order:
+                            metadata_json = candidate_metadata_json
+                            metadata_clocks["metadata_json"] = incoming_clock
+                        elif clock_order == current_clock_order:
+                            metadata_json = max(
+                                current_metadata_json, candidate_metadata_json
+                            )
+                            metadata_clocks["metadata_json"] = max(
+                                current_clock, incoming_clock
+                            )
+                    metadata_updated_at = max(
+                        [str(row["updated_at"]), *metadata_clocks.values()],
+                        key=lambda value: (self._updated_at_key(value), value),
+                    )
+                    metadata_clock_json = self._serialize_source_metadata_clocks(
+                        metadata_clocks
+                    )
+                    current_metadata_clock_json = (
+                        self._serialize_source_metadata_clocks(
+                            current_metadata_clocks
+                        )
+                    )
+                    metadata_changed = (
+                        metadata_values != current_metadata_values
+                        or metadata_json != current_metadata_json
+                        or metadata_clock_json != current_metadata_clock_json
+                    )
+                    derived_changed = False
                     if derived_supplied and not would_regress and incoming_derived != current_derived:
                         # Raw revisions and derived retrieval shadows have separate
                         # lifecycles.  A reconciled shadow must update in place even
@@ -979,8 +1142,40 @@ class Store:
                                 row["id"],
                             ),
                         )
+                        derived_changed = True
+                    if metadata_changed:
+                        # Source attribution can move independently of immutable
+                        # source bytes and their derived translation/native state.
+                        # Keep its timestamp monotonic so an older restored delta
+                        # cannot roll the attribution back.
+                        self.conn.execute(
+                            """UPDATE memories SET
+                            device_id=?,project=?,repo=?,worktree=?,source_agent=?,
+                            source_type=?,session_id=?,message_id=?,role=?,timestamp=?,
+                            source_path=?,agent_type=?,parent_session_id=?,agent_id=?,
+                            metadata_json=?,source_metadata_clock_json=?,updated_at=?
+                            WHERE id=?""",
+                            (
+                                *metadata_values,
+                                metadata_json,
+                                metadata_clock_json,
+                                metadata_updated_at,
+                                row["id"],
+                            ),
+                        )
+                    if derived_changed or metadata_changed:
                         updated += 1
-                        results.append({"id": row["id"], "status": "derived_updated", "source_identity": source_identity})
+                        results.append(
+                            {
+                                "id": row["id"],
+                                "status": (
+                                    "derived_updated"
+                                    if derived_changed
+                                    else "metadata_updated"
+                                ),
+                                "source_identity": source_identity,
+                            }
+                        )
                     else:
                         deduped += 1
                         results.append({"id": row["id"], "status": "deduped", "source_identity": source_identity})
@@ -994,7 +1189,7 @@ class Store:
                 if row:
                     self.conn.execute(
                         """UPDATE memories SET source_version=?, raw_text=?, retrieval_text=?,
-                        search_identifiers=?, metadata_json=?,
+                        search_identifiers=?, metadata_json=?, source_metadata_clock_json=?,
                         source_agent=?, source_type=?, device_id=?, project=?, repo=?, worktree=?, session_id=?,
                         message_id=?, role=?, timestamp=?, source_path=?, content_hash=?, updated_at=?, retrieval_updated_at=?, content_type=?,
                         source_missing=?, agent_type=?, parent_session_id=?, agent_id=?, translation_hash=?, translation_version=?, translation_status=?,
@@ -1002,7 +1197,7 @@ class Store:
                         native_index_memory=?, native_indexed_at=?, native_index_error=?,
                         retrieval_generation=?, native_generation=?,
                         embedding_generation=? WHERE id=?""",
-                        (source_version, raw, retrieval, search_identifiers, json.dumps(metadata, ensure_ascii=False),
+                        (source_version, raw, retrieval, search_identifiers, json.dumps(metadata, ensure_ascii=False), incoming_metadata_clock_json,
                          values.get("source_agent"), values.get("source_type"), values.get("device_id"),
                          values.get("project"), values.get("repo"), values.get("worktree"), values.get("session_id"),
                          values.get("message_id"), values.get("role"), values.get("timestamp"), values.get("source_path"),
@@ -1016,13 +1211,13 @@ class Store:
                     results.append({"id": row["id"], "status": "updated", "source_identity": source_identity})
                 else:
                     cur = self.conn.execute(
-                        """INSERT INTO memories(source_identity,source_version,raw_text,retrieval_text,search_identifiers,metadata_json,
+                        """INSERT INTO memories(source_identity,source_version,raw_text,retrieval_text,search_identifiers,metadata_json,source_metadata_clock_json,
                         source_agent,source_type,device_id,project,repo,worktree,session_id,message_id,role,timestamp,
                         source_path,content_hash,ingested_at,updated_at,retrieval_updated_at,content_type,source_missing,agent_type,parent_session_id,agent_id,translation_hash,translation_version,translation_status,
                         native_index_version,native_index_status,native_index_profile,native_index_memory,native_indexed_at,native_index_error,
                         retrieval_generation,native_generation,embedding_generation)
-                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                        (source_identity, source_version, raw, retrieval, search_identifiers, json.dumps(metadata, ensure_ascii=False),
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (source_identity, source_version, raw, retrieval, search_identifiers, json.dumps(metadata, ensure_ascii=False), incoming_metadata_clock_json,
                          values.get("source_agent"), values.get("source_type"), values.get("device_id"), values.get("project"),
                          values.get("repo"), values.get("worktree"), values.get("session_id"), values.get("message_id"),
                          values.get("role"), values.get("timestamp"), values.get("source_path"), content_hash, values.get("ingested_at") or now, incoming_updated, values.get("retrieval_updated_at"),
@@ -1047,6 +1242,78 @@ class Store:
             except ValueError:
                 return (1, text)
         return key(candidate) < key(current)
+
+    @staticmethod
+    def _updated_at_key(value: Any) -> tuple[int, Any]:
+        """Order numeric and RFC3339 timestamps on one stable time axis."""
+        text = str(value or "")
+        try:
+            return (2, datetime.fromtimestamp(float(text), timezone.utc).timestamp())
+        except (ValueError, OverflowError, OSError):
+            pass
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return (2, parsed.timestamp())
+        except (ValueError, OverflowError, OSError):
+            return (1, text)
+
+    @staticmethod
+    def _source_metadata_clocks(value: Any, fallback: Any) -> dict[str, str]:
+        if isinstance(value, dict):
+            parsed = value
+        else:
+            try:
+                parsed = json.loads(str(value or "{}"))
+            except json.JSONDecodeError:
+                parsed = {}
+        if not isinstance(parsed, dict):
+            parsed = {}
+        fallback_text = str(fallback or "")
+        return {
+            name: str(parsed.get(name) or fallback_text)
+            for name in SOURCE_METADATA_CLOCK_FIELDS
+        }
+
+    @classmethod
+    def _incoming_source_metadata_clocks(
+        cls, value: Any, updated_at: Any
+    ) -> dict[str, str]:
+        clocks = cls._source_metadata_clocks(value, updated_at)
+        upper = cls._updated_at_key(updated_at)
+        updated_text = str(updated_at or "")
+        return {
+            name: updated_text if cls._updated_at_key(clock) > upper else clock
+            for name, clock in clocks.items()
+        }
+
+    @staticmethod
+    def _serialize_source_metadata_clocks(clocks: dict[str, str]) -> str:
+        return json.dumps(
+            clocks, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+
+    @staticmethod
+    def _canonical_metadata_json(value: Any) -> str:
+        try:
+            metadata = json.loads(value) if isinstance(value, str) else value
+        except json.JSONDecodeError:
+            metadata = str(value or "")
+        return json.dumps(
+            metadata if metadata is not None else {},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+
+    @staticmethod
+    def _source_metadata_join(current: str | None, incoming: str | None) -> str | None:
+        """Join one equal-time source field with a stable None/string order."""
+        current_key = (0, "") if current is None else (1, str(current))
+        incoming_key = (0, "") if incoming is None else (1, str(incoming))
+        return incoming if incoming_key > current_key else current
 
     @staticmethod
     def _newer_timestamp(candidate: Any, current: Any) -> bool:
@@ -1089,6 +1356,9 @@ class Store:
         out = dict(row)
         out.pop("search_identifiers", None)
         out.pop("native_index_pending", None)
+        out[SOURCE_METADATA_CLOCK_KEY] = self._source_metadata_clocks(
+            out.pop("source_metadata_clock_json", "{}"), out.get("updated_at")
+        )
         out["source_missing"] = bool(out.get("source_missing"))
         try:
             out["metadata"] = json.loads(out.pop("metadata_json") or "{}")
@@ -2969,8 +3239,9 @@ class SnapshotSync:
                     durable_docs.append(self.store.native_index_state_record())
                 digest = hashlib.sha256(json.dumps(durable_docs, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:24]
                 # Content addressing makes a retry upload the same immutable
-                # object. Restore is order-independent because Store.ingest
-                # applies updated_at LWW rather than trusting filename order.
+                # object. Restore does not trust filename order: source revisions
+                # use their row high-water while source metadata uses persisted
+                # per-field clocks with deterministic equal-time joins.
                 path = self.store.data_dir / f"{self.delta_prefix}{digest}.jsonl.gz"
                 self._write_jsonl_gzip(durable_docs, path)
             else:
@@ -3154,6 +3425,80 @@ FINAL_TRANSLATION_STATUSES = {
 }
 
 
+def _same_revision_derived_change(
+    item: dict[str, Any],
+    metadata: dict[str, Any],
+    existing: dict[str, Any],
+    raw: str,
+) -> bool:
+    """Return whether supplied derived state can change the stored revision."""
+    def supplied(name: str) -> bool:
+        return name in item or name in metadata
+
+    def incoming(name: str) -> Any:
+        return item[name] if name in item else metadata.get(name)
+
+    if supplied("source_missing") and bool(incoming("source_missing")) != bool(
+        existing.get("source_missing")
+    ):
+        return True
+
+    current_retrieval_generation = int(existing.get("retrieval_generation") or 0)
+    incoming_retrieval_generation = (
+        int(incoming("retrieval_generation") or 0)
+        if supplied("retrieval_generation")
+        else current_retrieval_generation
+    )
+    if incoming_retrieval_generation > current_retrieval_generation:
+        return True
+    if incoming_retrieval_generation >= current_retrieval_generation:
+        retrieval_values = {
+            "retrieval_text": str(incoming("retrieval_text") or normalize_text(raw))
+            if supplied("retrieval_text")
+            else existing.get("retrieval_text"),
+            "translation_hash": incoming("translation_hash")
+            if supplied("translation_hash")
+            else existing.get("translation_hash"),
+            "translation_version": incoming("translation_version")
+            if supplied("translation_version")
+            else existing.get("translation_version"),
+            "translation_status": incoming("translation_status")
+            if supplied("translation_status")
+            else existing.get("translation_status"),
+            "retrieval_updated_at": incoming("retrieval_updated_at")
+            if supplied("retrieval_updated_at")
+            else existing.get("retrieval_updated_at"),
+        }
+        if any(retrieval_values[name] != existing.get(name) for name in retrieval_values):
+            return True
+
+    current_native_generation = int(existing.get("native_generation") or 0)
+    incoming_native_generation = (
+        int(incoming("native_generation") or 0)
+        if supplied("native_generation")
+        else current_native_generation
+    )
+    if incoming_native_generation > current_native_generation:
+        return True
+    if incoming_native_generation >= current_native_generation:
+        for name in (
+            "native_index_version",
+            "native_index_status",
+            "native_index_profile",
+            "native_index_memory",
+            "native_indexed_at",
+            "native_index_error",
+        ):
+            if supplied(name) and incoming(name) != existing.get(name):
+                return True
+
+    if supplied("embedding_generation"):
+        return int(incoming("embedding_generation") or 0) > int(
+            existing.get("embedding_generation") or 0
+        )
+    return False
+
+
 def prepare_ingest_documents(app: Any, docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Build the raw-first durable representation without calling a provider."""
     prepared = []
@@ -3172,32 +3517,70 @@ def prepare_ingest_documents(app: Any, docs: list[dict[str, Any]]) -> list[dict[
         metadata = item.get("metadata") or {}
         if not isinstance(metadata, dict):
             raise ValueError("metadata must be an object")
+
+        def supplied(name: str) -> bool:
+            return name in item or name in metadata
+
+        def incoming(name: str) -> Any:
+            return item[name] if name in item else metadata.get(name)
+
         identity = str(item.get("source_identity") or app.store._identity(item, metadata, raw))
         item["source_identity"] = identity
-        item["retrieval_generation"] = generation
-        item["native_generation"] = generation
-        item["embedding_generation"] = embedding_generation
         source_version = str(item.get("source_version", metadata.get("source_version", "")))
         content_hash = hashlib.sha256(raw.encode("utf-8")).hexdigest()
         existing = app.store.get(identity)
-        same_final_revision = bool(
+        same_revision = bool(
             existing
             and existing.get("content_hash") == content_hash
             and str(existing.get("source_version", "")) == source_version
+        )
+        derived_change = bool(
+            same_revision
+            and _same_revision_derived_change(item, metadata, existing, raw)
+        )
+        if same_revision and not derived_change:
+            # Source attribution refreshes are independent of the immutable raw
+            # revision. Let Store.ingest preserve every derived generation and
+            # checkpoint instead of stamping the latest global reindex epoch.
+            prepared.append(item)
+            continue
+        if same_revision:
+            for name in (
+                "retrieval_generation",
+                "native_generation",
+                "embedding_generation",
+            ):
+                if not supplied(name):
+                    item[name] = int(existing.get(name) or 0)
+        else:
+            item["retrieval_generation"] = generation
+            item["native_generation"] = generation
+            item["embedding_generation"] = embedding_generation
+        same_final_revision = bool(
+            same_revision
             and existing.get("translation_status") in FINAL_TRANSLATION_STATUSES
         )
-        if same_final_revision and not item.get("retrieval_text"):
+        supplied_retrieval = (
+            incoming("retrieval_text") if supplied("retrieval_text") else None
+        )
+        if same_final_revision and not supplied_retrieval:
             item["retrieval_text"] = existing.get("retrieval_text") or normalize_text(raw)
             for name in ("translation_hash", "translation_version", "translation_status"):
-                if existing.get(name) is not None:
-                    item.setdefault(name, existing[name])
+                if not supplied(name) and existing.get(name) is not None:
+                    item[name] = existing[name]
             prepared.append(item)
             continue
-        if item.get("retrieval_text"):
+        if supplied_retrieval:
             prepared.append(item)
             continue
-        source_type = str(item.get("source_type", item.get("kind", ""))).lower()
-        content_type = str(item.get("content_type", "")).lower()
+        source_type = str(
+            incoming("source_type")
+            if supplied("source_type")
+            else item.get("kind", "")
+        ).lower()
+        content_type = str(
+            incoming("content_type") if supplied("content_type") else ""
+        ).lower()
         native_session = source_type in {
             "session",
             "codex",
@@ -3361,6 +3744,11 @@ def ingest_documents(app: Any, docs: list[dict[str, Any]]) -> dict[str, Any]:
     )
     result["translation"] = {"attempted": 0, "updated": 0, "durable": True}
     if not result["durable"]:
+        durability_sensitive = {
+            str(item["source_identity"])
+            for item in result["items"]
+            if item["status"] in {"created", "updated", "derived_updated"}
+        }
         app.store.update_native_index(
             [
                 {
@@ -3374,6 +3762,7 @@ def ingest_documents(app: Any, docs: list[dict[str, Any]]) -> dict[str, Any]:
                     "native_generation": int(item.get("native_generation") or 0),
                 }
                 for item in canonical
+                if str(item["source_identity"]) in durability_sensitive
             ]
         )
         result["error"] = "durability_pending"
@@ -3591,6 +3980,7 @@ def make_handler(app: App):
             # HTTP always returns raw source truth, never its English shadow.
             item = dict(item)
             item.pop("retrieval_text", None)
+            item.pop(SOURCE_METADATA_CLOCK_KEY, None)
             return item
 
         def do_GET(self) -> None:

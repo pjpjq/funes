@@ -77,7 +77,7 @@ jobs:
 
   integration-test:
     name: Integration Test (real embedder)
-    runs-on: ubicloud-standard-2
+    runs-on: ubicloud-standard-4
     needs: lint-test
     timeout-minutes: 45
     env:

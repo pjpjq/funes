@@ -104,7 +104,7 @@ jobs:
       !cancelled() &&
       (startsWith(github.ref, 'refs/tags/') || needs.compute.result == 'success'
         || github.event_name == 'pull_request' || github.ref == 'refs/heads/main')
-    runs-on: ubicloud-standard-2
+    runs-on: ubicloud-standard-4
     # glibc compatibility is one-way: a binary runs on any glibc >= the one it was built against.
     # Building inside 22.04 pins the floor at glibc 2.35 — without the container, C deps compiled
     # on a newer runner could bind __isoc23_*@GLIBC_2.38 symbols. A check below enforces

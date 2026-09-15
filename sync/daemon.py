@@ -29,7 +29,7 @@ class SyncDaemon:
         self._source_cache=None; self._source_cache_at=0.0; self._source_cache_lock=threading.Lock()
         self._backfill_marker = self.config.state_dir / "initial-backfill.complete"
         self._source_schema_marker = self.config.state_dir / "source-schema-v2.complete"
-        self._zero_record_marker = self.config.state_dir / "zero-record-repair-v1.complete"
+        self._zero_record_marker = self.config.state_dir / "zero-record-repair-v2.complete"
         self._automation_identity_marker = self.config.state_dir / "automation-identity-v2.complete"
         remote_fingerprint=hashlib.sha256(self.config.remote_url.rstrip("/").encode()).hexdigest()[:16]
         self._remote_source_marker = self.config.state_dir / f"remote-source-v1-{remote_fingerprint}.complete"

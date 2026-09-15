@@ -1,4 +1,5 @@
 import gzip
+import hashlib
 import json
 import os
 import sqlite3
@@ -17,10 +18,10 @@ from service.server import QUERY_PROMPT_VERSION, QUERY_RETRIEVAL_PROMPT, RETRIEV
 class ServiceTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.old = {k: os.environ.get(k) for k in ("FUNES_DATA_DIR", "FUNES_AUTH_TOKEN", "FUNES_API_TOKEN", "FUNES_STORAGE_KEY", "FUNES_STORAGE_REPO", "FUNES_SNAPSHOT_FILE", "HF_TOKEN", "FUNES_REQUIRE_DURABLE_ACK", "FUNES_ALLOW_EMPTY_REMOTE", "FUNES_MAX_BODY_BYTES", "FUNES_RETRIEVAL_LANGUAGE_MODE", "TRANSLATION_BASE_URL", "TRANSLATION_API_KEY", "TRANSLATION_MODEL", "TRANSLATION_MAX_PER_INGEST", "TRANSLATION_QUERY_MAX_TOKENS", "TRANSLATION_RECONCILE_INTERVAL", "RETURN_RETRIEVAL_TEXT")}
+        self.old = {k: os.environ.get(k) for k in ("FUNES_DATA_DIR", "FUNES_AUTH_TOKEN", "FUNES_API_TOKEN", "FUNES_STORAGE_KEY", "FUNES_STORAGE_REPO", "FUNES_SNAPSHOT_FILE", "FUNES_RESTORE_MANIFEST_FILE", "HF_TOKEN", "FUNES_REQUIRE_DURABLE_ACK", "FUNES_ALLOW_EMPTY_REMOTE", "FUNES_MAX_BODY_BYTES", "FUNES_RETRIEVAL_LANGUAGE_MODE", "TRANSLATION_BASE_URL", "TRANSLATION_API_KEY", "TRANSLATION_MODEL", "TRANSLATION_MAX_PER_INGEST", "TRANSLATION_QUERY_MAX_TOKENS", "TRANSLATION_RECONCILE_INTERVAL", "RETURN_RETRIEVAL_TEXT")}
         os.environ["FUNES_DATA_DIR"] = self.tmp.name
         os.environ["FUNES_AUTH_TOKEN"] = "test-token"
-        for k in ("FUNES_API_TOKEN", "FUNES_STORAGE_KEY", "FUNES_STORAGE_REPO", "FUNES_SNAPSHOT_FILE", "HF_TOKEN", "FUNES_REQUIRE_DURABLE_ACK", "FUNES_ALLOW_EMPTY_REMOTE", "FUNES_MAX_BODY_BYTES", "FUNES_RETRIEVAL_LANGUAGE_MODE", "TRANSLATION_BASE_URL", "TRANSLATION_API_KEY", "TRANSLATION_MODEL", "TRANSLATION_MAX_PER_INGEST", "TRANSLATION_QUERY_MAX_TOKENS", "TRANSLATION_RECONCILE_INTERVAL", "RETURN_RETRIEVAL_TEXT"):
+        for k in ("FUNES_API_TOKEN", "FUNES_STORAGE_KEY", "FUNES_STORAGE_REPO", "FUNES_SNAPSHOT_FILE", "FUNES_RESTORE_MANIFEST_FILE", "HF_TOKEN", "FUNES_REQUIRE_DURABLE_ACK", "FUNES_ALLOW_EMPTY_REMOTE", "FUNES_MAX_BODY_BYTES", "FUNES_RETRIEVAL_LANGUAGE_MODE", "TRANSLATION_BASE_URL", "TRANSLATION_API_KEY", "TRANSLATION_MODEL", "TRANSLATION_MAX_PER_INGEST", "TRANSLATION_QUERY_MAX_TOKENS", "TRANSLATION_RECONCILE_INTERVAL", "RETURN_RETRIEVAL_TEXT"):
             os.environ.pop(k, None)
 
     def tearDown(self):
@@ -1010,6 +1011,55 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(target.search("durable")[0]["raw_text"], "durable text")
         self.assertEqual(target.translation_get("cache-key"), "cached retrieval text")
         source.close(); target.close(); second_dir.cleanup()
+
+    def test_snapshot_streams_memory_cursor_without_fetchall(self):
+        source = Store(self.tmp.name)
+        source.ingest(
+            [
+                {"source_identity": f"stream-{index}", "raw_text": f"row {index}"}
+                for index in range(3)
+            ]
+        )
+        connection = source.conn
+        iterated = False
+
+        class StreamingCursor:
+            def __init__(self, cursor):
+                self.cursor = cursor
+
+            def __iter__(self):
+                nonlocal iterated
+                iterated = True
+                return iter(self.cursor)
+
+            def fetchall(self):
+                raise AssertionError("snapshot must not materialize the memories cursor")
+
+        class ConnectionProbe:
+            def execute(self, sql, *args):
+                cursor = connection.execute(sql, *args)
+                if "SELECT * FROM memories ORDER BY id" in " ".join(sql.split()):
+                    return StreamingCursor(cursor)
+                return cursor
+
+            def __getattr__(self, name):
+                return getattr(connection, name)
+
+        snapshot = Path(self.tmp.name) / "streamed.jsonl.gz"
+        source.conn = ConnectionProbe()
+        try:
+            source.snapshot(snapshot)
+        finally:
+            source.conn = connection
+        with gzip.open(snapshot, "rt", encoding="utf-8") as stream:
+            memories = [
+                json.loads(line)["source_identity"]
+                for line in stream
+                if '"_funes_record": "memory"' in line
+            ]
+        self.assertTrue(iterated)
+        self.assertEqual(memories, ["stream-0", "stream-1", "stream-2"])
+        source.close()
 
     def test_snapshot_roundtrip_preserves_retrieval_and_native_state(self):
         source = Store(self.tmp.name)
@@ -2008,6 +2058,172 @@ class ServiceTests(unittest.TestCase):
         self.assertIsNone(syncer._restore_prefetch_root)
         store.close()
 
+    def test_hub_restore_without_manifest_replays_legacy_history(self):
+        from service.server import SnapshotSync
+
+        store = Store(self.tmp.name)
+        syncer = SnapshotSync(store)
+        syncer.repo = "owner/private"
+        syncer.token = "test-token"
+        files = [
+            "funes-delta-b.jsonl.gz.enc",
+            "funes-snapshot-old.jsonl.gz.enc",
+            "funes-reindex-0002.jsonl.gz.enc",
+            "funes-snapshot.jsonl.gz.enc",
+            "funes-delta-a.jsonl.gz.enc",
+        ]
+        api = mock.Mock()
+        api.repo_info.return_value.sha = "head-1"
+        api.list_repo_tree.return_value = [mock.Mock(path=name) for name in files]
+        module = mock.Mock(HfApi=mock.Mock(return_value=api))
+        with mock.patch.dict("sys.modules", {"huggingface_hub": module}):
+            selected = syncer._repo_files()
+
+        self.assertEqual(
+            selected,
+            [
+                "funes-snapshot-old.jsonl.gz.enc",
+                "funes-snapshot.jsonl.gz.enc",
+                "funes-delta-a.jsonl.gz.enc",
+                "funes-delta-b.jsonl.gz.enc",
+                "funes-reindex-0002.jsonl.gz.enc",
+            ],
+        )
+        store.close()
+
+    def test_hub_restore_manifest_selects_only_active_history(self):
+        from service.server import SnapshotSync
+
+        store = Store(self.tmp.name)
+        syncer = SnapshotSync(store)
+        syncer.repo = "owner/private"
+        syncer.token = "test-token"
+        active = {
+            "version": 1,
+            "snapshot": "funes-snapshot-current.jsonl.gz.enc",
+            "deltas": ["funes-delta-later.jsonl.gz.enc"],
+            "controls": ["funes-reindex-0003.jsonl.gz.enc"],
+        }
+        manifest_path = Path(self.tmp.name) / syncer.manifest_filename
+        manifest_path.write_text(json.dumps(active), encoding="utf-8")
+        repo_files = [
+            syncer.manifest_filename,
+            "funes-snapshot-old.jsonl.gz.enc",
+            "funes-delta-old.jsonl.gz.enc",
+            active["snapshot"],
+            *active["deltas"],
+            *active["controls"],
+        ]
+        api = mock.Mock()
+        api.repo_info.return_value.sha = "head-1"
+        api.list_repo_tree.return_value = [mock.Mock(path=name) for name in repo_files]
+        module = mock.Mock(
+            HfApi=mock.Mock(return_value=api),
+            hf_hub_download=mock.Mock(return_value=str(manifest_path)),
+        )
+        with mock.patch.dict("sys.modules", {"huggingface_hub": module}):
+            selected = syncer._repo_files()
+
+        self.assertEqual(
+            selected,
+            [active["snapshot"], *active["deltas"], *active["controls"]],
+        )
+        self.assertEqual(api.list_repo_tree.call_args.kwargs["revision"], "head-1")
+        self.assertEqual(
+            module.hf_hub_download.call_args.kwargs["revision"], "head-1"
+        )
+        store.close()
+
+    def test_present_restore_manifest_fails_closed_when_malformed(self):
+        from service.server import SnapshotSync
+
+        invalid_manifests = [
+            {
+                "version": 2,
+                "snapshot": "funes-snapshot-current.jsonl.gz.enc",
+                "deltas": [],
+                "controls": [],
+            },
+            {
+                "version": 1,
+                "snapshot": "../funes-snapshot-current.jsonl.gz.enc",
+                "deltas": [],
+                "controls": [],
+            },
+            {
+                "version": 1,
+                "snapshot": "funes-snapshot-current.jsonl.gz.enc",
+                "deltas": ["wrong-prefix.jsonl.gz.enc"],
+                "controls": [],
+            },
+            {
+                "version": 1,
+                "snapshot": "funes-snapshot-current.jsonl.gz",
+                "deltas": [],
+                "controls": [],
+            },
+        ]
+        store = Store(self.tmp.name)
+        try:
+            for index, value in enumerate(invalid_manifests):
+                with self.subTest(index=index):
+                    syncer = SnapshotSync(store)
+                    syncer.repo = "owner/private"
+                    syncer.token = "test-token"
+                    manifest_path = Path(self.tmp.name) / f"invalid-{index}.json"
+                    manifest_path.write_text(json.dumps(value), encoding="utf-8")
+                    api = mock.Mock()
+                    api.repo_info.return_value.sha = "head-1"
+                    api.list_repo_tree.return_value = [
+                        mock.Mock(path=syncer.manifest_filename),
+                        mock.Mock(path="funes-snapshot-current.jsonl.gz.enc"),
+                    ]
+                    module = mock.Mock(
+                        HfApi=mock.Mock(return_value=api),
+                        hf_hub_download=mock.Mock(return_value=str(manifest_path)),
+                    )
+                    with mock.patch.dict(
+                        "sys.modules", {"huggingface_hub": module}
+                    ), mock.patch.object(syncer, "_restore_file") as restore_file:
+                        self.assertEqual(syncer.restore(), -1)
+                    self.assertTrue(syncer.restore_failed)
+                    restore_file.assert_not_called()
+        finally:
+            store.close()
+
+    def test_present_restore_manifest_fails_closed_on_missing_reference(self):
+        from service.server import SnapshotSync
+
+        store = Store(self.tmp.name)
+        syncer = SnapshotSync(store)
+        syncer.repo = "owner/private"
+        syncer.token = "test-token"
+        manifest = {
+            "version": 1,
+            "snapshot": "funes-snapshot-current.jsonl.gz.enc",
+            "deltas": ["funes-delta-missing.jsonl.gz.enc"],
+            "controls": [],
+        }
+        manifest_path = Path(self.tmp.name) / syncer.manifest_filename
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        api = mock.Mock()
+        api.repo_info.return_value.sha = "head-1"
+        api.list_repo_tree.return_value = [
+            mock.Mock(path=syncer.manifest_filename),
+            mock.Mock(path=manifest["snapshot"]),
+        ]
+        module = mock.Mock(
+            HfApi=mock.Mock(return_value=api),
+            hf_hub_download=mock.Mock(return_value=str(manifest_path)),
+        )
+        with mock.patch.dict(
+            "sys.modules", {"huggingface_hub": module}
+        ), mock.patch.object(syncer, "_restore_file") as restore_file:
+            self.assertEqual(syncer.restore(), -1)
+        self.assertTrue(syncer.restore_failed)
+        restore_file.assert_not_called()
+        store.close()
+
     def test_restore_compacts_history_and_skips_satisfied_updates(self):
         store = Store(self.tmp.name)
         store.ingest(
@@ -2108,6 +2324,96 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(status, 503)
         self.assertFalse(body["queued"])
 
+    def test_queue_reindex_holds_upload_lock_until_control_is_local(self):
+        from service.server import SnapshotSync, queue_reindex
+
+        store = Store(self.tmp.name)
+        syncer = SnapshotSync(store)
+        app = mock.Mock(
+            store=store,
+            syncer=syncer,
+            reindex_lock=threading.Lock(),
+            reindex_wake=threading.Event(),
+        )
+        remote_committed = threading.Event()
+        competitor_attempted = threading.Event()
+        observed_local_counts = []
+        queue_results = []
+        errors = []
+        original_record = store.record_reindex_control
+
+        def upload_control(_control):
+            with syncer.upload_lock:
+                remote_committed.set()
+                if not competitor_attempted.wait(1):
+                    raise AssertionError("snapshot competitor did not start")
+                return {"uploaded": True, "durable": True}
+
+        def record_while_locked(control):
+            if not syncer.upload_lock._is_owned():
+                raise AssertionError("control record escaped the upload lock")
+            return original_record(control)
+
+        def queue_worker():
+            try:
+                queue_results.append(queue_reindex(app, "all"))
+            except BaseException as exc:
+                errors.append(exc)
+
+        def snapshot_competitor():
+            if not remote_committed.wait(1):
+                errors.append(AssertionError("remote control was not committed"))
+                return
+            competitor_attempted.set()
+            with syncer.upload_lock:
+                observed_local_counts.append(
+                    store.conn.execute("SELECT count(*) FROM reindex_controls").fetchone()[0]
+                )
+
+        with mock.patch.object(
+            syncer, "upload_reindex_control", side_effect=upload_control
+        ), mock.patch.object(
+            store, "record_reindex_control", side_effect=record_while_locked
+        ):
+            competitor = threading.Thread(target=snapshot_competitor)
+            queue = threading.Thread(target=queue_worker)
+            competitor.start()
+            queue.start()
+            queue.join(timeout=2)
+            competitor.join(timeout=2)
+
+        self.assertFalse(queue.is_alive())
+        self.assertFalse(competitor.is_alive())
+        self.assertEqual(errors, [])
+        self.assertTrue(queue_results[0]["durable"])
+        self.assertEqual(observed_local_counts, [1])
+        store.close()
+
+    def test_queue_reindex_remote_failure_does_not_create_local_control(self):
+        from service.server import SnapshotSync, queue_reindex
+
+        store = Store(self.tmp.name)
+        syncer = SnapshotSync(store)
+        app = mock.Mock(
+            store=store,
+            syncer=syncer,
+            reindex_lock=threading.Lock(),
+            reindex_wake=threading.Event(),
+        )
+        with mock.patch.object(
+            syncer,
+            "upload_reindex_control",
+            return_value={"uploaded": False, "durable": False, "reason": "offline"},
+        ):
+            result = queue_reindex(app, "all")
+
+        self.assertFalse(result["durable"])
+        self.assertEqual(
+            store.conn.execute("SELECT count(*) FROM reindex_controls").fetchone()[0],
+            0,
+        )
+        store.close()
+
     def test_reindex_control_is_encrypted_before_local_durable_ack(self):
         from service.server import SnapshotSync
         store = Store(self.tmp.name)
@@ -2130,6 +2436,581 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(result["reason"], "HF storage not configured")
         store.close()
 
+    def test_full_snapshot_and_manifest_are_one_atomic_commit(self):
+        from service.server import SnapshotSync
+
+        store = Store(self.tmp.name)
+        store.ingest([{"source_identity": "compact", "raw_text": "current"}])
+        os.environ.update(
+            FUNES_STORAGE_REPO="owner/private",
+            FUNES_STORAGE_KEY="test-storage-key",
+            HF_TOKEN="hf-test",
+        )
+        api = mock.Mock()
+        api.repo_info.return_value.sha = "head-1"
+        api.list_repo_tree.return_value = []
+        with mock.patch("huggingface_hub.HfApi", return_value=api):
+            syncer = SnapshotSync(store)
+            result = syncer.upload()
+
+        self.assertTrue(result["durable"])
+        api.upload_file.assert_not_called()
+        api.create_commit.assert_called_once()
+        kwargs = api.create_commit.call_args.kwargs
+        self.assertEqual(
+            set(kwargs),
+            {
+                "repo_id",
+                "repo_type",
+                "operations",
+                "commit_message",
+                "parent_commit",
+            },
+        )
+        self.assertEqual(kwargs["repo_id"], "owner/private")
+        self.assertEqual(kwargs["repo_type"], "dataset")
+        self.assertEqual(kwargs["parent_commit"], "head-1")
+        operations = {operation.path_in_repo: operation for operation in kwargs["operations"]}
+        snapshot_name = "funes-snapshot.jsonl.gz.enc"
+        self.assertEqual(set(operations), {snapshot_name, syncer.manifest_filename})
+        manifest = json.loads(operations[syncer.manifest_filename].path_or_fileobj)
+        self.assertEqual(
+            manifest,
+            {
+                "version": 1,
+                "snapshot": snapshot_name,
+                "deltas": [],
+                "controls": [],
+            },
+        )
+        self.assertEqual(kwargs["commit_message"], "funes encrypted source snapshot")
+        store.close()
+
+    def test_unrestored_active_manifest_cannot_compact(self):
+        from service.server import SnapshotSync
+
+        store = Store(self.tmp.name)
+        store.ingest([{"source_identity": "partial", "raw_text": "partial state"}])
+        os.environ.update(
+            FUNES_STORAGE_REPO="owner/private",
+            FUNES_STORAGE_KEY="test-storage-key",
+            HF_TOKEN="hf-test",
+        )
+        syncer = SnapshotSync(store)
+        manifest = {
+            "version": 1,
+            "snapshot": "funes-snapshot.jsonl.gz.enc",
+            "deltas": ["funes-delta-not-restored.jsonl.gz.enc"],
+            "controls": [],
+        }
+        manifest_path = Path(self.tmp.name) / syncer.manifest_filename
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        api = mock.Mock()
+        api.repo_info.return_value.sha = "head-active"
+        api.list_repo_tree.return_value = [
+            mock.Mock(path=syncer.manifest_filename, blob_id="manifest-active"),
+            mock.Mock(path=manifest["snapshot"], blob_id="snapshot-active"),
+            mock.Mock(path=manifest["deltas"][0], blob_id="delta-active"),
+        ]
+        original_snapshot = store.snapshot
+        with mock.patch("huggingface_hub.HfApi", return_value=api), mock.patch(
+            "huggingface_hub.hf_hub_download", return_value=str(manifest_path)
+        ), mock.patch.object(store, "snapshot", wraps=original_snapshot) as snapshot:
+            result = syncer.upload()
+
+        self.assertFalse(result["durable"])
+        snapshot.assert_not_called()
+        api.create_commit.assert_not_called()
+        store.close()
+
+    def test_unrestored_legacy_history_cannot_create_first_manifest(self):
+        from service.server import SnapshotSync
+
+        store = Store(self.tmp.name)
+        os.environ.update(
+            FUNES_STORAGE_REPO="owner/private",
+            FUNES_STORAGE_KEY="test-storage-key",
+            HF_TOKEN="hf-test",
+        )
+        syncer = SnapshotSync(store)
+        api = mock.Mock()
+        api.repo_info.return_value.sha = "head-legacy"
+        api.list_repo_tree.return_value = [
+            mock.Mock(
+                path="funes-snapshot-old.jsonl.gz.enc", blob_id="snapshot-old"
+            ),
+            mock.Mock(path="funes-delta-old.jsonl.gz.enc", blob_id="delta-old"),
+        ]
+        original_snapshot = store.snapshot
+        with mock.patch("huggingface_hub.HfApi", return_value=api), mock.patch.object(
+            store, "snapshot", wraps=original_snapshot
+        ) as snapshot:
+            result = syncer.upload()
+
+        self.assertFalse(result["durable"])
+        snapshot.assert_not_called()
+        api.create_commit.assert_not_called()
+        store.close()
+
+    def test_compaction_retries_with_only_concurrent_manifest_suffix(self):
+        from service.server import SnapshotSync
+
+        store = Store(self.tmp.name)
+        store.ingest([{"source_identity": "compact", "raw_text": "current"}])
+        os.environ.update(
+            FUNES_STORAGE_REPO="owner/private",
+            FUNES_STORAGE_KEY="test-storage-key",
+            HF_TOKEN="hf-test",
+        )
+        syncer = SnapshotSync(store)
+        syncer.covered_revision = "head-1"
+        snapshot_name = "funes-snapshot.jsonl.gz.enc"
+        old_delta = "funes-delta-old.jsonl.gz.enc"
+        new_delta = "funes-delta-concurrent.jsonl.gz.enc"
+        old_control = "funes-reindex-0001-old.jsonl.gz.enc"
+        new_control = "funes-reindex-0002-new.jsonl.gz.enc"
+        base_manifest = {
+            "version": 1,
+            "snapshot": snapshot_name,
+            "deltas": [old_delta],
+            "controls": [old_control],
+        }
+        concurrent_manifest = {
+            **base_manifest,
+            "deltas": [old_delta, new_delta],
+            "controls": [old_control, new_control],
+        }
+        base_path = Path(self.tmp.name) / "compact-head-1.json"
+        concurrent_path = Path(self.tmp.name) / "compact-head-2.json"
+        base_path.write_text(json.dumps(base_manifest), encoding="utf-8")
+        concurrent_path.write_text(json.dumps(concurrent_manifest), encoding="utf-8")
+        api = mock.Mock()
+        api.repo_info.side_effect = [mock.Mock(sha="head-1"), mock.Mock(sha="head-2")]
+        api.list_repo_tree.side_effect = [
+            [
+                mock.Mock(path=syncer.manifest_filename, blob_id="manifest-1"),
+                mock.Mock(path=snapshot_name, blob_id="snapshot-1"),
+                mock.Mock(path=old_delta, blob_id="delta-old"),
+                mock.Mock(path=old_control, blob_id="control-old"),
+            ],
+            [
+                mock.Mock(path=syncer.manifest_filename, blob_id="manifest-2"),
+                mock.Mock(path=snapshot_name, blob_id="snapshot-1"),
+                mock.Mock(path=old_delta, blob_id="delta-old"),
+                mock.Mock(path=new_delta, blob_id="delta-new"),
+                mock.Mock(path=old_control, blob_id="control-old"),
+                mock.Mock(path=new_control, blob_id="control-new"),
+            ],
+        ]
+        api.create_commit.side_effect = [
+            RuntimeError("stale parent"),
+            mock.Mock(oid="head-3"),
+        ]
+        snapshot_head_reads = []
+        original_snapshot = store.snapshot
+
+        def snapshot_after_head_read(path):
+            snapshot_head_reads.append(api.repo_info.call_count)
+            return original_snapshot(path)
+
+        with mock.patch("huggingface_hub.HfApi", return_value=api), mock.patch(
+            "huggingface_hub.hf_hub_download",
+            side_effect=[str(base_path), str(concurrent_path)],
+        ), mock.patch.object(store, "snapshot", side_effect=snapshot_after_head_read):
+            result = syncer.upload()
+
+        self.assertTrue(result["durable"])
+        self.assertEqual(snapshot_head_reads, [1])
+        self.assertEqual(
+            [call.kwargs["parent_commit"] for call in api.create_commit.call_args_list],
+            ["head-1", "head-2"],
+        )
+        operations = {
+            operation.path_in_repo: operation
+            for operation in api.create_commit.call_args_list[-1].kwargs["operations"]
+        }
+        manifest = json.loads(operations[syncer.manifest_filename].path_or_fileobj)
+        self.assertEqual(manifest["snapshot"], snapshot_name)
+        self.assertEqual(manifest["deltas"], [new_delta])
+        self.assertEqual(manifest["controls"], [new_control])
+        self.assertEqual(syncer.covered_revision, "head-1")
+        store.close()
+
+    def test_compaction_fails_closed_when_concurrent_snapshot_wins(self):
+        from service.server import SnapshotSync
+
+        store = Store(self.tmp.name)
+        os.environ.update(
+            FUNES_STORAGE_REPO="owner/private",
+            FUNES_STORAGE_KEY="test-storage-key",
+            HF_TOKEN="hf-test",
+        )
+        syncer = SnapshotSync(store)
+        syncer.covered_revision = "head-1"
+        snapshot_name = "funes-snapshot.jsonl.gz.enc"
+        manifest = {
+            "version": 1,
+            "snapshot": snapshot_name,
+            "deltas": [],
+            "controls": [],
+        }
+        base_path = Path(self.tmp.name) / "winner-head-1.json"
+        winner_path = Path(self.tmp.name) / "winner-head-2.json"
+        base_path.write_text(json.dumps(manifest), encoding="utf-8")
+        winner_path.write_text(json.dumps(manifest), encoding="utf-8")
+        api = mock.Mock()
+        api.repo_info.side_effect = [mock.Mock(sha="head-1"), mock.Mock(sha="head-2")]
+        api.list_repo_tree.side_effect = [
+            [
+                mock.Mock(path=syncer.manifest_filename, blob_id="manifest-1"),
+                mock.Mock(path=snapshot_name, blob_id="snapshot-1"),
+            ],
+            [
+                mock.Mock(path=syncer.manifest_filename, blob_id="manifest-2"),
+                mock.Mock(path=snapshot_name, blob_id="snapshot-2"),
+            ],
+        ]
+        api.create_commit.side_effect = RuntimeError("stale parent")
+        with mock.patch("huggingface_hub.HfApi", return_value=api), mock.patch(
+            "huggingface_hub.hf_hub_download",
+            side_effect=[str(base_path), str(winner_path)],
+        ):
+            result = syncer.upload()
+
+        self.assertFalse(result["durable"])
+        self.assertEqual(api.create_commit.call_count, 1)
+        store.close()
+
+    def test_successful_restore_then_compaction_resets_base_manifest_entries(self):
+        from service.server import SnapshotSync
+
+        store = Store(self.tmp.name)
+        os.environ.update(
+            FUNES_STORAGE_REPO="owner/private",
+            FUNES_STORAGE_KEY="test-storage-key",
+            HF_TOKEN="hf-test",
+        )
+        syncer = SnapshotSync(store)
+        manifest = {
+            "version": 1,
+            "snapshot": "funes-snapshot.jsonl.gz.enc",
+            "deltas": ["funes-delta-base.jsonl.gz.enc"],
+            "controls": ["funes-reindex-0001-base.jsonl.gz.enc"],
+        }
+        manifest_path = Path(self.tmp.name) / syncer.manifest_filename
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        tree = [
+            mock.Mock(path=syncer.manifest_filename, blob_id="manifest-base"),
+            mock.Mock(path=manifest["snapshot"], blob_id="snapshot-base"),
+            mock.Mock(path=manifest["deltas"][0], blob_id="delta-base"),
+            mock.Mock(path=manifest["controls"][0], blob_id="control-base"),
+        ]
+        api = mock.Mock()
+        api.repo_info.side_effect = [mock.Mock(sha="head-1"), mock.Mock(sha="head-1")]
+        api.list_repo_tree.return_value = tree
+        api.create_commit.return_value = mock.Mock(oid="head-2")
+        with mock.patch("huggingface_hub.HfApi", return_value=api), mock.patch(
+            "huggingface_hub.hf_hub_download", return_value=str(manifest_path)
+        ), mock.patch.object(syncer, "_restore_file", return_value=0), mock.patch.object(
+            syncer, "_prefetch_restore_files", return_value=None
+        ):
+            self.assertEqual(syncer.restore(), 0)
+            self.assertEqual(syncer.covered_revision, "head-1")
+            result = syncer.upload()
+
+        self.assertTrue(result["durable"])
+        self.assertEqual(syncer.covered_revision, "head-2")
+        operations = {
+            operation.path_in_repo: operation
+            for operation in api.create_commit.call_args.kwargs["operations"]
+        }
+        compacted = json.loads(
+            operations[syncer.manifest_filename].path_or_fileobj
+        )
+        self.assertEqual(compacted["deltas"], [])
+        self.assertEqual(compacted["controls"], [])
+        store.close()
+
+    def test_existing_delta_requires_manifest_membership_before_durable_ack(self):
+        from service.server import SnapshotSync
+
+        store = Store(self.tmp.name)
+        store.ingest([{"source_identity": "remote", "raw_text": "retry delta"}])
+        docs = store.get_many(["remote"])
+        os.environ.update(
+            FUNES_STORAGE_REPO="owner/private",
+            FUNES_STORAGE_KEY="test-storage-key",
+            HF_TOKEN="hf-test",
+        )
+        syncer = SnapshotSync(store)
+        durable_docs = [*docs, store.native_index_state_record()]
+        digest = hashlib.sha256(
+            json.dumps(
+                durable_docs,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()[:24]
+        delta_name = f"funes-delta-{digest}.jsonl.gz.enc"
+        snapshot_name = "funes-snapshot.jsonl.gz.enc"
+        manifest = {
+            "version": 1,
+            "snapshot": snapshot_name,
+            "deltas": [],
+            "controls": [],
+        }
+        manifest_path = Path(self.tmp.name) / syncer.manifest_filename
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        api = mock.Mock()
+        api.repo_info.return_value.sha = "head-1"
+        api.list_repo_tree.return_value = [
+            mock.Mock(path=syncer.manifest_filename),
+            mock.Mock(path=snapshot_name),
+            mock.Mock(path=delta_name),
+        ]
+        with mock.patch("huggingface_hub.HfApi", return_value=api), mock.patch(
+            "huggingface_hub.hf_hub_download", return_value=str(manifest_path)
+        ):
+            result = syncer.upload(docs)
+
+        self.assertTrue(result["durable"])
+        api.upload_file.assert_not_called()
+        api.create_commit.assert_called_once()
+        operations = {
+            operation.path_in_repo: operation
+            for operation in api.create_commit.call_args.kwargs["operations"]
+        }
+        self.assertEqual(
+            api.create_commit.call_args.kwargs["parent_commit"], "head-1"
+        )
+        self.assertEqual(set(operations), {delta_name, syncer.manifest_filename})
+        updated = json.loads(operations[syncer.manifest_filename].path_or_fileobj)
+        self.assertEqual(updated["deltas"], [delta_name])
+        store.close()
+
+    def test_stale_delta_writer_confirms_new_membership_before_durable_ack(self):
+        from service.server import SnapshotSync
+
+        store = Store(self.tmp.name)
+        store.ingest([{"source_identity": "ours", "raw_text": "our delta"}])
+        docs = store.get_many(["ours"])
+        os.environ.update(
+            FUNES_STORAGE_REPO="owner/private",
+            FUNES_STORAGE_KEY="test-storage-key",
+            HF_TOKEN="hf-test",
+        )
+        syncer = SnapshotSync(store)
+        snapshot_name = "funes-snapshot.jsonl.gz.enc"
+        concurrent_delta = "funes-delta-concurrent.jsonl.gz.enc"
+        durable_docs = [*docs, store.native_index_state_record()]
+        digest = hashlib.sha256(
+            json.dumps(
+                durable_docs,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()[:24]
+        delta_name = f"funes-delta-{digest}.jsonl.gz.enc"
+        base_manifest = {
+            "version": 1,
+            "snapshot": snapshot_name,
+            "deltas": [],
+            "controls": [],
+        }
+        concurrent_manifest = {
+            **base_manifest,
+            "deltas": [concurrent_delta, delta_name],
+        }
+        base_path = Path(self.tmp.name) / "manifest-head-1.json"
+        concurrent_path = Path(self.tmp.name) / "manifest-head-2.json"
+        base_path.write_text(json.dumps(base_manifest), encoding="utf-8")
+        concurrent_path.write_text(json.dumps(concurrent_manifest), encoding="utf-8")
+        api = mock.Mock()
+        api.repo_info.side_effect = [mock.Mock(sha="head-1"), mock.Mock(sha="head-2")]
+        api.list_repo_tree.side_effect = [
+            [
+                mock.Mock(path=syncer.manifest_filename, blob_id="manifest-1"),
+                mock.Mock(path=snapshot_name, blob_id="snapshot-1"),
+            ],
+            [
+                mock.Mock(path=syncer.manifest_filename, blob_id="manifest-2"),
+                mock.Mock(path=snapshot_name, blob_id="snapshot-1"),
+                mock.Mock(path=concurrent_delta, blob_id="delta-other"),
+                mock.Mock(path=delta_name, blob_id="delta-ours"),
+            ],
+        ]
+        api.create_commit.side_effect = RuntimeError("stale parent")
+        with mock.patch("huggingface_hub.HfApi", return_value=api), mock.patch(
+            "huggingface_hub.hf_hub_download",
+            side_effect=[str(base_path), str(concurrent_path)],
+        ):
+            result = syncer.upload(docs)
+
+        self.assertTrue(result["durable"])
+        self.assertFalse(result["uploaded"])
+        self.assertTrue(result["already_uploaded"])
+        self.assertEqual(api.create_commit.call_count, 1)
+        self.assertEqual(
+            [call.kwargs["parent_commit"] for call in api.create_commit.call_args_list],
+            ["head-1"],
+        )
+        self.assertEqual(concurrent_manifest["deltas"], [concurrent_delta, delta_name])
+        store.close()
+
+    def test_active_manifest_control_upload_is_one_atomic_commit(self):
+        from service.server import SnapshotSync
+
+        store = Store(self.tmp.name)
+        os.environ.update(
+            FUNES_STORAGE_REPO="owner/private",
+            FUNES_STORAGE_KEY="test-storage-key",
+            HF_TOKEN="hf-test",
+        )
+        syncer = SnapshotSync(store)
+        snapshot_name = "funes-snapshot.jsonl.gz.enc"
+        manifest = {
+            "version": 1,
+            "snapshot": snapshot_name,
+            "deltas": ["funes-delta-existing.jsonl.gz.enc"],
+            "controls": [],
+        }
+        manifest_path = Path(self.tmp.name) / "control-manifest-head-1.json"
+        concurrent_path = Path(self.tmp.name) / "control-manifest-head-2.json"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        api = mock.Mock()
+        api.repo_info.side_effect = [mock.Mock(sha="head-1"), mock.Mock(sha="head-2")]
+        control = store.next_reindex_control("all")
+        control_digest = hashlib.sha256(
+            json.dumps(
+                control,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()[:16]
+        control_name = (
+            f"funes-reindex-{control['generation']:020d}-{control_digest}.jsonl.gz.enc"
+        )
+        concurrent_control = (
+            "funes-reindex-00000000000000000001-aaaaaaaaaaaaaaaa.jsonl.gz.enc"
+        )
+        concurrent_manifest = {
+            **manifest,
+            "controls": [concurrent_control],
+        }
+        concurrent_path.write_text(json.dumps(concurrent_manifest), encoding="utf-8")
+        api.list_repo_tree.side_effect = [
+            [
+                mock.Mock(path=syncer.manifest_filename, blob_id="manifest-1"),
+                mock.Mock(path=snapshot_name, blob_id="snapshot-1"),
+                mock.Mock(path=manifest["deltas"][0], blob_id="delta-1"),
+                mock.Mock(path=control_name, blob_id="control-ours"),
+            ],
+            [
+                mock.Mock(path=syncer.manifest_filename, blob_id="manifest-2"),
+                mock.Mock(path=snapshot_name, blob_id="snapshot-1"),
+                mock.Mock(path=manifest["deltas"][0], blob_id="delta-1"),
+                mock.Mock(path=concurrent_control, blob_id="control-other"),
+                mock.Mock(path=control_name, blob_id="control-ours"),
+            ],
+        ]
+        api.create_commit.side_effect = [RuntimeError("stale parent"), None]
+        with mock.patch("huggingface_hub.HfApi", return_value=api), mock.patch(
+            "huggingface_hub.hf_hub_download",
+            side_effect=[str(manifest_path), str(concurrent_path)],
+        ):
+            result = syncer.upload_reindex_control(control)
+
+        self.assertTrue(result["durable"])
+        api.upload_file.assert_not_called()
+        self.assertEqual(api.create_commit.call_count, 2)
+        self.assertEqual(
+            [call.kwargs["parent_commit"] for call in api.create_commit.call_args_list],
+            ["head-1", "head-2"],
+        )
+        operations = {
+            operation.path_in_repo: operation
+            for operation in api.create_commit.call_args_list[-1].kwargs["operations"]
+        }
+        self.assertEqual(
+            api.create_commit.call_args_list[-1].kwargs["parent_commit"], "head-2"
+        )
+        control_names = [
+            name for name in operations if name.startswith("funes-reindex-")
+        ]
+        self.assertEqual(control_names, [control_name])
+        self.assertEqual(set(operations), {control_names[0], syncer.manifest_filename})
+        updated = json.loads(operations[syncer.manifest_filename].path_or_fileobj)
+        self.assertEqual(updated["deltas"], manifest["deltas"])
+        self.assertEqual(updated["controls"], [concurrent_control, *control_names])
+        store.close()
+
+    def test_local_delta_and_control_commits_advance_covered_revision(self):
+        from service.server import SnapshotSync
+
+        store = Store(self.tmp.name)
+        store.ingest([{"source_identity": "local", "raw_text": "local delta"}])
+        docs = store.get_many(["local"])
+        os.environ.update(
+            FUNES_STORAGE_REPO="owner/private",
+            FUNES_STORAGE_KEY="test-storage-key",
+            HF_TOKEN="hf-test",
+        )
+        syncer = SnapshotSync(store)
+        syncer.covered_revision = "head-1"
+        durable_docs = [*docs, store.native_index_state_record()]
+        digest = hashlib.sha256(
+            json.dumps(
+                durable_docs,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()[:24]
+        delta_name = f"funes-delta-{digest}.jsonl.gz.enc"
+        snapshot_name = "funes-snapshot.jsonl.gz.enc"
+        base_manifest = {
+            "version": 1,
+            "snapshot": snapshot_name,
+            "deltas": [],
+            "controls": [],
+        }
+        delta_manifest = {**base_manifest, "deltas": [delta_name]}
+        base_path = Path(self.tmp.name) / "coverage-head-1.json"
+        delta_path = Path(self.tmp.name) / "coverage-head-2.json"
+        base_path.write_text(json.dumps(base_manifest), encoding="utf-8")
+        delta_path.write_text(json.dumps(delta_manifest), encoding="utf-8")
+        api = mock.Mock()
+        api.repo_info.side_effect = [mock.Mock(sha="head-1"), mock.Mock(sha="head-2")]
+        api.list_repo_tree.side_effect = [
+            [
+                mock.Mock(path=syncer.manifest_filename, blob_id="manifest-1"),
+                mock.Mock(path=snapshot_name, blob_id="snapshot-1"),
+            ],
+            [
+                mock.Mock(path=syncer.manifest_filename, blob_id="manifest-2"),
+                mock.Mock(path=snapshot_name, blob_id="snapshot-1"),
+                mock.Mock(path=delta_name, blob_id="delta-local"),
+            ],
+        ]
+        api.create_commit.side_effect = [mock.Mock(oid="head-2"), mock.Mock(oid="head-3")]
+        with mock.patch("huggingface_hub.HfApi", return_value=api), mock.patch(
+            "huggingface_hub.hf_hub_download",
+            side_effect=[str(base_path), str(delta_path)],
+        ):
+            delta_result = syncer.upload(docs)
+            self.assertEqual(syncer.covered_revision, "head-2")
+            control_result = syncer.upload_reindex_control(
+                store.next_reindex_control("all")
+            )
+
+        self.assertTrue(delta_result["durable"])
+        self.assertTrue(control_result["durable"])
+        self.assertEqual(syncer.covered_revision, "head-3")
+        store.close()
+
     def test_existing_content_addressed_delta_is_durable_without_reupload(self):
         from service.server import SnapshotSync
         store = Store(self.tmp.name)
@@ -2140,6 +3021,8 @@ class ServiceTests(unittest.TestCase):
             HF_TOKEN="hf-test",
         )
         api = mock.Mock()
+        api.repo_info.return_value.sha = "head-1"
+        api.list_repo_tree.return_value = []
         api.file_exists.return_value = True
         module = mock.Mock(HfApi=mock.Mock(return_value=api))
         syncer = SnapshotSync(store)

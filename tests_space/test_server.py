@@ -2021,7 +2021,7 @@ def test_source_sidecar_updates_in_place_and_returns_only_raw_text(monkeypatch, 
         search_status, found = _post(
             server,
             "/search",
-            {"query": "english retrieval needle", "source_type": "memory", "limit": 3},
+            {"query": "新的中文正文", "source_type": "memory", "limit": 3},
         )
         get_status, item = _post(server, "/get", {"id": "memory-section"})
         count = app.store.count()
@@ -3354,7 +3354,7 @@ def test_restart_restores_pending_canonical_and_indexes_it(monkeypatch, tmp_path
     assert item["native_index_status"] == "indexed"
 
 
-def test_voyage_native_rank_maps_canonical_to_raw_without_sidecar_search(
+def test_voyage_native_rank_maps_canonical_to_raw_with_indexed_filter(
     monkeypatch, tmp_path
 ):
     app = _source_app(tmp_path)
@@ -3404,15 +3404,7 @@ def test_voyage_native_rank_maps_canonical_to_raw_without_sidecar_search(
             {
                 "query": "english retrieval",
                 "limit": 3,
-                "facets": {
-                    "source_agent": "codex",
-                    "source_type": "memory",
-                    "project": "demo",
-                    "repo": "owner/repo",
-                    "device_id": "device-1",
-                    "content_type": "summary",
-                    "source_missing": False,
-                },
+                "facets": {"source_agent": "codex"},
             },
         )
     finally:
@@ -3431,8 +3423,6 @@ def test_voyage_native_rank_maps_canonical_to_raw_without_sidecar_search(
     assert calls[0][0] == "english retrieval"
     assert body["retrieval_query"] == "english retrieval"
     assert calls[0][1]["source_agent"] == "codex"
-    assert calls[0][1]["source_type"] == "memory"
-    assert calls[0][1]["source_missing"] is False
 
 
 @pytest.mark.parametrize(
@@ -3519,7 +3509,7 @@ def test_voyage_native_search_uses_structured_hits_while_source_is_unavailable(
         status, body = _post(
             server,
             "/search",
-            {"query": "cold restore query", "limit": 3, "repo": "owner/repo"},
+            {"query": "cold restore query", "limit": 3, "source_agent": "codex"},
         )
     finally:
         server.shutdown()
@@ -3890,9 +3880,15 @@ def test_explicit_sidecar_filters_keep_sessions_primary(monkeypatch, filters):
         {"role": "user"},
         {"since": "2026-09-01"},
         {"until": "2026-09-02"},
+        {"source_type": "memory"},
+        {"project": "funes"},
+        {"repo": "pjpjq/funes"},
+        {"device_id": "dev-test"},
+        {"content_type": "memory"},
+        {"source_missing": False},
     ),
 )
-def test_http_voyage_role_and_time_filters_remain_sidecar_authoritative(
+def test_http_voyage_unindexed_filters_remain_sidecar_authoritative(
     monkeypatch, filters
 ):
     calls = []
@@ -3919,7 +3915,7 @@ def test_http_voyage_role_and_time_filters_remain_sidecar_authoritative(
         bridge,
         "recall",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("role/time filters must not enter native recall")
+            AssertionError("unindexed filters must not enter native recall")
         ),
     )
     server = ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
@@ -4108,7 +4104,7 @@ def test_http_selective_bm25_fuses_full_raw_union_with_filters(monkeypatch):
         def search(self, query, limit, *, filters, allow_broad_scan):
             assert query == raw_query
             assert limit == 9
-            assert filters == {"repo": "owner/repo"}
+            assert filters == {"source_agent": "codex"}
             assert allow_broad_scan is False
             return [
                 {**item, "source_type": "session", "source_agent": "codex", "retrieval_text": "DERIVED"}
@@ -4149,7 +4145,7 @@ def test_http_selective_bm25_fuses_full_raw_union_with_filters(monkeypatch):
             {
                 "query": raw_query,
                 "limit": 3,
-                "repo": "owner/repo",
+                "source_agent": "codex",
                 "harness": "codex",
             },
         )
@@ -4161,7 +4157,7 @@ def test_http_selective_bm25_fuses_full_raw_union_with_filters(monkeypatch):
     assert status == 200
     assert recall_calls == [raw_query]
     assert bm25_calls == [
-        (raw_query, 3, {"repo": "owner/repo"}, "codex")
+        (raw_query, 3, {"source_agent": "codex"}, "codex")
     ]
     assert body["query"] == raw_query
     assert body["retrieval_query"] == raw_query

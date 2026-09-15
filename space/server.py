@@ -688,7 +688,7 @@ def _partition_source_rankings(
     harness: str | None,
 ) -> tuple[list[list[dict]], list[list[dict]]]:
     """Keep raw public rows while preserving source-store rank order."""
-    native_filterable = set(filters).issubset({"source_agent", "repo"})
+    native_filterable = set(filters).issubset({"source_agent"})
     expected_agent = _normalized_harness_agent(harness) if harness else None
     fallback_enabled = not harness or expected_agent is not None
     source_rankings = []
@@ -1174,6 +1174,23 @@ CANONICAL_FACETS = (
     "source_path",
     "worktree",
     "message_id",
+)
+# Only source_agent has a scalar index in the canonical Lance dataset. Applying
+# any other provenance facet in native recall can scan the full remote corpus
+# before vector search and exceed the Space request deadline. Keep those facets
+# exact and bounded in the restored SQLite sidecar instead.
+SIDECAR_AUTHORITATIVE_FILTERS = frozenset(
+    (
+        "source_type",
+        "project",
+        "repo",
+        "device_id",
+        "role",
+        "content_type",
+        "source_missing",
+        "since",
+        "until",
+    )
 )
 NATIVE_GET_RE = re.compile(
     r"(?m)^\s*→\s*get\s+(.+?)(?=\s+--(?:from|to|memory)\b|$)"
@@ -2915,8 +2932,8 @@ class Handler(BaseHTTPRequestHandler):
                 harness = str(obj.get("harness", "")).strip() or None
                 profile = embedding_profile()
                 embedding_provider = str(profile["provider"])
-                sidecar_authoritative = any(
-                    key in filters for key in ("role", "since", "until")
+                sidecar_authoritative = bool(
+                    filters.keys() & SIDECAR_AUTHORITATIVE_FILTERS
                 )
                 source_restore_error = ""
                 if app is not None and (app.syncer.restoring or app.syncer.restore_failed):
@@ -2964,7 +2981,7 @@ class Handler(BaseHTTPRequestHandler):
                     source_rankings = []
                     session_fallback_rankings = []
                 elif embedding_provider == "voyage" and sidecar_authoritative:
-                    # Role and date filters are sidecar-only. Keep this one
+                    # Unindexed provenance filters are sidecar-only. Keep this
                     # raw BM25 lookup bounded by the same Voyage HTTP budget;
                     # a query translator/rewrite can otherwise consume it.
                     source_query = raw_query
@@ -3030,10 +3047,11 @@ class Handler(BaseHTTPRequestHandler):
                 ):
                     if name in filters:
                         tuning[name] = filters[name]
-                # Date/role filtering remains authoritative in the sidecar.
+                # Every unindexed provenance facet remains authoritative in the
+                # sidecar, rather than forcing a full Lance metadata scan.
                 native_allowed = (
                     (embedding_provider == "voyage" or not exact_sidecar)
-                    and not any(key in filters for key in ("role", "since", "until"))
+                    and not sidecar_authoritative
                 )
                 native_budget = (
                     CJK_NATIVE_TIMEOUT

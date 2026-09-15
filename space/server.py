@@ -30,6 +30,7 @@ from service.server import App as SourceApp
 from service.server import expanded_candidate_limit
 from service.server import ingest_documents as persist_source_ingest
 from service.server import NATIVE_SESSION_TYPES
+from service.server import SOURCE_METADATA_CLOCK_KEY
 from service.server import prepare_ingest_documents as prepare_source_ingest_documents
 from service.server import queue_reindex as queue_source_reindex
 from service.server import stable_rrf
@@ -1889,6 +1890,7 @@ def native_result_ids(output: str) -> list[str]:
 def _public_source_item(item: dict) -> dict:
     public = dict(item)
     public.pop("retrieval_text", None)
+    public.pop(SOURCE_METADATA_CLOCK_KEY, None)
     return public
 
 

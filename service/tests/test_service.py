@@ -12,7 +12,7 @@ from http.client import HTTPConnection
 from pathlib import Path
 from http.server import ThreadingHTTPServer
 
-from service.server import QUERY_PROMPT_VERSION, QUERY_RETRIEVAL_PROMPT, RETRIEVAL_PROMPT, App, Store, Translator, make_handler, persist_translation_documents, prepare_ingest_documents
+from service.server import QUERY_PROMPT_VERSION, QUERY_RETRIEVAL_PROMPT, RETRIEVAL_PROMPT, App, Store, Translator, ingest_documents, make_handler, persist_translation_documents, prepare_ingest_documents
 
 
 class ServiceTests(unittest.TestCase):
@@ -36,7 +36,14 @@ class ServiceTests(unittest.TestCase):
         store = Store(self.tmp.name)
         first = {"source_path": "a.md", "source_version": "1", "raw_text": "hello world", "project": "p"}
         self.assertEqual(store.ingest([first])["created"], 1)
+        before_retry = store.get("a.md")
         self.assertEqual(store.ingest([first])["deduped"], 1)
+        after_retry = store.get("a.md")
+        self.assertEqual(
+            after_retry["_source_metadata_clocks"],
+            before_retry["_source_metadata_clocks"],
+        )
+        self.assertEqual(after_retry["updated_at"], before_retry["updated_at"])
         changed = dict(first, source_version="2", raw_text="hello revised")
         self.assertEqual(store.ingest([changed])["updated"], 1)
         self.assertEqual(store.count(), 1)
@@ -269,6 +276,68 @@ class ServiceTests(unittest.TestCase):
         finally:
             app.close()
 
+    def test_metadata_refresh_does_not_consume_pending_reindex_generation(self):
+        store = Store(self.tmp.name)
+        raw = "原始正文"
+        store.ingest(
+            [{
+                "source_identity": "metadata-before-drain",
+                "source_version": "v1",
+                "raw_text": raw,
+                "retrieval_text": "old retrieval shadow",
+                "updated_at": "2026-09-14T00:00:00Z",
+                "translation_hash": "old-translation",
+                "translation_status": "ok",
+                "native_index_version": "old-native",
+                "native_index_status": "indexed",
+                "native_index_profile": "profile-v1",
+                "native_index_memory": "memory-v1",
+                "source_missing": False,
+            }]
+        )
+        store.record_reindex_control(
+            {
+                "generation": 1,
+                "scope": "all",
+                "created_at": "2026-09-14T01:00:00Z",
+            }
+        )
+        app = mock.Mock(store=store)
+        app.syncer.upload.return_value = {"durable": True}
+        app.translator.pending_document.side_effect = AssertionError(
+            "unchanged derived values must not schedule provider work"
+        )
+        result = ingest_documents(
+            app,
+            [{
+                "source_identity": "metadata-before-drain",
+                "source_version": "v1",
+                "raw_text": raw,
+                "updated_at": "2026-09-14T02:00:00Z",
+                "device_id": "new-device",
+                "source_missing": False,
+            }],
+        )
+        before_drain = store.get("metadata-before-drain")
+        self.assertEqual(result["items"][0]["status"], "metadata_updated")
+        self.assertEqual(before_drain["retrieval_generation"], 0)
+        self.assertEqual(before_drain["native_generation"], 0)
+        self.assertEqual(before_drain["embedding_generation"], 0)
+        self.assertEqual(before_drain["retrieval_text"], "old retrieval shadow")
+        self.assertEqual(before_drain["native_index_status"], "indexed")
+        app.translator.pending_document.assert_not_called()
+
+        drained = store.drain_reindex_controls(10)
+        after_drain = store.get("metadata-before-drain")
+        self.assertEqual(drained["updated"], 1)
+        self.assertEqual(after_drain["retrieval_generation"], 1)
+        self.assertEqual(after_drain["native_generation"], 1)
+        self.assertEqual(after_drain["embedding_generation"], 1)
+        self.assertEqual(after_drain["retrieval_text"], raw)
+        self.assertEqual(after_drain["translation_status"], "pending_provider")
+        self.assertIsNone(after_drain["native_index_status"])
+        store.close()
+
     def test_same_revision_updates_only_derived_fields_in_place(self):
         store = Store(self.tmp.name)
         raw = "原始正文"
@@ -299,6 +368,466 @@ class ServiceTests(unittest.TestCase):
         # successfully reconciled shadow.
         self.assertEqual(store.ingest([original])["deduped"], 1)
         self.assertEqual(store.get("derived-only")["translation_status"], "ok")
+        store.close()
+
+    def test_same_revision_updates_source_metadata_without_resetting_derived_state(self):
+        store = Store(self.tmp.name)
+        raw = "stable source bytes"
+        metadata_fields = (
+            "device_id",
+            "project",
+            "repo",
+            "worktree",
+            "source_agent",
+            "source_type",
+            "session_id",
+            "message_id",
+            "role",
+            "timestamp",
+            "source_path",
+            "agent_type",
+            "parent_session_id",
+            "agent_id",
+        )
+        original = {
+            "source_identity": "metadata-only",
+            "source_version": "v1",
+            "raw_text": raw,
+            "retrieval_text": "stable retrieval shadow",
+            "updated_at": "2026-09-14T01:00:00Z",
+            "content_type": "memory",
+            "source_missing": False,
+            "translation_hash": "translation-hash",
+            "translation_version": "translation-v1",
+            "translation_status": "ok",
+            "retrieval_updated_at": "2026-09-14T01:01:00Z",
+            "native_index_version": "native-v1",
+            "native_index_status": "indexed",
+            "native_index_profile": "profile-v1",
+            "native_index_memory": "memory-v1",
+            "native_indexed_at": "2026-09-14T01:02:00Z",
+            "native_index_error": "retained-checkpoint-detail",
+            "retrieval_generation": 4,
+            "native_generation": 5,
+            "embedding_generation": 6,
+            "metadata": {"label": "old", "nested": {"revision": 1}},
+            **{name: f"old-{name}" for name in metadata_fields},
+        }
+        self.assertEqual(store.ingest([original])["created"], 1)
+        with store.lock, store.conn:
+            store.conn.execute(
+                "UPDATE memories SET native_index_pending=0 WHERE source_identity=?",
+                (original["source_identity"],),
+            )
+        before = store.get(original["source_identity"])
+        derived_fields = (
+            "raw_text",
+            "retrieval_text",
+            "content_hash",
+            "source_version",
+            "translation_hash",
+            "translation_version",
+            "translation_status",
+            "retrieval_updated_at",
+            "native_index_version",
+            "native_index_status",
+            "native_index_profile",
+            "native_index_memory",
+            "native_indexed_at",
+            "native_index_error",
+            "retrieval_generation",
+            "native_generation",
+            "embedding_generation",
+            "content_type",
+            "source_missing",
+        )
+
+        refreshed = {
+            "source_identity": original["source_identity"],
+            "source_version": original["source_version"],
+            "raw_text": raw,
+            "updated_at": "2026-09-14T02:00:00Z",
+            "metadata": {"label": "new", "nested": {"revision": 2}},
+            **{name: f"new-{name}" for name in metadata_fields},
+        }
+        result = store.ingest([refreshed])
+        current = store.get(original["source_identity"])
+        self.assertEqual(result["updated"], 1)
+        self.assertEqual(result["items"][0]["status"], "metadata_updated")
+        self.assertEqual(
+            {name: current[name] for name in metadata_fields},
+            {name: refreshed[name] for name in metadata_fields},
+        )
+        self.assertEqual(current["metadata"], refreshed["metadata"])
+        self.assertEqual(current["updated_at"], refreshed["updated_at"])
+        self.assertEqual(
+            {name: current[name] for name in derived_fields},
+            {name: before[name] for name in derived_fields},
+        )
+        self.assertEqual(store.pending_translations(10), [])
+        with store.lock:
+            self.assertEqual(
+                store.conn.execute(
+                    "SELECT native_index_pending FROM memories WHERE source_identity=?",
+                    (original["source_identity"],),
+                ).fetchone()[0],
+                0,
+            )
+
+        # A legacy generation-zero delta may still replay later. Its older
+        # source timestamp must not roll current source metadata backward.
+        stale = {
+            **refreshed,
+            "updated_at": "2026-09-14T00:00:00Z",
+            "metadata": {"label": "stale"},
+            **{name: f"stale-{name}" for name in metadata_fields},
+        }
+        stale_result = store.ingest([stale])
+        current = store.get(original["source_identity"])
+        self.assertEqual(stale_result["items"][0]["status"], "deduped")
+        self.assertEqual(current["metadata"], refreshed["metadata"])
+        self.assertEqual(current["updated_at"], refreshed["updated_at"])
+        self.assertEqual(
+            {name: current[name] for name in metadata_fields},
+            {name: refreshed[name] for name in metadata_fields},
+        )
+
+        # A partial device-only refresh changes no other source metadata and
+        # does not invalidate the native/embedding checkpoint.
+        device_refresh = {
+            "source_identity": original["source_identity"],
+            "source_version": original["source_version"],
+            "raw_text": raw,
+            "updated_at": "2026-09-14T03:00:00Z",
+            "device_id": "newest-device",
+            "source_missing": False,
+        }
+        app = mock.Mock()
+        app.store = store
+        app.translator.pending_document.side_effect = AssertionError(
+            "metadata-only ingest must not schedule provider work"
+        )
+        app.syncer.upload.return_value = {"durable": True}
+        device_result = ingest_documents(app, [device_refresh])
+        current = store.get(original["source_identity"])
+        self.assertEqual(device_result["items"][0]["status"], "metadata_updated")
+        app.translator.pending_document.assert_not_called()
+        self.assertEqual(current["device_id"], "newest-device")
+        self.assertEqual(current["project"], refreshed["project"])
+        self.assertEqual(current["metadata"], refreshed["metadata"])
+        self.assertEqual(
+            {name: current[name] for name in derived_fields},
+            {name: before[name] for name in derived_fields},
+        )
+
+        # The canonical sync payload may carry the same source_missing value in
+        # metadata instead. A failed metadata-delta upload must still leave the
+        # already-durable native checkpoint usable for the retry.
+        app.syncer.upload.return_value = {
+            "uploaded": False,
+            "durable": False,
+            "reason": "offline",
+        }
+        failed_refresh = {
+            "source_identity": original["source_identity"],
+            "source_version": original["source_version"],
+            "raw_text": raw,
+            "updated_at": "2026-09-14T04:00:00Z",
+            "device_id": "retry-device",
+            "metadata": {**current["metadata"], "source_missing": False},
+        }
+        failed_result = ingest_documents(app, [failed_refresh])
+        current = store.get(original["source_identity"])
+        self.assertEqual(failed_result["items"][0]["status"], "metadata_updated")
+        self.assertFalse(failed_result["durable"])
+        self.assertEqual(failed_result["error"], "durability_pending")
+        self.assertEqual(current["native_index_status"], "indexed")
+        self.assertEqual(current["native_index_profile"], "profile-v1")
+        self.assertEqual(current["embedding_generation"], 6)
+        self.assertEqual(store.pending_translations(10), [])
+        app.translator.pending_document.assert_not_called()
+        with store.lock:
+            self.assertEqual(
+                store.conn.execute(
+                    "SELECT native_index_pending FROM memories WHERE source_identity=?",
+                    (original["source_identity"],),
+                ).fetchone()[0],
+                0,
+            )
+        store.close()
+
+    def test_equal_timestamp_metadata_deltas_restore_deterministically(self):
+        from service.server import SnapshotSync
+
+        os.environ.update(
+            FUNES_STORAGE_REPO="owner/private",
+            FUNES_STORAGE_KEY="test-storage-key",
+            HF_TOKEN="hf-test",
+        )
+        raw = "same immutable source"
+        fields = (
+            "device_id",
+            "project",
+            "repo",
+            "worktree",
+            "source_agent",
+            "source_type",
+            "session_id",
+            "message_id",
+            "role",
+            "timestamp",
+            "source_path",
+            "agent_type",
+            "parent_session_id",
+            "agent_id",
+        )
+        base = {
+            "source_identity": "metadata-tie",
+            "source_version": "v1",
+            "raw_text": raw,
+            "retrieval_text": "retained shadow",
+            "updated_at": "2026-09-14T00:00:00Z",
+            "translation_status": "ok",
+            "native_index_status": "indexed",
+            "native_index_profile": "profile-v1",
+            "native_index_memory": "memory-v1",
+            "metadata": {"label": "base"},
+            **{name: "base" for name in fields},
+            # Both replacements sort below their old values. A row-wide clock
+            # would incorrectly keep these values after the other partial delta
+            # advances updated_at.
+            "device_id": "old-device",
+            "project": "old-project",
+        }
+
+        def candidate(field, value, label):
+            return {
+                "source_identity": base["source_identity"],
+                "source_version": base["source_version"],
+                "raw_text": raw,
+                "updated_at": "2026-09-14T01:00:00Z",
+                "source_missing": False,
+                "metadata": {"label": label, "nested": {"value": label}},
+                field: value,
+            }
+
+        # This is the minimal non-commutative counterexample for a whole-state
+        # fingerprint: each equal-time delta changes a different source field.
+        deltas = [
+            {**candidate("device_id", "dev-0", "device"), "agent_id": None},
+            {**candidate("project", "proj-0", "project"), "agent_id": "b"},
+        ]
+        artifact_dir = Path(self.tmp.name) / "metadata-clock-artifacts"
+        artifact_dir.mkdir()
+        artifact_names = []
+        api = mock.Mock()
+        api.repo_info.return_value = mock.Mock(sha="head-1")
+        api.list_repo_tree.return_value = []
+        api.file_exists.return_value = False
+
+        def capture_upload(**kwargs):
+            name = kwargs["path_in_repo"]
+            (artifact_dir / name).write_bytes(
+                Path(kwargs["path_or_fileobj"]).read_bytes()
+            )
+            artifact_names.append(name)
+            return mock.Mock(oid=f"head-{len(artifact_names) + 1}")
+
+        api.upload_file.side_effect = capture_upload
+        with mock.patch("huggingface_hub.HfApi", return_value=api):
+            for delta in deltas:
+                # Build the remote delta through the production canonical path.
+                # The private clock map must survive get_many -> encryption.
+                branch_dir = tempfile.TemporaryDirectory()
+                branch = Store(branch_dir.name)
+                try:
+                    branch.ingest([base])
+                    self.assertEqual(
+                        branch.ingest([delta])["items"][0]["status"],
+                        "metadata_updated",
+                    )
+                    durable = branch.get_many([base["source_identity"]])
+                    self.assertIn("_source_metadata_clocks", durable[0])
+                    self.assertTrue(SnapshotSync(branch).upload(durable)["durable"])
+                finally:
+                    branch.close()
+                    branch_dir.cleanup()
+
+        def replay(order):
+            target_dir = tempfile.TemporaryDirectory()
+            target = Store(target_dir.name)
+            target.ingest([base])
+            try:
+                with mock.patch(
+                    "huggingface_hub.hf_hub_download",
+                    side_effect=AssertionError("prefetched deltas must be used"),
+                ):
+                    for position, index in enumerate(order):
+                        reader = SnapshotSync(target)
+                        reader._restore_prefetch_root = artifact_dir
+                        reader._restore_file(artifact_names[index])
+                        if position == 0:
+                            # Reopen SQLite between artifacts: correctness must
+                            # come from persisted clocks, not in-memory state.
+                            target.close()
+                            target = Store(target_dir.name)
+                return target.get(base["source_identity"])
+            finally:
+                target.close()
+                target_dir.cleanup()
+
+        forward = replay((0, 1))
+        reverse = replay((1, 0))
+        self.assertEqual(
+            {name: forward[name] for name in (*fields, "metadata", "updated_at")},
+            {name: reverse[name] for name in (*fields, "metadata", "updated_at")},
+        )
+        self.assertIn(forward["metadata"], [delta["metadata"] for delta in deltas])
+        self.assertEqual(
+            (forward["device_id"], forward["project"]),
+            ("dev-0", "proj-0"),
+        )
+        self.assertEqual(forward["agent_id"], "b")
+        self.assertEqual(forward["raw_text"], raw)
+        self.assertEqual(forward["retrieval_text"], "retained shadow")
+        self.assertEqual(forward["native_index_status"], "indexed")
+
+    def test_source_metadata_fields_use_independent_high_water_clocks(self):
+        raw = "same immutable source"
+        base = {
+            "source_identity": "metadata-independent-clocks",
+            "source_version": "v1",
+            "raw_text": raw,
+            "retrieval_text": "retained shadow",
+            "updated_at": "2026-09-14T00:00:00Z",
+            "device_id": "old-device",
+            "project": "old-project",
+            "translation_status": "ok",
+            "native_index_status": "indexed",
+        }
+        device_t2 = {
+            "source_identity": base["source_identity"],
+            "source_version": "v1",
+            "raw_text": raw,
+            "updated_at": "2026-09-14T02:00:00Z",
+            "device_id": "dev-0",
+            "source_missing": False,
+        }
+        project_t1 = {
+            "source_identity": base["source_identity"],
+            "source_version": "v1",
+            "raw_text": raw,
+            "updated_at": "2026-09-14T01:00:00Z",
+            "project": "proj-0",
+            "source_missing": False,
+        }
+
+        results = []
+        for order in ((device_t2, project_t1), (project_t1, device_t2)):
+            directory = tempfile.TemporaryDirectory()
+            store = Store(directory.name)
+            try:
+                store.ingest([base])
+                statuses = [store.ingest([delta])["items"][0]["status"] for delta in order]
+                current = store.get(base["source_identity"])
+                self.assertEqual(statuses, ["metadata_updated", "metadata_updated"])
+                self.assertEqual(current["updated_at"], device_t2["updated_at"])
+                self.assertEqual(current["retrieval_text"], "retained shadow")
+                self.assertEqual(current["native_index_status"], "indexed")
+                results.append((current["device_id"], current["project"]))
+
+                stale = dict(
+                    device_t2,
+                    updated_at="2026-09-14T01:30:00Z",
+                    device_id="zzzz-device",
+                )
+                stale_result = store.ingest([stale])
+                self.assertEqual(stale_result["items"][0]["status"], "deduped")
+                self.assertEqual(store.get(base["source_identity"])["device_id"], "dev-0")
+            finally:
+                store.close()
+                directory.cleanup()
+        self.assertEqual(results, [("dev-0", "proj-0"), ("dev-0", "proj-0")])
+
+    def test_canonical_clock_only_payload_persists_provenance(self):
+        store = Store(self.tmp.name)
+        raw = "same immutable source"
+        identity = "metadata-clock-only"
+        store.ingest(
+            [{
+                "source_identity": identity,
+                "source_version": "v1",
+                "raw_text": raw,
+                "retrieval_text": "retained shadow",
+                "updated_at": "2026-09-14T00:00:00Z",
+                "project": "same-project",
+                "native_index_status": "indexed",
+            }]
+        )
+        canonical = store.get(identity)
+        canonical["updated_at"] = "2026-09-14T02:00:00Z"
+        canonical["_source_metadata_clocks"] = {
+            **canonical["_source_metadata_clocks"],
+            "project": canonical["updated_at"],
+        }
+        result = store.ingest([canonical])
+        current = store.get(identity)
+        self.assertEqual(result["items"][0]["status"], "metadata_updated")
+        self.assertEqual(
+            current["_source_metadata_clocks"]["project"],
+            canonical["updated_at"],
+        )
+        self.assertEqual(current["retrieval_text"], "retained shadow")
+        self.assertEqual(current["native_index_status"], "indexed")
+
+        stale = {
+            "source_identity": identity,
+            "source_version": "v1",
+            "raw_text": raw,
+            "updated_at": "2026-09-14T01:00:00Z",
+            "project": "zzzz-project",
+        }
+        self.assertEqual(store.ingest([stale])["items"][0]["status"], "deduped")
+        self.assertEqual(store.get(identity)["project"], "same-project")
+        store.close()
+
+    def test_source_metadata_clock_migration_accepts_legacy_database(self):
+        identity = "legacy-metadata-clock"
+        store = Store(self.tmp.name)
+        store.ingest(
+            [{
+                "source_identity": identity,
+                "source_version": "v1",
+                "raw_text": "same immutable source",
+                "updated_at": "2026-09-14T00:00:00Z",
+                "device_id": "old-device",
+            }]
+        )
+        store.close()
+        connection = sqlite3.connect(Path(self.tmp.name) / "funes.sqlite3")
+        connection.execute(
+            "ALTER TABLE memories DROP COLUMN source_metadata_clock_json"
+        )
+        connection.commit()
+        connection.close()
+
+        store = Store(self.tmp.name)
+        result = store.ingest(
+            [{
+                "source_identity": identity,
+                "source_version": "v1",
+                "raw_text": "same immutable source",
+                "updated_at": "2026-09-14T01:00:00Z",
+                "device_id": "dev-0",
+            }]
+        )
+        current = store.get(identity)
+        self.assertEqual(result["items"][0]["status"], "metadata_updated")
+        self.assertEqual(current["device_id"], "dev-0")
+        self.assertEqual(
+            current["_source_metadata_clocks"]["device_id"],
+            "2026-09-14T01:00:00Z",
+        )
         store.close()
 
     def test_same_revision_native_status_update_preserves_raw_and_retrieval(self):
@@ -535,9 +1064,11 @@ class ServiceTests(unittest.TestCase):
         status, found = self._request(server, "POST", "/search", {"query": "alpha"})
         self.assertEqual(status, 200)
         self.assertEqual(found["results"][0]["raw_text"], "alpha beta")
+        self.assertNotIn("_source_metadata_clocks", found["results"][0])
         status, item = self._request(server, "POST", "/get", {"id": ident})
         self.assertEqual(status, 200)
         self.assertEqual(item["source_path"], "x")
+        self.assertNotIn("_source_metadata_clocks", item)
 
     def test_sources_check_requires_auth_and_returns_only_present_and_missing(self):
         server = self._server()

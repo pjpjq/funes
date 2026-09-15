@@ -27,7 +27,7 @@ env:
 jobs:
   lint-test:
     name: Lint & Unit Tests
-    runs-on: ubuntu-latest
+    runs-on: ubicloud-standard-2
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -77,7 +77,7 @@ jobs:
 
   integration-test:
     name: Integration Test (real embedder)
-    runs-on: ubuntu-latest
+    runs-on: ubicloud-standard-2
     needs: lint-test
     timeout-minutes: 45
     env:
@@ -141,7 +141,7 @@ jobs:
   onnx-variant:
     name: ONNX Variant (merge only)
     if: github.event_name == 'push'
-    runs-on: ubuntu-latest
+    runs-on: ubicloud-standard-2
     needs: lint-test
     timeout-minutes: 45
     env:

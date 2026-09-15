@@ -48,7 +48,7 @@ jobs:
   # release or pushes a bump branch.
   compute:
     if: github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-24.04
+    runs-on: ubicloud-standard-2
     timeout-minutes: 10
     outputs:
       version: ${{ steps.version.outputs.new }}
@@ -104,10 +104,10 @@ jobs:
       !cancelled() &&
       (startsWith(github.ref, 'refs/tags/') || needs.compute.result == 'success'
         || github.event_name == 'pull_request' || github.ref == 'refs/heads/main')
-    runs-on: ubuntu-24.04
+    runs-on: ubicloud-standard-2
     # glibc compatibility is one-way: a binary runs on any glibc >= the one it was built against.
-    # Building inside 22.04 pins the floor at glibc 2.35 — on the 24.04 runner image, C deps
-    # compiled during the build would bind __isoc23_*@GLIBC_2.38 symbols. A check below enforces
+    # Building inside 22.04 pins the floor at glibc 2.35 — without the container, C deps compiled
+    # on a newer runner could bind __isoc23_*@GLIBC_2.38 symbols. A check below enforces
     # the floor on every build.
     container: ubuntu:22.04
     timeout-minutes: 90
@@ -280,7 +280,7 @@ jobs:
       needs.build-linux.result == 'success' &&
       needs.build-macos.result == 'success' &&
       (startsWith(github.ref, 'refs/tags/') || needs.compute.result == 'success')
-    runs-on: ubuntu-24.04
+    runs-on: ubicloud-standard-2
     timeout-minutes: 15
     permissions:
       contents: write # push the tag, create the release, push the dev-bump branch

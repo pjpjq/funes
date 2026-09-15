@@ -304,6 +304,7 @@ def test_zero_record_migration_does_not_replay_converged_sources_forever(
         s.set_cursor(source.source_key,stat.st_size,stat.st_ino,stat.st_size)
     (c.state_dir/'initial-backfill.complete').write_text('legacy',encoding='utf-8')
     (c.state_dir/'source-schema-v2.complete').write_text('legacy',encoding='utf-8')
+    (c.state_dir/'zero-record-repair-v1.complete').write_text('legacy',encoding='utf-8')
     daemon=SyncDaemon(c,s,type("Client",(),{})())
 
     daemon.scan_once()

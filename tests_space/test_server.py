@@ -2918,6 +2918,241 @@ def test_canonical_index_intervals_preserve_legacy_override(environ, expected):
     assert bridge._canonical_index_intervals(environ) == expected
 
 
+@pytest.mark.parametrize(
+    ("environ", "expected"),
+    [
+        ({}, (8, 6000)),
+        ({"FUNES_CANONICAL_INDEX_REQUEST_ROWS": "4"}, (4, 6000)),
+        ({"FUNES_CANONICAL_INDEX_MAX_CHARS": "12000"}, (8, 12000)),
+        (
+            {
+                "FUNES_CANONICAL_INDEX_REQUEST_ROWS": "16",
+                "FUNES_CANONICAL_INDEX_MAX_CHARS": "20000",
+            },
+            (16, 20000),
+        ),
+        (
+            {
+                "FUNES_CANONICAL_INDEX_REQUEST_ROWS": "0",
+                "FUNES_CANONICAL_INDEX_MAX_CHARS": "-10",
+            },
+            (1, 1),
+        ),
+        (
+            {
+                "FUNES_CANONICAL_INDEX_REQUEST_ROWS": "invalid",
+                "FUNES_CANONICAL_INDEX_MAX_CHARS": "bad",
+            },
+            (8, 6000),
+        ),
+    ],
+)
+def test_canonical_index_request_limits_parsing(environ, expected):
+    assert bridge._canonical_index_request_limits(environ) == expected
+
+
+@pytest.mark.parametrize(
+    ("environ", "expected"),
+    [
+        ({}, 20.0),
+        ({"FUNES_CANONICAL_INDEX_MIN_REQUEST_INTERVAL": "10"}, 10.0),
+        ({"FUNES_CANONICAL_INDEX_MIN_REQUEST_INTERVAL": "0.5"}, 0.5),
+        ({"FUNES_CANONICAL_INDEX_MIN_REQUEST_INTERVAL": "-5"}, 0.0),
+        ({"FUNES_CANONICAL_INDEX_MIN_REQUEST_INTERVAL": "invalid"}, 20.0),
+    ],
+)
+def test_canonical_index_min_request_interval_parsing(environ, expected):
+    assert bridge._canonical_index_min_request_interval(environ) == expected
+
+
+def test_select_bounded_canonical_records_bounds_by_rows():
+    records = [
+        ({"source_identity": f"doc-{i}", "raw_text": f"text-{i}"}, {})
+        for i in range(12)
+    ]
+    selected = bridge.select_bounded_canonical_records(records, max_rows=5, max_chars=10000)
+    assert len(selected) == 5
+    assert [r[0]["source_identity"] for r in selected] == [f"doc-{i}" for i in range(5)]
+
+    selected_default = bridge.select_bounded_canonical_records(records)
+    assert len(selected_default) == 8
+    assert [r[0]["source_identity"] for r in selected_default] == [f"doc-{i}" for i in range(8)]
+
+
+def test_select_bounded_canonical_records_bounds_by_chars():
+    records = [
+        ({"source_identity": "doc-0", "raw_text": "a" * 2000}, {}),
+        ({"source_identity": "doc-1", "raw_text": "b" * 2500}, {}),
+        ({"source_identity": "doc-2", "raw_text": "c" * 2000}, {}),
+        ({"source_identity": "doc-3", "raw_text": "d" * 500}, {}),
+    ]
+    selected = bridge.select_bounded_canonical_records(records, max_rows=8, max_chars=5000)
+    assert len(selected) == 2
+    assert [r[0]["source_identity"] for r in selected] == ["doc-0", "doc-1"]
+
+
+def test_select_bounded_canonical_records_oversize_first_alone_no_starvation():
+    oversize = ({"source_identity": "oversize", "raw_text": "x" * 15000}, {})
+    small1 = ({"source_identity": "small-1", "raw_text": "y" * 100}, {})
+    small2 = ({"source_identity": "small-2", "raw_text": "z" * 100}, {})
+
+    selected = bridge.select_bounded_canonical_records([oversize, small1, small2], max_chars=6000)
+    assert len(selected) == 1
+    assert selected[0][0]["source_identity"] == "oversize"
+
+    selected_single = bridge.select_bounded_canonical_records([oversize], max_chars=6000)
+    assert len(selected_single) == 1
+    assert selected_single[0][0]["source_identity"] == "oversize"
+
+    selected_after = bridge.select_bounded_canonical_records([small1, oversize, small2], max_chars=6000)
+    assert len(selected_after) == 1
+    assert selected_after[0][0]["source_identity"] == "small-1"
+
+
+def test_select_bounded_canonical_records_empty_and_dict_inputs():
+    assert bridge.select_bounded_canonical_records([]) == []
+
+    records = [{"source_identity": f"doc-{i}", "raw_text": "test"} for i in range(5)]
+    selected = bridge.select_bounded_canonical_records(records, max_rows=2)
+    assert len(selected) == 2
+    assert [r["source_identity"] for r in selected] == ["doc-0", "doc-1"]
+
+
+def test_canonical_reconcile_state_exposes_safe_values():
+    app = SimpleNamespace()
+    bridge._initialize_canonical_reconcile_state(app)
+    status = bridge.canonical_reconcile_state(app)
+
+    assert status["batch_size"] == bridge.CANONICAL_INDEX_BATCH
+    assert status["request_rows"] == bridge.CANONICAL_INDEX_REQUEST_ROWS
+    assert status["max_chars"] == bridge.CANONICAL_INDEX_MAX_CHARS
+    assert status["min_request_interval_seconds"] == bridge.CANONICAL_INDEX_MIN_REQUEST_INTERVAL
+    assert status["timeout_seconds"] == bridge.CANONICAL_INDEX_TIMEOUT
+
+    dumped = json.dumps(status)
+    assert "raw_text" not in dumped
+    assert "token" not in dumped.lower()
+
+
+def test_canonical_background_enforces_min_request_interval_after_progress(monkeypatch):
+    stop = _RecordingCanonicalStop(stop_after=2)
+    app = SimpleNamespace(
+        restore_done=threading.Event(),
+        canonical_index_stop=stop,
+    )
+    app.restore_done.set()
+    monkeypatch.setattr(bridge, "CANONICAL_INDEX_ACTIVE_INTERVAL", 1.0)
+    monkeypatch.setattr(bridge, "CANONICAL_INDEX_MIN_REQUEST_INTERVAL", 20.0)
+    monkeypatch.setattr(bridge, "CANONICAL_INDEX_INTERVAL", 30.0)
+    bridge._initialize_canonical_reconcile_state(app)
+
+    results = iter([
+        {"attempted": 2, "indexed": 2, "held": 0, "durable": True},
+        {"attempted": 1, "indexed": 1, "held": 0, "durable": True},
+    ])
+    monkeypatch.setattr(bridge, "reconcile_canonical_index", lambda _app: next(results))
+
+    bridge._canonical_reconcile_background(app)
+
+    status = bridge.canonical_reconcile_state(app)
+    assert stop.waits == [20.0, 20.0]
+    assert status["wait_seconds"] == 20.0
+    assert status["min_request_interval_seconds"] == 20.0
+
+    stop2 = _RecordingCanonicalStop(stop_after=1)
+    app2 = SimpleNamespace(restore_done=threading.Event(), canonical_index_stop=stop2)
+    app2.restore_done.set()
+    monkeypatch.setattr(bridge, "CANONICAL_INDEX_ACTIVE_INTERVAL", 25.0)
+    bridge._initialize_canonical_reconcile_state(app2)
+    monkeypatch.setattr(
+        bridge, "reconcile_canonical_index",
+        lambda _app: {"attempted": 1, "indexed": 1, "held": 0, "durable": True}
+    )
+    bridge._canonical_reconcile_background(app2)
+    assert stop2.waits == [25.0]
+
+
+def test_reconcile_canonical_index_bounds_by_rows_and_persists_per_subprocess(monkeypatch, tmp_path):
+    app = _source_app(tmp_path)
+    for i in range(14):
+        _canonical_source(app.store, f"row-{i:02d}", raw=f"content {i}")
+
+    monkeypatch.setattr(bridge, "REMOTE", "owner/memory")
+    monkeypatch.setattr(bridge, "CANONICAL_INDEX_BATCH", 32)
+    monkeypatch.setattr(bridge, "CANONICAL_INDEX_REQUEST_ROWS", 5)
+    monkeypatch.setattr(bridge, "CANONICAL_INDEX_MAX_CHARS", 10000)
+
+    ingested_batches = []
+
+    def fake_run(*args, **_kwargs):
+        path = Path(args[1])
+        batch = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+        ingested_batches.append([doc["source_identity"] for doc in batch])
+        return 0, f"ingested sources={len(batch)} chunks={len(batch)} unchanged=0 stale=0 held=0 commit=rev\n", ""
+
+    monkeypatch.setattr(bridge, "run", fake_run)
+    monkeypatch.setattr(bridge, "request_warm", lambda **_kwargs: None)
+
+    try:
+        res1 = bridge.reconcile_canonical_index(app)
+        assert res1["attempted"] == 5
+        assert res1["indexed"] == 5
+        assert len(ingested_batches[0]) == 5
+
+        res2 = bridge.reconcile_canonical_index(app)
+        assert res2["attempted"] == 5
+        assert res2["indexed"] == 5
+        assert len(ingested_batches[1]) == 5
+
+        res3 = bridge.reconcile_canonical_index(app)
+        assert res3["attempted"] == 4
+        assert res3["indexed"] == 4
+        assert len(ingested_batches[2]) == 4
+
+        res4 = bridge.reconcile_canonical_index(app)
+        assert res4["attempted"] == 0
+    finally:
+        app.store.close()
+
+
+def test_reconcile_canonical_index_bounds_by_chars_and_admits_oversize_first(monkeypatch, tmp_path):
+    app = _source_app(tmp_path)
+    _canonical_source(app.store, "oversize-first", raw="超长中文内容" * 1500)
+    _canonical_source(app.store, "normal-1", raw="普通内容1")
+    _canonical_source(app.store, "normal-2", raw="普通内容2")
+
+    monkeypatch.setattr(bridge, "REMOTE", "owner/memory")
+    monkeypatch.setattr(bridge, "CANONICAL_INDEX_REQUEST_ROWS", 8)
+    monkeypatch.setattr(bridge, "CANONICAL_INDEX_MAX_CHARS", 6000)
+
+    ingested_batches = []
+
+    def fake_run(*args, **_kwargs):
+        path = Path(args[1])
+        batch = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+        ingested_batches.append([doc["source_identity"] for doc in batch])
+        return 0, f"ingested sources={len(batch)} chunks={len(batch)} unchanged=0 stale=0 held=0 commit=rev\n", ""
+
+    monkeypatch.setattr(bridge, "run", fake_run)
+    monkeypatch.setattr(bridge, "request_warm", lambda **_kwargs: None)
+
+    try:
+        res1 = bridge.reconcile_canonical_index(app)
+        assert res1["attempted"] == 1
+        assert res1["indexed"] == 1
+        assert ingested_batches[0] == ["oversize-first"]
+
+        res2 = bridge.reconcile_canonical_index(app)
+        assert res2["attempted"] == 2
+        assert res2["indexed"] == 2
+        assert ingested_batches[1] == ["normal-1", "normal-2"]
+
+        res3 = bridge.reconcile_canonical_index(app)
+        assert res3["attempted"] == 0
+    finally:
+        app.store.close()
+
+
 def test_canonical_background_uses_active_wait_for_consecutive_work(monkeypatch):
     stop = _RecordingCanonicalStop(stop_after=2)
     app = SimpleNamespace(
@@ -2927,6 +3162,7 @@ def test_canonical_background_uses_active_wait_for_consecutive_work(monkeypatch)
     app.restore_done.set()
     monkeypatch.setattr(bridge, "CANONICAL_INDEX_ACTIVE_INTERVAL", 0.25)
     monkeypatch.setattr(bridge, "CANONICAL_INDEX_INTERVAL", 9.0)
+    monkeypatch.setattr(bridge, "CANONICAL_INDEX_MIN_REQUEST_INTERVAL", 0.25)
     bridge._initialize_canonical_reconcile_state(app)
     results = iter(
         [

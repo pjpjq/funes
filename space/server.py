@@ -23,7 +23,8 @@ import time
 import urllib.error
 import urllib.request
 import zlib
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
+from typing import Any
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -51,6 +52,28 @@ INGEST_PUSH_TIMEOUT = int(os.getenv("FUNES_INGEST_PUSH_TIMEOUT", "1800"))
 CANONICAL_INDEX_BATCH = max(1, int(os.getenv("FUNES_CANONICAL_INDEX_BATCH", "32")))
 
 
+def _canonical_index_request_limits(
+    environ: Mapping[str, str] | None = None,
+) -> tuple[int, int]:
+    environ = os.environ if environ is None else environ
+    rows_val = environ.get("FUNES_CANONICAL_INDEX_REQUEST_ROWS")
+    chars_val = environ.get("FUNES_CANONICAL_INDEX_MAX_CHARS")
+    try:
+        rows = max(1, int(rows_val)) if rows_val is not None else 8
+    except (TypeError, ValueError):
+        rows = 8
+    try:
+        chars = max(1, int(chars_val)) if chars_val is not None else 6000
+    except (TypeError, ValueError):
+        chars = 6000
+    return rows, chars
+
+
+CANONICAL_INDEX_REQUEST_ROWS, CANONICAL_INDEX_MAX_CHARS = (
+    _canonical_index_request_limits()
+)
+
+
 def _canonical_index_intervals(
     environ: Mapping[str, str] | None = None,
 ) -> tuple[float, float]:
@@ -65,6 +88,20 @@ def _canonical_index_intervals(
 CANONICAL_INDEX_ACTIVE_INTERVAL, CANONICAL_INDEX_INTERVAL = (
     _canonical_index_intervals()
 )
+
+
+def _canonical_index_min_request_interval(
+    environ: Mapping[str, str] | None = None,
+) -> float:
+    environ = os.environ if environ is None else environ
+    val = environ.get("FUNES_CANONICAL_INDEX_MIN_REQUEST_INTERVAL", "20")
+    try:
+        return max(0.0, float(val))
+    except (TypeError, ValueError):
+        return 20.0
+
+
+CANONICAL_INDEX_MIN_REQUEST_INTERVAL = _canonical_index_min_request_interval()
 CANONICAL_INDEX_TIMEOUT = max(1, int(os.getenv("FUNES_CANONICAL_INDEX_TIMEOUT", "900")))
 CANONICAL_OPTIMIZE_TIMEOUT = max(1, int(os.getenv("FUNES_CANONICAL_OPTIMIZE_TIMEOUT", "900")))
 # Bump when a deployed native index needs one-time structural maintenance even
@@ -1338,6 +1375,63 @@ def _native_update(
     }
 
 
+def _canonical_source_chars(record: object) -> int:
+    if isinstance(record, (tuple, list)) and len(record) >= 2:
+        item, document = record[0], record[1]
+    elif isinstance(record, (tuple, list)) and len(record) == 1:
+        item, document = record[0], None
+    else:
+        item, document = record, None
+    raw = None
+    if isinstance(item, Mapping):
+        raw = item.get("raw_text")
+    if raw is None and isinstance(document, Mapping):
+        raw = document.get("raw_text")
+    return len(str(raw or ""))
+
+
+def select_bounded_canonical_records(
+    records: Sequence[Any],
+    *,
+    max_rows: int | None = None,
+    max_chars: int | None = None,
+) -> list[Any]:
+    if not records:
+        return []
+    try:
+        limit_rows = (
+            CANONICAL_INDEX_REQUEST_ROWS
+            if max_rows is None
+            else max(1, int(max_rows))
+        )
+    except (TypeError, ValueError):
+        limit_rows = 8
+    try:
+        limit_chars = (
+            CANONICAL_INDEX_MAX_CHARS
+            if max_chars is None
+            else max(1, int(max_chars))
+        )
+    except (TypeError, ValueError):
+        limit_chars = 6000
+
+    selected: list[Any] = []
+    total_chars = 0
+    for record in records:
+        chars = _canonical_source_chars(record)
+        if not selected:
+            selected.append(record)
+            total_chars += chars
+            continue
+        if len(selected) >= limit_rows:
+            break
+        if total_chars >= limit_chars or total_chars + chars > limit_chars:
+            break
+        selected.append(record)
+        total_chars += chars
+    return selected
+
+
 def _write_canonical_jsonl(path: Path, records: list[tuple[dict, dict]]) -> None:
     with path.open("w", encoding="utf-8") as stream:
         for _, document in records:
@@ -1601,10 +1695,13 @@ def canonical_reconcile_state(app) -> dict[str, object]:
     public.update(
         thread_alive=bool(thread is not None and thread.is_alive()),
         batch_size=CANONICAL_INDEX_BATCH,
+        request_rows=CANONICAL_INDEX_REQUEST_ROWS,
+        max_chars=CANONICAL_INDEX_MAX_CHARS,
         timeout_seconds=CANONICAL_INDEX_TIMEOUT,
         interval_seconds=CANONICAL_INDEX_INTERVAL,
         active_interval_seconds=CANONICAL_INDEX_ACTIVE_INTERVAL,
         idle_interval_seconds=CANONICAL_INDEX_INTERVAL,
+        min_request_interval_seconds=CANONICAL_INDEX_MIN_REQUEST_INTERVAL,
     )
     return public
 
@@ -1630,7 +1727,7 @@ def reconcile_canonical_index(app) -> dict[str, object]:
             str(profile["fingerprint"]),
             memory,
         )
-        selected = []
+        candidates = []
         for item in rows:
             document = canonical_document(item, profile)
             if (
@@ -1642,7 +1739,12 @@ def reconcile_canonical_index(app) -> dict[str, object]:
                 and item.get("native_index_memory") == memory
             ):
                 continue
-            selected.append((item, document))
+            candidates.append((item, document))
+        selected = select_bounded_canonical_records(
+            candidates,
+            max_rows=CANONICAL_INDEX_REQUEST_ROWS,
+            max_chars=CANONICAL_INDEX_MAX_CHARS,
+        )
         if not selected:
             return selected, [], False
         _canonical_reconcile_phase(app, "native_ingest")
@@ -1858,11 +1960,13 @@ def _canonical_reconcile_background(app) -> None:
             made_progress = int(result.get("indexed") or 0) > 0 or int(
                 result.get("held") or 0
             ) > 0
-            wait_seconds = (
-                CANONICAL_INDEX_ACTIVE_INTERVAL
-                if durable and made_progress
-                else CANONICAL_INDEX_INTERVAL
-            )
+            if durable and made_progress:
+                wait_seconds = max(
+                    CANONICAL_INDEX_ACTIVE_INTERVAL,
+                    CANONICAL_INDEX_MIN_REQUEST_INTERVAL,
+                )
+            else:
+                wait_seconds = CANONICAL_INDEX_INTERVAL
             failures = (
                 0
                 if durable

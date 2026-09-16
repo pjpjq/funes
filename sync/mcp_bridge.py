@@ -303,10 +303,10 @@ def _remote_call(path, payload):
     _validated_url(base)
     headers = _auth_headers(token, hub_token)
     recall = path in ("/search", "/recall")
-    total = _float_env("FUNES_REMOTE_TIMEOUT", 4 if recall else 180, 0.1, 300)
+    total = _float_env("FUNES_REMOTE_TIMEOUT", 8 if recall else 180, 0.1, 300)
     attempts = _int_env("FUNES_REMOTE_ATTEMPTS", 1 if recall else 5, 1, 5)
     attempt_timeout = _float_env(
-        "FUNES_REMOTE_ATTEMPT_TIMEOUT", 4 if recall else 50, 0.1, 55
+        "FUNES_REMOTE_ATTEMPT_TIMEOUT", 8 if recall else 50, 0.1, 55
     )
     deadline = time.monotonic() + total
 

@@ -141,9 +141,9 @@ const manualBudget: CallBudget = {
 };
 
 const automaticRecallBudget: CallBudget = {
-  timeoutMs: 6_500,
+  timeoutMs: 4_500,
   attempts: 1,
-  attemptTimeoutMs: 6_500,
+  attemptTimeoutMs: 4_500,
   readyTimeoutMs: 1_750,
   readyPolls: 1,
 };

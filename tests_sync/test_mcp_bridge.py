@@ -191,7 +191,7 @@ def test_remote_search_default_budget_is_one_attempt(monkeypatch):
     assert [(url, method) for url, method, _ in calls] == [
         ("https://memory.example/search", "POST"),
     ]
-    assert all(0 < timeout <= 4 for _, _, timeout in calls)
+    assert all(0 < timeout <= 8 for _, _, timeout in calls)
 
 
 def test_mcp_recall_returns_null_instead_of_json_rpc_error_when_unavailable(

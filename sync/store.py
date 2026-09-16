@@ -44,6 +44,7 @@ class Store:
         CREATE TABLE IF NOT EXISTS queue(record_id TEXT PRIMARY KEY,attempts INTEGER DEFAULT 0,next_at REAL DEFAULT 0,last_error TEXT,queued_at REAL);
         CREATE INDEX IF NOT EXISTS queue_failed ON queue(last_error) WHERE last_error IS NOT NULL;
         CREATE INDEX IF NOT EXISTS queue_schedule ON queue(next_at,queued_at);
+        CREATE INDEX IF NOT EXISTS queue_ready_order ON queue(queued_at,next_at);
         CREATE TABLE IF NOT EXISTS cursors(source_key TEXT PRIMARY KEY,offset INTEGER DEFAULT 0,inode INTEGER,size INTEGER,updated_at REAL);
         CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL,updated_at REAL NOT NULL);
         CREATE INDEX IF NOT EXISTS sources_active_kind ON sources(active,kind);

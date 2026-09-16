@@ -4,6 +4,7 @@ import json
 import os
 import sqlite3
 import stat
+import time
 from datetime import datetime
 from pathlib import Path, PureWindowsPath
 from types import SimpleNamespace
@@ -491,7 +492,7 @@ def test_existing_database_gets_meta_migration_without_data_loss(tmp_path):
                 "SELECT name FROM sqlite_master WHERE type='index'"
             )
         }
-        assert {"records_source", "queue_failed", "queue_schedule", "sources_active_kind"}.issubset(indexes)
+        assert {"records_source", "queue_failed", "queue_schedule", "queue_ready_order", "sources_active_kind"}.issubset(indexes)
     finally:
         store.close()
 
@@ -545,3 +546,49 @@ def test_existing_store_restricts_sqlite_files_without_data_loss(tmp_path):
     finally:
         store.close()
         legacy.close()
+
+
+def test_pending_query_plan_uses_ready_order_index_without_temp_btree(tmp_path):
+    cfg = Config(tmp_path, tmp_path / ".state", tmp_path / "config.toml")
+    store = Store(config=cfg)
+    now = time.time()
+    try:
+        source = Source("source", "codex", tmp_path / "session.jsonl", "device")
+        store.register_source(source)
+        chunks = [
+            Chunk(
+                record_id=f"record:{i:02d}",
+                source_key="source",
+                kind="codex",
+                path=str(source.path),
+                session_id="session",
+                ordinal=i,
+                role="user",
+                text=f"payload {i}",
+                raw_text=f"payload {i}",
+            )
+            for i in range(10)
+        ]
+        store.upsert_chunks(chunks)
+        store.db.execute(
+            "UPDATE queue SET next_at=? WHERE record_id IN ('record:08', 'record:09')",
+            (now + 3600,),
+        )
+        store.db.commit()
+
+        plan = store.db.execute(
+            "EXPLAIN QUERY PLAN SELECT q.*,r.payload FROM queue q JOIN records r ON r.record_id=q.record_id WHERE q.next_at<=? ORDER BY q.queued_at LIMIT ?",
+            (now, 50),
+        ).fetchall()
+        details = [row[3] for row in plan]
+        assert any("queue_ready_order" in detail for detail in details)
+        assert not any("USE TEMP B-TREE FOR ORDER BY" in detail for detail in details)
+
+        pending = store.pending(limit=50, now=now)
+        assert len(pending) == 8
+        assert [r["record_id"] for r in pending] == [f"record:{i:02d}" for i in range(8)]
+
+        limited = store.pending(limit=3, now=now)
+        assert [r["record_id"] for r in limited] == ["record:00", "record:01", "record:02"]
+    finally:
+        store.close()

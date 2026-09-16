@@ -360,6 +360,34 @@ fn named_ids(by_session: &HashMap<String, Vec<String>>, sessions: &[String]) -> 
     Ok(sessions.iter().flat_map(|s| by_session[s].iter().cloned()).collect())
 }
 
+/// Refresh one remote memory's existing Lance indexes without opening or scanning local memory.
+/// Used by the durable raw-source rebuild after its last embedding batch is committed.
+pub async fn run_reindex_only(target: Memory) -> Result<String> {
+    let uri = match &target {
+        Memory::Remote { uri } => uri.clone(),
+        Memory::Local { .. } => bail!("optimize-index target must be a remote memory"),
+    };
+    match target.state().await? {
+        MemoryState::Ready(_) => {}
+        MemoryState::Offline => bail!("{uri} is unreachable — cannot refresh its indexes"),
+        MemoryState::Missing => return Err(target.missing_error()),
+        MemoryState::Unauthorized => return Err(target.unauthorized_error()),
+        MemoryState::Empty => bail!("{uri} has no memory dataset to optimize"),
+    }
+
+    let (owner, name, _) = hub::parse_hf(&uri)?;
+    let token = hub::hf_token().context("no HF token (set HF_TOKEN) — required to optimize")?;
+    let repo = hub::client(Some(token.as_str()), true)?.dataset(owner, name);
+    let revision = "main".to_string();
+    let dataset_uri = dataset::table_uri(&uri);
+    let opts = HashMap::from([
+        ("hf_token".to_string(), token),
+        ("revision".to_string(), revision.clone()),
+    ]);
+    let report = reindex_forced(&repo, &dataset_uri, &opts, &revision).await?;
+    Ok(format!("{}: index refresh complete\n{report}", target.label()))
+}
+
 /// Publish the local memory's new chunks to `target` (a remote memory on the HF Hub). With
 /// `force_reindex`, refresh the remote index after the data commit (retrying until it lands) even
 /// if the unindexed backlog is below [`REINDEX_THRESHOLD`]; with no new chunks pending it's a pure

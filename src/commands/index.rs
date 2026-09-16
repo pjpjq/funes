@@ -9,8 +9,8 @@
 
 use crate::chunk::{self, Tier};
 use crate::hub;
-use crate::inference::{self, embed_batched, Embedder};
-use crate::memory::dataset::{self, build_batch, schema, MODEL};
+use crate::inference::{self, embed_batched, Embedder, EmbeddingProfile};
+use crate::memory::dataset::{self, build_batch_for_schema, schema_for};
 use crate::memory::lock;
 use crate::scan;
 use crate::traces::harness::Harness;
@@ -23,6 +23,7 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::io::{IsTerminal, Write as _};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Take the memory lock. An interactive caller (a human at `funes index`/`funes add`) waits out a
@@ -244,6 +245,7 @@ pub(crate) fn local_index_coverage() -> Option<IndexCoverage> {
 struct Indexer {
     uri: String,
     ds: Option<Dataset>,
+    profile: EmbeddingProfile,
     /// [`stored_ids`] at open plus everything appended this run — the dedup baseline for new chunks.
     existing: HashSet<String>,
     embedder: Box<dyn Embedder>,
@@ -317,18 +319,16 @@ impl Indexer {
         let _lock = acquire_lock(interactive).await?;
 
         let uri = dataset::table_uri(&dataset::local_memory_dir());
-        let ds = dataset::open(&uri, HashMap::new()).await.ok();
+        let mut ds = dataset::open(&uri, HashMap::new()).await.ok();
+        let profile = inference::embedding_profile()?;
 
-        // Model-pin: refuse to add to a memory built with a different embedding model. The id rides
-        // in the dataset's schema metadata; a pre-metadata memory (no id) is tolerated and guarded
-        // only by the dimension check until it is reindexed.
+        // Profile-pin: provider/model/dimension/schema/input contract must all match. Same-width
+        // vectors from different providers are not interchangeable.
         if let Some(ds) = &ds {
-            let schema = arrow_schema::Schema::from(ds.schema());
-            if let Some(em) = schema.metadata().get("embedding_model") {
-                if em != MODEL {
-                    return Err(anyhow!("index built with model {em:?}, refusing to mix with {MODEL:?}"));
-                }
-            }
+            crate::memory::check_compat_with_profile(ds, &profile)?;
+        }
+        if let Some(ds) = &mut ds {
+            dataset::ensure_canonical_columns(ds).await?;
         }
 
         let first_index = ds.is_none();
@@ -347,7 +347,7 @@ impl Indexer {
                 .unwrap_or_default()
         };
 
-        let embedder: Box<dyn Embedder> = inference::embedder()?;
+        let embedder: Box<dyn Embedder> = inference::embedder_for(&profile)?;
         // Best-effort secret redaction: if the scanner isn't installed, indexing continues
         // unredacted — the push gate still scans, fail-closed, before any upload, so a secret can't
         // reach the Hub.
@@ -372,6 +372,7 @@ impl Indexer {
         Ok(Indexer {
             uri,
             ds,
+            profile,
             existing,
             embedder,
             scanner,
@@ -464,7 +465,7 @@ impl Indexer {
         let repo = self.repo_for(&key);
         if !repo.is_empty() {
             for c in &mut chunks {
-                c.repo.clone_from(&repo);
+                c.repo = Some(repo.clone());
             }
         }
         let total_chunks = chunks.len();
@@ -534,8 +535,13 @@ impl Indexer {
             t0.elapsed().as_secs_f64()
         );
 
-        let batch = build_batch(new_chunks, &vectors)?;
-        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema());
+        let target_schema = self
+            .ds
+            .as_ref()
+            .map(|d| Arc::new(arrow_schema::Schema::from(d.schema())))
+            .unwrap_or_else(|| schema_for(&self.profile));
+        let batch = build_batch_for_schema(new_chunks, &vectors, target_schema.clone())?;
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], target_schema);
         let uri = self.uri.clone();
         match &mut self.ds {
             Some(d) => {
@@ -548,16 +554,16 @@ impl Indexer {
         Ok(n as u64)
     }
 
-    /// Build the FTS + IVF_PQ indexes (best-effort), reap superseded versions, and print the run
-    /// summary. Consumes the indexer, releasing the memory lock. The vector index bounds how much a
-    /// query reads — what makes recall over a remote (hf://) tier lazy rather than a full scan; lance
-    /// enforces its own training minimum (256 rows) and skips below it, falling back to brute force.
+    /// Build or repair the FTS + IVF_PQ indexes, reap superseded versions, and print the run summary.
+    /// Consumes the indexer, releasing the memory lock. The vector index bounds how much a query reads
+    /// — what makes recall over a remote (hf://) tier lazy rather than a full scan.
     async fn finalize(mut self) -> Result<()> {
-        // Nothing written → the memory is unchanged since it opened; skip the rebuild and its
-        // version churn.
-        if self.n_chunks > 0 {
-            if let Some(d) = &mut self.ds {
-                dataset::build_indexes(d, |phase| eprintln!("building {phase}…")).await;
+        if let Some(d) = &mut self.ds {
+            // A crash after append can leave state.json current even though FTS/IVF creation never
+            // completed. Check the stored index health even on a no-new-chunk retry, so that debt
+            // heals rather than becoming permanent.
+            if self.n_chunks > 0 || dataset::indexes_need_rebuild(d).await? {
+                dataset::build_indexes(d, |phase| eprintln!("building {phase}…")).await?;
 
                 // Reap superseded versions — best-effort; on failure the reap waits for next run.
                 match d.cleanup_old_versions(chrono::Duration::minutes(10), None, None).await {

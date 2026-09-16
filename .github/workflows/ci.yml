@@ -9,6 +9,9 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "scripts/**"
+      - "**/*.py"
+      - "**/requirements*.txt"
+      - "integrations/pi/**"
       - ".github/workflows/ci.yml"
   push:
     branches: [main]
@@ -25,6 +28,25 @@ env:
   RUST_BACKTRACE: "1"
 
 jobs:
+  python-test:
+    name: Python Sync & Space Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: service/requirements.txt
+
+      - name: Install Python test dependencies
+        run: python -m pip install pytest -r service/requirements.txt
+
+      - name: Python tests
+        run: env -u FUNES_REMOTE_URL PYTHONPATH=. python -m pytest -q tests_sync tests_space tests_scripts service/tests scripts/funes-sync/tests
+
   lint-test:
     name: Lint & Unit Tests
     runs-on: ubicloud-standard-2

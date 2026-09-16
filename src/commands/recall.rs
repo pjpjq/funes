@@ -1,15 +1,15 @@
 //! The read surface: `recall`, `get`, `status` over the existing index.
-//! Recall pipeline: hybrid (vector + BM25, fused by reciprocal rank) → cross-encoder rerank →
+//! Recall pipeline: hybrid (vector + BM25, fused by reciprocal rank) → optional rerank →
 //! recency reweight → neighbor expansion. `recall`/`get` return results rendered in the agent
 //! format; `recall_hits`/`get_turns` return the structured results for other renderings
 //! (see `render`).
 
 use crate::chunk;
-use crate::inference::{self, Embedder, Reranker};
+use crate::inference::{self, Embedder, EmbeddingProfile, RerankScoreKind, Reranker};
 use crate::memory::dataset;
 use crate::memory::{Memory, MemoryState};
 use crate::traces::harness::Harness;
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, Result};
 use arrow_array::{Float32Array, Int64Array, RecordBatch, StringArray, UInt64Array};
 use chrono::{DateTime, Utc};
 use futures::TryStreamExt;
@@ -56,6 +56,13 @@ pub struct Hit {
     pub block_type: String,
     pub harness: String,
     pub neighbors: Vec<Neighbor>,
+}
+
+/// One recall pipeline result carried to the MCP adapter as both the stable rendered text and the
+/// raw hits that produced it. CLI callers keep using [`recall_filtered`] and see only `text`.
+pub(crate) struct RecallResult {
+    pub text: String,
+    pub hits: Vec<(Hit, f64)>,
 }
 
 /// Matching blocks `scan` lists before it stops. What the cap dropped is always reported.
@@ -171,6 +178,7 @@ fn esc(s: &str) -> String {
 }
 
 /// `block_type = '…' AND harness = '…'` over whichever filters are set, else None.
+#[cfg(test)]
 fn build_where(block_type: Option<&str>, harness: Option<&str>) -> Option<String> {
     let mut clauses = Vec::new();
     if let Some(bt) = block_type {
@@ -184,6 +192,51 @@ fn build_where(block_type: Option<&str>, harness: Option<&str>) -> Option<String
     } else {
         Some(clauses.join(" AND "))
     }
+}
+
+/// Optional provenance facets for canonical-document recall. A requested facet that an old
+/// memory does not carry matches no rows instead of leaking a Lance missing-column error.
+#[derive(Default, Clone)]
+pub struct FacetFilter {
+    pub block_type: Option<String>,
+    pub harness: Option<String>,
+    pub source_identity: Option<String>,
+    pub source_version: Option<String>,
+    pub content_hash: Option<String>,
+    pub updated_at: Option<String>,
+    pub source_agent: Option<String>,
+    pub source_type: Option<String>,
+    pub project: Option<String>,
+    pub repo: Option<String>,
+    pub device_id: Option<String>,
+    pub content_type: Option<String>,
+    pub source_missing: Option<bool>,
+}
+
+fn build_facet_where(filter: &FacetFilter) -> Option<String> {
+    let mut clauses = Vec::new();
+    for (name, value) in [
+        ("block_type", filter.block_type.as_deref()),
+        ("harness", filter.harness.as_deref()),
+        ("source_identity", filter.source_identity.as_deref()),
+        ("source_version", filter.source_version.as_deref()),
+        ("content_hash", filter.content_hash.as_deref()),
+        ("updated_at", filter.updated_at.as_deref()),
+        ("source_agent", filter.source_agent.as_deref()),
+        ("source_type", filter.source_type.as_deref()),
+        ("project", filter.project.as_deref()),
+        ("repo", filter.repo.as_deref()),
+        ("device_id", filter.device_id.as_deref()),
+        ("content_type", filter.content_type.as_deref()),
+    ] {
+        if let Some(value) = value {
+            clauses.push(format!("{name} = '{}'", esc(value)));
+        }
+    }
+    if let Some(value) = filter.source_missing {
+        clauses.push(format!("source_missing = {value}"));
+    }
+    (!clauses.is_empty()).then(|| clauses.join(" AND "))
 }
 
 /// 0.5^(age/half_life): 1.0 for fresh, decaying with age. half_life <= 0 disables.
@@ -200,6 +253,13 @@ fn recency_weight(ts: &str, now: DateTime<Utc>, half_life: f64) -> f64 {
     }
 }
 
+fn rerank_relevance(kind: RerankScoreKind, score: f32) -> f64 {
+    match kind {
+        RerankScoreKind::Logit => 1.0 / (1.0 + (-(score as f64)).exp()),
+        RerankScoreKind::Relevance => score as f64,
+    }
+}
+
 /// A dataset opened for reading.
 struct Read {
     ds: Dataset,
@@ -209,6 +269,14 @@ struct Read {
     /// Label of the memory the dataset actually came from (the requested one, or the local memory
     /// after an offline degrade).
     memory_label: Option<String>,
+}
+
+/// One immutable dataset opened for a long-lived MCP server. The dataset stays opaque here so the
+/// caller cannot bypass the recall pipeline's profile checks, filtering, neighbor expansion, or
+/// rendering contract.
+pub(crate) struct PinnedRead {
+    read: Read,
+    requested_label: String,
 }
 
 /// What a read verb does about the memory's state: query it, degrade to the local index, or point a
@@ -265,9 +333,33 @@ async fn open_read(memory: &Memory) -> Result<Read> {
             note: None,
             memory_label: Some(memory.label()),
         }),
-        ReadOutcome::Offline => degrade_offline(&memory.label()).await,
+        ReadOutcome::Offline if native_fallback_enabled() => degrade_offline(&memory.label()).await,
+        ReadOutcome::Offline => Err(anyhow!(
+            "remote {} unavailable; native fallback is disabled",
+            memory.label()
+        )),
         ReadOutcome::NoIndex => Err(no_index_error()),
     }
+}
+
+/// Open the server's default memory once for immutable, process-lifetime recall. This is an
+/// explicit MCP-only optimization; normal CLI and MCP reads continue through [`open_read`] for
+/// every call and therefore resolve a remote's current head.
+pub(crate) async fn pin_read(memory: Memory) -> Result<PinnedRead> {
+    let requested_label = memory.label();
+    let read = open_read(&memory).await?;
+    Ok(PinnedRead { read, requested_label })
+}
+
+fn native_fallback_enabled() -> bool {
+    !matches!(
+        std::env::var("FUNES_NATIVE_FALLBACK")
+            .unwrap_or_else(|_| "true".to_string())
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "0" | "false" | "no" | "off"
+    )
 }
 
 /// The error a read verb returns when the default local memory has no index yet — points at the
@@ -307,19 +399,25 @@ pub fn memory_hint(read: Option<&str>) -> String {
 /// after. The `Mutex` serializes recalls (both models run with `&mut`), which is fine: the work is
 /// CPU-bound and the server's calls are serial anyway.
 struct Models {
+    profile_fingerprint: String,
     embedder: Box<dyn Embedder>,
-    reranker: Box<dyn Reranker>,
+    reranker: Option<Box<dyn Reranker>>,
 }
 
 static MODELS: OnceCell<Mutex<Models>> = OnceCell::const_new();
 
 /// The shared model cache, built on first use.
-async fn models() -> Result<&'static Mutex<Models>> {
+async fn models(profile: &EmbeddingProfile) -> Result<&'static Mutex<Models>> {
+    let profile = profile.clone();
     MODELS
-        .get_or_try_init(|| async {
-            let embedder = inference::embedder()?;
+        .get_or_try_init(|| async move {
+            let embedder = inference::embedder_for(&profile)?;
             let reranker = inference::reranker()?;
-            Ok::<_, anyhow::Error>(Mutex::new(Models { embedder, reranker }))
+            Ok::<_, anyhow::Error>(Mutex::new(Models {
+                profile_fingerprint: profile.fingerprint,
+                embedder,
+                reranker,
+            }))
         })
         .await
 }
@@ -342,26 +440,92 @@ pub async fn recall(
     block_type: Option<String>,
     harness: Option<String>,
 ) -> Result<String> {
-    let (note, memory_label, hits) = recall_hits(
+    recall_filtered(
         memory,
         query,
         k,
         candidates,
         half_life,
         neighbors,
-        block_type,
-        harness,
-        &|_| (),
+        FacetFilter {
+            block_type,
+            harness,
+            ..FacetFilter::default()
+        },
+    )
+    .await
+}
+
+/// Recall with canonical provenance filters in addition to the legacy block/harness filters.
+#[allow(clippy::too_many_arguments)]
+pub async fn recall_filtered(
+    memory: Memory,
+    query: String,
+    k: usize,
+    candidates: usize,
+    half_life: f64,
+    neighbors: i64,
+    filter: FacetFilter,
+) -> Result<String> {
+    Ok(
+        recall_filtered_result(memory, query, k, candidates, half_life, neighbors, filter)
+            .await?
+            .text,
+    )
+}
+
+/// Recall once while retaining the raw hits for protocol adapters that expose additive structured
+/// data alongside the byte-stable agent rendering.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn recall_filtered_result(
+    memory: Memory,
+    query: String,
+    k: usize,
+    candidates: usize,
+    half_life: f64,
+    neighbors: i64,
+    filter: FacetFilter,
+) -> Result<RecallResult> {
+    let (note, memory_label, hits) =
+        recall_hits_filtered(memory, query, k, candidates, half_life, neighbors, filter, &|_| ()).await?;
+    Ok(recall_result(note, memory_label, hits))
+}
+
+/// Recall against an already-opened immutable dataset. Only the MCP server's explicit opt-in
+/// default-memory path calls this; call-level overrides and every ordinary read open afresh.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn recall_filtered_pinned(
+    pinned: &PinnedRead,
+    query: String,
+    k: usize,
+    candidates: usize,
+    half_life: f64,
+    neighbors: i64,
+    filter: FacetFilter,
+) -> Result<RecallResult> {
+    let progress = &|_: &str| ();
+    progress(&format!("searching {}…", pinned.requested_label));
+    let (note, memory_label, hits) = recall_hits_filtered_read(
+        &pinned.read,
+        query,
+        k,
+        candidates,
+        half_life,
+        neighbors,
+        filter,
+        progress,
     )
     .await?;
-    if hits.is_empty() {
-        return Ok(format!("{note}no results"));
-    }
-    Ok(crate::ui::render::recall_agent(
-        &note,
-        &memory_hint(memory_label.as_deref()),
-        &hits,
-    ))
+    Ok(recall_result(note, memory_label, hits))
+}
+
+fn recall_result(note: String, memory_label: Option<String>, hits: Vec<(Hit, f64)>) -> RecallResult {
+    let text = if hits.is_empty() {
+        format!("{note}no results")
+    } else {
+        crate::ui::render::recall_agent(&note, &memory_hint(memory_label.as_deref()), &hits)
+    };
+    RecallResult { text, hits }
 }
 
 /// Run the recall pipeline over one memory: hybrid retrieval → rerank → recency reweight →
@@ -381,36 +545,91 @@ pub async fn recall_hits(
     harness: Option<String>,
     progress: &(dyn Fn(&str) + Sync),
 ) -> Result<(String, Option<String>, Vec<(Hit, f64)>)> {
+    recall_hits_filtered(
+        memory,
+        query,
+        k,
+        candidates,
+        half_life,
+        neighbors,
+        FacetFilter {
+            block_type,
+            harness,
+            ..FacetFilter::default()
+        },
+        progress,
+    )
+    .await
+}
+
+/// Structured recall with all canonical provenance filters.
+#[allow(clippy::too_many_arguments)]
+pub async fn recall_hits_filtered(
+    memory: Memory,
+    query: String,
+    k: usize,
+    candidates: usize,
+    half_life: f64,
+    neighbors: i64,
+    filter: FacetFilter,
+    progress: &(dyn Fn(&str) + Sync),
+) -> Result<(String, Option<String>, Vec<(Hit, f64)>)> {
+    progress(&format!("searching {}…", memory.label()));
+    let read = open_read(&memory).await?;
+    recall_hits_filtered_read(&read, query, k, candidates, half_life, neighbors, filter, progress).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn recall_hits_filtered_read(
+    read: &Read,
+    query: String,
+    k: usize,
+    candidates: usize,
+    half_life: f64,
+    neighbors: i64,
+    mut filter: FacetFilter,
+    progress: &(dyn Fn(&str) + Sync),
+) -> Result<(String, Option<String>, Vec<(Hit, f64)>)> {
     // `--harness` accepts the same spellings as `index`/`add` (claude|codex|pi); normalize to the
     // stored facet (Claude's is `claude_code`) so `--harness claude` filters instead of silently
     // matching nothing, and an unknown value errors here rather than returning zero hits.
-    let harness = harness
+    filter.harness = filter
+        .harness
+        .take()
         .map(|h| Harness::parse(&h))
         .transpose()?
         .map(|h| h.as_str().to_string());
 
-    progress("loading model…");
-    let mut guard = models().await?.lock().await;
-    let Models { embedder, reranker } = &mut *guard;
-
-    let qv: Vec<f32> = embedder
-        .embed(&[query.as_str()])?
-        .into_iter()
-        .next()
-        .context("empty embedding")?;
-
-    progress(&format!("searching {}…", memory.label()));
-    let read = open_read(&memory).await?;
     let note = read.note.clone().unwrap_or_default();
     let ds = &read.ds;
+    // Memory::open validates this for ordinary reads. A pinned dataset skips that open on later
+    // calls, so repeat the cheap schema/profile check against the current process environment.
+    // Do it before any early filter return so no pinned call can bypass the embedding contract.
+    let profile = inference::embedding_profile()?;
+    crate::memory::check_compat_with_profile(ds, &profile)?;
     // A `--harness` filter needs the column; on an un-migrated memory it would fail deep inside Lance
     // with an opaque schema error, so refuse with a clear message instead.
-    if harness.is_some() && !has_harness_col(ds) {
+    if filter.harness.is_some() && !has_harness_col(ds) {
         return Err(anyhow!(
             "this memory predates the harness facet — reindex it, or drop --harness"
         ));
     }
-    let where_clause = build_where(block_type.as_deref(), harness.as_deref());
+    if !facet_columns_present(ds, &filter) {
+        return Ok((note, read.memory_label.clone(), Vec::new()));
+    }
+    let where_clause = build_facet_where(&filter);
+
+    // Validate the memory before loading/calling any provider. This both fails fast on a profile
+    // mismatch and ensures a Voyage query vector is never sent to a local-BGE memory.
+    progress("loading embedding provider…");
+    let mut guard = models(&profile).await?.lock().await;
+    if guard.profile_fingerprint != profile.fingerprint {
+        return Err(anyhow!(
+            "embedding profile changed while the process was running; restart before recalling"
+        ));
+    }
+    let Models { embedder, reranker, .. } = &mut *guard;
+    let qv = embedder.embed_query(query.as_str())?;
 
     // Hybrid retrieval: a vector ANN scan and a BM25 scan, fused by reciprocal rank. The FTS index
     // can be absent (it's best-effort at index time), so the FTS leg is skipped when it errors —
@@ -420,27 +639,43 @@ pub async fn recall_hits(
         return Ok((note, read.memory_label.clone(), Vec::new()));
     }
 
-    let docs: Vec<&str> = hits.iter().map(|h| h.text.as_str()).collect();
-    progress(&format!("reranking {} candidates…", docs.len()));
-    let scores = reranker.rerank(query.as_str(), &docs)?;
-
     let now = Utc::now();
-    let mut scored: Vec<(usize, f64)> = scores
-        .iter()
-        .enumerate()
-        .map(|(i, &s)| {
-            let relevance = 1.0 / (1.0 + (-(s as f64)).exp());
-            (i, relevance * recency_weight(&hits[i].ts, now, half_life))
-        })
-        .collect();
+    let rank_scores = || {
+        (0..hits.len())
+            .map(|i| {
+                let relevance = hits[i].1;
+                (i, relevance * recency_weight(&hits[i].0.ts, now, half_life))
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut scored = if let Some(reranker) = reranker.as_deref_mut() {
+        let docs: Vec<&str> = hits.iter().map(|(hit, _)| hit.text.as_str()).collect();
+        let score_kind = reranker.score_kind();
+        progress(&format!("reranking {} candidates…", docs.len()));
+        match reranker.rerank(query.as_str(), &docs) {
+            Ok(scores) if scores.len() == hits.len() => scores
+                .iter()
+                .enumerate()
+                .map(|(i, &score)| {
+                    let relevance = rerank_relevance(score_kind, score);
+                    (i, relevance * recency_weight(&hits[i].0.ts, now, half_life))
+                })
+                .collect(),
+            // Reranking is optional. A provider error must not discard the already-computed RRF
+            // result or fall through to a slow local cross-encoder.
+            Ok(_) | Err(_) => rank_scores(),
+        }
+    } else {
+        rank_scores()
+    };
     scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     scored.truncate(k);
 
     // Keep only the top-k hits, in scored order, carrying their score along.
     let mut top: Vec<(Hit, f64)> = Vec::with_capacity(scored.len());
-    let mut taken: Vec<Option<Hit>> = hits.into_iter().map(Some).collect();
+    let mut taken: Vec<Option<(Hit, f64)>> = hits.into_iter().map(Some).collect();
     for (idx, score) in &scored {
-        if let Some(h) = taken[*idx].take() {
+        if let Some((h, _)) = taken[*idx].take() {
             top.push((h, *score));
         }
     }
@@ -462,7 +697,7 @@ async fn hybrid_candidates(
     query: &str,
     candidates: usize,
     filter: Option<&str>,
-) -> Result<Vec<Hit>> {
+) -> Result<Vec<(Hit, f64)>> {
     let vector = vector_candidates(ds, qv, candidates, filter).await?;
     let fts = fts_candidates(ds, query, candidates, filter).await.unwrap_or_default();
     Ok(rrf_fuse(vector, fts, candidates))
@@ -504,6 +739,26 @@ async fn fts_candidates(ds: &Dataset, query: &str, limit: usize, filter: Option<
 /// migrated column is asked for before it is read.
 fn has_col(ds: &Dataset, name: &str) -> bool {
     arrow_schema::Schema::from(ds.schema()).column_with_name(name).is_some()
+}
+
+fn facet_columns_present(ds: &Dataset, filter: &FacetFilter) -> bool {
+    [
+        ("block_type", filter.block_type.is_some()),
+        ("harness", filter.harness.is_some()),
+        ("source_identity", filter.source_identity.is_some()),
+        ("source_version", filter.source_version.is_some()),
+        ("content_hash", filter.content_hash.is_some()),
+        ("updated_at", filter.updated_at.is_some()),
+        ("source_agent", filter.source_agent.is_some()),
+        ("source_type", filter.source_type.is_some()),
+        ("project", filter.project.is_some()),
+        ("repo", filter.repo.is_some()),
+        ("device_id", filter.device_id.is_some()),
+        ("content_type", filter.content_type.is_some()),
+        ("source_missing", filter.source_missing.is_some()),
+    ]
+    .into_iter()
+    .all(|(name, requested)| !requested || has_col(ds, name))
 }
 
 /// Whether the memory carries the `harness` column — false for one built before the facet existed.
@@ -562,8 +817,8 @@ async fn collect_hits(scan: lance::dataset::scanner::Scanner) -> Result<Vec<(u64
 }
 
 /// Reciprocal-rank fusion (k=60): each list contributes `1/(rank + 60)` to a row's score; return
-/// the top `limit` rows by fused score, deduped by `_rowid`.
-fn rrf_fuse(vector: Vec<(u64, Hit)>, fts: Vec<(u64, Hit)>, limit: usize) -> Vec<Hit> {
+/// the top `limit` rows with their fused score, deduped by `_rowid`.
+fn rrf_fuse(vector: Vec<(u64, Hit)>, fts: Vec<(u64, Hit)>, limit: usize) -> Vec<(Hit, f64)> {
     const K: f32 = 60.0;
     let mut scores: HashMap<u64, f32> = HashMap::new();
     let mut rows: HashMap<u64, Hit> = HashMap::new();
@@ -576,7 +831,10 @@ fn rrf_fuse(vector: Vec<(u64, Hit)>, fts: Vec<(u64, Hit)>, limit: usize) -> Vec<
     let mut ranked: Vec<(u64, f32)> = scores.into_iter().collect();
     ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     ranked.truncate(limit);
-    ranked.into_iter().filter_map(|(id, _)| rows.remove(&id)).collect()
+    ranked
+        .into_iter()
+        .filter_map(|(id, score)| rows.remove(&id).map(|hit| (hit, score as f64)))
+        .collect()
 }
 
 /// For each hit, pull chunks in the same session within `window` of its seq (excluding the
@@ -696,7 +954,13 @@ pub async fn get_turns(memory: Memory, session_id: String, range: TurnRange) -> 
 
     let cols = ["turn_uuid", "seq", "ts", "role", "text", "block_idx", "split_idx"];
     let filter = format!("session_id = '{}'", esc(&session_id));
-    let batches = dataset::scan_rows(ds, &cols, Some(filter.as_str()), None).await?;
+    let mut batches = dataset::scan_rows(ds, &cols, Some(filter.as_str()), None).await?;
+    // Canonical documents may retain their original session id. Let callers address one directly
+    // by the source identity a filtered recall exposed when no session has that name.
+    if batches.iter().all(|batch| batch.num_rows() == 0) && has_col(ds, "source_identity") {
+        let filter = format!("source_identity = '{}'", esc(&session_id));
+        batches = dataset::scan_rows(ds, &cols, Some(filter.as_str()), None).await?;
+    }
 
     // `text` is already the rendered chunk as stored by the indexer — do not re-render.
     let mut rows: Vec<TurnRow> = Vec::new();
@@ -1344,6 +1608,20 @@ mod tests {
     use super::*;
     use chrono::TimeZone;
 
+    fn hit(text: &str) -> Hit {
+        Hit {
+            text: text.to_string(),
+            session_id: String::new(),
+            workdir: String::new(),
+            turn_uuid: String::new(),
+            seq: 0,
+            ts: "2026-01-31T00:00:00Z".to_string(),
+            block_type: "text".to_string(),
+            harness: String::new(),
+            neighbors: Vec::new(),
+        }
+    }
+
     #[test]
     fn is_scaffolding_flags_wrappers_and_headings() {
         assert!(is_scaffolding("<ide_opened_file>/foo/bar.rs</ide_opened_file>"));
@@ -1411,6 +1689,16 @@ mod tests {
         );
         // values are escaped against filter-string injection.
         assert_eq!(build_where(None, Some("a'b")).as_deref(), Some("harness = 'a''b'"));
+        let facets = FacetFilter {
+            source_agent: Some("codex".to_string()),
+            project: Some("owner's repo".to_string()),
+            source_missing: Some(false),
+            ..FacetFilter::default()
+        };
+        assert_eq!(
+            build_facet_where(&facets).as_deref(),
+            Some("source_agent = 'codex' AND project = 'owner''s repo' AND source_missing = false")
+        );
     }
 
     #[test]
@@ -1426,5 +1714,30 @@ mod tests {
         assert!((recency_weight("2026-02-10T00:00:00Z", now, 30.0) - 1.0).abs() < 1e-9);
         // unparseable -> neutral 1.0
         assert_eq!(recency_weight("not-a-date", now, 30.0), 1.0);
+    }
+
+    #[test]
+    fn rrf_keeps_the_true_fused_score_for_recency_weighting() {
+        let fused = rrf_fuse(
+            vec![(1, hit("vector-only")), (2, hit("shared"))],
+            vec![(2, hit("shared")), (3, hit("fts-only"))],
+            3,
+        );
+
+        assert_eq!(fused[0].0.text, "shared");
+        assert!((fused[0].1 - (1.0 / 60.0 + 1.0 / 61.0)).abs() < 1e-7);
+        for (hit, score) in &fused[1..] {
+            assert!(
+                (*score - 1.0 / 60.0).abs() < 1e-7 || (*score - 1.0 / 61.0).abs() < 1e-7,
+                "{} kept an invented rank score: {score}",
+                hit.text
+            );
+        }
+    }
+
+    #[test]
+    fn reranker_score_contract_only_sigmoids_local_logits() {
+        assert!((rerank_relevance(RerankScoreKind::Logit, 0.0) - 0.5).abs() < f64::EPSILON);
+        assert!((rerank_relevance(RerankScoreKind::Relevance, 0.1) - 0.1).abs() < 1e-7);
     }
 }

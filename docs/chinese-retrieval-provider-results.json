@@ -1,0 +1,901 @@
+{
+  "status": "completed",
+  "recorded_at": "2026-09-12T21:29:41.585465+00:00",
+  "benchmark_kind": "provider_backed_native_funes_chinese_retrieval_v2",
+  "provider": {
+    "protocol": "OpenAI-compatible chat completions",
+    "endpoint": "https://router.huggingface.co/v1/chat/completions",
+    "model": "Qwen/Qwen3-4B-Instruct-2507",
+    "credential_source": "environment variable HF_TOKEN_BOLIKOTO",
+    "credential_value_recorded": false,
+    "document_prompt_version": "funes-retrieval-v2",
+    "document_prompt_sha256": "51126f284ab95de720dad59e66ab63f26a79fd0cd31f5a414a36aa0c2d90f45f",
+    "document_max_tokens": null,
+    "query_prompt_version": "funes-query-retrieval-v1",
+    "query_prompt_sha256": "6574a0472e612b842161a752af4d28d68a72f22b5e48c46e53a078c0562310a1",
+    "query_max_tokens": 128,
+    "request_attempts": 44,
+    "request_seconds": 58.911,
+    "checkpoint_reused_for_retrieval": false
+  },
+  "dataset": {
+    "fixture": "scripts/benchmark_chinese_retrieval.py",
+    "memories": 60,
+    "queries": 20,
+    "unique_provider_inputs": 44,
+    "document_provider_inputs": 24,
+    "query_provider_inputs": 20,
+    "query_fallbacks": 1
+  },
+  "retrieval": {
+    "backend": "native Funes Lance vector + BM25 + cross-encoder rerank",
+    "embedding_model": "BAAI/bge-small-en-v1.5",
+    "k": 5,
+    "candidates": 12,
+    "neighbors": 0,
+    "half_life": 0
+  },
+  "method": {
+    "before": "canonical retrieval_text contains raw Chinese and queries use raw Chinese",
+    "after": "canonical retrieval_text contains only document-prompt provider shadows; queries use query-prompt rewrites or raw-query fallback after service-equivalent validation",
+    "ingestion": "both arms use funes ingest-docs with explicit local --memory paths; no transcript or raw_text sidecar is indexed",
+    "isolation": "each arm has a separate temporary FUNES_HOME and local memory path; temporary files are removed after the run"
+  },
+  "before": {
+    "recall@1": 0.75,
+    "recall@3": 0.9,
+    "recall@5": 0.9,
+    "index_seconds": 1.817,
+    "mean_query_seconds": 0.272
+  },
+  "after": {
+    "recall@1": 0.7,
+    "recall@3": 0.9,
+    "recall@5": 0.9,
+    "index_seconds": 1.469,
+    "mean_query_seconds": 0.256
+  },
+  "delta": {
+    "recall@1": -0.05,
+    "recall@3": 0.0,
+    "recall@5": 0.0
+  },
+  "rows": [
+    {
+      "query": "CPA 第二轮为什么丢上下文？",
+      "provider_query_shadow": "Why does CPA lose context in round two?",
+      "provider_query_output": "Why does CPA lose context in round two?",
+      "effective_retrieval_query": "Why does CPA lose context in round two?",
+      "query_validation_status": "accepted",
+      "expected": "codex-cpa",
+      "before_rank": 1,
+      "after_rank": 1,
+      "before_seconds": 1.521,
+      "after_seconds": 1.006
+    },
+    {
+      "query": "之前 Pi 里讨论过的 Tailscale 延迟",
+      "provider_query_shadow": "Tailscale latency discussed previously in Pi",
+      "provider_query_output": "Tailscale latency discussed previously in Pi",
+      "effective_retrieval_query": "Tailscale latency discussed previously in Pi",
+      "query_validation_status": "accepted",
+      "expected": "pi-tailscale",
+      "before_rank": 3,
+      "after_rank": 2,
+      "before_seconds": 0.196,
+      "after_seconds": 0.189
+    },
+    {
+      "query": "Gemini 默认 reasoning 配置是什么？",
+      "provider_query_shadow": "What is the default reasoning configuration for Gemini?",
+      "provider_query_output": "What is the default reasoning configuration for Gemini?",
+      "effective_retrieval_query": "What is the default reasoning configuration for Gemini?",
+      "query_validation_status": "accepted",
+      "expected": "codex-gemini",
+      "before_rank": 1,
+      "after_rank": 1,
+      "before_seconds": 0.214,
+      "after_seconds": 0.179
+    },
+    {
+      "query": "chatcmpl-* 和 previous_response_id 的关系",
+      "provider_query_shadow": "Relationship between chatcmpl-* and previous_response_id",
+      "provider_query_output": "Relationship between chatcmpl-* and previous_response_id",
+      "effective_retrieval_query": "Relationship between chatcmpl-* and previous_response_id",
+      "query_validation_status": "accepted",
+      "expected": "codex-chatcmpl",
+      "before_rank": 1,
+      "after_rank": 1,
+      "before_seconds": 0.216,
+      "after_seconds": 0.256
+    },
+    {
+      "query": "Claude 的后台任务如何保持运行？",
+      "provider_query_shadow": "How does Claude's background task maintain runtime?",
+      "provider_query_output": "How does Claude's background task maintain runtime?",
+      "effective_retrieval_query": "How does Claude's background task maintain runtime?",
+      "query_validation_status": "accepted",
+      "expected": "claude-launchd",
+      "before_rank": 1,
+      "after_rank": 2,
+      "before_seconds": 0.21,
+      "after_seconds": 0.224
+    },
+    {
+      "query": "HF Space 重启后如何恢复记忆？",
+      "provider_query_shadow": "How to restore memory after restarting HF Space?",
+      "provider_query_output": "How to restore memory after restarting HF Space?",
+      "effective_retrieval_query": "How to restore memory after restarting HF Space?",
+      "query_validation_status": "accepted",
+      "expected": "codex-hf",
+      "before_rank": 1,
+      "after_rank": null,
+      "before_seconds": 0.171,
+      "after_seconds": 0.23
+    },
+    {
+      "query": "Pi 和 Surge 共存要注意什么？",
+      "provider_query_shadow": "What should be noted when Pi and Surge are used together?",
+      "provider_query_output": "What should be noted when Pi and Surge are used together?",
+      "effective_retrieval_query": "What should be noted when Pi and Surge are used together?",
+      "query_validation_status": "accepted",
+      "expected": "pi-surge",
+      "before_rank": 1,
+      "after_rank": 1,
+      "before_seconds": 0.185,
+      "after_seconds": 0.231
+    },
+    {
+      "query": "social_signal 查询前为什么要看字段？",
+      "provider_query_shadow": "Why check fields before querying social_signal?",
+      "provider_query_output": "Why check fields before querying social_signal?",
+      "effective_retrieval_query": "Why check fields before querying social_signal?",
+      "query_validation_status": "accepted",
+      "expected": "codex-d1",
+      "before_rank": 1,
+      "after_rank": 1,
+      "before_seconds": 0.231,
+      "after_seconds": 0.279
+    },
+    {
+      "query": "tool_result 在检索中应该怎样处理？",
+      "provider_query_shadow": "How should tool_result be handled in retrieval?",
+      "provider_query_output": "How should tool_result be handled in retrieval?",
+      "effective_retrieval_query": "How should tool_result be handled in retrieval?",
+      "query_validation_status": "accepted",
+      "expected": "claude-bm25",
+      "before_rank": 1,
+      "after_rank": 1,
+      "before_seconds": 0.218,
+      "after_seconds": 0.28
+    },
+    {
+      "query": "断网时 Pi 的记忆会丢吗？",
+      "provider_query_shadow": "Will Pi's memory be lost when offline?",
+      "provider_query_output": "Will Pi's memory be lost when offline?",
+      "effective_retrieval_query": "Will Pi's memory be lost when offline?",
+      "query_validation_status": "accepted",
+      "expected": "pi-offline",
+      "before_rank": 1,
+      "after_rank": 1,
+      "before_seconds": 0.233,
+      "after_seconds": 0.183
+    },
+    {
+      "query": "部署失败怎样自动恢复？",
+      "provider_query_shadow": "how to automatically recover from deployment failure?",
+      "provider_query_output": "how to automatically recover from deployment failure?",
+      "effective_retrieval_query": "how to automatically recover from deployment failure?",
+      "query_validation_status": "accepted",
+      "expected": "codex-rollback",
+      "before_rank": 1,
+      "after_rank": 1,
+      "before_seconds": 0.215,
+      "after_seconds": 0.227
+    },
+    {
+      "query": "raw_text 和 retrieval_text 谁是真源？",
+      "provider_query_shadow": "Which is the true source, raw_text or retrieval_text?",
+      "provider_query_output": "Which is the true source, raw_text or retrieval_text?",
+      "effective_retrieval_query": "Which is the true source, raw_text or retrieval_text?",
+      "query_validation_status": "accepted",
+      "expected": "claude-raw",
+      "before_rank": 1,
+      "after_rank": 1,
+      "before_seconds": 0.214,
+      "after_seconds": 0.231
+    },
+    {
+      "query": "Pi 能不能搜 Codex？",
+      "provider_query_shadow": "Can Pi search Codex?",
+      "provider_query_output": "Can Pi search Codex?",
+      "effective_retrieval_query": "Can Pi search Codex?",
+      "query_validation_status": "accepted",
+      "expected": "pi-cross",
+      "before_rank": 1,
+      "after_rank": 2,
+      "before_seconds": 0.189,
+      "after_seconds": 0.299
+    },
+    {
+      "query": "多台 Mac 如何避免泄露硬件标识？",
+      "provider_query_shadow": "多台 Mac 如何避免泄露硬件标识？",
+      "provider_query_output": "how to prevent hardware identifiers from leaking on multiple mac devices",
+      "effective_retrieval_query": "多台 Mac 如何避免泄露硬件标识？",
+      "query_validation_status": "fallback_invalid_query",
+      "expected": "codex-device",
+      "before_rank": 1,
+      "after_rank": 1,
+      "before_seconds": 0.201,
+      "after_seconds": 0.186
+    },
+    {
+      "query": "Claude 扫描时哪些文件不能上传？",
+      "provider_query_shadow": "Which files cannot be uploaded during Claude scanning?",
+      "provider_query_output": "Which files cannot be uploaded during Claude scanning?",
+      "effective_retrieval_query": "Which files cannot be uploaded during Claude scanning?",
+      "query_validation_status": "accepted",
+      "expected": "claude-secret",
+      "before_rank": 1,
+      "after_rank": 1,
+      "before_seconds": 0.196,
+      "after_seconds": 0.184
+    },
+    {
+      "query": "watcher 监听哪些变化？",
+      "provider_query_shadow": "watcher monitors what changes?",
+      "provider_query_output": "watcher monitors what changes?",
+      "effective_retrieval_query": "watcher monitors what changes?",
+      "query_validation_status": "accepted",
+      "expected": "distractor-watcher-0",
+      "before_rank": 2,
+      "after_rank": 2,
+      "before_seconds": 0.188,
+      "after_seconds": 0.161
+    },
+    {
+      "query": "重复扫描如何去重？",
+      "provider_query_shadow": "how to deduplicate repeated scans?",
+      "provider_query_output": "how to deduplicate repeated scans?",
+      "effective_retrieval_query": "how to deduplicate repeated scans?",
+      "query_validation_status": "accepted",
+      "expected": "distractor-dedupe-0",
+      "before_rank": null,
+      "after_rank": 1,
+      "before_seconds": 0.221,
+      "after_seconds": 0.205
+    },
+    {
+      "query": "换 embedding 模型如何重建？",
+      "provider_query_shadow": "How to reinitialize the embedding model?",
+      "provider_query_output": "How to reinitialize the embedding model?",
+      "effective_retrieval_query": "How to reinitialize the embedding model?",
+      "query_validation_status": "accepted",
+      "expected": "distractor-reindex-0",
+      "before_rank": null,
+      "after_rank": null,
+      "before_seconds": 0.209,
+      "after_seconds": 0.195
+    },
+    {
+      "query": "远程 MCP 挂了怎么办？",
+      "provider_query_shadow": "What should I do if the remote MCP fails?",
+      "provider_query_output": "What should I do if the remote MCP fails?",
+      "effective_retrieval_query": "What should I do if the remote MCP fails?",
+      "query_validation_status": "accepted",
+      "expected": "distractor-mcp-0",
+      "before_rank": 2,
+      "after_rank": 1,
+      "before_seconds": 0.206,
+      "after_seconds": 0.194
+    },
+    {
+      "query": "日志时区怎么对齐？",
+      "provider_query_shadow": "how to align log timezones?",
+      "provider_query_output": "how to align log timezones?",
+      "effective_retrieval_query": "how to align log timezones?",
+      "query_validation_status": "accepted",
+      "expected": "distractor-logs-0",
+      "before_rank": 1,
+      "after_rank": 1,
+      "before_seconds": 0.21,
+      "after_seconds": 0.182
+    }
+  ],
+  "document_shadows": [
+    {
+      "id": "codex-cpa",
+      "provider_shadow": "Deployed CPA on Northflank; second round of previous_response_id causes context loss."
+    },
+    {
+      "id": "pi-tailscale",
+      "provider_shadow": "MacBook Pro experiencing high latency when connecting to Office Mac mini via Tailscale"
+    },
+    {
+      "id": "codex-gemini",
+      "provider_shadow": "default Gemini uses high reasoning effort"
+    },
+    {
+      "id": "codex-chatcmpl",
+      "provider_shadow": "Codex calls CPA with previous_response_id containing \"chatcmpl-*\", causing loss of second turn context."
+    },
+    {
+      "id": "claude-launchd",
+      "provider_shadow": "Claude Code LaunchAgent must use KeepAlive and retrieve token from Keychain."
+    },
+    {
+      "id": "codex-hf",
+      "provider_shadow": "Hugging Face Space restart; recover raw_text using private dataset; embedding reconstruction successful"
+    },
+    {
+      "id": "pi-surge",
+      "provider_shadow": "Pi records coexistence of Surge and Tailscale userspace without compromising existing proxy configurations."
+    },
+    {
+      "id": "codex-d1",
+      "provider_shadow": "retrieval keywords: D1, social_signal, SHOW COLUMNS, schema, column schema, schema inference, query constraint, schema validation, database schema inspection, avoid guessing schema, explicit schema check"
+    },
+    {
+      "id": "claude-bm25",
+      "provider_shadow": "Claude memory retrieval defaults to retaining BM25 and downweights tool_result."
+    },
+    {
+      "id": "pi-offline",
+      "provider_shadow": "Pi queues uploads in pending state during offline mode and implements exponential backoff retry upon network restoration."
+    },
+    {
+      "id": "codex-rollback",
+      "provider_shadow": "Deployment must include health probe and automatic rollback; relying solely on CI green status is insufficient."
+    },
+    {
+      "id": "claude-raw",
+      "provider_shadow": "original session is the source of truth; retrieval_text is a derived shadow."
+    },
+    {
+      "id": "pi-cross",
+      "provider_shadow": "query: Pi query Codex history with source_agent=codex metadata preserved"
+    },
+    {
+      "id": "codex-device",
+      "provider_shadow": "privacy-safe device_id across multiple Mac devices; no MAC address upload"
+    },
+    {
+      "id": "claude-secret",
+      "provider_shadow": "Scan the Claude project to exclude auth.json, .env, and credentials."
+    },
+    {
+      "id": "distractor-latency-0",
+      "provider_shadow": "Retrieve latency issues by analyzing TCP handshake sequences, log timestamps, and metrics data."
+    },
+    {
+      "id": "distractor-memory-0",
+      "provider_shadow": "Retrieve resident-memory sources for memory fixation deployment; do not directly increase memory limits."
+    },
+    {
+      "id": "distractor-release-0",
+      "provider_shadow": "Before release, must read-back remote SHA and service status."
+    },
+    {
+      "id": "distractor-logs-0",
+      "provider_shadow": "Grafana Loki query aligns log timestamps by UTC and local UTC+8 timezone."
+    },
+    {
+      "id": "distractor-config-0",
+      "provider_shadow": "configuration file saves only token_env, not API key"
+    },
+    {
+      "id": "distractor-watcher-0",
+      "provider_shadow": "file watcher processes only: create, modify, rename, append"
+    },
+    {
+      "id": "distractor-dedupe-0",
+      "provider_shadow": "Stabilize source_identity to prevent memory increase during repeated scans."
+    },
+    {
+      "id": "distractor-reindex-0",
+      "provider_shadow": "Switch from BGE-M3: reconstruct retrieval index using raw_text."
+    },
+    {
+      "id": "distractor-mcp-0",
+      "provider_shadow": "When remote MCP is unavailable, fall back to local stdio bridge."
+    },
+    {
+      "id": "distractor-latency-1",
+      "provider_shadow": "Retrieve latency issues by analyzing TCP handshake sequences, log timestamps, and metrics data."
+    },
+    {
+      "id": "distractor-memory-1",
+      "provider_shadow": "Retrieve resident-memory sources for memory fixation deployment; do not directly increase memory limits."
+    },
+    {
+      "id": "distractor-release-1",
+      "provider_shadow": "Before release, must read-back remote SHA and service status."
+    },
+    {
+      "id": "distractor-logs-1",
+      "provider_shadow": "Grafana Loki query aligns log timestamps by UTC and local UTC+8 timezone."
+    },
+    {
+      "id": "distractor-config-1",
+      "provider_shadow": "configuration file saves only token_env, not API key"
+    },
+    {
+      "id": "distractor-watcher-1",
+      "provider_shadow": "file watcher processes only: create, modify, rename, append"
+    },
+    {
+      "id": "distractor-dedupe-1",
+      "provider_shadow": "Stabilize source_identity to prevent memory increase during repeated scans."
+    },
+    {
+      "id": "distractor-reindex-1",
+      "provider_shadow": "Switch from BGE-M3: reconstruct retrieval index using raw_text."
+    },
+    {
+      "id": "distractor-mcp-1",
+      "provider_shadow": "When remote MCP is unavailable, fall back to local stdio bridge."
+    },
+    {
+      "id": "distractor-latency-2",
+      "provider_shadow": "Retrieve latency issues by analyzing TCP handshake sequences, log timestamps, and metrics data."
+    },
+    {
+      "id": "distractor-memory-2",
+      "provider_shadow": "Retrieve resident-memory sources for memory fixation deployment; do not directly increase memory limits."
+    },
+    {
+      "id": "distractor-release-2",
+      "provider_shadow": "Before release, must read-back remote SHA and service status."
+    },
+    {
+      "id": "distractor-logs-2",
+      "provider_shadow": "Grafana Loki query aligns log timestamps by UTC and local UTC+8 timezone."
+    },
+    {
+      "id": "distractor-config-2",
+      "provider_shadow": "configuration file saves only token_env, not API key"
+    },
+    {
+      "id": "distractor-watcher-2",
+      "provider_shadow": "file watcher processes only: create, modify, rename, append"
+    },
+    {
+      "id": "distractor-dedupe-2",
+      "provider_shadow": "Stabilize source_identity to prevent memory increase during repeated scans."
+    },
+    {
+      "id": "distractor-reindex-2",
+      "provider_shadow": "Switch from BGE-M3: reconstruct retrieval index using raw_text."
+    },
+    {
+      "id": "distractor-mcp-2",
+      "provider_shadow": "When remote MCP is unavailable, fall back to local stdio bridge."
+    },
+    {
+      "id": "distractor-latency-3",
+      "provider_shadow": "Retrieve latency issues by analyzing TCP handshake sequences, log timestamps, and metrics data."
+    },
+    {
+      "id": "distractor-memory-3",
+      "provider_shadow": "Retrieve resident-memory sources for memory fixation deployment; do not directly increase memory limits."
+    },
+    {
+      "id": "distractor-release-3",
+      "provider_shadow": "Before release, must read-back remote SHA and service status."
+    },
+    {
+      "id": "distractor-logs-3",
+      "provider_shadow": "Grafana Loki query aligns log timestamps by UTC and local UTC+8 timezone."
+    },
+    {
+      "id": "distractor-config-3",
+      "provider_shadow": "configuration file saves only token_env, not API key"
+    },
+    {
+      "id": "distractor-watcher-3",
+      "provider_shadow": "file watcher processes only: create, modify, rename, append"
+    },
+    {
+      "id": "distractor-dedupe-3",
+      "provider_shadow": "Stabilize source_identity to prevent memory increase during repeated scans."
+    },
+    {
+      "id": "distractor-reindex-3",
+      "provider_shadow": "Switch from BGE-M3: reconstruct retrieval index using raw_text."
+    },
+    {
+      "id": "distractor-mcp-3",
+      "provider_shadow": "When remote MCP is unavailable, fall back to local stdio bridge."
+    },
+    {
+      "id": "distractor-latency-4",
+      "provider_shadow": "Retrieve latency issues by analyzing TCP handshake sequences, log timestamps, and metrics data."
+    },
+    {
+      "id": "distractor-memory-4",
+      "provider_shadow": "Retrieve resident-memory sources for memory fixation deployment; do not directly increase memory limits."
+    },
+    {
+      "id": "distractor-release-4",
+      "provider_shadow": "Before release, must read-back remote SHA and service status."
+    },
+    {
+      "id": "distractor-logs-4",
+      "provider_shadow": "Grafana Loki query aligns log timestamps by UTC and local UTC+8 timezone."
+    },
+    {
+      "id": "distractor-config-4",
+      "provider_shadow": "configuration file saves only token_env, not API key"
+    },
+    {
+      "id": "distractor-watcher-4",
+      "provider_shadow": "file watcher processes only: create, modify, rename, append"
+    },
+    {
+      "id": "distractor-dedupe-4",
+      "provider_shadow": "Stabilize source_identity to prevent memory increase during repeated scans."
+    },
+    {
+      "id": "distractor-reindex-4",
+      "provider_shadow": "Switch from BGE-M3: reconstruct retrieval index using raw_text."
+    },
+    {
+      "id": "distractor-mcp-4",
+      "provider_shadow": "When remote MCP is unavailable, fall back to local stdio bridge."
+    }
+  ],
+  "provider_outputs": [
+    {
+      "input_type": "document",
+      "input_sha256": "e75dd42775f651a1369c9dc2010767090611ee3dd5381491b8dae5a61a691b06",
+      "input": "我把 CPA 部署在 Northflank 上，第二轮 previous_response_id 会导致上下文丢失。",
+      "output": "Deployed CPA on Northflank; second round of previous_response_id causes context loss.",
+      "effective_output": "Deployed CPA on Northflank; second round of previous_response_id causes context loss.",
+      "validation_status": "accepted"
+    },
+    {
+      "input_type": "document",
+      "input_sha256": "32b847d44266c37aad2c2bc2f086a5a0268be49811c4622e6afd8949230ac7f1",
+      "input": "MacBook Pro 通过 Tailscale 连接办公室 Mac mini 时出现高延迟。",
+      "output": "MacBook Pro experiencing high latency when connecting to Office Mac mini via Tailscale",
+      "effective_output": "MacBook Pro experiencing high latency when connecting to Office Mac mini via Tailscale",
+      "validation_status": "accepted"
+    },
+    {
+      "input_type": "document",
+      "input_sha256": "9af1c8c1772bba3364912ad9f44918abfdb03702847d42e681d4f15fc892ceb6",
+      "input": "默认 Gemini 使用 High reasoning effort。",
+      "output": "default Gemini uses high reasoning effort",
+      "effective_output": "default Gemini uses high reasoning effort",
+      "validation_status": "accepted"
+    },
+    {
+      "input_type": "document",
+      "input_sha256": "a94b3e5eccad80af817bac287ff1f2d5346e3edc28af5c19f6bf32e19fd8229e",
+      "input": "Codex 调用 CPA 时 previous_response_id 返回 chatcmpl-* 导致 second turn context 丢失。",
+      "output": "Codex calls CPA with previous_response_id containing \"chatcmpl-*\", causing loss of second turn context.",
+      "effective_output": "Codex calls CPA with previous_response_id containing \"chatcmpl-*\", causing loss of second turn context.",
+      "validation_status": "accepted"
+    },
+    {
+      "input_type": "document",
+      "input_sha256": "0b9a8ffee49dcd6c955c48089b25967a4f05f2cf467b82a7b56a22ee09530d85",
+      "input": "Claude Code 的 LaunchAgent 必须使用 KeepAlive，并从 Keychain 读取 token。",
+      "output": "Claude Code LaunchAgent must use KeepAlive and retrieve token from Keychain.",
+      "effective_output": "Claude Code LaunchAgent must use KeepAlive and retrieve token from Keychain.",
+      "validation_status": "accepted"
+    },
+    {
+      "input_type": "document",
+      "input_sha256": "d8d4d455fe6ff8bab07867c4565523bb82225074f3eb04d362712628bc08838d",
+      "input": "Hugging Face Space 重启后用私有 dataset 恢复 raw_text，embedding 可以重建。",
+      "output": "Hugging Face Space restart; recover raw_text using private dataset; embedding reconstruction successful",
+      "effective_output": "Hugging Face Space restart; recover raw_text using private dataset; embedding reconstruction successful",
+      "validation_status": "accepted"
+    },
+    {
+      "input_type": "document",
+      "input_sha256": "c7c0987583350d2a7f8594051b6fc4c103cd3e9078427ec0e148bc5afbb513aa",
+      "input": "Pi 里记录过 Surge 与 Tailscale userspace 共存，不能改坏现有代理。",
+      "output": "Pi records coexistence of Surge and Tailscale userspace without compromising existing proxy configurations.",
+      "effective_output": "Pi records coexistence of Surge and Tailscale userspace without compromising existing proxy configurations.",
+      "validation_status": "accepted"
+    },
+    {
+      "input_type": "document",
+      "input_sha256": "0818bdd288c9b3bdaaed1688b5ccf0554e196106a7b533e9171bf4475f94f019",
+      "input": "D1 social_signal 查询必须先 SHOW COLUMNS，不能猜 schema。",
+      "output": "retrieval keywords: D1, social_signal, SHOW COLUMNS, schema, column schema, schema inference, query constraint, schema validation, database schema inspection, avoid guessing schema, explicit schema check",
+      "effective_output": "retrieval keywords: D1, social_signal, SHOW COLUMNS, schema, column schema, schema inference, query constraint, schema validation, database schema inspection, avoid guessing schema, explicit schema check",
+      "validation_status": "accepted"
+    },
+    {
+      "input_type": "document",
+      "input_sha256": "dd136f8a30d3bdf47f6712651df64101d3cc41a7f4cbeca0b0ff257584d5a15c",
+      "input": "Claude 记忆检索默认保留 BM25，并把 tool_result 降权。",
+      "output": "Claude memory retrieval defaults to retaining BM25 and downweights tool_result.",
+      "effective_output": "Claude memory retrieval defaults to retaining BM25 and downweights tool_result.",
+      "validation_status": "accepted"
+    },
+    {
+      "input_type": "document",
+      "input_sha256": "884f2ee10757187991697298e88edc63b4e7a13699b9b564b4195a5875a51c72",
+      "input": "Pi 离线时把上传放入 pending queue，恢复网络后指数退避重试。",
+      "output": "Pi queues uploads in pending state during offline mode and implements exponential backoff retry upon network restoration.",
+      "effective_output": "Pi queues uploads in pending state during offline mode and implements exponential backoff retry upon network restoration.",
+      "validation_status": "accepted"
+    },
+    {
+      "input_type": "document",
+      "input_sha256": "de1220304e7cce16617cecb6ff01703dc767746db8e99a9b4f26be4c40f2217e",
+      "input": "部署必须带 health probe 和 automatic rollback，不能只看 CI 绿色。",
+      "output": "Deployment must include health probe and automatic rollback; relying solely on CI green status is insufficient.",
+      "effective_output": "Deployment must include health probe and automatic rollback; relying solely on CI green status is insufficient.",
+      "validation_status": "accepted"
+    },
+    {
+      "input_type": "document",
+      "input_sha256": "6f4302a6d45333d4685fe5f9440055d022e8ff8aa57bb7ed09c7e634cc982677",
+      "input": "原始 session 永远是 source of truth，retrieval_text 只能是 derived shadow。",
+      "output": "original session is the source of truth; retrieval_text is a derived shadow.",
+      "effective_output": "original session is the source of truth; retrieval_text is a derived shadow.",
+      "validation_status": "accepted"
+    },
+    {
+      "input_type": "document",
+      "input_sha256": "1ff68eba826ddf386fc14fe8fa0bf40b946e4a133d5774d6e952ee7d2b3b69cc",
+      "input": "Pi 查询 Codex 历史时保留 source_agent=codex metadata。",
+      "output": "query: Pi query Codex history with source_agent=codex metadata preserved",
+      "effective_output": "query: Pi query Codex history with source_agent=codex metadata preserved",
+      "validation_status": "accepted"
+    },
+    {
+      "input_type": "document",
+      "input_sha256": "60a55839a3515e70b154c01f17a32e0fc9f1acaadf3ab31f09d720c0fb3b3a1b",
+      "input": "多台 Mac 使用 privacy-safe device_id，不能上传 MAC address。",
+      "output": "privacy-safe device_id across multiple Mac devices; no MAC address upload",
+      "effective_output": "privacy-safe device_id across multiple Mac devices; no MAC address upload",
+      "validation_status": "accepted"
+    },
+    {
+      "input_type": "document",
+      "input_sha256": "ff631d40eaec5437022616b1bc0dafe4220456dddf89b1e929e34802f16a0b47",
+      "input": "Claude 项目扫描要排除 auth.json、.env 和 credentials。",
+      "output": "Scan the Claude project to exclude auth.json, .env, and credentials.",
+      "effective_output": "Scan the Claude project to exclude auth.json, .env, and credentials.",
+      "validation_status": "accepted"
+    },
+    {
+      "input_type": "document",
+      "input_sha256": "747efe286389cd6927e2f53343153823516b87d34f9f5a37e21acc6ac93eacc7",
+      "input": "延迟排查要同时看 TCP handshake、日志时间戳和 metrics。",
+      "output": "Retrieve latency issues by analyzing TCP handshake sequences, log timestamps, and metrics data.",
+      "effective_output": "Retrieve latency issues by analyzing TCP handshake sequences, log timestamps, and metrics data.",
+      "validation_status": "accepted"
+    },
+    {
+      "input_type": "document",
+      "input_sha256": "a35d4e90e74ef935b521310166b9516c64bb5d39154df342227b77dc1a84b850",
+      "input": "固定 memory 部署先定位 resident-memory 来源，不能直接调大限制。",
+      "output": "Retrieve resident-memory sources for memory fixation deployment; do not directly increase memory limits.",
+      "effective_output": "Retrieve resident-memory sources for memory fixation deployment; do not directly increase memory limits.",
+      "validation_status": "accepted"
+    },
+    {
+      "input_type": "document",
+      "input_sha256": "23ddee769ba096b3d934aa8456e83be72adb60bf577e4be09d2fdb4b2b8108cd",
+      "input": "发布前必须 read-back remote SHA 和服务状态。",
+      "output": "Before release, must read-back remote SHA and service status.",
+      "effective_output": "Before release, must read-back remote SHA and service status.",
+      "validation_status": "accepted"
+    },
+    {
+      "input_type": "document",
+      "input_sha256": "763f8d7a4f4bc3a76919225687695beb6adc30b8b6b8b9ad502e9192e25c8878",
+      "input": "Grafana Loki 查询按 UTC 日志和本地 UTC+8 对齐。",
+      "output": "Grafana Loki query aligns log timestamps by UTC and local UTC+8 timezone.",
+      "effective_output": "Grafana Loki query aligns log timestamps by UTC and local UTC+8 timezone.",
+      "validation_status": "accepted"
+    },
+    {
+      "input_type": "document",
+      "input_sha256": "3673b1811d9f97826205ad03433708be8f9eece2efed84692e97adc8664248ae",
+      "input": "配置文件不保存 API key，只保存 token_env。",
+      "output": "configuration file saves only token_env, not API key",
+      "effective_output": "configuration file saves only token_env, not API key",
+      "validation_status": "accepted"
+    },
+    {
+      "input_type": "document",
+      "input_sha256": "3f59d9ce41140765c0abc84018ea88e36166866b86c929ef2be28be2151ca66f",
+      "input": "文件 watcher 只处理 create、modify、rename、append。",
+      "output": "file watcher processes only: create, modify, rename, append",
+      "effective_output": "file watcher processes only: create, modify, rename, append",
+      "validation_status": "accepted"
+    },
+    {
+      "input_type": "document",
+      "input_sha256": "d1665c9d505bbe1386c0fbeb7126409ae48914750f822853ee8c634fbc8263bc",
+      "input": "稳定 source_identity 让重复扫描不会增加 memory 数量。",
+      "output": "Stabilize source_identity to prevent memory increase during repeated scans.",
+      "effective_output": "Stabilize source_identity to prevent memory increase during repeated scans.",
+      "validation_status": "accepted"
+    },
+    {
+      "input_type": "document",
+      "input_sha256": "92a11045270fc62d4ecfe696ccdca02189af687ed91228be74932aeea18825ef",
+      "input": "切换 BGE-M3 前从 raw_text 重建 retrieval index。",
+      "output": "Switch from BGE-M3: reconstruct retrieval index using raw_text.",
+      "effective_output": "Switch from BGE-M3: reconstruct retrieval index using raw_text.",
+      "validation_status": "accepted"
+    },
+    {
+      "input_type": "document",
+      "input_sha256": "0d348d839e1f58f9ab4bfb0e8be4c00bfeec42ce2351d34bf736eceeb642de16",
+      "input": "远程 MCP 不可用时使用本地 stdio bridge。",
+      "output": "When remote MCP is unavailable, fall back to local stdio bridge.",
+      "effective_output": "When remote MCP is unavailable, fall back to local stdio bridge.",
+      "validation_status": "accepted"
+    },
+    {
+      "input_type": "query",
+      "input_sha256": "ce588de7a2ddd5fda569ad205399dd6f92b5fe991507e4d431c5a38e69a8cc12",
+      "input": "CPA 第二轮为什么丢上下文？",
+      "output": "Why does CPA lose context in round two?",
+      "effective_output": "Why does CPA lose context in round two?",
+      "validation_status": "accepted"
+    },
+    {
+      "input_type": "query",
+      "input_sha256": "7ebfb6681ba88a016f72590399d3f80053033bcf9a637cf0c338d23842eab15f",
+      "input": "之前 Pi 里讨论过的 Tailscale 延迟",
+      "output": "Tailscale latency discussed previously in Pi",
+      "effective_output": "Tailscale latency discussed previously in Pi",
+      "validation_status": "accepted"
+    },
+    {
+      "input_type": "query",
+      "input_sha256": "310d8ba91f942ab51895cd2281d4f59861d721d852a8e47995094bf410c1ac8f",
+      "input": "Gemini 默认 reasoning 配置是什么？",
+      "output": "What is the default reasoning configuration for Gemini?",
+      "effective_output": "What is the default reasoning configuration for Gemini?",
+      "validation_status": "accepted"
+    },
+    {
+      "input_type": "query",
+      "input_sha256": "7e8421ed4a48c94dccbabc9e8bc32bdfe63f2e74056aacd1b8c9ae475d8f3bf9",
+      "input": "chatcmpl-* 和 previous_response_id 的关系",
+      "output": "Relationship between chatcmpl-* and previous_response_id",
+      "effective_output": "Relationship between chatcmpl-* and previous_response_id",
+      "validation_status": "accepted"
+    },
+    {
+      "input_type": "query",
+      "input_sha256": "aab3c4b4d93dbd9f950013739cd1dbc8cbcb881fb40b6a670f50f1101bc4a07e",
+      "input": "Claude 的后台任务如何保持运行？",
+      "output": "How does Claude's background task maintain runtime?",
+      "effective_output": "How does Claude's background task maintain runtime?",
+      "validation_status": "accepted"
+    },
+    {
+      "input_type": "query",
+      "input_sha256": "236f08e3329d2a79b63b1f1a642d98064409f47dfcd96e51d4070d958f60e885",
+      "input": "HF Space 重启后如何恢复记忆？",
+      "output": "How to restore memory after restarting HF Space?",
+      "effective_output": "How to restore memory after restarting HF Space?",
+      "validation_status": "accepted"
+    },
+    {
+      "input_type": "query",
+      "input_sha256": "6eab82102a8dac92052fb4c31818a58e33e3a1d5e41e135f7217dd2fbed78f6d",
+      "input": "Pi 和 Surge 共存要注意什么？",
+      "output": "What should be noted when Pi and Surge are used together?",
+      "effective_output": "What should be noted when Pi and Surge are used together?",
+      "validation_status": "accepted"
+    },
+    {
+      "input_type": "query",
+      "input_sha256": "7ec0c8dcb9762a8940db4c6570fd2adcbb89ac151e3f9b92b1654238a341ae41",
+      "input": "social_signal 查询前为什么要看字段？",
+      "output": "Why check fields before querying social_signal?",
+      "effective_output": "Why check fields before querying social_signal?",
+      "validation_status": "accepted"
+    },
+    {
+      "input_type": "query",
+      "input_sha256": "cee25196ee422f017a2830687168c7e09742880e999672999b41e5c92d87b86e",
+      "input": "tool_result 在检索中应该怎样处理？",
+      "output": "How should tool_result be handled in retrieval?",
+      "effective_output": "How should tool_result be handled in retrieval?",
+      "validation_status": "accepted"
+    },
+    {
+      "input_type": "query",
+      "input_sha256": "330d1a748c258252adfe502cb93beb8ae6e6af1cc7ffca802e8dbe5660d0d7e1",
+      "input": "断网时 Pi 的记忆会丢吗？",
+      "output": "Will Pi's memory be lost when offline?",
+      "effective_output": "Will Pi's memory be lost when offline?",
+      "validation_status": "accepted"
+    },
+    {
+      "input_type": "query",
+      "input_sha256": "a1ae69016f2485f9d7f656bf0fb3514fe702142ac39a5b5a1f90797f3913f377",
+      "input": "部署失败怎样自动恢复？",
+      "output": "how to automatically recover from deployment failure?",
+      "effective_output": "how to automatically recover from deployment failure?",
+      "validation_status": "accepted"
+    },
+    {
+      "input_type": "query",
+      "input_sha256": "75370d39b2af76d028ebb0a3d3a33f25974f3c25fd55edce29a4cbeb55027705",
+      "input": "raw_text 和 retrieval_text 谁是真源？",
+      "output": "Which is the true source, raw_text or retrieval_text?",
+      "effective_output": "Which is the true source, raw_text or retrieval_text?",
+      "validation_status": "accepted"
+    },
+    {
+      "input_type": "query",
+      "input_sha256": "d93352f6d7c2e878102ec6d53ef1a609b053ee879fde4a2fcf969699031e5e37",
+      "input": "Pi 能不能搜 Codex？",
+      "output": "Can Pi search Codex?",
+      "effective_output": "Can Pi search Codex?",
+      "validation_status": "accepted"
+    },
+    {
+      "input_type": "query",
+      "input_sha256": "994c3347eb81226e1130c8b093b10ec98af948eeb7df57e49f2ec8434f6f0f50",
+      "input": "多台 Mac 如何避免泄露硬件标识？",
+      "output": "how to prevent hardware identifiers from leaking on multiple mac devices",
+      "effective_output": "多台 Mac 如何避免泄露硬件标识？",
+      "validation_status": "fallback_invalid_query"
+    },
+    {
+      "input_type": "query",
+      "input_sha256": "dcd3e55dee0981fe667bc10a3f49039cb5869213dc0eaf196c8774bf5cfd7dc8",
+      "input": "Claude 扫描时哪些文件不能上传？",
+      "output": "Which files cannot be uploaded during Claude scanning?",
+      "effective_output": "Which files cannot be uploaded during Claude scanning?",
+      "validation_status": "accepted"
+    },
+    {
+      "input_type": "query",
+      "input_sha256": "053ef5357dda7d1571dd09c7dfa4a6779941690332c6d888b6921db5e5a7ef7b",
+      "input": "watcher 监听哪些变化？",
+      "output": "watcher monitors what changes?",
+      "effective_output": "watcher monitors what changes?",
+      "validation_status": "accepted"
+    },
+    {
+      "input_type": "query",
+      "input_sha256": "f73e616481050cf1d6b3999c74a2047dcc7940498581be2fd9a97175e6159008",
+      "input": "重复扫描如何去重？",
+      "output": "how to deduplicate repeated scans?",
+      "effective_output": "how to deduplicate repeated scans?",
+      "validation_status": "accepted"
+    },
+    {
+      "input_type": "query",
+      "input_sha256": "273f53bd010aff5318c96f5bf6ec10420f8aa136ff7a4c35fb5fb5a776b20a14",
+      "input": "换 embedding 模型如何重建？",
+      "output": "How to reinitialize the embedding model?",
+      "effective_output": "How to reinitialize the embedding model?",
+      "validation_status": "accepted"
+    },
+    {
+      "input_type": "query",
+      "input_sha256": "aaa863707c337e4a9785cfe9c9d823d8cf9098edd0f84f996ae5d3beb3731cc5",
+      "input": "远程 MCP 挂了怎么办？",
+      "output": "What should I do if the remote MCP fails?",
+      "effective_output": "What should I do if the remote MCP fails?",
+      "validation_status": "accepted"
+    },
+    {
+      "input_type": "query",
+      "input_sha256": "2f1318fcffedbf514df83c72ec2e14cd0ef2e16bf05b6872494ac7a7ef8201ae",
+      "input": "日志时区怎么对齐？",
+      "output": "how to align log timezones?",
+      "effective_output": "how to align log timezones?",
+      "validation_status": "accepted"
+    }
+  ]
+}

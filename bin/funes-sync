@@ -1,0 +1,30 @@
+#!/bin/sh
+# Stable launcher for the unified sync package when the repository is not installed as a wheel.
+set -eu
+ROOT=${FUNES_SYNC_ROOT:-$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)}
+export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"
+if [ -z "${FUNES_API_TOKEN:-}" ] && command -v security >/dev/null 2>&1; then
+  FUNES_API_TOKEN="$(security find-generic-password -a "${USER:-$(id -un)}" -s funes-api-token -w 2>/dev/null || true)"
+  if [ -n "$FUNES_API_TOKEN" ]; then export FUNES_API_TOKEN; fi
+fi
+if [ -z "${FUNES_HF_TOKEN:-}" ] && command -v security >/dev/null 2>&1; then
+  FUNES_HF_TOKEN="$(security find-generic-password -a "${USER:-$(id -un)}" -s funes-hf-token -w 2>/dev/null || true)"
+  if [ -n "$FUNES_HF_TOKEN" ]; then export FUNES_HF_TOKEN; fi
+fi
+# Some macOS launchd contexts cannot unlock/read the login Keychain even though
+# an interactive shell can.  The user-configured zshrc is the documented
+# fallback; source it in a quiet child shell so no credential is persisted in
+# the plist or exposed in argv/logs.
+if [ -z "${FUNES_API_TOKEN:-}" ] || [ -z "${FUNES_HF_TOKEN:-}" ]; then
+  if [ -r "${HOME:-}/.zshrc" ] && command -v zsh >/dev/null 2>&1; then
+    if [ -z "${FUNES_API_TOKEN:-}" ]; then
+      FUNES_API_TOKEN="$(zsh -c 'source "$HOME/.zshrc" >/dev/null 2>&1; printf %s "${FUNES_API_TOKEN:-}"' 2>/dev/null || true)"
+      if [ -n "$FUNES_API_TOKEN" ]; then export FUNES_API_TOKEN; fi
+    fi
+    if [ -z "${FUNES_HF_TOKEN:-}" ]; then
+      FUNES_HF_TOKEN="$(zsh -c 'source "$HOME/.zshrc" >/dev/null 2>&1; printf %s "${FUNES_HF_TOKEN:-}"' 2>/dev/null || true)"
+      if [ -n "$FUNES_HF_TOKEN" ]; then export FUNES_HF_TOKEN; fi
+    fi
+  fi
+fi
+exec "${PYTHON:-python3}" -m sync "$@"

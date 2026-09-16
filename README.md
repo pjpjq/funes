@@ -67,9 +67,13 @@ in Codex next week, and each one recalls the *entire* history, not just its own 
 shows which agent it came from). Another agent can join through a compatible `.parquet` trace
 export; [the import contract](docs/index.md#parquet-trace-format) defines the required schema.
 
-Models work the same way. funes runs pinned local embedding and reranking models, but no generative
-model of its own: you reason with whatever your agent uses — through **pi**, any local model or one
-served through the Hugging Face router. Switch models between sessions and the memory doesn't move.
+Models work the same way. funes has no generative model of its own: you reason with whatever your
+agent uses — through **pi**, any local model or one served through the Hugging Face router. Its
+retrieval embedding provider is selected at runtime: `local` keeps the pinned BGE model and needs no
+API, while `voyage` sends the original multilingual text to Voyage with explicit `document` and
+`query` input types. Reranking is separate and can be disabled or provided locally or by Voyage;
+production defaults to no reranker. Switch reasoning models between sessions and the memory doesn't
+move. See [configuration](docs/configuration.md#retrieval-providers) for the provider contract.
 
 ## Your memory on the Hub
 
@@ -132,9 +136,12 @@ The per-turn indexing and session-boundary publishing the hooks run are detailed
 
 `funes add` runs one loop: **index** what you've done, **recall** it when it matters — and index what
 you just did, so it's recallable next time. Both halves are one deterministic pipeline: each source
-is parsed into a generic turn/block shape, chunked, embedded with a pinned local model, and written to
-a local Lance dataset; recall fuses vector + BM25 search, reranks, and reweights by recency. Because
-everything downstream of parsing is source-agnostic, adding an agent means implementing one
+is parsed into a generic turn/block shape, chunked, embedded by the configured runtime provider, and
+written to a local Lance dataset. Recall keeps the raw query for BM25 lexical matches, combines that
+ranking with vector search through reciprocal-rank fusion (RRF), optionally reranks, and reweights
+by recency. With Voyage, original multilingual documents use `input_type=document` and the original
+query uses `input_type=query`; no translation or English shadow text is introduced in `raw` mode.
+Because everything downstream of parsing is source-agnostic, adding an agent means implementing one
 [`TraceSource`](src/source.rs) trait — not touching the indexing or query path.
 
 `funes` shapes its output for agents, not people — so to put a question to a memory yourself, borrow
@@ -163,12 +170,13 @@ brew install protobuf                        # macOS
 export PROTOC="$PWD/.tools/protoc/bin/protoc"
 ```
 
-Then `cargo build --release` (binary at `target/release/funes`); `cargo test` runs the suite. The
-integration test downloads the embedder/reranker weights on first run.
+Then `cargo build --release` (binary at `target/release/funes`); `cargo test` runs the suite. Tests
+that exercise local inference download the embedder/reranker weights on first run.
 
-Inference (embedding + reranking) runs on a built-in backend — Accelerate on macOS, pure Rust on
-Linux — so the default build has no ML runtime dependency and runs on any glibc ≥ 2.35 (Ubuntu
-22.04). An ONNX Runtime backend is available as an opt-in variant:
+Local inference runs on a built-in backend — Accelerate on macOS, pure Rust on Linux — so the
+default build has no ML runtime dependency and runs on any glibc ≥ 2.35 (Ubuntu 22.04). A Voyage
+provider uses its native HTTP API instead. An ONNX Runtime backend is available as an opt-in local
+variant:
 
 ```bash
 cargo build --release --no-default-features --features onnx   # ONNX backend instead
@@ -177,10 +185,12 @@ cargo run --release --features onnx --example bench_backends  # A/B both backend
 
 ## Notes
 
-- **Embedding model is pinned** and stamped into the memory; querying with a different embedding
-  model is refused. To change it, rebuild from the transcripts (the memory is a disposable derived
-  artifact — the raw text is retained in every row). This is separate from the model you *reason*
-  with, which is free to change.
+- **The complete embedding profile is pinned** in memory metadata: provider, model, dimensions,
+  schema version, and a fingerprint that also covers document/query input modes, normalization, and
+  metric. A mismatch is refused even when vector dimensions happen to match. To change profiles,
+  rebuild from the transcripts (the memory is a disposable derived artifact — the raw text is
+  retained in every row). This is separate from the model you *reason* with, which is free to
+  change.
 - **Subagent transcripts** (`.../subagents/agent-*.jsonl`) are indexed too.
 
 ## Why funes

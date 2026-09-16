@@ -41,14 +41,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{ensure, Context, Result};
-use arrow_array::{RecordBatch, RecordBatchIterator};
-use arrow_schema::SchemaRef;
+use arrow_array::{new_null_array, RecordBatch, RecordBatchIterator};
+use arrow_schema::{Schema, SchemaRef};
 use async_trait::async_trait;
 use bytes::Bytes;
 use hf_hub::progress::{Progress, ProgressEvent, ProgressHandler, UploadEvent};
 use hf_hub::repository::{CommitInfo, CommitOperation};
 use hf_hub::{HFError, HFRepository, RepoTypeDataset};
-use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::{Dataset, NewColumnTransform, WriteParams};
 use lance::index::DatasetIndexExt;
 use lance_index::optimize::OptimizeOptions;
@@ -78,6 +77,14 @@ pub(crate) enum Reindexed {
     Conflict,
 }
 
+/// Outcome of one canonical-document replace attempt.
+pub(crate) enum Replaced {
+    Committed(String),
+    /// The Hub branch moved after the dataset version was read. The caller must reopen it and
+    /// re-evaluate source revisions before retrying.
+    Conflict,
+}
+
 /// Append `batches` to the remote Lance dataset at `dataset_uri` (an `hf://…/<table>.lance` URI)
 /// and land them in one `create_commit` on branch `rev`, guarded by the current head. The append
 /// writes only data — a new fragment, manifest, and transaction — and leaves the new rows
@@ -99,17 +106,58 @@ pub(crate) async fn append(
     extra_files: &BTreeMap<String, Bytes>,
 ) -> Result<Appended> {
     let parent = head_oid(repo, rev).await?;
-    let (mut ds, wrapper) = open_capturing(dataset_uri, storage_options).await?;
+    append_at(
+        repo,
+        dataset_uri,
+        storage_options,
+        parent,
+        rev,
+        message,
+        batches,
+        schema,
+        extra_files,
+        true,
+    )
+    .await
+}
 
-    let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
+#[allow(clippy::too_many_arguments)] // Shared CAS append boundary for push and canonical ingestion.
+async fn append_at(
+    repo: &HFRepository<RepoTypeDataset>,
+    dataset_uri: &str,
+    storage_options: HashMap<String, String>,
+    parent: String,
+    rev: &str,
+    message: String,
+    batches: Vec<RecordBatch>,
+    schema: SchemaRef,
+    extra_files: &BTreeMap<String, Bytes>,
+    measure_unindexed: bool,
+) -> Result<Appended> {
+    let (mut ds, wrapper) = open_capturing(repo, &parent, dataset_uri, storage_options).await?;
+    if schema.column_with_name("source_identity").is_some() {
+        dataset::ensure_canonical_columns(&mut ds).await?;
+    }
+
+    let target_schema = Arc::new(Schema::from(ds.schema()));
+    let batches = batches
+        .into_iter()
+        .map(|batch| align_batch(batch, target_schema.clone()))
+        .collect::<Result<Vec<_>>>()?;
+    let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), target_schema);
     ds.append(reader, None)
         .await
         .context("appending to the remote dataset")?;
 
-    // Snapshot the captured writes before reading index stats: `index_statistics` can write a stats
-    // migration through the same wrapper, and that must not leak into the data commit.
+    // Snapshot the captured writes before optionally reading index stats: `index_statistics` can
+    // write a stats migration through the same wrapper, and that must not leak into the data commit.
     let mut files = captured_files(&wrapper);
-    let unindexed = max_unindexed_rows(&ds).await;
+    // Canonical ingestion discards this result, so it skips the expensive statistics reads.
+    let unindexed = if measure_unindexed {
+        max_unindexed_rows(&ds).await
+    } else {
+        0
+    };
     for (path, body) in extra_files {
         files.insert(path.clone(), body.clone());
     }
@@ -123,6 +171,54 @@ pub(crate) async fn append(
         Err(e) if head_moved(&e) => Ok(Appended::Conflict),
         Err(e) => Err(anyhow::Error::new(e).context("data commit failed")),
     }
+}
+
+/// Append canonical rows known to be absent at `expected_parent` without a full merge scan.
+#[allow(clippy::too_many_arguments)] // Keep the selected snapshot and CAS target explicit.
+pub(crate) async fn append_documents(
+    repo: &HFRepository<RepoTypeDataset>,
+    dataset_uri: &str,
+    storage_options: HashMap<String, String>,
+    expected_parent: &str,
+    rev: &str,
+    message: String,
+    batches: Vec<RecordBatch>,
+    schema: SchemaRef,
+) -> Result<Replaced> {
+    let extra_files = BTreeMap::new();
+    match append_at(
+        repo,
+        dataset_uri,
+        storage_options,
+        expected_parent.to_string(),
+        rev,
+        message,
+        batches,
+        schema,
+        &extra_files,
+        false,
+    )
+    .await?
+    {
+        Appended::Committed { oid, .. } => Ok(Replaced::Committed(oid)),
+        Appended::Conflict => Ok(Replaced::Conflict),
+    }
+}
+
+/// Align an append batch to the remote schema, filling additive nullable columns with null. This
+/// lets old transcript memories and canonical-aware memories publish to each other safely.
+fn align_batch(batch: RecordBatch, target: SchemaRef) -> Result<RecordBatch> {
+    let columns = target
+        .fields()
+        .iter()
+        .map(|field| {
+            batch
+                .column_by_name(field.name())
+                .cloned()
+                .unwrap_or_else(|| new_null_array(field.data_type(), batch.num_rows()))
+        })
+        .collect();
+    Ok(RecordBatch::try_new(target, columns)?)
 }
 
 /// Build the whole dataset locally (data + indexes) and upload it in one `create_commit` — unlike
@@ -152,7 +248,7 @@ pub(crate) async fn first_publish(
     let mut ds = Dataset::write(reader, &table_uri, Some(WriteParams::default()))
         .await
         .context("building the dataset for first publish")?;
-    dataset::build_indexes(&mut ds, on_phase).await;
+    dataset::build_indexes(&mut ds, on_phase).await?;
 
     let mut ops = Vec::new();
     for entry in walkdir::WalkDir::new(&db_dir).into_iter().filter_map(|e| e.ok()) {
@@ -183,6 +279,50 @@ pub(crate) async fn first_publish(
     Ok(Some(info.commit_oid.unwrap_or_else(|| "?".to_string())))
 }
 
+/// Publish a first canonical dataset in one parent-guarded Hub commit. Unlike the general push
+/// bootstrap, canonical ingestion must notice a concurrent creator and re-read its revisions.
+pub(crate) async fn first_document_publish(
+    repo: &HFRepository<RepoTypeDataset>,
+    prefix: &str,
+    batches: Vec<RecordBatch>,
+    schema: SchemaRef,
+    expected_parent: &str,
+    rev: &str,
+    message: String,
+) -> Result<Replaced> {
+    let staging = tempfile::tempdir()?;
+    let db_dir = if prefix.is_empty() {
+        staging.path().to_path_buf()
+    } else {
+        staging.path().join(prefix)
+    };
+    std::fs::create_dir_all(&db_dir)?;
+    let table_uri = dataset::table_uri(&db_dir.to_string_lossy());
+    let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
+    let mut ds = Dataset::write(reader, &table_uri, Some(WriteParams::default()))
+        .await
+        .context("building the first canonical dataset")?;
+    dataset::build_indexes(&mut ds, |_| {}).await?;
+
+    let mut ops = Vec::new();
+    for entry in walkdir::WalkDir::new(&db_dir).into_iter().filter_map(|e| e.ok()) {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let rel = entry.path().strip_prefix(staging.path()).unwrap_or(entry.path());
+        ops.push(CommitOperation::add_file(
+            rel.to_string_lossy().into_owned(),
+            entry.path().to_path_buf(),
+        ));
+    }
+    ensure!(!ops.is_empty(), "canonical dataset build produced no files");
+    match send_commit(repo, ops, expected_parent.to_string(), rev, message).await {
+        Ok(info) => Ok(Replaced::Committed(info.commit_oid.unwrap_or_else(|| "?".to_string()))),
+        Err(e) if head_moved(&e) => Ok(Replaced::Conflict),
+        Err(e) => Err(anyhow::Error::new(e).context("canonical data commit failed")),
+    }
+}
+
 /// Fold an index's delta sub-indexes back into one once this many pile up. Queries fan out across
 /// every delta (and per-segment BM25 stats drift), so the pile must stay bounded. Only the deltas
 /// are merged — the base is never re-read, which would be the full-index rewrite [`reindex`]
@@ -202,7 +342,8 @@ pub(crate) async fn reindex(
     message: String,
 ) -> Result<Reindexed> {
     let parent = head_oid(repo, rev).await?;
-    let (mut ds, wrapper) = open_capturing(dataset_uri, storage_options).await?;
+    let (mut ds, wrapper) = open_capturing(repo, &parent, dataset_uri, storage_options).await?;
+    dataset::ensure_required_indexes(&mut ds, |_| {}).await?;
 
     for (name, subs) in sub_index_counts(&ds).await? {
         // subs = base + deltas; merge(deltas) folds every delta into one, sparing the base.
@@ -245,7 +386,7 @@ pub async fn add_column(
     read_columns: Vec<String>,
 ) -> Result<String> {
     let parent = head_oid(repo, rev).await?;
-    let (mut ds, wrapper) = open_capturing(dataset_uri, storage_options).await?;
+    let (mut ds, wrapper) = open_capturing(repo, &parent, dataset_uri, storage_options).await?;
     ds.add_columns(transform, Some(read_columns), None)
         .await
         .context("adding the remote column")?;
@@ -258,21 +399,74 @@ pub async fn add_column(
     Ok(info.commit_oid.unwrap_or_else(|| "?".to_string()))
 }
 
-/// Open the remote dataset with a [`CaptureStore`] installed, returning the wrapped dataset and the
-/// wrapper that holds the shared capture map.
-async fn open_capturing(
+/// Atomically replace every split belonging to selected canonical sources. The indexed delete and
+/// append run through the same capture store and land in one guarded Hub commit.
+#[allow(clippy::too_many_arguments)] // Keep the selected snapshot and CAS target explicit at this write boundary.
+pub(crate) async fn replace_documents(
+    repo: &HFRepository<RepoTypeDataset>,
     dataset_uri: &str,
     storage_options: HashMap<String, String>,
+    expected_parent: &str,
+    rev: &str,
+    message: String,
+    batches: Vec<RecordBatch>,
+    delete_filter: &str,
+) -> Result<Replaced> {
+    let (mut ds, wrapper) = open_capturing(repo, expected_parent, dataset_uri, storage_options).await?;
+    dataset::ensure_canonical_columns(&mut ds).await?;
+    replace_dataset_rows(&mut ds, batches, delete_filter).await?;
+
+    let files = captured_files(&wrapper);
+    ensure!(!files.is_empty(), "canonical replace produced no files to commit");
+    let (ops, _dir) = write_ops(&files)?;
+    match send_commit(repo, ops, expected_parent.to_string(), rev, message).await {
+        Ok(info) => Ok(Replaced::Committed(info.commit_oid.unwrap_or_else(|| "?".to_string()))),
+        Err(e) if head_moved(&e) => Ok(Replaced::Conflict),
+        Err(e) => Err(anyhow::Error::new(e).context("canonical data commit failed")),
+    }
+}
+
+async fn replace_dataset_rows(ds: &mut Dataset, batches: Vec<RecordBatch>, delete_filter: &str) -> Result<()> {
+    ds.delete(delete_filter)
+        .await
+        .context("deleting stale canonical document rows")?;
+    let target_schema = Arc::new(Schema::from(ds.schema()));
+    let batches = batches
+        .into_iter()
+        .map(|batch| align_batch(batch, target_schema.clone()))
+        .collect::<Result<Vec<_>>>()?;
+    let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), target_schema);
+    ds.append(reader, None)
+        .await
+        .context("appending replacement canonical document rows")?;
+    Ok(())
+}
+
+/// Open one immutable remote revision with read-through caching inside the write capture. Reads
+/// must be wrapped before `load`: otherwise Lance's initial manifest/index requests bypass the
+/// cache and can wait indefinitely in the live OpenDAL HF store.
+async fn open_capturing(
+    repo: &HFRepository<RepoTypeDataset>,
+    revision: &str,
+    dataset_uri: &str,
+    mut storage_options: HashMap<String, String>,
 ) -> Result<(Dataset, Arc<CaptureWrapper>)> {
+    storage_options.insert("revision".to_string(), revision.to_string());
+    storage_options.insert("hf_revision".to_string(), revision.to_string());
     let wrapper = Arc::new(CaptureWrapper {
         captured: Captured::default(),
+        fetcher: Arc::new(HubFetcher {
+            repo: Arc::new(repo.clone()),
+            revision: revision.to_string(),
+        }),
     });
-    let ds = DatasetBuilder::from_uri(dataset_uri)
-        .with_storage_options(storage_options)
-        .load()
-        .await
-        .context("opening the remote dataset")?;
-    let ds = ds.with_object_store_wrappers([wrapper.clone() as Arc<dyn WrappingObjectStore>]);
+    let ds = dataset::open_wrapped(
+        dataset_uri,
+        storage_options,
+        wrapper.clone() as Arc<dyn WrappingObjectStore>,
+    )
+    .await
+    .context("opening the remote dataset")?;
     Ok((ds, wrapper))
 }
 
@@ -320,7 +514,7 @@ async fn sub_index_counts(ds: &Dataset) -> Result<Vec<(String, usize)>> {
 }
 
 /// Read the commit at the tip of branch `rev` — the parent-commit guard for the next commit.
-async fn head_oid(repo: &HFRepository<RepoTypeDataset>, rev: &str) -> Result<String> {
+pub(crate) async fn head_oid(repo: &HFRepository<RepoTypeDataset>, rev: &str) -> Result<String> {
     let refs = repo.list_refs().send().await.context("listing remote refs")?;
     refs.branches
         .iter()
@@ -460,11 +654,13 @@ fn human_bytes(n: u64) -> String {
 #[derive(Debug)]
 struct CaptureWrapper {
     captured: Captured,
+    fetcher: Arc<dyn FileFetcher>,
 }
 
 impl WrappingObjectStore for CaptureWrapper {
     fn wrap(&self, _prefix: &str, original: Arc<dyn OSObjectStore>) -> Arc<dyn OSObjectStore> {
-        Arc::new(CaptureStore::new(original, self.captured.clone()))
+        let cached = Arc::new(FetchStore::new(original, self.fetcher.clone()));
+        Arc::new(CaptureStore::new(cached, self.captured.clone()))
     }
 }
 
@@ -543,12 +739,24 @@ pub(crate) async fn fetch_wrapper(
     Ok((Arc::new(FetchWrapper::new(repo, sha.clone())), sha))
 }
 
+/// Build the read wrapper for one already-resolved immutable commit. Canonical ingestion uses this
+/// so revision selection and the eventual `parent_commit` refer to exactly the same snapshot.
+pub(crate) fn fetch_wrapper_at(
+    owner: &str,
+    name: &str,
+    token: Option<&str>,
+    revision: &str,
+) -> Result<Arc<FetchWrapper>> {
+    let repo = Arc::new(hub::client(token, true)?.dataset(owner, name));
+    Ok(Arc::new(FetchWrapper::new(repo, revision.to_string())))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use arrow_array::StringArray;
     use arrow_schema::{DataType, Field, Schema};
-    use lance_index::scalar::InvertedIndexParams;
+    use lance_index::scalar::{InvertedIndexParams, ScalarIndexParams};
     use lance_index::IndexType;
 
     /// Pins the Lance behavior [`reindex`] relies on: `append()` adds one delta sub-index per
@@ -589,6 +797,79 @@ mod tests {
         assert!(
             after.iter().any(|i| i.uuid == base_uuid),
             "the base index must survive untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn indexed_delete_append_replaces_only_selected_sources() {
+        let batch = |identities: &[&str], texts: &[&str]| {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("source_identity", DataType::Utf8, false),
+                Field::new("text", DataType::Utf8, false),
+            ]));
+            let rows = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(StringArray::from(identities.to_vec())),
+                    Arc::new(StringArray::from(texts.to_vec())),
+                ],
+            )
+            .unwrap();
+            (rows, schema)
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().join("replace.lance");
+        let (initial, schema) = batch(&["replace-me", "keep-me"], &["old", "untouched"]);
+        let mut ds = Dataset::write(
+            RecordBatchIterator::new([Ok(initial)], schema),
+            uri.to_str().unwrap(),
+            None,
+        )
+        .await
+        .unwrap();
+        ds.create_index(
+            &["source_identity"],
+            IndexType::Scalar,
+            Some("source_identity_idx".to_string()),
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+
+        let (replacement, _) = batch(&["replace-me"], &["new"]);
+        replace_dataset_rows(&mut ds, vec![replacement], "source_identity IN ('replace-me')")
+            .await
+            .unwrap();
+
+        let rows = dataset::scan_rows(&ds, &["source_identity", "text"], None, None)
+            .await
+            .unwrap();
+        let mut actual = rows
+            .iter()
+            .flat_map(|row| {
+                let identities = row
+                    .column_by_name("source_identity")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                let texts = row
+                    .column_by_name("text")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                (0..row.num_rows()).map(|index| (identities.value(index).to_string(), texts.value(index).to_string()))
+            })
+            .collect::<Vec<_>>();
+        actual.sort();
+        assert_eq!(
+            actual,
+            vec![
+                ("keep-me".to_string(), "untouched".to_string()),
+                ("replace-me".to_string(), "new".to_string()),
+            ]
         );
     }
 

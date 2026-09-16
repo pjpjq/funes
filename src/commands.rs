@@ -5,6 +5,7 @@
 
 pub mod ask;
 pub mod index;
+pub mod ingest_docs;
 pub mod mcp;
 pub mod push;
 pub mod recall;

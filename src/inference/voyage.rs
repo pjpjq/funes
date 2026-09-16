@@ -21,8 +21,12 @@ const RERANK_URL: &str = "https://api.voyageai.com/v1/rerank";
 const RERANK_MODEL: &str = "rerank-3-lite";
 const DOCUMENT_TIMEOUT: Duration = Duration::from_secs(30);
 const QUERY_TIMEOUT: Duration = Duration::from_secs(3);
-const DOCUMENT_ATTEMPTS: usize = 3;
+const DOCUMENT_ATTEMPTS: usize = 5;
 const DOCUMENT_RETRY_DELAY: Duration = Duration::from_millis(200);
+const DOCUMENT_RATE_LIMIT_DELAY: Duration = Duration::from_secs(60);
+// Four capped sleeps plus five 30-second requests stay below the Space's
+// 900-second canonical-ingest subprocess deadline.
+const DOCUMENT_MAX_RATE_LIMIT_DELAY: Duration = Duration::from_secs(120);
 
 #[derive(Serialize)]
 struct EmbeddingsRequest<'a> {
@@ -198,6 +202,7 @@ pub struct VoyageEmbedder {
     query_timeout: Duration,
     document_attempts: usize,
     document_retry_delay: Duration,
+    document_rate_limit_delay: Duration,
 }
 
 impl VoyageEmbedder {
@@ -211,6 +216,7 @@ impl VoyageEmbedder {
             QUERY_TIMEOUT,
             DOCUMENT_ATTEMPTS,
             DOCUMENT_RETRY_DELAY,
+            DOCUMENT_RATE_LIMIT_DELAY,
         )
     }
 
@@ -224,6 +230,7 @@ impl VoyageEmbedder {
         query_timeout: Duration,
         document_attempts: usize,
         document_retry_delay: Duration,
+        document_rate_limit_delay: Duration,
     ) -> Result<Self> {
         if model.trim().is_empty() {
             bail!("Voyage embedding model must not be empty")
@@ -245,7 +252,19 @@ impl VoyageEmbedder {
             query_timeout,
             document_attempts,
             document_retry_delay,
+            document_rate_limit_delay,
         })
+    }
+
+    fn rate_limit_delay(&self, response: &reqwest::blocking::Response) -> Duration {
+        response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .map(Duration::from_secs)
+            .unwrap_or(self.document_rate_limit_delay)
+            .min(DOCUMENT_MAX_RATE_LIMIT_DELAY)
     }
 
     fn request(&self, texts: &[&str], input_type: &'static str, documents: bool) -> Result<Vec<Vec<f32>>> {
@@ -261,7 +280,7 @@ impl VoyageEmbedder {
             model: &self.model,
             input_type,
             output_dimension: self.dimensions,
-            truncation: false,
+            truncation: true,
         };
         let attempts = if documents { self.document_attempts } else { 1 };
         let timeout = if documents {
@@ -300,7 +319,12 @@ impl VoyageEmbedder {
                 return decode_embeddings(response, texts.len(), self.dimensions);
             }
             if documents && retryable(status) && attempt + 1 < attempts {
-                thread::sleep(self.document_retry_delay.saturating_mul((attempt + 1) as u32));
+                let delay = if status == StatusCode::TOO_MANY_REQUESTS {
+                    self.rate_limit_delay(&response)
+                } else {
+                    self.document_retry_delay.saturating_mul((attempt + 1) as u32)
+                };
+                thread::sleep(delay);
                 continue;
             }
             bail!("Voyage embeddings request failed with HTTP {}", status.as_u16())
@@ -400,7 +424,7 @@ impl VoyageReranker {
             documents: docs.to_vec(),
             model: &self.model,
             return_documents: false,
-            truncation: false,
+            truncation: true,
         };
         let response = self
             .client
@@ -443,6 +467,7 @@ mod tests {
         status: u16,
         body: String,
         delay: Duration,
+        headers: Vec<(&'static str, &'static str)>,
     }
 
     impl MockResponse {
@@ -451,6 +476,7 @@ mod tests {
                 status,
                 body: body.to_string(),
                 delay: Duration::ZERO,
+                headers: Vec::new(),
             }
         }
 
@@ -459,7 +485,13 @@ mod tests {
                 status,
                 body: body.to_string(),
                 delay,
+                headers: Vec::new(),
             }
+        }
+
+        fn with_header(mut self, name: &'static str, value: &'static str) -> Self {
+            self.headers.push((name, value));
+            self
         }
     }
 
@@ -491,10 +523,16 @@ mod tests {
                         captured.lock().unwrap().push(request);
                         std::thread::sleep(response.delay);
                         let reason = if response.status == 200 { "OK" } else { "Error" };
+                        let headers = response
+                            .headers
+                            .iter()
+                            .map(|(name, value)| format!("{name}: {value}\r\n"))
+                            .collect::<String>();
                         let wire = format!(
-                            "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
                             response.status,
                             reason,
+                            headers,
                             response.body.len(),
                             response.body
                         );
@@ -559,6 +597,7 @@ mod tests {
             Duration::from_millis(100),
             DOCUMENT_ATTEMPTS,
             Duration::ZERO,
+            Duration::ZERO,
         )
         .unwrap()
     }
@@ -622,11 +661,11 @@ mod tests {
         assert_eq!(requests[0].body["model"], "test-embedding-model");
         assert_eq!(requests[0].body["input_type"], "document");
         assert_eq!(requests[0].body["output_dimension"], TEST_DIMENSIONS);
-        assert_eq!(requests[0].body["truncation"], false);
+        assert_eq!(requests[0].body["truncation"], true);
         assert_eq!(requests[1].body["input"], json!(["needle"]));
         assert_eq!(requests[1].body["input_type"], "query");
         assert_eq!(requests[1].body["output_dimension"], TEST_DIMENSIONS);
-        assert_eq!(requests[1].body["truncation"], false);
+        assert_eq!(requests[1].body["truncation"], true);
     }
 
     #[test]
@@ -658,6 +697,8 @@ mod tests {
         let exhausted = MockServer::start(vec![
             MockResponse::json(500, json!({ "private": "first-body" })),
             MockResponse::json(502, json!({ "private": "second-body" })),
+            MockResponse::json(503, json!({ "private": "third-body" })),
+            MockResponse::json(504, json!({ "private": "fourth-body" })),
             MockResponse::json(599, json!({ "private": "last-body" })),
         ]);
         let mut embedder = test_embedder(&exhausted, TEST_DIMENSIONS);
@@ -665,6 +706,35 @@ mod tests {
         assert!(error.contains("HTTP 599"));
         assert!(!error.contains("last-body"));
         assert_eq!(exhausted.finish().len(), DOCUMENT_ATTEMPTS);
+    }
+
+    #[test]
+    fn document_429_honors_retry_after_without_using_the_fallback_delay() {
+        let server = MockServer::start(vec![
+            MockResponse::json(429, json!({ "private": "rate-limited" })).with_header("Retry-After", "0"),
+            MockResponse::json(200, embedding_response(vec![(0, unit_vector(0))])),
+        ]);
+        let mut embedder = test_embedder(&server, TEST_DIMENSIONS);
+        embedder.document_rate_limit_delay = Duration::from_millis(250);
+        let started = Instant::now();
+        assert_eq!(embedder.embed_documents(&["document"]).unwrap(), vec![unit_vector(0)]);
+        assert!(started.elapsed() < Duration::from_millis(200));
+        assert_eq!(server.finish().len(), 2);
+    }
+
+    #[test]
+    fn document_429_without_retry_after_uses_the_rate_limit_delay() {
+        let server = MockServer::start(vec![
+            MockResponse::json(429, json!({ "private": "rate-limited" })),
+            MockResponse::json(200, embedding_response(vec![(0, unit_vector(0))])),
+        ]);
+        let mut embedder = test_embedder(&server, TEST_DIMENSIONS);
+        embedder.document_rate_limit_delay = Duration::from_millis(40);
+        let started = Instant::now();
+        assert_eq!(embedder.embed_documents(&["document"]).unwrap(), vec![unit_vector(0)]);
+        assert!(started.elapsed() >= Duration::from_millis(35));
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert_eq!(server.finish().len(), 2);
     }
 
     #[test]
@@ -696,6 +766,17 @@ mod tests {
         assert!(error.contains("HTTP 503"));
         assert!(!error.contains("do-not-return-this-body"));
         assert_eq!(failed.finish().len(), 1);
+
+        let rate_limited = MockServer::start(vec![MockResponse::json(
+            429,
+            json!({ "private": "do-not-return-this-body" }),
+        )]);
+        let mut embedder = test_embedder(&rate_limited, TEST_DIMENSIONS);
+        let started = Instant::now();
+        let error = embedder.embed_query("needle").unwrap_err().to_string();
+        assert!(error.contains("HTTP 429"));
+        assert!(started.elapsed() < Duration::from_millis(200));
+        assert_eq!(rate_limited.finish().len(), 1);
 
         let slow = MockServer::start(vec![MockResponse::delayed(
             200,
@@ -743,6 +824,6 @@ mod tests {
         assert_eq!(requests[0].body["documents"], json!(["first", "second"]));
         assert_eq!(requests[0].body["model"], "custom-rerank");
         assert_eq!(requests[0].body["return_documents"], false);
-        assert_eq!(requests[0].body["truncation"], false);
+        assert_eq!(requests[0].body["truncation"], true);
     }
 }

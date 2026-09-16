@@ -874,6 +874,66 @@ def test_successful_ingest_is_not_followed_by_full_snapshot(tmp_path):
     assert client.snapshot_calls == 0
 
 
+def test_continuous_daemon_flushes_before_remote_inventory(tmp_path):
+    events = []
+
+    class StoreWithBacklog:
+        db = None
+
+        def __init__(self):
+            self.pending_rows = 1
+
+        def pending(self, _limit):
+            if not self.pending_rows:
+                return []
+            return [{"record_id": "one", "payload": '{"raw_text":"one"}', "attempts": 0}]
+
+        def ack(self, _record_ids):
+            events.append("flush")
+            self.pending_rows = 0
+
+        def pending_count(self):
+            return self.pending_rows
+
+        def fail(self, *_args):
+            raise AssertionError("the fake upload should succeed")
+
+    class Client:
+        def ingest(self, records):
+            assert len(records) == 1
+            return {"accepted": 1}
+
+    class Wake:
+        def is_set(self):
+            return False
+
+        def wait(self, _timeout):
+            daemon.running = False
+
+        def clear(self):
+            return None
+
+        def set(self):
+            return None
+
+    c = cfg(tmp_path)
+    c.auto_discover = False
+    daemon = SyncDaemon(c, StoreWithBacklog(), Client())
+    daemon._wake = Wake()
+    daemon.scan_once = lambda: events.append("scan") or 0
+    daemon.reconcile_remote_sources = lambda *_args, **_kwargs: events.append("reconcile") or {
+        "complete": True,
+        "checked": 0,
+        "queued": 0,
+    }
+    daemon._start_watcher = lambda: None
+    daemon._stop_watcher = lambda: None
+
+    daemon.run()
+
+    assert events[:3] == ["scan", "flush", "reconcile"]
+
+
 def test_flush_batch_respects_serialized_byte_limit(tmp_path):
     payloads = [
         json.dumps({"raw_text": "a" * 20}),

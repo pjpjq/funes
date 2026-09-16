@@ -291,7 +291,14 @@ class SyncDaemon:
                 self._wake.wait(max(1,self.config.interval)); self._wake.clear()
                 continue
             self.scan_once()
-            inventory=self.reconcile_remote_sources(None if once else 16,interruptible=True)
+            # In continuous mode, drain already durable local records before
+            # spending a long interval on the cross-device identity inventory.
+            # A large first-run queue must not be starved by reconciliation:
+            # each inventory request is remote I/O and can take several
+            # seconds, while the queue is the source-of-truth delivery path.
+            inventory={"complete": self._remote_source_marker.exists(), "checked": 0, "queued": 0}
+            if once:
+                inventory=self.reconcile_remote_sources(None,interruptible=True)
             # A one-shot backfill must drain the durable queue completely when
             # the remote is available; otherwise the first startup would leave
             # most history pending until the next 5-minute pass.  The continuous
@@ -313,9 +320,17 @@ class SyncDaemon:
                     # then rescan before sending another batch.
                     if not self.running or self._wake.is_set():
                         break
+                # Reconcile only after the current durable queue is empty.  A
+                # bounded one-batch step preserves cross-device dedupe without
+                # blocking future uploads; the next loop drains any identities
+                # that this step queues.
+                if self.running and not self.store.pending_count():
+                    inventory=self.reconcile_remote_sources(1,interruptible=True)
             if once: break
             if not self.running: break
-            wait=1 if not inventory.get("complete") and inventory.get("checked") else max(1,self.config.interval)
+            wait=1 if self.store.pending_count() or (
+                not inventory.get("complete") and inventory.get("checked")
+            ) else max(1,self.config.interval)
             self._wake.wait(wait); self._wake.clear()
         finally:
             self._stop_watcher()

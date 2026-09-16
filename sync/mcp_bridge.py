@@ -304,7 +304,7 @@ def _remote_call(path, payload):
     headers = _auth_headers(token, hub_token)
     recall = path in ("/search", "/recall")
     total = _float_env("FUNES_REMOTE_TIMEOUT", 8 if recall else 180, 0.1, 300)
-    attempts = _int_env("FUNES_REMOTE_ATTEMPTS", 1 if recall else 5, 1, 5)
+    attempts = _int_env("FUNES_REMOTE_ATTEMPTS", 2 if recall else 5, 1, 5)
     attempt_timeout = _float_env(
         "FUNES_REMOTE_ATTEMPT_TIMEOUT", 8 if recall else 50, 0.1, 55
     )

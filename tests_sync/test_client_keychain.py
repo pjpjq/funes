@@ -571,3 +571,137 @@ def test_ingest_trickle_response_cannot_outlive_total_deadline(tmp_path, monkeyp
         server_thread.join(timeout=2)
 
     assert elapsed < 0.8
+
+
+def test_ingest_repeated_429_contention_eventually_succeeds(tmp_path, monkeypatch):
+    _async_client_environment(monkeypatch)
+    clock = [0.0]
+    sleeps = []
+    requests = []
+    operation_id = "op-contention"
+    responses = [
+        # 6 consecutive 429 responses with Retry-After: 2
+        # (exceeds the legacy consecutive_failures limit of 4)
+        client_module.error.HTTPError(
+            "http://127.0.0.1:7860/ingest",
+            429,
+            "Too Many Requests",
+            {"Retry-After": "2"},
+            None,
+        ),
+        client_module.error.HTTPError(
+            "http://127.0.0.1:7860/ingest",
+            429,
+            "Too Many Requests",
+            {"Retry-After": "2"},
+            None,
+        ),
+        _IngestResponse(
+            429,
+            {"ok": False, "error": "ingest_busy", "retry_after": 2},
+            {"Retry-After": "2"},
+        ),
+        _IngestResponse(
+            429,
+            {"ok": False, "error": "ingest_busy", "retry_after": 2},
+            {"Retry-After": "2"},
+        ),
+        client_module.error.HTTPError(
+            "http://127.0.0.1:7860/ingest",
+            429,
+            "Too Many Requests",
+            {"Retry-After": "2"},
+            None,
+        ),
+        _IngestResponse(
+            429,
+            {"ok": False, "error": "ingest_busy", "retry_after": 2},
+            {"Retry-After": "2"},
+        ),
+        # 7th request finally succeeds
+        _IngestResponse(
+            200,
+            {"operation_id": operation_id, "durable": True, "accepted": 1},
+        ),
+    ]
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        clock[0] += seconds
+
+    def urlopen(req, timeout):
+        requests.append((req, timeout))
+        res = responses.pop(0)
+        if isinstance(res, Exception):
+            raise res
+        return res
+
+    monkeypatch.setattr(client_module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(client_module.time, "sleep", sleep)
+    monkeypatch.setattr(client_module, "open_no_redirect", urlopen)
+
+    result = SyncClient(cfg(tmp_path)).ingest([{"raw_text": "drains after contention"}])
+
+    assert result["durable"] is True
+    assert result["accepted"] == 1
+    assert len(requests) == 7
+    assert sleeps == [2.0, 2.0, 2.0, 2.0, 2.0, 2.0]
+    assert clock[0] == 12.0
+
+
+def test_ingest_permanent_4xx_error_fails_immediately_without_retry(tmp_path, monkeypatch):
+    _async_client_environment(monkeypatch)
+    sleeps = []
+
+    # 1. urllib HTTPError for 400 Bad Request
+    def urlopen_400(req, timeout):
+        raise client_module.error.HTTPError(req.full_url, 400, "bad request", {}, None)
+
+    monkeypatch.setattr(client_module.time, "sleep", sleeps.append)
+    monkeypatch.setattr(client_module, "open_no_redirect", urlopen_400)
+    with pytest.raises(client_module.error.HTTPError) as exc_info:
+        SyncClient(cfg(tmp_path)).ingest([{"raw_text": "bad request payload"}])
+    assert exc_info.value.code == 400
+    assert sleeps == []
+
+    # 2. Response object with status 403 Forbidden
+    def urlopen_403(req, timeout):
+        return _IngestResponse(403, {"error": "forbidden"})
+
+    monkeypatch.setattr(client_module, "open_no_redirect", urlopen_403)
+    with pytest.raises(RuntimeError, match="remote ingest returned HTTP 403"):
+        SyncClient(cfg(tmp_path)).ingest([{"raw_text": "forbidden payload"}])
+    assert sleeps == []
+
+
+def test_ingest_repeated_429_exhausts_transient_retries_without_unbounded_loop(tmp_path, monkeypatch):
+    _async_client_environment(monkeypatch)
+    monkeypatch.setenv("FUNES_REMOTE_TRANSIENT_RETRIES", "5")
+    clock = [0.0]
+    sleeps = []
+    requests = []
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        clock[0] += seconds
+
+    def urlopen(req, timeout):
+        requests.append((req, timeout))
+        raise client_module.error.HTTPError(
+            req.full_url,
+            429,
+            "Too Many Requests",
+            {"Retry-After": "2"},
+            None,
+        )
+
+    monkeypatch.setattr(client_module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(client_module.time, "sleep", sleep)
+    monkeypatch.setattr(client_module, "open_no_redirect", urlopen)
+
+    with pytest.raises(RuntimeError, match="remote ingest failed after retries"):
+        SyncClient(cfg(tmp_path)).ingest([{"raw_text": "must fail after max retries"}])
+
+    assert len(requests) == 5
+    assert len(sleeps) == 4
+    assert clock[0] == 8.0

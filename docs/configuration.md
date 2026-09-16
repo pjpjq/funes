@@ -100,7 +100,7 @@ environment: never commit it, write it into these files, or include it in logs.
 | `FUNES_BIN` | Binary path recorded in supported MCP registrations and used by the pi bridge. Hook workers instead find `funes` on `PATH` or in common install directories. |
 | `FUNES_MEMORY` | Per-run memory override understood by the pi extension; otherwise its binding from `funes add pi [memory]` is used. |
 | `FUNES_INDEX_MEMORY` | Optional blue/green build target for the Space canonical reconciler. It defaults to `FUNES_MEMORY`; set it to a new private dataset when changing embedding spaces. |
-| `FUNES_NATIVE_PRIMARY` | When `true`, `funes-sync` delegates production index/push to native Funes instead of the migration HTTP path. |
+| `FUNES_NATIVE_PRIMARY` | Legacy opt-in. When `true`, macOS also runs a local native index/push helper. Keep the default `false` when the remote Space has a canonical reconciler. |
 | `FUNES_NATIVE_FALLBACK` | Remote-read fallback policy. `false` disables substitution of the offline local memory; production sets `false`. The standalone default is enabled. |
 | `FUNES_EMBEDDING_PROVIDER` | Runtime embedding provider: `local` or `voyage`. Standalone default: `local`; production image default: `voyage`. |
 | `FUNES_EMBEDDING_MODEL` | Voyage embedding model; default `voyage-4-lite`. Local embedding remains pinned to `BAAI/bge-small-en-v1.5`. |

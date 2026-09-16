@@ -2,23 +2,16 @@
 
 `sync/` 是唯一的同步实现；`scripts/funes-sync/funes-sync` 只是兼容入口。它发现 Codex（含
 active/archived）、Claude Code、pi 的会话，以及 Codex/Claude/pi 和仓库中的 `AGENTS.md`/`MEMORY.md`，
-将每个新文件转换为带稳定 source id 的记录。生产远端路径应由原生 `funes index` →
-`funes push` 完成；这会保留 Lance vector/BM25/rerank/recency/neighbors 和 TruffleHog gate。
-兼容 HTTP 服务只用于迁移/测试，不替代 Funes 检索引擎。
+将每个新文件转换为带稳定 source id 的记录。默认生产路径把原文和 source metadata 通过
+authenticated HTTP 持久化到加密 sidecar；HF Space 的 canonical reconciler 再从该 source of
+truth 增量构建可重建的 Lance vector/BM25 索引。检索仍由原生 Funes 引擎完成。
 
-当 `FUNES_MEMORY_ONLY=1` 用于避免轻量 HTTP daemon 重复运行 native index 时，它仍会把
-session 原文和 source metadata 写入加密 sidecar；历史 session 的派生索引则由
-`deploy/funes-sync/native-backfill.sh` 调用官方原生 parser/index/push。它完成首次回填后不会退出，
-而是按 `FUNES_NATIVE_BACKFILL_RECONCILE_INTERVAL`（默认 300 秒）继续扫描 Codex、Pi、Claude
-和 Hermes 的新建/追加 session；`--yes` 会一次 drain 完整 tier backlog，避免每 60 秒重建
-text/vector index；这样 memory-only daemon 不会留下未来 session 的接管空档。macOS `lockf`
-内核锁会在最后一个进程描述符关闭时自动释放，不依赖 PID 或删除 lock 文件，Mac/进程重启不会
-因 stale lock 永久停摆。
-原生 auto-discovery 之外还显式复用官方 parser 扫描 Codex `archived_sessions`/`subagents`、
-Pi legacy/custom session roots 和 Claude `history`，不会把这些目录改用兼容 parser。
-原生 push 成功后，LaunchAgent 会通过受保护的 `/warm` 通知让 HF Space 在后台刷新读取
-worker；通知默认按 `FUNES_NATIVE_WARM_MIN_INTERVAL=300` 节流，避免历史回填期间重复加载
-embedding/index。通知失败不影响本地已完成的 durable push。
+macOS 默认只安装轻量 `com.funes.sync` LaunchAgent。它在 `FUNES_MEMORY_ONLY=1` 模式下仍会
+发现、解析、去重、watch 和上传 Codex/Pi/Claude session 与 memory 文件；Space 负责 derived
+index，因此 Mac 不需要持续重建同一份本地向量索引。只有没有 canonical reconciler 的 legacy
+远端才设置 `FUNES_NATIVE_PRIMARY=true`，额外安装 `com.funes.native-backfill` 并运行
+`deploy/funes-sync/native-backfill.sh`。从 native 模式切回默认模式后再次运行 `funes sync install`
+会停止并移除旧 helper plist，不会让它在重启后复活。
 
 ## 快速使用
 

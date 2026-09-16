@@ -16,10 +16,10 @@ before they enter the private Hub source dataset.
   front door; `/ready` additionally checks the application bearer);
 - bearer-authenticated `POST /ingest`, `/search`, `/recall`, and `/get`.
 
-Source discovery, backfill, index rebuild, and sync status are local-daemon/CLI
-operations (`funes sync status`, `funes sources`, `funes index --yes`, then
-`funes push <memory> --force-reindex`); the Space
-does not pretend to access the Mac filesystem.
+Source discovery and backfill remain local-daemon operations (`funes sync status`,
+`funes sources`). The daemon uploads durable raw/source records; the Space canonical reconciler
+incrementally rebuilds and publishes the derived native index. The Space never accesses the Mac
+filesystem directly.
 
 Set `FUNES_MEMORY` to the rebuildable private Funes dataset and
 `FUNES_STORAGE_REPO` to the separate private encrypted-source dataset. The

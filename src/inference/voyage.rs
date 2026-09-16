@@ -6,10 +6,11 @@
 
 use std::env;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Result};
 use reqwest::blocking::Client;
+use reqwest::header::HeaderMap;
 use reqwest::redirect::Policy;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
@@ -145,6 +146,41 @@ fn retryable_request_error(error: &reqwest::Error) -> bool {
     error.is_timeout() || error.is_connect() || error.is_body()
 }
 
+fn retry_after_delay(value: &str, now: SystemTime) -> Option<Duration> {
+    if let Ok(seconds) = value.trim().parse::<u64>() {
+        return Some(Duration::from_secs(seconds));
+    }
+    let reset = chrono::DateTime::parse_from_rfc2822(value.trim()).ok()?.timestamp();
+    let now = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    Some(Duration::from_secs(reset.saturating_sub(now as i64).max(0) as u64))
+}
+
+fn epoch_reset_delay(value: &str, now: SystemTime) -> Option<Duration> {
+    let reset = value.trim().parse::<u64>().ok()?;
+    let now = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    Some(Duration::from_secs(reset.saturating_sub(now)))
+}
+
+fn exponential_rate_limit_delay(base: Duration, attempt: usize) -> Duration {
+    let multiplier = 1u32.checked_shl(attempt as u32).unwrap_or(u32::MAX);
+    base.saturating_mul(multiplier).min(DOCUMENT_MAX_RATE_LIMIT_DELAY)
+}
+
+fn rate_limit_delay_from_headers(headers: &HeaderMap, now: SystemTime, fallback: Duration) -> Duration {
+    headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| retry_after_delay(value, now))
+        .or_else(|| {
+            headers
+                .get("x-ratelimit-reset")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| epoch_reset_delay(value, now))
+        })
+        .unwrap_or(fallback)
+        .min(DOCUMENT_MAX_RATE_LIMIT_DELAY)
+}
+
 fn normalize(vector: &mut [f32]) -> Result<()> {
     if vector.iter().any(|value| !value.is_finite()) {
         bail!("Voyage embeddings returned a non-finite vector")
@@ -256,15 +292,12 @@ impl VoyageEmbedder {
         })
     }
 
-    fn rate_limit_delay(&self, response: &reqwest::blocking::Response) -> Duration {
-        response
-            .headers()
-            .get(reqwest::header::RETRY_AFTER)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.trim().parse::<u64>().ok())
-            .map(Duration::from_secs)
-            .unwrap_or(self.document_rate_limit_delay)
-            .min(DOCUMENT_MAX_RATE_LIMIT_DELAY)
+    fn rate_limit_delay(&self, response: &reqwest::blocking::Response, attempt: usize) -> Duration {
+        rate_limit_delay_from_headers(
+            response.headers(),
+            SystemTime::now(),
+            exponential_rate_limit_delay(self.document_rate_limit_delay, attempt),
+        )
     }
 
     fn request(&self, texts: &[&str], input_type: &'static str, documents: bool) -> Result<Vec<Vec<f32>>> {
@@ -320,7 +353,7 @@ impl VoyageEmbedder {
             }
             if documents && retryable(status) && attempt + 1 < attempts {
                 let delay = if status == StatusCode::TOO_MANY_REQUESTS {
-                    self.rate_limit_delay(&response)
+                    self.rate_limit_delay(&response, attempt)
                 } else {
                     self.document_retry_delay.saturating_mul((attempt + 1) as u32)
                 };
@@ -706,6 +739,43 @@ mod tests {
         assert!(error.contains("HTTP 599"));
         assert!(!error.contains("last-body"));
         assert_eq!(exhausted.finish().len(), DOCUMENT_ATTEMPTS);
+    }
+
+    #[test]
+    fn retry_delay_accepts_http_date_and_rate_limit_reset() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_600_000_000);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            "Sun, 13 Sep 2020 12:27:00 GMT".parse().unwrap(),
+        );
+        assert_eq!(
+            rate_limit_delay_from_headers(&headers, now, Duration::from_secs(60)),
+            Duration::from_secs(20)
+        );
+
+        headers.remove(reqwest::header::RETRY_AFTER);
+        headers.insert("x-ratelimit-reset", "1600000060".parse().unwrap());
+        assert_eq!(
+            rate_limit_delay_from_headers(&headers, now, Duration::from_secs(120)),
+            Duration::from_secs(60)
+        );
+    }
+
+    #[test]
+    fn retry_delay_uses_capped_exponential_fallback() {
+        assert_eq!(
+            exponential_rate_limit_delay(Duration::from_secs(10), 0),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            exponential_rate_limit_delay(Duration::from_secs(10), 2),
+            Duration::from_secs(40)
+        );
+        assert_eq!(
+            exponential_rate_limit_delay(Duration::from_secs(60), 4),
+            DOCUMENT_MAX_RATE_LIMIT_DELAY
+        );
     }
 
     #[test]

@@ -167,7 +167,7 @@ def test_remote_search_does_not_probe_while_source_store_restores(monkeypatch):
     assert [url for url, _, _ in calls] == ["https://memory.example/search"]
 
 
-def test_remote_search_default_budget_is_one_attempt(monkeypatch):
+def test_remote_search_default_budget_is_two_attempts(monkeypatch):
     monkeypatch.setenv("FUNES_REMOTE_URL", "https://memory.example")
     monkeypatch.setenv("FUNES_API_TOKEN", "api-token")
     for name in (
@@ -190,8 +190,107 @@ def test_remote_search_default_budget_is_one_attempt(monkeypatch):
     assert bridge._remote_call("/search", {"query": "previous"}) is None
     assert [(url, method) for url, method, _ in calls] == [
         ("https://memory.example/search", "POST"),
+        ("https://memory.example/search", "POST"),
     ]
     assert all(0 < timeout <= 8 for _, _, timeout in calls)
+
+    # Explicit override back to 1 attempt is honored
+    calls.clear()
+    monkeypatch.setenv("FUNES_REMOTE_ATTEMPTS", "1")
+    assert bridge._remote_call("/search", {"query": "previous"}) is None
+    assert [(url, method) for url, method, _ in calls] == [
+        ("https://memory.example/search", "POST"),
+    ]
+
+
+def test_remote_search_retries_transient_429_by_default(monkeypatch):
+    monkeypatch.setenv("FUNES_REMOTE_URL", "https://memory.example")
+    monkeypatch.setenv("FUNES_API_TOKEN", "api-token")
+    for name in (
+        "FUNES_REMOTE_TIMEOUT",
+        "FUNES_REMOTE_ATTEMPTS",
+        "FUNES_REMOTE_ATTEMPT_TIMEOUT",
+        "FUNES_REMOTE_READY_TIMEOUT",
+        "FUNES_REMOTE_READY_POLLS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    calls = []
+    slept = []
+
+    def fake_urlopen(req, timeout):
+        calls.append((req.full_url, req.method, timeout))
+        if len(calls) == 1:
+            body = io.BytesIO(b'{"error": "native_mcp_busy"}')
+            raise HTTPError(req.full_url, 429, "too many requests", {"Retry-After": "1"}, body)
+        return _Response({"ok": True, "results": [{"raw_text": "retried"}]})
+
+    monkeypatch.setattr(bridge, "_open_remote", fake_urlopen)
+    monkeypatch.setattr(bridge.time, "sleep", lambda s: slept.append(s))
+
+    result = bridge._remote_call("/search", {"query": "previous"})
+    assert result == {"ok": True, "results": [{"raw_text": "retried"}]}
+    assert [(url, method) for url, method, _ in calls] == [
+        ("https://memory.example/search", "POST"),
+        ("https://memory.example/search", "POST"),
+    ]
+    assert len(slept) == 1
+    assert slept[0] > 0
+
+
+def test_remote_search_retries_transient_transport_failure_by_default(monkeypatch):
+    monkeypatch.setenv("FUNES_REMOTE_URL", "https://memory.example")
+    monkeypatch.setenv("FUNES_API_TOKEN", "api-token")
+    for name in (
+        "FUNES_REMOTE_TIMEOUT",
+        "FUNES_REMOTE_ATTEMPTS",
+        "FUNES_REMOTE_ATTEMPT_TIMEOUT",
+        "FUNES_REMOTE_READY_TIMEOUT",
+        "FUNES_REMOTE_READY_POLLS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    calls = []
+
+    def fake_urlopen(req, timeout):
+        calls.append((req.full_url, req.method, timeout))
+        if len(calls) == 1:
+            raise OSError("connection reset")
+        return _Response({"ok": True, "results": [{"raw_text": "recovered"}]})
+
+    monkeypatch.setattr(bridge, "_open_remote", fake_urlopen)
+    monkeypatch.setattr(bridge.time, "sleep", lambda _seconds: None)
+
+    result = bridge._remote_call("/search", {"query": "previous"})
+    assert result == {"ok": True, "results": [{"raw_text": "recovered"}]}
+    assert [(url, method) for url, method, _ in calls] == [
+        ("https://memory.example/search", "POST"),
+        ("https://memory.example/search", "POST"),
+    ]
+
+
+def test_remote_search_does_not_retry_permanent_auth_error(monkeypatch):
+    monkeypatch.setenv("FUNES_REMOTE_URL", "https://memory.example")
+    monkeypatch.setenv("FUNES_API_TOKEN", "api-token")
+    for name in (
+        "FUNES_REMOTE_TIMEOUT",
+        "FUNES_REMOTE_ATTEMPTS",
+        "FUNES_REMOTE_ATTEMPT_TIMEOUT",
+        "FUNES_REMOTE_READY_TIMEOUT",
+        "FUNES_REMOTE_READY_POLLS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    calls = []
+
+    def fake_urlopen(req, timeout):
+        calls.append((req.full_url, req.method, timeout))
+        raise HTTPError(req.full_url, 401, "unauthorized", {}, io.BytesIO(b'{"error": "unauthorized"}'))
+
+    monkeypatch.setattr(bridge, "_open_remote", fake_urlopen)
+    with pytest.raises(HTTPError) as exc_info:
+        bridge._remote_call("/search", {"query": "secret"})
+    assert exc_info.value.code == 401
+    assert [(url, method) for url, method, _ in calls] == [
+        ("https://memory.example/search", "POST"),
+    ]
 
 
 def test_mcp_recall_returns_null_instead_of_json_rpc_error_when_unavailable(

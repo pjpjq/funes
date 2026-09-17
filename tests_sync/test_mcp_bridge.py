@@ -586,3 +586,118 @@ def test_mcp_get_uses_source_identity_and_recall_exposes_filters(monkeypatch):
         "until",
     } <= set(recall["inputSchema"]["properties"])
     assert calls == [("/get", {"source_identity": "memory-1"})]
+
+
+def test_remote_search_ignores_long_remote_timeout_env(monkeypatch):
+    monkeypatch.setenv("FUNES_REMOTE_URL", "https://memory.example")
+    monkeypatch.setenv("FUNES_API_TOKEN", "api-token")
+    monkeypatch.setenv("FUNES_REMOTE_TIMEOUT", "900")
+    monkeypatch.setenv("FUNES_REMOTE_ATTEMPT_TIMEOUT", "50")
+    calls = []
+
+    def unavailable(req, timeout):
+        calls.append((req.full_url, timeout))
+        raise OSError("unavailable")
+
+    monkeypatch.setattr(bridge, "_open_remote", unavailable)
+    monkeypatch.setattr(bridge.time, "sleep", lambda _seconds: None)
+
+    assert bridge._remote_call("/search", {"query": "test"}) is None
+    assert len(calls) == 2
+    assert all(0 < timeout <= 5.0 for _, timeout in calls)
+
+
+def test_remote_search_reads_dedicated_recall_timeout_env(monkeypatch):
+    monkeypatch.setenv("FUNES_REMOTE_URL", "https://memory.example")
+    monkeypatch.setenv("FUNES_API_TOKEN", "api-token")
+    monkeypatch.setenv("FUNES_REMOTE_TIMEOUT", "900")
+    monkeypatch.setenv("FUNES_REMOTE_RECALL_TIMEOUT", "15")
+    monkeypatch.setenv("FUNES_REMOTE_RECALL_ATTEMPT_TIMEOUT", "6.5")
+    monkeypatch.setenv("FUNES_REMOTE_RECALL_ATTEMPTS", "3")
+    calls = []
+
+    def unavailable(req, timeout):
+        calls.append((req.full_url, timeout))
+        raise OSError("unavailable")
+
+    monkeypatch.setattr(bridge, "_open_remote", unavailable)
+    monkeypatch.setattr(bridge.time, "sleep", lambda _seconds: None)
+
+    assert bridge._remote_call("/search", {"query": "test"}) is None
+    assert len(calls) == 3
+    assert all(6.0 <= timeout <= 6.5 for _, timeout in calls)
+
+
+def test_remote_search_reads_search_alias_env(monkeypatch):
+    monkeypatch.setenv("FUNES_REMOTE_URL", "https://memory.example")
+    monkeypatch.setenv("FUNES_API_TOKEN", "api-token")
+    monkeypatch.delenv("FUNES_REMOTE_RECALL_TIMEOUT", raising=False)
+    monkeypatch.delenv("FUNES_REMOTE_RECALL_ATTEMPT_TIMEOUT", raising=False)
+    monkeypatch.delenv("FUNES_REMOTE_RECALL_ATTEMPTS", raising=False)
+    monkeypatch.setenv("FUNES_REMOTE_SEARCH_TIMEOUT", "14")
+    monkeypatch.setenv("FUNES_REMOTE_SEARCH_ATTEMPT_TIMEOUT", "5.5")
+    monkeypatch.setenv("FUNES_REMOTE_SEARCH_ATTEMPTS", "4")
+    calls = []
+
+    def unavailable(req, timeout):
+        calls.append((req.full_url, timeout))
+        raise OSError("unavailable")
+
+    monkeypatch.setattr(bridge, "_open_remote", unavailable)
+    monkeypatch.setattr(bridge.time, "sleep", lambda _seconds: None)
+
+    assert bridge._remote_call("/search", {"query": "test"}) is None
+    assert len(calls) == 4
+    assert all(5.0 <= timeout <= 5.5 for _, timeout in calls)
+
+
+def test_remote_search_short_backoff_on_503_preserves_second_attempt_budget(monkeypatch):
+    monkeypatch.setenv("FUNES_REMOTE_URL", "https://memory.example")
+    monkeypatch.setenv("FUNES_API_TOKEN", "api-token")
+    for name in (
+        "FUNES_REMOTE_TIMEOUT",
+        "FUNES_REMOTE_ATTEMPTS",
+        "FUNES_REMOTE_ATTEMPT_TIMEOUT",
+        "FUNES_REMOTE_RECALL_TIMEOUT",
+        "FUNES_REMOTE_RECALL_ATTEMPT_TIMEOUT",
+        "FUNES_REMOTE_RECALL_ATTEMPTS",
+        "FUNES_REMOTE_SEARCH_TIMEOUT",
+        "FUNES_REMOTE_SEARCH_ATTEMPT_TIMEOUT",
+        "FUNES_REMOTE_SEARCH_ATTEMPTS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    calls = []
+    slept = []
+
+    def fake_urlopen(req, timeout):
+        calls.append((req.full_url, timeout))
+        if len(calls) == 1:
+            raise HTTPError(req.full_url, 503, "Service Unavailable", {}, None)
+        return _Response({"ok": True, "results": [{"raw_text": "retried_503"}]})
+
+    monkeypatch.setattr(bridge, "_open_remote", fake_urlopen)
+    monkeypatch.setattr(bridge.time, "sleep", lambda s: slept.append(s))
+
+    result = bridge._remote_call("/search", {"query": "test"})
+    assert result == {"ok": True, "results": [{"raw_text": "retried_503"}]}
+    assert len(calls) == 2
+    assert slept == [0.5]
+    assert 4.0 <= calls[1][1] <= 5.0
+
+
+def test_remote_get_still_uses_remote_timeout_env(monkeypatch):
+    monkeypatch.setenv("FUNES_REMOTE_URL", "https://memory.example")
+    monkeypatch.setenv("FUNES_API_TOKEN", "api-token")
+    monkeypatch.setenv("FUNES_REMOTE_TIMEOUT", "200")
+    monkeypatch.setenv("FUNES_REMOTE_ATTEMPT_TIMEOUT", "45")
+    monkeypatch.setenv("FUNES_REMOTE_ATTEMPTS", "2")
+    calls = []
+
+    def fake_urlopen(req, timeout):
+        calls.append((req.full_url, timeout))
+        return _Response({"ok": True})
+
+    monkeypatch.setattr(bridge, "_open_remote", fake_urlopen)
+    assert bridge._remote_call("/get", {"source_identity": "one"}) == {"ok": True}
+    assert len(calls) == 1
+    assert calls[0][1] == 45.0

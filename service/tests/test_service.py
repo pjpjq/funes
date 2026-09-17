@@ -627,7 +627,9 @@ class ServiceTests(unittest.TestCase):
 
         def capture_upload(**kwargs):
             name = kwargs["path_in_repo"]
-            (artifact_dir / name).write_bytes(
+            target_path = artifact_dir / name
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            target_path.write_bytes(
                 Path(kwargs["path_or_fileobj"]).read_bytes()
             )
             artifact_names.append(name)
@@ -3283,7 +3285,7 @@ class ServiceTests(unittest.TestCase):
                 separators=(",", ":"),
             ).encode()
         ).hexdigest()[:24]
-        delta_name = f"funes-delta-{digest}.jsonl.gz.enc"
+        delta_name = syncer.delta_target(digest)
         snapshot_name = "funes-snapshot.jsonl.gz.enc"
         manifest = {
             "version": 1,
@@ -3638,6 +3640,438 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(result["reason"], "restore_failed")
         store.close()
 
+
+
+    def test_delta_target_shards_deterministically_by_digest_prefix(self):
+        from service.server import SnapshotSync
+
+        store = Store(self.tmp.name)
+        syncer = SnapshotSync(store)
+        digest = "4a1b2c3d4e5f60718293a4b5"
+        self.assertEqual(
+            syncer.delta_target(digest),
+            "deltas/4a/funes-delta-4a1b2c3d4e5f60718293a4b5.jsonl.gz.enc",
+        )
+
+        with mock.patch.dict(os.environ, {"FUNES_DELTA_DIR": "archive/deltas", "FUNES_DELTA_PREFIX": "custom-delta-"}):
+            custom_syncer = SnapshotSync(store)
+            self.assertEqual(
+                custom_syncer.delta_target(digest),
+                "archive/deltas/4a/custom-delta-4a1b2c3d4e5f60718293a4b5.jsonl.gz.enc",
+            )
+
+        with mock.patch.dict(os.environ, {"FUNES_DELTA_DIR": ""}):
+            unsharded_syncer = SnapshotSync(store)
+            self.assertEqual(
+                unsharded_syncer.delta_target(digest),
+                "funes-delta-4a1b2c3d4e5f60718293a4b5.jsonl.gz.enc",
+            )
+        store.close()
+
+    def test_sharded_delta_deduplication_recognizes_legacy_root_deltas(self):
+        from service.server import SnapshotSync
+
+        store = Store(self.tmp.name)
+        store.ingest([{"source_identity": "legacy-dedupe", "raw_text": "text"}])
+        docs = store.get_many(["legacy-dedupe"])
+        os.environ.update(
+            FUNES_STORAGE_REPO="owner/private",
+            FUNES_STORAGE_KEY="test-storage-key",
+            HF_TOKEN="hf-test",
+        )
+        syncer = SnapshotSync(store)
+        durable_docs = [*docs, store.native_index_state_record()]
+        digest = hashlib.sha256(
+            json.dumps(
+                durable_docs,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()[:24]
+        legacy_delta = f"funes-delta-{digest}.jsonl.gz.enc"
+        sharded_delta = syncer.delta_target(digest)
+        self.assertNotEqual(legacy_delta, sharded_delta)
+
+        manifest = {
+            "version": 1,
+            "snapshot": "funes-snapshot.jsonl.gz.enc",
+            "deltas": [legacy_delta],
+            "controls": [],
+        }
+        manifest_path = Path(self.tmp.name) / "manifest-legacy-dedupe.json"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+        api = mock.Mock()
+        api.repo_info.return_value = mock.Mock(sha="head-1")
+        api.list_repo_tree.return_value = [
+            mock.Mock(path=syncer.manifest_filename, blob_id="m-1"),
+            mock.Mock(path="funes-snapshot.jsonl.gz.enc", blob_id="s-1"),
+            mock.Mock(path=legacy_delta, blob_id="d-1"),
+        ]
+        with mock.patch("huggingface_hub.HfApi", return_value=api), mock.patch(
+            "huggingface_hub.hf_hub_download", return_value=str(manifest_path)
+        ):
+            result = syncer.upload(docs)
+
+        self.assertTrue(result["durable"])
+        self.assertTrue(result["already_uploaded"])
+        self.assertFalse(result["uploaded"])
+        api.create_commit.assert_not_called()
+        api.upload_file.assert_not_called()
+        store.close()
+
+    def test_repo_files_orders_legacy_root_deltas_before_sharded_deltas_without_manifest(self):
+        from service.server import SnapshotSync
+
+        store = Store(self.tmp.name)
+        syncer = SnapshotSync(store)
+        syncer.repo = "owner/private"
+        syncer.token = "test-token"
+        repo_files = [
+            "funes-snapshot.jsonl.gz.enc",
+            "deltas/0b/funes-delta-0b2.jsonl.gz.enc",
+            "funes-delta-z.jsonl.gz.enc",
+            "deltas/0a/funes-delta-0a1.jsonl.gz.enc",
+            "funes-delta-a.jsonl.gz.enc",
+            "funes-reindex-0001.jsonl.gz.enc",
+            "deltas/invalid-not-three-parts.jsonl.gz.enc",
+            "other_dir/0a/funes-delta-0a1.jsonl.gz.enc",
+        ]
+        api = mock.Mock()
+        api.repo_info.return_value = mock.Mock(sha="head-1")
+        api.list_repo_tree.return_value = [mock.Mock(path=p) for p in repo_files]
+        with mock.patch("huggingface_hub.HfApi", return_value=api):
+            files = syncer._repo_files()
+
+        self.assertEqual(
+            files,
+            [
+                "funes-snapshot.jsonl.gz.enc",
+                "funes-delta-a.jsonl.gz.enc",
+                "funes-delta-z.jsonl.gz.enc",
+                "deltas/0a/funes-delta-0a1.jsonl.gz.enc",
+                "deltas/0b/funes-delta-0b2.jsonl.gz.enc",
+                "funes-reindex-0001.jsonl.gz.enc",
+            ],
+        )
+        store.close()
+
+    def test_restore_roundtrip_mixed_snapshot_legacy_and_sharded_deltas(self):
+        from service.server import SnapshotSync
+
+        os.environ["FUNES_STORAGE_KEY"] = "test-storage-key"
+        source_dir = tempfile.TemporaryDirectory()
+        source = Store(source_dir.name)
+        source.ingest([{"source_identity": "doc-snapshot", "raw_text": "from snapshot"}])
+        source.ingest([{"source_identity": "doc-legacy", "raw_text": "from legacy delta"}])
+        source.ingest([{"source_identity": "doc-sharded", "raw_text": "from sharded delta"}])
+
+        syncer_writer = SnapshotSync(source)
+        artifacts_dir = Path(self.tmp.name) / "mixed-restore-artifacts"
+        artifacts_dir.mkdir(parents=True, exist_ok=True)
+
+        # 1. Snapshot
+        snapshot_plain = artifacts_dir / "funes-snapshot.jsonl.gz"
+        snapshot_enc = artifacts_dir / "funes-snapshot.jsonl.gz.enc"
+        syncer_writer._write_jsonl_gzip(source.get_many(["doc-snapshot"]), snapshot_plain)
+        syncer_writer._encrypt_file(snapshot_plain, snapshot_enc)
+
+        # 2. Legacy delta
+        legacy_plain = artifacts_dir / "funes-delta-legacy.jsonl.gz"
+        legacy_enc = artifacts_dir / "funes-delta-legacy.jsonl.gz.enc"
+        syncer_writer._write_jsonl_gzip(source.get_many(["doc-legacy"]), legacy_plain)
+        syncer_writer._encrypt_file(legacy_plain, legacy_enc)
+
+        # 3. Sharded delta
+        sharded_dir = artifacts_dir / "deltas" / "3f"
+        sharded_dir.mkdir(parents=True, exist_ok=True)
+        sharded_plain = sharded_dir / "funes-delta-3f123.jsonl.gz"
+        sharded_enc = sharded_dir / "funes-delta-3f123.jsonl.gz.enc"
+        syncer_writer._write_jsonl_gzip(source.get_many(["doc-sharded"]), sharded_plain)
+        syncer_writer._encrypt_file(sharded_plain, sharded_enc)
+
+        # Restore target
+        target_dir = tempfile.TemporaryDirectory()
+        target = Store(target_dir.name)
+        syncer_reader = SnapshotSync(target)
+        syncer_reader.repo = "owner/private"
+        syncer_reader.token = "test-token"
+
+        manifest = {
+            "version": 1,
+            "snapshot": "funes-snapshot.jsonl.gz.enc",
+            "deltas": [
+                "funes-delta-legacy.jsonl.gz.enc",
+                "deltas/3f/funes-delta-3f123.jsonl.gz.enc",
+            ],
+            "controls": [],
+        }
+        manifest_path = artifacts_dir / syncer_reader.manifest_filename
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+        api = mock.Mock()
+        api.repo_info.return_value = mock.Mock(sha="head-1")
+        api.list_repo_tree.return_value = [
+            mock.Mock(path=syncer_reader.manifest_filename),
+            mock.Mock(path=manifest["snapshot"]),
+            mock.Mock(path=manifest["deltas"][0]),
+            mock.Mock(path=manifest["deltas"][1]),
+        ]
+
+        def fake_download(**kwargs):
+            return str(artifacts_dir / kwargs["filename"])
+
+        with mock.patch("huggingface_hub.HfApi", return_value=api), mock.patch(
+            "huggingface_hub.hf_hub_download", side_effect=fake_download
+        ):
+            restored_count = syncer_reader.restore()
+
+        self.assertEqual(restored_count, 3)
+        self.assertEqual(target.get("doc-snapshot")["raw_text"], "from snapshot")
+        self.assertEqual(target.get("doc-legacy")["raw_text"], "from legacy delta")
+        self.assertEqual(target.get("doc-sharded")["raw_text"], "from sharded delta")
+
+        source.close(); source_dir.cleanup()
+        target.close(); target_dir.cleanup()
+
+    def test_sharded_manifest_validation_rejects_traversal_and_malformed_deltas(self):
+        from service.server import SnapshotSync
+
+        store = Store(self.tmp.name)
+        syncer = SnapshotSync(store)
+        repo_files = {
+            "funes-snapshot.jsonl.gz.enc",
+            "deltas/ab/funes-delta-ab12.jsonl.gz.enc",
+        }
+        # Valid sharded delta passes
+        valid_manifest = {
+            "version": 1,
+            "snapshot": "funes-snapshot.jsonl.gz.enc",
+            "deltas": ["deltas/ab/funes-delta-ab12.jsonl.gz.enc"],
+            "controls": [],
+        }
+        validated = syncer._validate_restore_manifest(valid_manifest, repo_files)
+        self.assertEqual(validated["deltas"], ["deltas/ab/funes-delta-ab12.jsonl.gz.enc"])
+
+        # Path traversal fails
+        with self.assertRaises(ValueError):
+            syncer._validate_restore_manifest(
+                {**valid_manifest, "deltas": ["../deltas/ab/funes-delta-ab12.jsonl.gz.enc"]},
+                repo_files,
+            )
+        # Slashes traversal
+        with self.assertRaises(ValueError):
+            syncer._validate_restore_manifest(
+                {**valid_manifest, "deltas": ["deltas/../funes-delta-ab12.jsonl.gz.enc"]},
+                repo_files,
+            )
+        # Bad prefix under deltas/
+        with self.assertRaises(ValueError):
+            syncer._validate_restore_manifest(
+                {**valid_manifest, "deltas": ["deltas/ab/wrong-prefix.jsonl.gz.enc"]},
+                repo_files,
+            )
+        store.close()
+
+
+    def test_compaction_retains_concurrent_sharded_deltas(self):
+        from service.server import SnapshotSync
+
+        store = Store(self.tmp.name)
+        os.environ.update(
+            FUNES_STORAGE_REPO="owner/private",
+            FUNES_STORAGE_KEY="test-storage-key",
+            HF_TOKEN="hf-test",
+        )
+        syncer = SnapshotSync(store)
+        syncer.covered_revision = "head-1"
+        snapshot_name = "funes-snapshot.jsonl.gz.enc"
+        base_delta = "funes-delta-base.jsonl.gz.enc"
+        sharded_concurrent_delta = "deltas/ab/funes-delta-ab1234567890123456789012.jsonl.gz.enc"
+        base_manifest = {
+            "version": 1,
+            "snapshot": snapshot_name,
+            "deltas": [base_delta],
+            "controls": [],
+        }
+        concurrent_manifest = {
+            **base_manifest,
+            "deltas": [base_delta, sharded_concurrent_delta],
+        }
+        base_path = Path(self.tmp.name) / "compact-shard-head-1.json"
+        concurrent_path = Path(self.tmp.name) / "compact-shard-head-2.json"
+        base_path.write_text(json.dumps(base_manifest), encoding="utf-8")
+        concurrent_path.write_text(json.dumps(concurrent_manifest), encoding="utf-8")
+        api = mock.Mock()
+        api.repo_info.side_effect = [mock.Mock(sha="head-1"), mock.Mock(sha="head-2")]
+        api.list_repo_tree.side_effect = [
+            [
+                mock.Mock(path=syncer.manifest_filename, blob_id="manifest-1"),
+                mock.Mock(path=snapshot_name, blob_id="snapshot-1"),
+                mock.Mock(path=base_delta, blob_id="delta-base"),
+            ],
+            [
+                mock.Mock(path=syncer.manifest_filename, blob_id="manifest-2"),
+                mock.Mock(path=snapshot_name, blob_id="snapshot-1"),
+                mock.Mock(path=base_delta, blob_id="delta-base"),
+                mock.Mock(path=sharded_concurrent_delta, blob_id="delta-sharded"),
+            ],
+        ]
+        api.create_commit.side_effect = [
+            RuntimeError("stale parent"),
+            mock.Mock(oid="head-3"),
+        ]
+        with mock.patch("huggingface_hub.HfApi", return_value=api), mock.patch(
+            "huggingface_hub.hf_hub_download",
+            side_effect=[str(base_path), str(concurrent_path)],
+        ):
+            result = syncer.upload()
+
+        self.assertTrue(result["durable"])
+        operations = {
+            operation.path_in_repo: operation
+            for operation in api.create_commit.call_args_list[-1].kwargs["operations"]
+        }
+        manifest = json.loads(operations[syncer.manifest_filename].path_or_fileobj)
+        self.assertEqual(manifest["snapshot"], snapshot_name)
+        self.assertEqual(manifest["deltas"], [sharded_concurrent_delta])
+        store.close()
+
+    def test_unmanifested_existing_legacy_delta_is_durable_without_reupload(self):
+        from service.server import SnapshotSync
+
+        store = Store(self.tmp.name)
+        store.ingest([{"source_identity": "legacy-nomani", "raw_text": "text"}])
+        os.environ.update(
+            FUNES_STORAGE_REPO="owner/private",
+            FUNES_STORAGE_KEY="test-storage-key",
+            HF_TOKEN="hf-test",
+        )
+        docs = store.get_many(["legacy-nomani"])
+        syncer = SnapshotSync(store)
+        durable_docs = [*docs, store.native_index_state_record()]
+        digest = hashlib.sha256(
+            json.dumps(
+                durable_docs,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()[:24]
+        legacy_delta = f"funes-delta-{digest}.jsonl.gz.enc"
+        sharded_delta = syncer.delta_target(digest)
+
+        api = mock.Mock()
+        api.repo_info.return_value = mock.Mock(sha="head-1")
+        api.list_repo_tree.return_value = []
+        # Sharded target does not exist, but legacy target exists
+        def fake_file_exists(repo_id, filename, repo_type, revision, token):
+            return filename == legacy_delta
+
+        api.file_exists.side_effect = fake_file_exists
+        module = mock.Mock(HfApi=mock.Mock(return_value=api))
+        with mock.patch.dict("sys.modules", {"huggingface_hub": module}):
+            result = syncer.upload(docs)
+
+        self.assertTrue(result["durable"])
+        self.assertTrue(result["already_uploaded"])
+        api.upload_file.assert_not_called()
+        self.assertFalse(list(Path(self.tmp.name).glob("funes-delta-*.jsonl.gz")))
+        store.close()
+
+
+    def test_arbitrary_delta_dir_prefix_sharding_and_manifest_validation(self):
+        from service.server import SnapshotSync
+
+        store = Store(self.tmp.name)
+        with mock.patch.dict(
+            os.environ,
+            {
+                "FUNES_DELTA_DIR": "archive/nested/deltas",
+                "FUNES_DELTA_PREFIX": "funes-delta-",
+            },
+        ):
+            syncer = SnapshotSync(store)
+            self.assertEqual(syncer.delta_dir, "archive/nested/deltas")
+            digest = "ab1234567890abcdef123456"
+            target = syncer.delta_target(digest)
+            self.assertEqual(
+                target,
+                "archive/nested/deltas/ab/funes-delta-ab1234567890abcdef123456.jsonl.gz.enc",
+            )
+            # Accepts configured multi-level directory
+            self.assertTrue(syncer._is_delta_name(target))
+            # Accepts canonical deltas/ fallback
+            self.assertTrue(
+                syncer._is_delta_name(
+                    "deltas/ab/funes-delta-ab1234567890abcdef123456.jsonl.gz.enc"
+                )
+            )
+            # Accepts legacy root delta fallback
+            self.assertTrue(
+                syncer._is_delta_name(
+                    "funes-delta-ab1234567890abcdef123456.jsonl.gz.enc"
+                )
+            )
+            # Fails on path traversal
+            self.assertFalse(
+                syncer._is_delta_name(
+                    "archive/nested/deltas/../other/ab/funes-delta-ab.jsonl.gz.enc"
+                )
+            )
+            # Fails on unmatched directory
+            self.assertFalse(
+                syncer._is_delta_name(
+                    "other/nested/deltas/ab/funes-delta-ab.jsonl.gz.enc"
+                )
+            )
+            # Fails on insufficient segments
+            self.assertFalse(
+                syncer._is_delta_name(
+                    "archive/nested/deltas/funes-delta-ab.jsonl.gz.enc"
+                )
+            )
+
+            # Manifest validation accepts multi-level sharded delta alongside legacy root
+            manifest = {
+                "version": 1,
+                "snapshot": "funes-snapshot.jsonl.gz.enc",
+                "deltas": [
+                    "funes-delta-legacy.jsonl.gz.enc",
+                    target,
+                ],
+                "controls": [],
+            }
+            repo_files = {
+                syncer.manifest_filename,
+                manifest["snapshot"],
+                *manifest["deltas"],
+            }
+            validated = syncer._validate_restore_manifest(manifest, repo_files)
+            self.assertEqual(validated["deltas"], manifest["deltas"])
+
+            # _repo_files fallback orders legacy root deltas before multi-level sharded deltas
+            syncer.repo = "owner/private"
+            syncer.token = "test-token"
+            api = mock.Mock()
+            api.repo_info.return_value = mock.Mock(sha="head-1")
+            api.list_repo_tree.return_value = [
+                mock.Mock(path=manifest["snapshot"]),
+                mock.Mock(path=target),
+                mock.Mock(path="funes-delta-legacy.jsonl.gz.enc"),
+            ]
+            with mock.patch("huggingface_hub.HfApi", return_value=api):
+                ordered = syncer._repo_files()
+            self.assertEqual(
+                ordered,
+                [
+                    "funes-snapshot.jsonl.gz.enc",
+                    "funes-delta-legacy.jsonl.gz.enc",
+                    target,
+                ],
+            )
+        store.close()
 
 if __name__ == "__main__":
     unittest.main()

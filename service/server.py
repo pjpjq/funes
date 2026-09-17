@@ -2535,6 +2535,7 @@ class SnapshotSync:
         self.filename = os.getenv("FUNES_SNAPSHOT_FILE", "funes-snapshot.jsonl.gz")
         self.prefix = os.getenv("FUNES_SNAPSHOT_PREFIX", "funes-snapshot-")
         self.delta_prefix = os.getenv("FUNES_DELTA_PREFIX", "funes-delta-")
+        self.delta_dir = (os.getenv("FUNES_DELTA_DIR", "deltas") or "").strip("/")
         self.control_prefix = os.getenv("FUNES_REINDEX_PREFIX", "funes-reindex-")
         self.manifest_filename = os.getenv(
             "FUNES_RESTORE_MANIFEST_FILE", "funes-restore-manifest-v1.json"
@@ -2575,6 +2576,13 @@ class SnapshotSync:
     def snapshot_path(self) -> Path:
         return self.store.data_dir / self.filename
 
+    def delta_target(self, digest: str) -> str:
+        shard = digest[:2] if len(digest) >= 2 else digest.zfill(2)
+        filename = f"{self.delta_prefix}{digest}.jsonl.gz.enc"
+        if self.delta_dir:
+            return f"{self.delta_dir}/{shard}/{filename}"
+        return filename
+
     @staticmethod
     def _safe_repo_filename(value: Any) -> bool:
         return (
@@ -2583,6 +2591,38 @@ class SnapshotSync:
             and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,254}", value)
             is not None
         )
+
+    @staticmethod
+    def _safe_repo_path(value: Any) -> bool:
+        if not isinstance(value, str) or not value:
+            return False
+        parts = value.split("/")
+        return all(
+            part not in {".", ".."}
+            and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,254}", part) is not None
+            for part in parts
+        )
+
+    def _is_delta_name(self, name: str) -> bool:
+        encrypted_suffixes = (".jsonl.enc", ".jsonl.gz.enc")
+        if not (
+            isinstance(name, str)
+            and self._safe_repo_path(name)
+            and name.endswith(encrypted_suffixes)
+            and bool(self.delta_prefix)
+        ):
+            return False
+        if "/" not in name:
+            return name.startswith(self.delta_prefix)
+        if name.count("/") < 2:
+            return False
+        prefix, shard, filename = name.rsplit("/", 2)
+        valid_dirs = {
+            d.strip("/")
+            for d in (self.delta_dir, "deltas")
+            if d and d.strip("/")
+        }
+        return prefix in valid_dirs and filename.startswith(self.delta_prefix)
 
     def _validate_restore_manifest(
         self, value: Any, repo_files: set[str]
@@ -2611,20 +2651,22 @@ class SnapshotSync:
             )
         ):
             raise ValueError("invalid restore manifest snapshot")
-        for names, prefix, kind in (
-            (deltas, self.delta_prefix, "delta"),
-            (controls, self.control_prefix, "control"),
-        ):
-            if any(
-                not self._safe_repo_filename(name)
-                or not prefix
-                or not name.startswith(prefix)
-                or not name.endswith(encrypted_suffixes)
-                for name in names
+        for name in deltas:
+            if not self._is_delta_name(name):
+                raise ValueError("invalid restore manifest delta")
+        if len(deltas) != len(set(deltas)):
+            raise ValueError("duplicate restore manifest delta")
+
+        for name in controls:
+            if not (
+                self._safe_repo_filename(name)
+                and bool(self.control_prefix)
+                and name.startswith(self.control_prefix)
+                and name.endswith(encrypted_suffixes)
             ):
-                raise ValueError(f"invalid restore manifest {kind}")
-            if len(names) != len(set(names)):
-                raise ValueError(f"duplicate restore manifest {kind}")
+                raise ValueError("invalid restore manifest control")
+        if len(controls) != len(set(controls)):
+            raise ValueError("duplicate restore manifest control")
         referenced = [snapshot, *deltas, *controls]
         if len(referenced) != len(set(referenced)):
             raise ValueError("duplicate restore manifest entry")
@@ -2717,7 +2759,7 @@ class SnapshotSync:
             and (
                 name == self.filename + ".enc"
                 or (bool(self.prefix) and name.startswith(self.prefix))
-                or (bool(self.delta_prefix) and name.startswith(self.delta_prefix))
+                or self._is_delta_name(name)
                 or (bool(self.control_prefix) and name.startswith(self.control_prefix))
             )
         }
@@ -2782,11 +2824,16 @@ class SnapshotSync:
         state: dict[str, Any],
     ) -> tuple[bool, bool]:
         last_error = None
+        legacy_target = (
+            Path(target).name if field == "deltas" and "/" in target else None
+        )
         for _ in range(3):
             manifest = state["manifest"]
             if manifest is None:
                 raise RuntimeError("active restore manifest disappeared")
-            if target in manifest[field]:
+            if target in manifest[field] or (
+                legacy_target is not None and legacy_target in manifest[field]
+            ):
                 return False, True
             updated_manifest = {
                 **manifest,
@@ -2810,7 +2857,10 @@ class SnapshotSync:
                     raise
                 state = latest
         manifest = state["manifest"]
-        if manifest is not None and target in manifest[field]:
+        if manifest is not None and (
+            target in manifest[field]
+            or (legacy_target is not None and legacy_target in manifest[field])
+        ):
             return False, True
         raise RuntimeError("restore manifest changed repeatedly") from last_error
 
@@ -2904,7 +2954,10 @@ class SnapshotSync:
             ]
         files = list(self._source_artifact_names(repo_files))
         snapshots = sorted(name for name in files if name == self.filename + ".enc" or name.startswith(self.prefix))
-        deltas = sorted(name for name in files if name.startswith(self.delta_prefix))
+        deltas = sorted(
+            (name for name in files if self._is_delta_name(name)),
+            key=lambda name: (1 if "/" in name else 0, name),
+        )
         controls = sorted(name for name in files if name.startswith(self.control_prefix))
         # Controls replay last and carry monotonic per-derived-field generations.
         # This makes immutable hash-named deltas safe regardless of their order.
@@ -3295,7 +3348,16 @@ class SnapshotSync:
                         "path": str(path),
                         "reason": reason,
                     }
-            target = (path.name if docs is not None else self.filename) + ".enc"
+            target = (
+                self.delta_target(digest)
+                if docs is not None
+                else self.filename + ".enc"
+            )
+            legacy_target = (
+                f"{path.name}.enc"
+                if docs is not None and "/" in target
+                else None
+            )
             manifest = None
             if docs is not None:
                 try:
@@ -3304,7 +3366,13 @@ class SnapshotSync:
                     state = self._remote_restore_state(api)
                     manifest = state["manifest"]
                     if manifest is not None:
-                        already_durable = target in manifest["deltas"]
+                        already_durable = (
+                            target in manifest["deltas"]
+                            or (
+                                legacy_target is not None
+                                and legacy_target in manifest["deltas"]
+                            )
+                        )
                     else:
                         already_durable = api.file_exists(
                             repo_id=self.repo,
@@ -3313,12 +3381,26 @@ class SnapshotSync:
                             revision=state["head"],
                             token=self.token,
                         )
+                        if not already_durable and legacy_target is not None:
+                            already_durable = api.file_exists(
+                                repo_id=self.repo,
+                                filename=legacy_target,
+                                repo_type="dataset",
+                                revision=state["head"],
+                                token=self.token,
+                            )
                         if already_durable:
                             latest = self._remote_restore_state(api)
                             if latest["manifest"] is not None:
                                 state = latest
                                 manifest = latest["manifest"]
-                                already_durable = target in manifest["deltas"]
+                                already_durable = (
+                                    target in manifest["deltas"]
+                                    or (
+                                        legacy_target is not None
+                                        and legacy_target in manifest["deltas"]
+                                    )
+                                )
                     if already_durable:
                         path.unlink(missing_ok=True)
                         self.store.set_sync(last_sync=utc_now(), snapshot_path=str(path), last_error=None)

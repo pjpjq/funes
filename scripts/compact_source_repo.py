@@ -708,9 +708,11 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Total root deltas count: {plan['root_deltas_count']}")
         print(f"Total sharded deltas count: {plan['sharded_deltas_count']}")
         print(f"Compaction action: {plan['action_compaction']}")
+        total_to_prune_all = plan["root_deltas_count"] if plan["action_compaction"] == "consolidate" else plan["unreferenced_deltas_count"]
+        total_batches_all = math.ceil(total_to_prune_all / plan["batch_size"]) if total_to_prune_all > 0 else 0
         print(
-            f"Prune batch plan: {plan['total_deltas_to_prune']} deltas in "
-            f"{plan['prune_batches']} batches (batch_size={plan['batch_size']})"
+            f"Prune batch plan: {plan['unreferenced_deltas_count']} currently unreferenced deltas "
+            f"(total {total_to_prune_all} root deltas post-compaction across {total_batches_all} batches, max {plan['batch_size']}/batch)"
         )
         print(
             f"Active compressed data size: {plan['total_active_compressed_bytes'] / (1024*1024):.2f} MB "

@@ -592,3 +592,75 @@ def test_pending_query_plan_uses_ready_order_index_without_temp_btree(tmp_path):
         assert [r["record_id"] for r in limited] == ["record:00", "record:01", "record:02"]
     finally:
         store.close()
+
+
+def test_ack_session_records_only_deletes_appendable_session_kinds(tmp_path):
+    cfg = Config(tmp_path, tmp_path / ".state", tmp_path / "config.toml")
+    store = Store(config=cfg)
+    try:
+        sources = [
+            Source("s_codex", "codex", tmp_path / "codex.jsonl", "dev"),
+            Source("s_codex_s", "codex_session", tmp_path / "codex_s.jsonl", "dev"),
+            Source("s_pi", "pi", tmp_path / "pi.jsonl", "dev"),
+            Source("s_pi_s", "pi_session", tmp_path / "pi_s.jsonl", "dev"),
+            Source("s_claude", "claude", tmp_path / "claude.jsonl", "dev"),
+            Source("s_claude_s", "claude_session", tmp_path / "claude_s.jsonl", "dev"),
+            Source("s_mem", "codex_memory", tmp_path / "memory.md", "dev"),
+            Source("s_agents", "agents_md", tmp_path / "AGENTS.md", "dev"),
+            Source("s_persist", "persistent", tmp_path / "persist.json", "dev"),
+            Source("s_retired", "codex", tmp_path / "retired.jsonl", "dev"),
+        ]
+        for s in sources:
+            store.register_source(s)
+        store.db.execute("UPDATE sources SET retired=1 WHERE source_key='s_retired'")
+        store.db.commit()
+
+        chunks = [
+            Chunk(
+                record_id=f"rec_{s.source_key}",
+                source_key=s.source_key,
+                kind=s.kind,
+                path=str(s.path),
+                session_id="sess",
+                ordinal=0,
+                role="user",
+                text="content",
+                raw_text="content",
+            )
+            for s in sources
+        ]
+        store.upsert_chunks(chunks)
+        assert store.pending_count() == 10
+
+        # Empty list returns 0
+        assert store.ack_session_records([]) == 0
+        assert store.pending_count() == 10
+
+        # Non-existent ID returns 0
+        assert store.ack_session_records(["non_existent_id"]) == 0
+        assert store.pending_count() == 10
+
+        # ACK all records: only the 6 active session sources should be pruned
+        all_ids = [c.record_id for c in chunks] + ["non_existent_id"]
+        deleted = store.ack_session_records(all_ids)
+
+        assert deleted == 6
+        assert store.pending_count() == 4
+
+        remaining = [r["record_id"] for r in store.pending(limit=10)]
+        assert set(remaining) == {
+            "rec_s_mem",
+            "rec_s_agents",
+            "rec_s_persist",
+            "rec_s_retired",
+        }
+
+        sync_meta = store.meta_value("last_successful_sync")
+        assert sync_meta is not None
+        assert len(sync_meta) > 0
+
+        # Subsequent ACK is idempotent
+        assert store.ack_session_records(all_ids) == 0
+        assert store.pending_count() == 4
+    finally:
+        store.close()

@@ -159,17 +159,17 @@ class SyncDaemon:
         """Queue only local identities absent from the durable remote source store."""
         required=("meta_value","record_ids_after","enqueue_records","set_meta")
         if any(not hasattr(self.store,name) for name in required):
-            return {"complete":True,"checked":0,"queued":0,"skipped":True}
+            return {"complete":True,"checked":0,"queued":0,"acknowledged":0,"skipped":True}
         if force:
             self._remote_source_marker.unlink(missing_ok=True)
             self.store.set_meta(self._remote_source_cursor_key,"")
         if self._remote_source_marker.exists():
-            return {"complete":True,"checked":0,"queued":0}
+            return {"complete":True,"checked":0,"queued":0,"acknowledged":0}
         cursor=self.store.meta_value(self._remote_source_cursor_key) or ""
-        checked=queued=batches=0
+        checked=queued=acknowledged=batches=0
         while max_batches is None or batches<max_batches:
             if interruptible and (not self.running or self._wake.is_set()):
-                return {"complete":False,"checked":checked,"queued":queued,"interrupted":True}
+                return {"complete":False,"checked":checked,"queued":queued,"acknowledged":acknowledged,"interrupted":True}
             identities=self.store.record_ids_after(cursor,5000)
             if not identities:
                 complete=self.store.pending_count()==0
@@ -177,18 +177,22 @@ class SyncDaemon:
                     self._remote_source_marker.parent.mkdir(parents=True,exist_ok=True)
                     self._remote_source_marker.write_text(str(time.time()),encoding="utf-8")
                     self.store.set_meta(self._remote_source_cursor_key,"")
-                return {"complete":complete,"checked":checked,"queued":queued}
+                return {"complete":complete,"checked":checked,"queued":queued,"acknowledged":acknowledged}
             try:
                 missing=self.client.missing_source_identities(identities)
             except Exception as exc:
                 log.warning("remote source inventory unavailable: %s",type(exc).__name__)
-                return {"complete":False,"checked":checked,"queued":queued,"error":type(exc).__name__}
+                return {"complete":False,"checked":checked,"queued":queued,"acknowledged":acknowledged,"error":type(exc).__name__}
+            missing_set=set(missing)
+            present=[i for i in identities if i not in missing_set]
+            if present and hasattr(self.store,"ack_session_records"):
+                acknowledged+=self.store.ack_session_records(present)
             queued+=self.store.enqueue_records(missing)
             checked+=len(identities)
             batches+=1
             cursor=identities[-1]
             self.store.set_meta(self._remote_source_cursor_key,cursor)
-        return {"complete":False,"checked":checked,"queued":queued}
+        return {"complete":False,"checked":checked,"queued":queued,"acknowledged":acknowledged}
 
     def state_status(self) -> dict:
         return {
@@ -296,7 +300,7 @@ class SyncDaemon:
             # A large first-run queue must not be starved by reconciliation:
             # each inventory request is remote I/O and can take several
             # seconds, while the queue is the source-of-truth delivery path.
-            inventory={"complete": self._remote_source_marker.exists(), "checked": 0, "queued": 0}
+            inventory={"complete": self._remote_source_marker.exists(), "checked": 0, "queued": 0, "acknowledged": 0}
             if once:
                 inventory=self.reconcile_remote_sources(None,interruptible=True)
             # A one-shot backfill must drain the durable queue completely when
@@ -328,7 +332,7 @@ class SyncDaemon:
                     inventory=self.reconcile_remote_sources(1,interruptible=True)
             if once: break
             if not self.running: break
-            wait=1 if self.store.pending_count() or (
+            wait=1 if self.store.pending_count() > 0 or (
                 not inventory.get("complete") and inventory.get("checked")
             ) else max(1,self.config.interval)
             self._wake.wait(wait); self._wake.clear()

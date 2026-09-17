@@ -13,6 +13,12 @@ from .discovery import Source
 from .parsers import Chunk
 
 
+SESSION_SOURCE_KINDS: frozenset[str] = frozenset({
+    "codex", "codex_session", "pi", "pi_session", "claude", "claude_session",
+})
+_SESSION_KINDS_SQL = ",".join(f"'{k}'" for k in sorted(SESSION_SOURCE_KINDS))
+
+
 class Store:
     def __init__(self, path: Path|str|None=None, config: Config|None=None):
         self.config=config or Config.load(); self.config.ensure()
@@ -177,6 +183,39 @@ class Store:
                 if cursor.rowcount > 0:
                     stamp=datetime.fromtimestamp(now, timezone.utc).isoformat()
                     self.db.execute("INSERT INTO meta(key,value,updated_at) VALUES('last_successful_sync',?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",(stamp,now))
+    def ack_session_records(self, record_ids: list[str]) -> int:
+        """Acknowledge append-only session records confirmed present remotely.
+
+        Mutable sources (e.g. memory files or agents_md) must never be pruned
+        by inventory reconciliation, as local edits require re-syncing even if
+        an older version was previously stored remotely.
+        """
+        if not record_ids:
+            return 0
+        before = self.db.total_changes
+        now = time.time()
+        with self.db:
+            self.db.executemany(
+                f"""DELETE FROM queue
+                WHERE record_id=?
+                  AND EXISTS (
+                    SELECT 1 FROM records r
+                    JOIN sources s ON s.source_key=r.source_key
+                    WHERE r.record_id=queue.record_id
+                      AND s.kind IN ({_SESSION_KINDS_SQL})
+                      AND COALESCE(s.retired,0)=0
+                  )""",
+                ((i,) for i in dict.fromkeys(record_ids)),
+            )
+            deleted = self.db.total_changes - before
+            if deleted > 0:
+                stamp = datetime.fromtimestamp(now, timezone.utc).isoformat()
+                self.db.execute(
+                    "INSERT INTO meta(key,value,updated_at) VALUES('last_successful_sync',?,?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+                    (stamp, now),
+                )
+        return deleted
     def fail(self,record_id,error,delay=30):
         self.db.execute("UPDATE queue SET attempts=attempts+1,next_at=?,last_error=? WHERE record_id=?",(time.time()+delay,error[:1000],record_id)); self.db.commit()
     @staticmethod

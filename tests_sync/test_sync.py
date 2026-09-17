@@ -642,22 +642,22 @@ def test_remote_source_reconciliation_resumes_and_only_queues_missing(tmp_path):
 
     first=daemon.reconcile_remote_sources(1)
 
-    assert first == {"complete":False,"checked":4,"queued":2}
+    assert first == {"complete":False,"checked":4,"queued":2,"acknowledged":0}
     assert client.calls == [["a","b","c","d"]]
     assert s.meta_value(daemon._remote_source_cursor_key) == "d"
     assert s.pending_count() == 2
     assert not daemon._remote_source_marker.exists()
 
     resumed=SyncDaemon(c,s,client).reconcile_remote_sources(1)
-    assert resumed == {"complete":False,"checked":0,"queued":0}
+    assert resumed == {"complete":False,"checked":0,"queued":0,"acknowledged":0}
     s.ack(["b","d"])
     completed=SyncDaemon(c,s,client).reconcile_remote_sources(1)
-    assert completed == {"complete":True,"checked":0,"queued":0}
+    assert completed == {"complete":True,"checked":0,"queued":0,"acknowledged":0}
     assert daemon._remote_source_marker.exists()
     assert s.meta_value(daemon._remote_source_cursor_key) == ""
 
     forced=SyncDaemon(c,s,client).reconcile_remote_sources(1,force=True)
-    assert forced == {"complete":False,"checked":4,"queued":2}
+    assert forced == {"complete":False,"checked":4,"queued":2,"acknowledged":0}
 
     other=cfg(tmp_path)
     other.remote_url="https://other-memory.example"
@@ -708,6 +708,7 @@ def test_remote_source_reconciliation_stops_between_batches(tmp_path):
         "complete":False,
         "checked":1,
         "queued":0,
+        "acknowledged":0,
         "interrupted":True,
     }
     assert client.calls == 1
@@ -925,6 +926,7 @@ def test_continuous_daemon_flushes_before_remote_inventory(tmp_path):
         "complete": True,
         "checked": 0,
         "queued": 0,
+        "acknowledged": 0,
     }
     daemon._start_watcher = lambda: None
     daemon._stop_watcher = lambda: None
@@ -1081,3 +1083,126 @@ def test_remote_failure_keeps_pending_for_recovery(tmp_path):
     assert daemon.flush_once() == 0
     assert s.pending_count() == 1
     s.close()
+
+
+def test_remote_source_reconciliation_acks_present_session_records_only(tmp_path):
+    class Client:
+        def __init__(self):
+            self.calls = []
+
+        def missing_source_identities(self, identities):
+            self.calls.append(list(identities))
+            return [i for i in identities if i == "s_missing"]
+
+    c = cfg(tmp_path)
+    s = Store(config=c)
+    try:
+        from sync.discovery import Source
+        from sync.parsers import Chunk
+        s.register_source(Source("src_sess", "codex", tmp_path / "sess.jsonl", "dev"))
+        s.register_source(Source("src_mem", "codex_memory", tmp_path / "mem.md", "dev"))
+        s.register_source(Source("src_ret", "pi", tmp_path / "ret.jsonl", "dev"))
+        s.db.execute("UPDATE sources SET retired=1 WHERE source_key='src_ret'")
+        s.db.commit()
+
+        s.upsert_chunks([
+            Chunk("s_session", "src_sess", "codex", "sess.jsonl", "sess", 0, "user", "text", "text"),
+            Chunk("s_missing", "src_sess", "codex", "sess.jsonl", "sess", 1, "user", "text2", "text2"),
+            Chunk("s_memory", "src_mem", "codex_memory", "mem.md", "mem", 0, "user", "text3", "text3"),
+            Chunk("s_retired", "src_ret", "pi", "ret.jsonl", "ret", 0, "user", "text4", "text4"),
+        ])
+        assert s.pending_count() == 4
+        # Ack s_missing to simulate a record previously evicted or not yet in queue
+        s.ack(["s_missing"])
+        assert s.pending_count() == 3
+
+        client = Client()
+        daemon = SyncDaemon(c, s, client)
+
+        result = daemon.reconcile_remote_sources(1)
+
+        assert result["acknowledged"] == 1
+        assert result["queued"] == 1
+        assert result["checked"] == 3
+
+        remaining = [r["record_id"] for r in s.pending(limit=10)]
+        assert "s_session" not in remaining
+        assert "s_memory" in remaining
+        assert "s_missing" in remaining
+        assert "s_retired" in remaining
+        assert s.pending_count() == 3
+    finally:
+        s.close()
+
+
+def test_continuous_daemon_adaptive_wait_under_backlog_vs_idle(tmp_path):
+    class FakeStore:
+        def __init__(self, initial_pending: int):
+            self._pending = initial_pending
+
+        def pending(self, limit):
+            count = min(self._pending, limit)
+            return [{"record_id": f"r{i}", "payload": '{"raw_text":"a"}', "attempts": 0} for i in range(count)]
+
+        def ack(self, record_ids):
+            self._pending = max(0, self._pending - min(len(record_ids), 2))
+
+        def pending_count(self):
+            return self._pending
+
+        def fail(self, *_args):
+            pass
+
+    class FakeClient:
+        def ingest(self, records):
+            return {"accepted": len(records)}
+
+    class FakeWake:
+        def __init__(self):
+            self.waits = []
+
+        def is_set(self):
+            return False
+
+        def wait(self, timeout):
+            self.waits.append(timeout)
+            daemon.running = False
+
+        def clear(self):
+            pass
+
+        def set(self):
+            pass
+
+    c = cfg(tmp_path)
+    c.auto_discover = False
+    c.interval = 300
+
+    # 1. Backlog scenario: pending_count > 0 after burst -> short wait (1s)
+    backlog_store = FakeStore(initial_pending=50)
+    wake1 = FakeWake()
+    daemon = SyncDaemon(c, backlog_store, FakeClient())
+    daemon._wake = wake1
+    daemon.scan_once = lambda: 0
+    daemon._start_watcher = lambda: None
+    daemon._stop_watcher = lambda: None
+    daemon._remote_source_marker.parent.mkdir(parents=True, exist_ok=True)
+    daemon._remote_source_marker.write_text("1", encoding="utf-8")
+
+    daemon.run()
+    assert wake1.waits == [1]
+    assert backlog_store.pending_count() > 0
+
+    # 2. Idle scenario: pending_count == 0 -> normal idle wait (config.interval: 300s)
+    idle_store = FakeStore(initial_pending=0)
+    wake2 = FakeWake()
+    daemon = SyncDaemon(c, idle_store, FakeClient())
+    daemon._wake = wake2
+    daemon.scan_once = lambda: 0
+    daemon._start_watcher = lambda: None
+    daemon._stop_watcher = lambda: None
+    daemon._remote_source_marker.parent.mkdir(parents=True, exist_ok=True)
+    daemon._remote_source_marker.write_text("1", encoding="utf-8")
+
+    daemon.run()
+    assert wake2.waits == [300]

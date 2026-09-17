@@ -9,9 +9,11 @@ deletes legacy root deltas in bounded batches (<=2000 per commit).
 from __future__ import annotations
 
 import argparse
+import hashlib
 import math
 import os
 import re
+import shutil
 import sys
 import tempfile
 import time
@@ -63,7 +65,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--token",
         default=None,
-        help="Hugging Face API token (defaults to HF_TOKEN env var)",
+        help="Hugging Face API token (defaults to FUNES_HF_TOKEN / HF_TOKEN_BOLIKOTO / HF_TOKEN)",
     )
     parser.add_argument(
         "--storage-key",
@@ -118,7 +120,12 @@ def get_credentials(
     if not repo:
         raise ValueError("Repository ID is required (via --repo or FUNES_STORAGE_REPO)")
 
-    token = args.token or os.getenv("HF_TOKEN", "")
+    token = (
+        args.token
+        or os.getenv("FUNES_HF_TOKEN")
+        or os.getenv("HF_TOKEN_BOLIKOTO")
+        or os.getenv("HF_TOKEN", "")
+    )
     token = token.strip() if token else ""
 
     storage_key = (
@@ -152,6 +159,7 @@ def inspect_source_repo(
 
     repo_files: set[str] = set()
     blob_ids: dict[str, str] = {}
+    file_sizes: dict[str, int] = {}
     for item in api.list_repo_tree(
         repo,
         repo_type="dataset",
@@ -165,12 +173,18 @@ def inspect_source_repo(
             blob_id = getattr(item, "blob_id", "")
             if isinstance(blob_id, str) and blob_id:
                 blob_ids[name] = blob_id
+            size = getattr(item, "size", 0)
+            if isinstance(size, int):
+                file_sizes[name] = size
 
     manifest: dict[str, Any] | None = None
+    manifest_blob_id: str | None = None
+    manifest_sha256: str | None = None
     if manifest_filename in repo_files:
         from huggingface_hub import hf_hub_download
         import json
 
+        manifest_blob_id = blob_ids.get(manifest_filename)
         with tempfile.TemporaryDirectory(prefix="funes-manifest-check-") as tmp_dir:
             downloaded = hf_hub_download(
                 repo_id=repo,
@@ -180,9 +194,10 @@ def inspect_source_repo(
                 token=token or None,
                 local_dir=tmp_dir,
             )
-            raw = Path(downloaded).read_text(encoding="utf-8")
+            raw_bytes = Path(downloaded).read_bytes()
+            manifest_sha256 = hashlib.sha256(raw_bytes).hexdigest()
             try:
-                parsed = json.loads(raw)
+                parsed = json.loads(raw_bytes.decode("utf-8"))
             except Exception as exc:
                 raise ValueError(f"Invalid JSON in restore manifest: {exc}") from exc
 
@@ -205,6 +220,15 @@ def inspect_source_repo(
         for name in repo_files
         if "/" not in name
         and name.startswith(delta_prefix)
+        and name.endswith(ENCRYPTED_SUFFIXES)
+    )
+
+    # Identify sharded deltas
+    sharded_deltas = sorted(
+        name
+        for name in repo_files
+        if "/" in name
+        and (name.startswith(delta_dir + "/") or f"/{delta_prefix}" in name)
         and name.endswith(ENCRYPTED_SUFFIXES)
     )
 
@@ -242,13 +266,17 @@ def inspect_source_repo(
         "head": head,
         "repo_files": repo_files,
         "blob_ids": blob_ids,
+        "file_sizes": file_sizes,
         "manifest": manifest,
+        "manifest_blob_id": manifest_blob_id,
+        "manifest_sha256": manifest_sha256,
         "target_snapshot_name": target_snapshot_name,
         "active_snapshot": active_snapshot,
         "active_deltas": active_deltas,
         "active_controls": active_controls,
         "protected": protected,
         "root_deltas": root_deltas,
+        "sharded_deltas": sharded_deltas,
         "unreferenced_root_deltas": unreferenced_root_deltas,
         "is_already_compacted": is_already_compacted,
     }
@@ -258,30 +286,62 @@ def plan_compaction(
     inventory: dict[str, Any],
     batch_size: int = DEFAULT_BATCH_SIZE,
     force_recompact: bool = False,
+    staging_dir: str | Path | None = None,
 ) -> dict[str, Any]:
-    """Generate safe compaction and deletion plan."""
+    """Generate safe compaction and deletion plan including disk estimates."""
     bounded_batch_size = max(1, min(batch_size, MAX_BATCH_SIZE))
     is_compacted = inventory["is_already_compacted"] and not force_recompact
 
+    root_deltas = inventory["root_deltas"]
     unref_deltas = inventory["unreferenced_root_deltas"]
     unref_count = len(unref_deltas)
     prune_batches = math.ceil(unref_count / bounded_batch_size) if unref_count > 0 else 0
+    total_root_deltas_count = len(root_deltas)
+    post_compaction_prune_batches = math.ceil(total_root_deltas_count / bounded_batch_size) if total_root_deltas_count > 0 else 0
+
+    file_sizes = inventory.get("file_sizes", {})
+    active_snapshot = inventory["active_snapshot"]
+    active_deltas = inventory["active_deltas"]
+    snapshot_size = file_sizes.get(active_snapshot, 0) if active_snapshot else 0
+    deltas_size = sum(file_sizes.get(d, 0) for d in active_deltas)
+    total_active_compressed = snapshot_size + deltas_size
+
+    # Estimated staging disk: compressed downloads + uncompressed SQLite (typically ~5x compressed)
+    estimated_staging = total_active_compressed * 5
+    staging_path = Path(staging_dir) if staging_dir else Path("/private/tmp" if os.path.exists("/private/tmp") else tempfile.gettempdir())
+    free_disk = shutil.disk_usage(staging_path).free
+
+    manifest = inventory.get("manifest")
 
     return {
         "head": inventory["head"],
-        "has_manifest": inventory["manifest"] is not None,
-        "active_snapshot": inventory["active_snapshot"],
+        "has_manifest": manifest is not None,
+        "manifest_blob_id": inventory.get("manifest_blob_id"),
+        "manifest_sha256": inventory.get("manifest_sha256"),
+        "manifest_version": manifest.get("version") if manifest else None,
+        "manifest_schema": sorted(list(manifest.keys())) if manifest else [],
+        "active_snapshot": active_snapshot,
         "target_snapshot": inventory["target_snapshot_name"],
-        "active_deltas_count": len(inventory["active_deltas"]),
+        "active_deltas_count": len(active_deltas),
         "active_controls_count": len(inventory["active_controls"]),
         "total_repo_files": len(inventory["repo_files"]),
         "root_deltas_count": len(inventory["root_deltas"]),
-        "unreferenced_deltas_count": unref_count,
+        "sharded_deltas_count": len(inventory.get("sharded_deltas", [])),
+        "unreferenced_deltas_count": len(unref_deltas),
+        "total_deltas_to_prune": unref_count,
+        "post_compaction_prune_count": total_root_deltas_count,
+        "post_compaction_prune_batches": post_compaction_prune_batches,
         "batch_size": bounded_batch_size,
         "prune_batches": prune_batches,
         "is_already_compacted": is_compacted,
         "action_compaction": "skip" if is_compacted else "consolidate",
         "action_prune": unref_count > 0,
+        "snapshot_compressed_bytes": snapshot_size,
+        "active_deltas_compressed_bytes": deltas_size,
+        "total_active_compressed_bytes": total_active_compressed,
+        "estimated_staging_bytes": estimated_staging,
+        "staging_path": str(staging_path),
+        "local_free_disk_bytes": free_disk,
     }
 
 
@@ -502,6 +562,7 @@ def compact_source_repo(
         inventory=inventory,
         batch_size=bounded_batch_size,
         force_recompact=force_recompact,
+        staging_dir=temp_dir,
     )
 
     current_head = inventory["head"]
@@ -520,7 +581,7 @@ def compact_source_repo(
                     "total_batches": plan["prune_batches"],
                     "file_count": min(
                         bounded_batch_size,
-                        plan["unreferenced_deltas_count"] - (idx - 1) * bounded_batch_size,
+                        plan["total_deltas_to_prune"] - (idx - 1) * bounded_batch_size,
                     ),
                     "commit_oid": None,
                 }
@@ -634,19 +695,33 @@ def main(argv: list[str] | None = None) -> int:
         )
 
         plan = result["plan"]
+        print("=== Funes Source Storage Compactor Plan ===")
         print(f"Repository: {result['repo']}")
-        print(f"Initial head: {plan['head'][:8] if plan['head'] else 'none'}")
-        print(f"Files in repository: {plan['total_repo_files']}")
-        print(f"Root deltas: {plan['root_deltas_count']}")
-        print(f"Active deltas in manifest: {plan['active_deltas_count']}")
-        print(f"Compaction status: {plan['action_compaction']}")
+        print(f"HEAD commit SHA: {plan['head']}")
+        print(f"Total repository files: {plan['total_repo_files']}")
+        print(f"Snapshot filename: {plan['active_snapshot']}")
+        print(f"Manifest blob SHA: {plan.get('manifest_blob_id')}")
+        print(f"Manifest sha256: {plan.get('manifest_sha256')}")
+        print(f"Manifest version: {plan.get('manifest_version')}")
+        print(f"Manifest schema keys: {plan.get('manifest_schema')}")
+        print(f"Active deltas count: {plan['active_deltas_count']}")
+        print(f"Total root deltas count: {plan['root_deltas_count']}")
+        print(f"Total sharded deltas count: {plan['sharded_deltas_count']}")
+        print(f"Compaction action: {plan['action_compaction']}")
         print(
-            f"Legacy deltas to prune: {plan['unreferenced_deltas_count']} "
-            f"({plan['prune_batches']} batches, max {plan['batch_size']}/batch)"
+            f"Prune batch plan: {plan['total_deltas_to_prune']} deltas in "
+            f"{plan['prune_batches']} batches (batch_size={plan['batch_size']})"
         )
+        print(
+            f"Active compressed data size: {plan['total_active_compressed_bytes'] / (1024*1024):.2f} MB "
+            f"(snapshot: {plan['snapshot_compressed_bytes'] / (1024*1024):.2f} MB, "
+            f"deltas: {plan['active_deltas_compressed_bytes'] / (1024*1024):.2f} MB)"
+        )
+        print(f"Estimated staging disk needed: ~{plan['estimated_staging_bytes'] / (1024*1024):.2f} MB (~{plan['estimated_staging_bytes'] / (1024**3):.2f} GB)")
+        print(f"Local free disk space ({plan['staging_path']}): {plan['local_free_disk_bytes'] / (1024**3):.2f} GB")
 
         if result.get("dry_run"):
-            print("\n[DRY RUN] Plan verified successfully. No remote changes made.")
+            print("\n[DRY RUN ONLY] Inspection and plan verified successfully. No remote changes made.")
             return 0
 
         print(f"\nFinal head: {result.get('final_head', '')[:8]}")

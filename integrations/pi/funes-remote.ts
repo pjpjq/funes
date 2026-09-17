@@ -95,6 +95,14 @@ function envNumber(name: string): number | undefined {
   return Number.isFinite(value) ? value : undefined;
 }
 
+function firstEnvNumber(names: string[]): number | undefined {
+  for (const name of names) {
+    const value = envNumber(name);
+    if (value !== undefined) return value;
+  }
+  return undefined;
+}
+
 function bounded(value: number | undefined, fallback: number, minimum: number, maximum: number): number {
   return Math.min(maximum, Math.max(minimum, value ?? fallback));
 }
@@ -138,6 +146,48 @@ const manualBudget: CallBudget = {
   attemptTimeoutMs: remoteAttemptTimeoutMs,
   readyTimeoutMs: remoteReadyTimeoutMs,
   readyPolls: remoteReadyPolls,
+};
+
+const recallTimeoutMs = (() => {
+  const ms = firstEnvNumber(["FUNES_REMOTE_RECALL_TIMEOUT_MS", "FUNES_REMOTE_SEARCH_TIMEOUT_MS"]);
+  if (ms !== undefined) return bounded(ms, 12_000, 100, 60_000);
+  const sec = firstEnvNumber(["FUNES_REMOTE_RECALL_TIMEOUT", "FUNES_REMOTE_SEARCH_TIMEOUT"]);
+  if (sec !== undefined) return bounded(sec * 1_000, 12_000, 100, 60_000);
+  return 12_000;
+})();
+
+const recallAttempts = Math.floor(
+  bounded(
+    firstEnvNumber([
+      "FUNES_REMOTE_RECALL_ATTEMPTS",
+      "FUNES_REMOTE_SEARCH_ATTEMPTS",
+    ]),
+    2,
+    1,
+    5,
+  ),
+);
+
+const recallAttemptTimeoutMs = (() => {
+  const ms = firstEnvNumber([
+    "FUNES_REMOTE_RECALL_ATTEMPT_TIMEOUT_MS",
+    "FUNES_REMOTE_SEARCH_ATTEMPT_TIMEOUT_MS",
+  ]);
+  if (ms !== undefined) return bounded(ms, 5_000, 100, 30_000);
+  const sec = firstEnvNumber([
+    "FUNES_REMOTE_RECALL_ATTEMPT_TIMEOUT",
+    "FUNES_REMOTE_SEARCH_ATTEMPT_TIMEOUT",
+  ]);
+  if (sec !== undefined) return bounded(sec * 1_000, 5_000, 100, 30_000);
+  return 5_000;
+})();
+
+const manualRecallBudget: CallBudget = {
+  timeoutMs: recallTimeoutMs,
+  attempts: recallAttempts,
+  attemptTimeoutMs: recallAttemptTimeoutMs,
+  readyTimeoutMs: 2_000,
+  readyPolls: 1,
 };
 
 const automaticRecallBudget: CallBudget = {
@@ -208,14 +258,25 @@ function isRetryableStatus(status: number): boolean {
   return status === 408 || status === 425 || status === 429 || status >= 500;
 }
 
-function retryDelay(response: FetchResult | undefined, attempt: number): number {
+function retryDelay(response: FetchResult | undefined, attempt: number, recall: boolean = false): number {
   const exponential = Math.min(30_000, 1_000 * 2 ** (attempt + 1));
+  const status = response ? statusOf(response) : 0;
   const retryAfter = response?.response.headers?.get("retry-after");
-  if (!retryAfter) return exponential;
-  const seconds = Number(retryAfter);
-  if (Number.isFinite(seconds) && seconds >= 0) return Math.max(exponential, Math.min(30_000, seconds * 1_000));
-  const date = Date.parse(retryAfter);
-  if (Number.isFinite(date)) return Math.max(exponential, Math.min(30_000, Math.max(0, date - now())));
+  if (retryAfter) {
+    const seconds = Number(retryAfter);
+    if (Number.isFinite(seconds) && seconds >= 0) {
+      const ms = seconds * 1_000;
+      return recall ? Math.min(30_000, ms) : Math.max(exponential, Math.min(30_000, ms));
+    }
+    const date = Date.parse(retryAfter);
+    if (Number.isFinite(date)) {
+      const ms = Math.max(0, date - now());
+      return recall ? Math.min(30_000, ms) : Math.max(exponential, Math.min(30_000, ms));
+    }
+  }
+  if (recall && status === 503) {
+    return 500;
+  }
   return exponential;
 }
 
@@ -275,7 +336,9 @@ function shouldRecall(prompt: string): boolean {
   return /(之前|上次|历史|做过|决定|决策|测试结果|偏好|已有实现|为什么放弃|以前|回忆|prior|previous|history|earlier|last time|we decided|decision|past work|preference|already implemented|old bug|regression)/i.test(prompt);
 }
 
-async function call(path: string, body: Record<string, unknown>, budget: CallBudget = manualBudget) {
+async function call(path: string, body: Record<string, unknown>, budget?: CallBudget) {
+  const isRecall = path === "/search" || path === "/recall";
+  const activeBudget = budget ?? (isRecall ? manualRecallBudget : manualBudget);
   if (!base || !token) return null;
   let encodedBody: string;
   try {
@@ -292,12 +355,12 @@ async function call(path: string, body: Record<string, unknown>, budget: CallBud
     headers.Authorization = `Bearer ${token}`;
   }
 
-  const deadline = now() + budget.timeoutMs;
+  const deadline = now() + activeBudget.timeoutMs;
   // /search already owns its cold-restore/degraded behavior. Giving a
   // readiness probe inside the bounded automatic budget can suppress an
   // otherwise successful recall, so only the legacy /recall path preflights.
   if (path === "/recall") {
-    const ready = await waitUntilReady(headers, deadline, budget);
+    const ready = await waitUntilReady(headers, deadline, activeBudget);
     // A permanent readiness response (most commonly 401/403) must not be
     // followed by a duplicate POST. A still-warming service can be queried if
     // the bounded poll count was reached before the overall deadline.
@@ -305,7 +368,7 @@ async function call(path: string, body: Record<string, unknown>, budget: CallBud
   }
 
   let lastResponse: FetchResult | undefined;
-  for (let attempt = 0; attempt < budget.attempts; attempt += 1) {
+  for (let attempt = 0; attempt < activeBudget.attempts; attempt += 1) {
     const remaining = deadline - now();
     if (remaining <= 0) break;
     lastResponse = undefined;
@@ -317,7 +380,7 @@ async function call(path: string, body: Record<string, unknown>, budget: CallBud
           headers,
           body: encodedBody,
         },
-        Math.min(budget.attemptTimeoutMs, remaining),
+        Math.min(activeBudget.attemptTimeoutMs, remaining),
       );
       const status = statusOf(response);
       if (isSuccess(response)) {
@@ -335,10 +398,10 @@ async function call(path: string, body: Record<string, unknown>, budget: CallBud
       // are bounded by the shared deadline and safe to retry.
     }
 
-    if (attempt + 1 >= budget.attempts) break;
+    if (attempt + 1 >= activeBudget.attempts) break;
     const remainingAfterAttempt = deadline - now();
     if (remainingAfterAttempt <= 0) break;
-    if (!(await sleepUntil(retryDelay(lastResponse, attempt), deadline))) break;
+    if (!(await sleepUntil(retryDelay(lastResponse, attempt, isRecall), deadline))) break;
   }
   return null;
 }
@@ -349,14 +412,14 @@ export default function funesRemote(pi: ExtensionAPI) {
     label: "funes recall",
     description: "Search unified Codex, Pi and Claude memory and return original raw context.",
     parameters: { type: "object", properties: { query: { type: "string" }, limit: { type: "integer" } }, required: ["query"] },
-    execute: async (_id: string, args: Record<string, unknown>) => ({ content: [{ type: "text", text: JSON.stringify(await call("/search", args), null, 2) }], details: {} }),
+    execute: async (_id: string, args: Record<string, unknown>) => ({ content: [{ type: "text", text: JSON.stringify(await call("/search", args, manualRecallBudget), null, 2) }], details: {} }),
   });
   pi.registerTool({
     name: "funes_get",
     label: "funes get",
     description: "Read one original unified memory record.",
     parameters: { type: "object", properties: { record_id: { type: "string" } }, required: ["record_id"] },
-    execute: async (_id: string, args: Record<string, unknown>) => ({ content: [{ type: "text", text: JSON.stringify(await call("/get", { id: args.record_id }), null, 2) }], details: {} }),
+    execute: async (_id: string, args: Record<string, unknown>) => ({ content: [{ type: "text", text: JSON.stringify(await call("/get", { id: args.record_id }, manualBudget), null, 2) }], details: {} }),
   });
   pi.on("before_agent_start", async (event) => {
     const prompt = String(event.prompt || "").trim();

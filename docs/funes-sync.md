@@ -37,7 +37,7 @@ content hash 和 pending queue。mtime/hash 未改变时不会重写源文件；
   identity 重新入队。首次运行由 daemon 自动执行一次，切换远端会按 URL 隐私指纹重新执行；
   显式命令会强制重查同一 URL，适合远端重建恢复。
 - `status`、`sources`、`doctor`、`logs [--follow]`：只读诊断。
-- `install`：原子写入 `~/Library/LaunchAgents/com.funes.sync.plist`；遇到非本工具 plist 会拒绝覆盖，`--force` 仅允许覆盖同 label。可从 `config.toml` 的 `[sync]` 或既有 plist 环境变量持久继承 `remote_timeout`（`FUNES_REMOTE_TIMEOUT`）与 `remote_transient_retries`（`FUNES_REMOTE_TRANSIENT_RETRIES`），token 等敏感凭据绝不落盘。MCP bridge 的 `recall`/`search` 与后台 ingest 解耦，使用专用交互超时（`FUNES_REMOTE_RECALL_TIMEOUT` 默认 12s、单次 5s），不受后台 `FUNES_REMOTE_TIMEOUT` 影响。
+- `install`：原子写入 `~/Library/LaunchAgents/com.funes.sync.plist`；遇到非本工具 plist 会拒绝覆盖，`--force` 仅允许覆盖同 label。可从 `config.toml` 的 `[sync]` 或既有 plist 环境变量持久继承 `remote_timeout`（`FUNES_REMOTE_TIMEOUT`）与 `remote_transient_retries`（`FUNES_REMOTE_TRANSIENT_RETRIES`），token 等敏感凭据绝不落盘。MCP bridge 与 Pi 扩展的 `recall`/`search` 与后台 ingest 解耦，使用专用交互超时（`FUNES_REMOTE_RECALL_TIMEOUT` 默认 12s、单次 5s），不受后台 `FUNES_REMOTE_TIMEOUT` 影响。
 - `start`、`stop`、`restart`：macOS `launchctl bootstrap/bootout`；Linux 上安全返回错误，不启动后台进程。
 
 离线 push 失败不会丢数据：pending 队列留在 SQLite，只有远端 Hub commit 完成并由 operation

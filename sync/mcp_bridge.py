@@ -39,6 +39,22 @@ def _int_env(name, default, lower, upper):
     return min(int(upper), max(int(lower), value))
 
 
+def _first_float_env(names, default, lower, upper):
+    for name in names:
+        raw = os.environ.get(name)
+        if raw is not None and raw.strip():
+            return _float_env(name, default, lower, upper)
+    return float(default)
+
+
+def _first_int_env(names, default, lower, upper):
+    for name in names:
+        raw = os.environ.get(name)
+        if raw is not None and raw.strip():
+            return _int_env(name, default, lower, upper)
+    return int(default)
+
+
 def _auth_headers(token, hub_token):
     headers = {"Content-Type": "application/json", "User-Agent": "funes-sync-mcp/1"}
     if hub_token:
@@ -282,14 +298,16 @@ def _wait_until_ready(base, headers, deadline, default_timeout=8, default_polls=
     return state
 
 
-def _retry_after(exc, attempt):
+def _retry_after(exc, attempt, recall=False):
     exponential = min(30.0, float(2 ** (attempt + 1)))
     if isinstance(exc, error.HTTPError):
         try:
             value = float(exc.headers.get("Retry-After", ""))
-            return max(exponential, min(30.0, max(0.0, value)))
+            return min(30.0, max(0.0, value)) if recall else max(exponential, min(30.0, max(0.0, value)))
         except (AttributeError, TypeError, ValueError):
             pass
+        if recall and exc.code == 503:
+            return 0.5
     return exponential
 
 
@@ -303,11 +321,38 @@ def _remote_call(path, payload):
     _validated_url(base)
     headers = _auth_headers(token, hub_token)
     recall = path in ("/search", "/recall")
-    total = _float_env("FUNES_REMOTE_TIMEOUT", 8 if recall else 180, 0.1, 300)
-    attempts = _int_env("FUNES_REMOTE_ATTEMPTS", 2 if recall else 5, 1, 5)
-    attempt_timeout = _float_env(
-        "FUNES_REMOTE_ATTEMPT_TIMEOUT", 8 if recall else 50, 0.1, 55
-    )
+    if recall:
+        total = _first_float_env(
+            ["FUNES_REMOTE_RECALL_TIMEOUT", "FUNES_REMOTE_SEARCH_TIMEOUT"],
+            12.0,
+            0.1,
+            60.0,
+        )
+        attempts = _first_int_env(
+            [
+                "FUNES_REMOTE_RECALL_ATTEMPTS",
+                "FUNES_REMOTE_SEARCH_ATTEMPTS",
+                "FUNES_REMOTE_ATTEMPTS",
+            ],
+            2,
+            1,
+            5,
+        )
+        attempt_timeout = _first_float_env(
+            [
+                "FUNES_REMOTE_RECALL_ATTEMPT_TIMEOUT",
+                "FUNES_REMOTE_SEARCH_ATTEMPT_TIMEOUT",
+            ],
+            5.0,
+            0.1,
+            30.0,
+        )
+    else:
+        total = _float_env("FUNES_REMOTE_TIMEOUT", 180, 0.1, 300)
+        attempts = _int_env("FUNES_REMOTE_ATTEMPTS", 5, 1, 5)
+        attempt_timeout = _float_env(
+            "FUNES_REMOTE_ATTEMPT_TIMEOUT", 50, 0.1, 55
+        )
     deadline = time.monotonic() + total
 
     # /search owns its cold-restore/degraded behavior and must receive the
@@ -347,7 +392,7 @@ def _remote_call(path, payload):
         except (error.URLError, TimeoutError, OSError, ValueError, RuntimeError) as exc:
             last = exc
         if attempt + 1 < attempts:
-            delay = min(_retry_after(last, attempt), max(0.0, deadline - time.monotonic()))
+            delay = min(_retry_after(last, attempt, recall=recall), max(0.0, deadline - time.monotonic()))
             if delay:
                 time.sleep(delay)
     if recall:

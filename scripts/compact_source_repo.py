@@ -17,6 +17,7 @@ import tempfile
 import time
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 # Ensure repository root is on sys.path
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -26,13 +27,17 @@ if str(REPO_ROOT) not in sys.path:
 from service.server import Store, SnapshotSync, ENCRYPTED_MAGIC
 
 
-DEFAULT_REPO = "bolikoto/funes-memory-source"
+DEFAULT_REPO = os.getenv("FUNES_STORAGE_REPO", "bolikoto/funes-memory-source")
 DEFAULT_BATCH_SIZE = 1000
 MAX_BATCH_SIZE = 2000
-DEFAULT_SNAPSHOT_FILE = "funes-snapshot.jsonl.gz"
-DEFAULT_MANIFEST_FILE = "funes-restore-manifest-v1.json"
-DEFAULT_DELTA_PREFIX = "funes-delta-"
-DEFAULT_CONTROL_PREFIX = "funes-reindex-"
+DEFAULT_SNAPSHOT_FILE = os.getenv("FUNES_SNAPSHOT_FILE", "funes-snapshot.jsonl.gz")
+DEFAULT_SNAPSHOT_PREFIX = os.getenv("FUNES_SNAPSHOT_PREFIX", "funes-snapshot-")
+DEFAULT_DELTA_PREFIX = os.getenv("FUNES_DELTA_PREFIX", "funes-delta-")
+DEFAULT_DELTA_DIR = os.getenv("FUNES_DELTA_DIR", "deltas")
+DEFAULT_CONTROL_PREFIX = os.getenv("FUNES_REINDEX_PREFIX", "funes-reindex-")
+DEFAULT_MANIFEST_FILE = os.getenv(
+    "FUNES_RESTORE_MANIFEST_FILE", "funes-restore-manifest-v1.json"
+)
 ENCRYPTED_SUFFIXES = (".jsonl.enc", ".jsonl.gz.enc")
 
 
@@ -52,7 +57,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--repo",
-        default=os.getenv("FUNES_STORAGE_REPO") or DEFAULT_REPO,
+        default=DEFAULT_REPO,
         help="Hugging Face repository ID (dataset repo)",
     )
     parser.add_argument(
@@ -92,6 +97,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=3,
         help="Retry attempts for transient Hub network operations",
     )
+    parser.add_argument(
+        "--snapshot-file",
+        default=DEFAULT_SNAPSHOT_FILE,
+        help="Base snapshot filename (defaults to FUNES_SNAPSHOT_FILE)",
+    )
+    parser.add_argument(
+        "--manifest-file",
+        default=DEFAULT_MANIFEST_FILE,
+        help="Manifest filename (defaults to FUNES_RESTORE_MANIFEST_FILE)",
+    )
     return parser.parse_args(argv)
 
 
@@ -124,10 +139,12 @@ def inspect_source_repo(
     *,
     manifest_filename: str = DEFAULT_MANIFEST_FILE,
     snapshot_filename: str = DEFAULT_SNAPSHOT_FILE,
+    snapshot_prefix: str = DEFAULT_SNAPSHOT_PREFIX,
     delta_prefix: str = DEFAULT_DELTA_PREFIX,
+    delta_dir: str = DEFAULT_DELTA_DIR,
     control_prefix: str = DEFAULT_CONTROL_PREFIX,
 ) -> dict[str, Any]:
-    """Inspect remote repository state and partition active vs legacy objects."""
+    """Inspect remote repository state, validate manifest fully, and partition active vs legacy objects."""
     info = api.repo_info(repo_id=repo, repo_type="dataset", token=token or None)
     head = getattr(info, "sha", "")
     if not isinstance(head, str) or not head:
@@ -164,20 +181,25 @@ def inspect_source_repo(
                 local_dir=tmp_dir,
             )
             raw = Path(downloaded).read_text(encoding="utf-8")
-            parsed = json.loads(raw)
-            # Basic validation
-            if (
-                isinstance(parsed, dict)
-                and parsed.get("version") == 1
-                and isinstance(parsed.get("snapshot"), str)
-                and isinstance(parsed.get("deltas"), list)
-                and isinstance(parsed.get("controls"), list)
-            ):
-                manifest = parsed
+            try:
+                parsed = json.loads(raw)
+            except Exception as exc:
+                raise ValueError(f"Invalid JSON in restore manifest: {exc}") from exc
+
+            # Full schema and invariant validation matching SnapshotSync
+            syncer_validator = SnapshotSync(store=mock.Mock())
+            syncer_validator.filename = snapshot_filename
+            syncer_validator.prefix = snapshot_prefix
+            syncer_validator.delta_prefix = delta_prefix
+            syncer_validator.delta_dir = delta_dir
+            syncer_validator.control_prefix = control_prefix
+            syncer_validator.manifest_filename = manifest_filename
+
+            manifest = syncer_validator._validate_restore_manifest(parsed, repo_files)
 
     target_snapshot_name = snapshot_filename + ".enc"
 
-    # Identify root deltas
+    # Identify legacy root deltas (flat, non-sharded)
     root_deltas = sorted(
         name
         for name in repo_files
@@ -333,6 +355,7 @@ def execute_prune_deltas(
     protected: set[str],
     parent_commit: str,
     *,
+    token: str = "",
     batch_size: int = DEFAULT_BATCH_SIZE,
     dry_run: bool = False,
     retries: int = 3,
@@ -387,15 +410,33 @@ def execute_prune_deltas(
                     operations=operations,
                     commit_message=commit_msg,
                     parent_commit=current_head,
+                    token=token or None,
                 )
                 new_commit_oid = getattr(res, "oid", None)
                 if not new_commit_oid and hasattr(api, "repo_info"):
-                    info = api.repo_info(repo_id=repo, repo_type="dataset")
+                    info = api.repo_info(
+                        repo_id=repo,
+                        repo_type="dataset",
+                        token=token or None,
+                    )
                     new_commit_oid = getattr(info, "sha", None)
                 break
             except Exception as exc:
                 last_error = exc
                 if attempt < retries - 1:
+                    # Refresh current_head from remote on retry (handles parent commit conflict)
+                    if hasattr(api, "repo_info"):
+                        try:
+                            info = api.repo_info(
+                                repo_id=repo,
+                                repo_type="dataset",
+                                token=token or None,
+                            )
+                            refreshed_head = getattr(info, "sha", None)
+                            if isinstance(refreshed_head, str) and refreshed_head:
+                                current_head = refreshed_head
+                        except Exception:
+                            pass
                     time.sleep(1.0 * (attempt + 1))
                 else:
                     raise RuntimeError(
@@ -425,11 +466,16 @@ def compact_source_repo(
     force_recompact: bool = False,
     temp_dir: str | None = None,
     retries: int = 3,
+    snapshot_file: str = DEFAULT_SNAPSHOT_FILE,
+    snapshot_prefix: str = DEFAULT_SNAPSHOT_PREFIX,
+    delta_prefix: str = DEFAULT_DELTA_PREFIX,
+    delta_dir: str = DEFAULT_DELTA_DIR,
+    control_prefix: str = DEFAULT_CONTROL_PREFIX,
+    manifest_file: str = DEFAULT_MANIFEST_FILE,
     api: Any = None,
 ) -> dict[str, Any]:
     """Execute complete restart-safe source repo compaction workflow."""
     bounded_batch_size = max(1, min(batch_size, MAX_BATCH_SIZE))
-    secrets_to_redact = [token, storage_key]
 
     if not token and not dry_run:
         raise RuntimeError("HF_TOKEN is required for compaction operations")
@@ -445,6 +491,12 @@ def compact_source_repo(
         api=api,
         repo=repo,
         token=token,
+        manifest_filename=manifest_file,
+        snapshot_filename=snapshot_file,
+        snapshot_prefix=snapshot_prefix,
+        delta_prefix=delta_prefix,
+        delta_dir=delta_dir,
+        control_prefix=control_prefix,
     )
     plan = plan_compaction(
         inventory=inventory,
@@ -486,6 +538,12 @@ def compact_source_repo(
             syncer.repo = repo
             syncer.token = token
             syncer.storage_key = storage_key
+            syncer.filename = snapshot_file
+            syncer.prefix = snapshot_prefix
+            syncer.delta_prefix = delta_prefix
+            syncer.delta_dir = delta_dir
+            syncer.control_prefix = control_prefix
+            syncer.manifest_filename = manifest_file
 
             base_state = {
                 "head": inventory["head"],
@@ -513,6 +571,12 @@ def compact_source_repo(
         api=api,
         repo=repo,
         token=token,
+        manifest_filename=manifest_file,
+        snapshot_filename=snapshot_file,
+        snapshot_prefix=snapshot_prefix,
+        delta_prefix=delta_prefix,
+        delta_dir=delta_dir,
+        control_prefix=control_prefix,
     )
 
     # 4. Prune unreferenced legacy root deltas in bounded batches
@@ -525,6 +589,7 @@ def compact_source_repo(
         candidates=prune_candidates,
         protected=protected_set,
         parent_commit=post_inventory["head"],
+        token=token,
         batch_size=bounded_batch_size,
         dry_run=False,
         retries=retries,
@@ -564,6 +629,8 @@ def main(argv: list[str] | None = None) -> int:
             force_recompact=args.force_recompact,
             temp_dir=args.temp_dir,
             retries=args.retries,
+            snapshot_file=args.snapshot_file,
+            manifest_file=args.manifest_file,
         )
 
         plan = result["plan"]

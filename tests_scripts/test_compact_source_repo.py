@@ -40,6 +40,8 @@ class MockHfHub:
         operations=None,
         commit_message: str = "",
         parent_commit: str | None = None,
+        token: str | None = None,
+        **kwargs,
     ):
         new_head = f"head-{len(self.commits) + 1}"
         for op in (operations or []):
@@ -452,6 +454,126 @@ class TestCompactSourceRepo(unittest.TestCase):
         self.assertIn("deltas/4a/funes-delta-4a123.jsonl.gz.enc", inv["protected"])
         self.assertNotIn("deltas/4a/funes-delta-4a123.jsonl.gz.enc", inv["root_deltas"])
         self.assertEqual(inv["unreferenced_root_deltas"], ["funes-delta-unref.jsonl.gz.enc"])
+
+
+    def test_prune_refreshes_current_head_on_retry_conflict(self):
+        api = mock.Mock()
+        # First commit call fails with stale parent conflict; second succeeds
+        api.create_commit.side_effect = [
+            RuntimeError("A commit has happened since. Please refresh."),
+            mock.Mock(oid="head-refreshed-commit"),
+        ]
+        # repo_info returns refreshed head
+        api.repo_info.return_value = mock.Mock(sha="head-externally-advanced")
+
+        candidates = ["funes-delta-old1.jsonl.gz.enc"]
+        protected = {"funes-snapshot.jsonl.gz.enc"}
+
+        results = compactor.execute_prune_deltas(
+            api=api,
+            repo="owner/repo",
+            candidates=candidates,
+            protected=protected,
+            parent_commit="head-stale",
+            token="test-token",
+            retries=3,
+        )
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["commit_oid"], "head-refreshed-commit")
+        self.assertEqual(api.create_commit.call_count, 2)
+
+        # Verify first call used stale parent, second call used refreshed parent
+        first_call = api.create_commit.call_args_list[0].kwargs
+        second_call = api.create_commit.call_args_list[1].kwargs
+        self.assertEqual(first_call["parent_commit"], "head-stale")
+        self.assertEqual(first_call["token"], "test-token")
+        self.assertEqual(second_call["parent_commit"], "head-externally-advanced")
+        self.assertEqual(second_call["token"], "test-token")
+
+        # Verify repo_info was called with explicit token
+        api.repo_info.assert_called_with(repo_id="owner/repo", repo_type="dataset", token="test-token")
+
+    def test_inspect_source_repo_full_manifest_validation_fails_closed_on_missing_file(self):
+        manifest_data = {
+            "version": 1,
+            "snapshot": "funes-snapshot.jsonl.gz.enc",
+            "deltas": ["funes-delta-nonexistent.jsonl.gz.enc"],
+            "controls": [],
+        }
+        hub = MockHfHub(
+            files={
+                ".gitattributes": b"",
+                "funes-restore-manifest-v1.json": json.dumps(manifest_data).encode("utf-8"),
+                "funes-snapshot.jsonl.gz.enc": b"content-base",
+            }
+        )
+
+        with mock.patch("huggingface_hub.hf_hub_download", side_effect=make_fake_download(hub)):
+            with self.assertRaises(FileNotFoundError):
+                compactor.inspect_source_repo(
+                    api=hub,
+                    repo="test/repo",
+                    token="test-token",
+                )
+
+    def test_inspect_source_repo_full_manifest_validation_fails_closed_on_invalid_schema(self):
+        # Version 2 is unsupported
+        manifest_data = {
+            "version": 2,
+            "snapshot": "funes-snapshot.jsonl.gz.enc",
+            "deltas": [],
+            "controls": [],
+        }
+        hub = MockHfHub(
+            files={
+                ".gitattributes": b"",
+                "funes-restore-manifest-v1.json": json.dumps(manifest_data).encode("utf-8"),
+                "funes-snapshot.jsonl.gz.enc": b"content-base",
+            }
+        )
+
+        with mock.patch("huggingface_hub.hf_hub_download", side_effect=make_fake_download(hub)):
+            with self.assertRaises(ValueError):
+                compactor.inspect_source_repo(
+                    api=hub,
+                    repo="test/repo",
+                    token="test-token",
+                )
+
+    def test_inspect_source_repo_honors_env_prefixes(self):
+        custom_manifest = {
+            "version": 1,
+            "snapshot": "custom-snapshot-01.jsonl.gz.enc",
+            "deltas": ["custom-delta-01.jsonl.gz.enc"],
+            "controls": ["custom-reindex-01.jsonl.gz.enc"],
+        }
+        hub = MockHfHub(
+            files={
+                ".gitattributes": b"",
+                "custom-manifest.json": json.dumps(custom_manifest).encode("utf-8"),
+                "custom-snapshot-01.jsonl.gz.enc": b"content",
+                "custom-delta-01.jsonl.gz.enc": b"content",
+                "custom-reindex-01.jsonl.gz.enc": b"content",
+                "custom-delta-legacy.jsonl.gz.enc": b"content",
+            }
+        )
+
+        with mock.patch("huggingface_hub.hf_hub_download", side_effect=make_fake_download(hub)):
+            inv = compactor.inspect_source_repo(
+                api=hub,
+                repo="test/repo",
+                token="test-token",
+                manifest_filename="custom-manifest.json",
+                snapshot_prefix="custom-snapshot-",
+                delta_prefix="custom-delta-",
+                control_prefix="custom-reindex-",
+            )
+
+        self.assertEqual(inv["active_snapshot"], "custom-snapshot-01.jsonl.gz.enc")
+        self.assertEqual(inv["active_deltas"], ["custom-delta-01.jsonl.gz.enc"])
+        self.assertEqual(inv["active_controls"], ["custom-reindex-01.jsonl.gz.enc"])
+        self.assertEqual(inv["unreferenced_root_deltas"], ["custom-delta-legacy.jsonl.gz.enc"])
 
 if __name__ == "__main__":
     unittest.main()

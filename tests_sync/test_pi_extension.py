@@ -21,6 +21,7 @@ def run_harness(
     source: str,
     body: str,
     extra_env: dict[str, str] | None = None,
+    timeout: int = 15,
 ) -> subprocess.CompletedProcess[str]:
     config = tmp_path / "config.toml"
     config.write_text(source, encoding="utf-8")
@@ -45,7 +46,7 @@ def run_harness(
         check=False,
         capture_output=True,
         text=True,
-        timeout=10,
+        timeout=timeout,
     )
 
 
@@ -220,7 +221,7 @@ def test_pi_before_agent_start_allows_slow_search_within_automatic_budget(tmp_pa
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self):
             requests.append(self.path)
-            time.sleep(4.1)
+            time.sleep(6.1)
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
@@ -259,7 +260,7 @@ def test_pi_before_agent_start_allows_slow_search_within_automatic_budget(tmp_pa
             "systemPrompt": "base\n\n## Funes unified memory\n1. remembered decision"
         }
         assert requests == ["/search"]
-        assert 3.75 < elapsed < 5
+        assert 5.8 < elapsed < 8.0
     finally:
         server.shutdown()
         server.server_close()
@@ -324,7 +325,7 @@ def test_pi_before_agent_start_fails_open_with_automatic_budget(tmp_path, failur
         assert result.returncode == 0, result.stderr
         assert result.stdout.strip() == "null"
         assert requests == ["/search"]
-        assert elapsed < (7.5 if failure == "hang" else 5)
+        assert elapsed < (10.5 if failure == "hang" else 5)
     finally:
         server.shutdown()
         server.server_close()
@@ -512,6 +513,53 @@ def test_pi_funes_get_keeps_standard_backoff_and_remote_budget(tmp_path):
         assert requests[0][0] == "/get"
         delay = requests[1][1] - requests[0][1]
         assert delay >= 1.8, f"expected standard backoff >= 1.8s, got {delay}"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+@pytest.mark.skipif(NODE is None, reason="node is unavailable")
+def test_pi_funes_recall_allows_slow_search_matching_large_index_latency(tmp_path):
+    requests = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            requests.append(self.path)
+            time.sleep(6.1)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(
+                b'{"ok":true,"results":[{"raw_text":"large index raw text"}]}'
+            )
+
+        def log_message(self, format, *args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server.daemon_threads = True
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        body = (
+            "const tools = {};\n"
+            "const pi = {registerTool(tool) { tools[tool.name] = tool; }, on() {}};\n"
+            "extension(pi);\n"
+            "const result = await tools.funes_recall.execute('test', {query: 'bm25'});\n"
+            "console.log(result.content[0].text);\n"
+        )
+        started = time.monotonic()
+        result = run_harness(
+            tmp_path,
+            f'[remote]\nurl = "http://127.0.0.1:{server.server_port}"\n',
+            body,
+        )
+        elapsed = time.monotonic() - started
+        assert result.returncode == 0, result.stderr
+        parsed = json.loads(result.stdout)
+        assert parsed["ok"] is True
+        assert parsed["results"][0]["raw_text"] == "large index raw text"
+        assert len(requests) == 1
+        assert 5.8 < elapsed < 8.0
     finally:
         server.shutdown()
         server.server_close()

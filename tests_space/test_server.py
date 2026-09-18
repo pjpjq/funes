@@ -4996,6 +4996,85 @@ def test_voyage_blocked_native_returns_sidecar_bm25_within_http_budget(monkeypat
     assert legacy_calls == []
 
 
+def test_voyage_native_timeout_allocates_separate_bounded_fallback_window(monkeypatch):
+    release_native = threading.Event()
+    native_finished = threading.Event()
+    search_calls = []
+
+    class Store:
+        def get(self, _identity):
+            return None
+
+        def search(self, query, limit, filters, *, allow_broad_scan):
+            # Production BM25 returns in 1-6s. Taking 1.0s exceeds the 0.5s
+            # leftover of the 4.5s shared deadline after native consumes 4.0s.
+            time.sleep(1.0)
+            search_calls.append((query, limit, filters, allow_broad_scan))
+            return [{
+                "source_identity": "session-hit",
+                "source_type": "memory",
+                "raw_text": "raw session text",
+                "retrieval_text": "derived shadow",
+            }]
+
+    app = SimpleNamespace(
+        translator=SimpleNamespace(
+            rewrite_query=lambda _query: (_ for _ in ()).throw(
+                AssertionError("degraded Voyage fallback must stay raw and local")
+            )
+        ),
+        store=Store(),
+        syncer=SimpleNamespace(restoring=False, restore_failed=False),
+    )
+    monkeypatch.setattr(bridge, "SOURCE_APP", app)
+    monkeypatch.setattr(bridge, "TOKEN", "test-token")
+    monkeypatch.setenv("FUNES_EMBEDDING_PROVIDER", "voyage")
+    monkeypatch.setenv("FUNES_NATIVE_FALLBACK", "false")
+
+    def blocked_native(*_args, **_kwargs):
+        try:
+            release_native.wait(40)
+            return ""
+        finally:
+            native_finished.set()
+
+    monkeypatch.setattr(bridge, "recall", blocked_native)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    watchdog = threading.Timer(6.0, release_native.set)
+    watchdog.daemon = True
+    watchdog.start()
+    started = time.monotonic()
+    try:
+        status, body = _post(
+            server,
+            "/search",
+            {"query": "raw query", "limit": 3, "source_agent": "codex"},
+        )
+        elapsed = time.monotonic() - started
+    finally:
+        release_native.set()
+        watchdog.cancel()
+        native_finished.wait(1)
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert status == 200
+    assert elapsed < bridge.HTTP_NATIVE_TIMEOUT
+    assert body["retrieval_degraded"] == "voyage_unavailable"
+    assert body["retrieval_backend"] == "bm25"
+    assert body["results"] == [{
+        "source_identity": "session-hit",
+        "source_type": "memory",
+        "raw_text": "raw session text",
+    }]
+    assert body["results_text"] == "raw session text"
+    assert "retrieval_text" not in body["results"][0]
+    assert search_calls == [("raw query", 9, {"source_agent": "codex"}, False)]
+
+
 def test_concurrent_voyage_native_request_returns_busy_without_foreign_result(
     monkeypatch,
 ):

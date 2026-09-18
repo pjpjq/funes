@@ -324,7 +324,7 @@ def _remote_call(path, payload):
     if recall:
         total = _first_float_env(
             ["FUNES_REMOTE_RECALL_TIMEOUT", "FUNES_REMOTE_SEARCH_TIMEOUT"],
-            12.0,
+            18.0,
             0.1,
             60.0,
         )
@@ -343,7 +343,7 @@ def _remote_call(path, payload):
                 "FUNES_REMOTE_RECALL_ATTEMPT_TIMEOUT",
                 "FUNES_REMOTE_SEARCH_ATTEMPT_TIMEOUT",
             ],
-            5.0,
+            8.0,
             0.1,
             30.0,
         )

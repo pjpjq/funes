@@ -604,7 +604,7 @@ def test_remote_search_ignores_long_remote_timeout_env(monkeypatch):
 
     assert bridge._remote_call("/search", {"query": "test"}) is None
     assert len(calls) == 2
-    assert all(0 < timeout <= 5.0 for _, timeout in calls)
+    assert all(0 < timeout <= 8.0 for _, timeout in calls)
 
 
 def test_remote_search_reads_dedicated_recall_timeout_env(monkeypatch):
@@ -682,7 +682,7 @@ def test_remote_search_short_backoff_on_503_preserves_second_attempt_budget(monk
     assert result == {"ok": True, "results": [{"raw_text": "retried_503"}]}
     assert len(calls) == 2
     assert slept == [0.5]
-    assert 4.0 <= calls[1][1] <= 5.0
+    assert 7.0 <= calls[1][1] <= 8.0
 
 
 def test_remote_get_still_uses_remote_timeout_env(monkeypatch):

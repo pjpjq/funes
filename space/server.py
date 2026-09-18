@@ -161,6 +161,13 @@ try:
     )
 except ValueError:
     VOYAGE_HTTP_TIMEOUT = 4.5
+try:
+    VOYAGE_FALLBACK_TIMEOUT = min(
+        HTTP_NATIVE_TIMEOUT,
+        max(0.1, float(os.getenv("FUNES_VOYAGE_FALLBACK_TIMEOUT", "8"))),
+    )
+except ValueError:
+    VOYAGE_FALLBACK_TIMEOUT = min(HTTP_NATIVE_TIMEOUT, 8.0)
 PROMPT_VERSION = "funes-retrieval-v1"
 LANGUAGE_MODE = os.getenv("FUNES_RETRIEVAL_LANGUAGE_MODE", "raw").lower()
 SELECTIVE_BM25_RESULT_WINDOW = 6
@@ -3041,6 +3048,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(202, {"ok": True, "native_warm": request_warm(force=True)})
                 return
             if self.path in ("/search", "/recall"):
+                search_started = time.monotonic()
                 raw_query = str(obj.get("query", "")).strip()
                 if not raw_query:
                     self.send_json(400, {"error": "query is required"})
@@ -3301,13 +3309,17 @@ class Handler(BaseHTTPRequestHandler):
                                     limit,
                                 )
                 if native_failure and voyage_hot_path and not source_restore_error:
+                    fallback_deadline = min(
+                        time.monotonic() + VOYAGE_FALLBACK_TIMEOUT,
+                        search_started + HTTP_NATIVE_TIMEOUT,
+                    )
                     try:
                         source_rankings, session_fallback_rankings = (
                             _run_before_deadline(
                                 lambda: search_source_bm25_rankings(
                                     raw_query, limit, filters, harness
                                 ),
-                                voyage_deadline,
+                                fallback_deadline,
                                 thread_name="funes-http-sidecar-bm25",
                             )
                         )

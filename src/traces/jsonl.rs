@@ -48,6 +48,11 @@ pub fn workdir_of_cwd(cwd: &str) -> Option<String> {
     munged.contains(|c: char| c != '-').then_some(munged)
 }
 
+/// The workdir facet of a session: its recorded `cwd` munged ([`workdir_of_cwd`]), else `fallback`.
+pub fn workdir_facet(cwd: Option<&str>, fallback: &str) -> String {
+    cwd.and_then(workdir_of_cwd).unwrap_or_else(|| fallback.to_string())
+}
+
 /// Parse a `*.jsonl` file into one [`Value`] per non-blank, parseable line. A read failure
 /// propagates as `Err` so the indexer skips the file *without recording state* — swallowing it
 /// would silently mark an unreadable file fully indexed. A line that doesn't parse is dropped (a
@@ -116,6 +121,7 @@ pub fn backfill_tool_names(turns: &mut [Turn]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::traces::FORMAT_VERSION;
     use std::io::Write;
 
     #[test]
@@ -191,7 +197,9 @@ mod tests {
             tool_use_id: Some(id.into()),
         };
         let turn = |uuid: &str, blocks: Vec<crate::traces::Block>| Turn {
+            format: FORMAT_VERSION,
             session_id: "s".into(),
+            cwd: None,
             workdir: "p".into(),
             turn_uuid: uuid.into(),
             parent_uuid: None,

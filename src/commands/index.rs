@@ -125,6 +125,33 @@ fn redact_turns(
     Ok(())
 }
 
+/// A unit's turns chunked at `tiers` as the memory stores them — data URIs elided and, with a
+/// `scanner`, secrets redacted first, since both change the text a block splits into.
+fn chunks_of(
+    turns: &mut [traces::Turn],
+    tiers: &[Tier],
+    include_thinking: bool,
+    scanner: Option<&scan::Trufflehog>,
+) -> Result<Vec<chunk::Chunk>> {
+    elide_turns(turns);
+    if let Some(scanner) = scanner {
+        redact_turns(turns, scanner, tiers, include_thinking)?;
+    }
+    Ok(chunk::chunks_from_turns(turns, tiers, include_thinking))
+}
+
+/// The secret scanner, if installed. Best-effort: without one, indexing continues unredacted — the
+/// push gate still scans, fail-closed, before any upload, so a secret can't reach the Hub.
+fn find_scanner() -> Option<scan::Trufflehog> {
+    match scan::Trufflehog::find() {
+        Ok(s) => Some(s),
+        Err(e) => {
+            eprintln!("note: secret redaction disabled — {e}");
+            None
+        }
+    }
+}
+
 /// A unit's distinct-session count and a log label: `"<sid> (<workdir>)"` for a single session (a
 /// JSONL file), `"<n> sessions"` for a bulk unit (many sessions in one artifact), and the unit's `key` (its
 /// path) when it has no turns at all. The borrow of `turns` is confined here so callers keep it mutable.
@@ -273,6 +300,9 @@ struct Indexer {
     n_sessions: u64,
     n_skipped: u64,
     n_chunks: u64,
+    /// Units (by index) whose read failed this run — reported once, and not retried by a later
+    /// tier pass; no state is recorded, so the next run retries them.
+    rejected: HashSet<usize>,
 }
 
 /// Enumerate every source's units (each source orders its own — recency-desc, subagents last),
@@ -348,16 +378,7 @@ impl Indexer {
         };
 
         let embedder: Box<dyn Embedder> = inference::embedder()?;
-        // Best-effort secret redaction: if the scanner isn't installed, indexing continues
-        // unredacted — the push gate still scans, fail-closed, before any upload, so a secret can't
-        // reach the Hub.
-        let scanner = match scan::Trufflehog::find() {
-            Ok(s) => Some(s),
-            Err(e) => {
-                eprintln!("note: secret redaction disabled — {e}");
-                None
-            }
-        };
+        let scanner = find_scanner();
 
         let existing = match &ds {
             Some(d) => stored_ids(d).await?,
@@ -390,6 +411,7 @@ impl Indexer {
             n_sessions: 0,
             n_skipped: 0,
             n_chunks: 0,
+            rejected: HashSet::new(),
         })
     }
 
@@ -440,6 +462,9 @@ impl Indexer {
                 return Ok(0);
             }
         }
+        if self.rejected.contains(&i) {
+            return Ok(0);
+        }
 
         // Best-effort sources retry a failed read next run (no state recorded); a fatal source
         // aborts rather than silently dropping data.
@@ -448,7 +473,8 @@ impl Indexer {
             match src.read(&self.units[i].1) {
                 Ok(t) => t,
                 Err(e) if !src.fatal_on_read_error() => {
-                    eprintln!("{progress} {key} — read failed, skipping: {e}");
+                    eprintln!("{progress} {key} — rejected: {e}");
+                    self.rejected.insert(i);
                     return Ok(0);
                 }
                 Err(e) => return Err(e),
@@ -456,15 +482,18 @@ impl Indexer {
         };
 
         let (sessions, label) = unit_summary(&turns, &key);
-        elide_turns(&mut turns);
-        if let Some(scanner) = &self.scanner {
-            redact_turns(&mut turns, scanner, tiers, self.include_thinking)?;
+        let mut chunks = chunks_of(&mut turns, tiers, self.include_thinking, self.scanner.as_ref())?;
+        let mut repo_by_turn: HashMap<(&str, &str), String> = HashMap::new();
+        for t in &turns {
+            if let Some(cwd) = &t.cwd {
+                repo_by_turn
+                    .entry((t.session_id.as_str(), t.turn_uuid.as_str()))
+                    .or_insert_with(|| self.repo_for(cwd));
+            }
         }
-        let mut chunks = chunk::chunks_from_turns(&turns, tiers, self.include_thinking);
-        let repo = self.repo_for(&key);
-        if !repo.is_empty() {
-            for c in &mut chunks {
-                c.repo.clone_from(&repo);
+        for c in &mut chunks {
+            if let Some(repo) = repo_by_turn.get(&(c.session_id.as_str(), c.turn_uuid.as_str())) {
+                c.repo.clone_from(repo);
             }
         }
         let total_chunks = chunks.len();
@@ -472,7 +501,13 @@ impl Indexer {
             eprintln!("{progress} {label} — no indexable content");
             0
         } else {
-            let new_chunks: Vec<chunk::Chunk> = chunks.into_iter().filter(|c| !self.existing.contains(&c.id)).collect();
+            // A unit can carry one id twice (a turn re-emitted under its `turn_uuid`); the first wins,
+            // as it would have had the two arrived in separate runs.
+            let mut in_batch = HashSet::new();
+            let new_chunks: Vec<chunk::Chunk> = chunks
+                .into_iter()
+                .filter(|c| !self.existing.contains(&c.id) && in_batch.insert(c.id.clone()))
+                .collect();
             if new_chunks.is_empty() {
                 eprintln!("{progress} {label} — {total_chunks} chunks, all already indexed");
                 0
@@ -505,16 +540,11 @@ impl Indexer {
         Ok(added)
     }
 
-    /// The session's repo(s) for the unit at `key`, resolved from its transcript's cwd and cached
-    /// per cwd so each distinct checkout runs `git` once across the run. Empty for a non-transcript
-    /// unit (a parquet shard) or a checkout that can't be resolved (gone, not a git repo).
-    fn repo_for(&mut self, key: &str) -> String {
-        let Some(cwd) = repo::cwd_of_transcript(Path::new(key)) else {
-            return String::new();
-        };
+    /// [`repo::of_cwd`], cached so each distinct checkout runs `git` once across the run.
+    fn repo_for(&mut self, cwd: &str) -> String {
         self.repo_cache
-            .entry(cwd.clone())
-            .or_insert_with(|| repo::of_cwd(&cwd))
+            .entry(cwd.to_string())
+            .or_insert_with(|| repo::of_cwd(cwd))
             .clone()
     }
 
@@ -578,21 +608,27 @@ impl Indexer {
                 self.n_sessions,
                 self.n_skipped,
                 self.n_chunks,
+                self.rejected.len() as u64,
                 self.units.len(),
             )
         );
+        if !self.rejected.is_empty() {
+            anyhow::bail!("{} unit(s) rejected", self.rejected.len());
+        }
         Ok(())
     }
 }
 
-/// The run summary line. An interactive rerun that added nothing — and left nothing owed — gets a
-/// friendly "up to date" instead of a zero-count tally; an automated run (no reader) or any run
-/// that indexed or still owes something gets the tally.
-fn run_summary(done: bool, sessions: u64, skipped: u64, chunks: u64, units: usize) -> String {
-    if done && chunks == 0 {
+/// The run summary line. An interactive rerun that added nothing — and left nothing owed or
+/// rejected — gets a friendly "up to date" instead of a zero-count tally; an automated run (no
+/// reader) or any run that indexed, rejected or still owes something gets the tally.
+fn run_summary(done: bool, sessions: u64, skipped: u64, chunks: u64, rejected: u64, units: usize) -> String {
+    if done && chunks == 0 && rejected == 0 {
         format!("up to date ({units} sessions, all tiers)")
-    } else {
+    } else if rejected == 0 {
         format!("indexed sessions={sessions} skipped={skipped} chunks={chunks}")
+    } else {
+        format!("indexed sessions={sessions} skipped={skipped} chunks={chunks} rejected={rejected}")
     }
 }
 
@@ -610,7 +646,7 @@ pub async fn run_index_roots(
     let sources = roots
         .iter()
         .map(|(path, harness)| source::open_with_harness(path, max_sessions, *harness))
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
     index_sources(sources, no_thinking, yes).await
 }
 
@@ -653,7 +689,7 @@ pub async fn run_index_budgeted(
     let sources = roots
         .iter()
         .map(|(path, harness)| source::open_with_harness(path, max_sessions, *harness))
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
     let finish = if yes { Finish::All } else { Finish::Ask };
     run_budgeted(sources, no_thinking, finish).await
 }
@@ -663,7 +699,7 @@ pub async fn run_index_budgeted(
 /// budget on text (decisions, rationale) first, so recall works in about a minute; a small history
 /// simply finishes whole.
 pub async fn run_index_seed(root: &Path, harness: Harness) -> Result<()> {
-    let sources = vec![source::open_with_harness(root, None, Some(harness))];
+    let sources = vec![source::open_with_harness(root, None, Some(harness))?];
     run_budgeted(sources, false, Finish::Stop).await
 }
 
@@ -775,6 +811,69 @@ async fn index_sources(sources: Vec<Box<dyn source::TraceSource>>, no_thinking: 
     }
 
     indexer.finalize().await
+}
+
+/// What a dry run found.
+pub struct CheckReport {
+    pub text: String,
+    pub rejected: usize,
+    pub duplicate_ids: usize,
+}
+
+impl CheckReport {
+    pub fn is_clean(&self) -> bool {
+        self.rejected == 0 && self.duplicate_ids == 0
+    }
+}
+
+/// Dry-run `path`: read and chunk every unit exactly as an index would, count turns and chunks,
+/// find the ids a unit produces twice (a turn re-emitted under its `turn_uuid` would be deduped
+/// away, never indexed), and write nothing — no lock, no memory, no model.
+pub fn check(path: &Path, no_thinking: bool, limit: Option<usize>, harness: Option<Harness>) -> Result<CheckReport> {
+    if !path.exists() {
+        anyhow::bail!("no such path: {}", path.display());
+    }
+    let src = source::open_with_harness(path, limit, harness)?;
+    let units = src.units()?;
+    let scanner = find_scanner();
+    let mut text = format!("checking {}\n", path.display());
+    let (mut turns, mut chunks, mut rejected, mut duplicate_ids) = (0usize, 0usize, 0usize, 0usize);
+    for unit in &units {
+        let mut unit_turns = match src.read(unit) {
+            Ok(t) => t,
+            Err(e) => {
+                rejected += 1;
+                text.push_str(&format!("  {} — rejected: {e}\n", unit.key));
+                continue;
+            }
+        };
+        let unit_chunks = chunks_of(&mut unit_turns, &Tier::ALL, !no_thinking, scanner.as_ref())?;
+        text.push_str(&format!(
+            "  {} — {} turns, {} chunks\n",
+            unit.key,
+            unit_turns.len(),
+            unit_chunks.len()
+        ));
+        let mut seen = HashSet::new();
+        for c in unit_chunks.iter().filter(|c| !seen.insert(c.id.as_str())) {
+            duplicate_ids += 1;
+            text.push_str(&format!(
+                "    duplicate id {}: session {} turn {} block {} split {}\n",
+                c.id, c.session_id, c.turn_uuid, c.block_idx, c.split_idx
+            ));
+        }
+        turns += unit_turns.len();
+        chunks += unit_chunks.len();
+    }
+    text.push_str(&format!(
+        "checked {} unit(s): {turns} turns, {chunks} chunks, {rejected} rejected, {duplicate_ids} duplicate id(s)\n",
+        units.len()
+    ));
+    Ok(CheckReport {
+        text,
+        rejected,
+        duplicate_ids,
+    })
 }
 
 /// Build/update the local index from a single source root, auto-detecting its harness — a thin
@@ -1051,7 +1150,7 @@ mod tests {
         let key = |f: &str| root.join(f).to_string_lossy().into_owned();
         let sweep = || -> Vec<Box<dyn source::TraceSource>> {
             vec![
-                source::open_with_harness(&root, None, Some(Harness::Claude)),
+                source::open_with_harness(&root, None, Some(Harness::Claude)).unwrap(),
                 // A store that claims no key contributes none, however its units are signed.
                 Box::new(MockSource {
                     name: "remote",
@@ -1090,7 +1189,7 @@ mod tests {
         .unwrap();
         let key = |sid: &str| format!("{}#{sid}", db.display());
         let sweep = || -> Vec<Box<dyn source::TraceSource>> {
-            vec![source::open_with_harness(&db, None, Some(Harness::Hermes))]
+            vec![source::open_with_harness(&db, None, Some(Harness::Hermes)).unwrap()]
         };
         assert_eq!(
             pending_after_a_sweep(&coverage, &sweep()),
@@ -1106,16 +1205,24 @@ mod tests {
     #[test]
     fn run_summary_says_up_to_date_only_on_a_done_no_op() {
         // Interactive rerun that added nothing and owes nothing → the friendly no-op.
-        assert_eq!(run_summary(true, 0, 30, 0, 30), "up to date (30 sessions, all tiers)");
+        assert_eq!(
+            run_summary(true, 0, 30, 0, 0, 30),
+            "up to date (30 sessions, all tiers)"
+        );
         // A run that indexed something → the tally, not "up to date".
         assert_eq!(
-            run_summary(true, 2, 28, 57, 30),
+            run_summary(true, 2, 28, 57, 0, 30),
             "indexed sessions=2 skipped=28 chunks=57"
         );
         // Stopped early (or no reader at all) → the tally, even with nothing added: work is owed.
         assert_eq!(
-            run_summary(false, 0, 30, 0, 30),
+            run_summary(false, 0, 30, 0, 0, 30),
             "indexed sessions=0 skipped=30 chunks=0"
+        );
+        // A rejected unit is never "up to date", and shows in the tally.
+        assert_eq!(
+            run_summary(true, 0, 29, 0, 1, 30),
+            "indexed sessions=0 skipped=29 chunks=0 rejected=1"
         );
     }
 
@@ -1166,7 +1273,9 @@ mod tests {
             },
         ]);
         let mut turns = vec![traces::Turn {
+            format: traces::FORMAT_VERSION,
             session_id: "sess".into(),
+            cwd: None,
             workdir: "proj".into(),
             turn_uuid: "turn".into(),
             parent_uuid: None,
@@ -1209,7 +1318,9 @@ mod tests {
             tool_use_id: None,
         };
         let mut turns = vec![traces::Turn {
+            format: traces::FORMAT_VERSION,
             session_id: "sess".into(),
+            cwd: None,
             workdir: "proj".into(),
             turn_uuid: "turn".into(),
             parent_uuid: None,
@@ -1245,7 +1356,9 @@ mod tests {
             }
         }
         let mut turns = vec![traces::Turn {
+            format: traces::FORMAT_VERSION,
             session_id: "sess".into(),
+            cwd: None,
             workdir: "proj".into(),
             turn_uuid: "turn".into(),
             parent_uuid: None,

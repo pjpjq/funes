@@ -11,7 +11,7 @@
 //! parsers.
 
 use super::jsonl;
-use super::{Block, Turn};
+use super::{Block, Turn, FORMAT_VERSION};
 use crate::hub;
 use anyhow::{anyhow, ensure, Context, Result};
 use arrow_array::{Array, LargeStringArray, ListArray, RecordBatch, StringArray};
@@ -145,13 +145,11 @@ pub fn turns_from_parquet(path: &Path, fallback_workdir: &str, limit: Option<usi
             let harness = str_at(&batch, "harness", i).unwrap_or_default();
             // Per-row facet: the munged recorded cwd (`metadata.cwd`, where
             // the normalizer surfaces it), else the dataset-level fallback (its file stem).
-            let workdir = metadata_cwd(&batch, i)
-                .as_deref()
-                .and_then(jsonl::workdir_of_cwd)
-                .unwrap_or_else(|| fallback_workdir.to_string());
+            let cwd = metadata_cwd(&batch, i);
+            let workdir = jsonl::workdir_facet(cwd.as_deref(), fallback_workdir);
 
             let msgs = parse_message_list(&messages.value(i))?;
-            let turns = turns_from_messages(&msgs, &sid, &workdir, &ts, &source, &harness);
+            let turns = turns_from_messages(&msgs, &sid, cwd.as_deref(), &workdir, &ts, &source, &harness);
             if !turns.is_empty() {
                 out.extend(turns);
                 sessions += 1;
@@ -206,6 +204,7 @@ fn parse_message_list(elems: &dyn Array) -> Result<Vec<Value>> {
 fn turns_from_messages(
     msgs: &[Value],
     session_id: &str,
+    cwd: Option<&str>,
     workdir: &str,
     ts: &str,
     source: &str,
@@ -222,7 +221,9 @@ fn turns_from_messages(
         let role = m.get("role").and_then(Value::as_str).unwrap_or("").to_string();
         let turn_uuid = format!("{session_id}-{seq}");
         turns.push(Turn {
+            format: FORMAT_VERSION,
             session_id: session_id.to_string(),
+            cwd: cwd.map(str::to_string),
             workdir: workdir.to_string(),
             turn_uuid: turn_uuid.clone(),
             parent_uuid: parent.take(),

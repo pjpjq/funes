@@ -170,19 +170,37 @@ fn esc(s: &str) -> String {
     s.replace('\'', "''")
 }
 
-/// `block_type = '…' AND harness = '…'` over whichever filters are set, else None.
-fn build_where(block_type: Option<&str>, harness: Option<&str>) -> Option<String> {
+/// `block_type = '…' AND harness IN ('…')` over whichever filters are set, else None.
+fn build_where(block_type: Option<&str>, harness: &[String]) -> Option<String> {
     let mut clauses = Vec::new();
     if let Some(bt) = block_type {
         clauses.push(format!("block_type = '{}'", esc(bt)));
     }
-    if let Some(h) = harness {
-        clauses.push(format!("harness = '{}'", esc(h)));
+    match harness {
+        [] => {}
+        [h] => clauses.push(format!("harness = '{}'", esc(h))),
+        many => {
+            let list: Vec<String> = many.iter().map(|h| format!("'{}'", esc(h))).collect();
+            clauses.push(format!("harness IN ({})", list.join(", ")));
+        }
     }
     if clauses.is_empty() {
         None
     } else {
         Some(clauses.join(" AND "))
+    }
+}
+
+/// The stored `harness` facets a `--harness` value names. A known agent's name matches both its
+/// stored facet and its CLI spelling where they differ (`claude_code` and `claude`), since a turns
+/// file may store either; any other value matches as given.
+fn harness_spellings(h: String) -> Vec<String> {
+    match Harness::parse(&h) {
+        Ok(known) if known.as_str() != known.cli_name() => {
+            vec![known.as_str().to_string(), known.cli_name().to_string()]
+        }
+        Ok(known) => vec![known.as_str().to_string()],
+        Err(_) => vec![h],
     }
 }
 
@@ -381,13 +399,7 @@ pub async fn recall_hits(
     harness: Option<String>,
     progress: &(dyn Fn(&str) + Sync),
 ) -> Result<(String, Option<String>, Vec<(Hit, f64)>)> {
-    // `--harness` accepts the same spellings as `index`/`add` (claude|codex|pi); normalize to the
-    // stored facet (Claude's is `claude_code`) so `--harness claude` filters instead of silently
-    // matching nothing, and an unknown value errors here rather than returning zero hits.
-    let harness = harness
-        .map(|h| Harness::parse(&h))
-        .transpose()?
-        .map(|h| h.as_str().to_string());
+    let harness = harness.map(harness_spellings).unwrap_or_default();
 
     progress("loading model…");
     let mut guard = models().await?.lock().await;
@@ -405,12 +417,12 @@ pub async fn recall_hits(
     let ds = &read.ds;
     // A `--harness` filter needs the column; on an un-migrated memory it would fail deep inside Lance
     // with an opaque schema error, so refuse with a clear message instead.
-    if harness.is_some() && !has_harness_col(ds) {
+    if !harness.is_empty() && !has_harness_col(ds) {
         return Err(anyhow!(
             "this memory predates the harness facet — reindex it, or drop --harness"
         ));
     }
-    let where_clause = build_where(block_type.as_deref(), harness.as_deref());
+    let where_clause = build_where(block_type.as_deref(), &harness);
 
     // Hybrid retrieval: a vector ANN scan and a BM25 scan, fused by reciprocal rank. The FTS index
     // can be absent (it's best-effort at index time), so the FTS leg is skipped when it errors —
@@ -830,9 +842,9 @@ pub(crate) fn is_scaffolding(block_start: &str) -> bool {
         || t.starts_with("This session is being continued from a previous conversation")
 }
 
-/// The opening real prompt of each session in `ids` — its earliest user text block that isn't
-/// injected scaffolding, collapsed to one line. A session whose user turns are all scaffolding is
-/// absent from the map.
+/// The opening real prompt of each session in `ids` — its earliest `user` text block that isn't
+/// injected scaffolding, or its earliest text block of any role when it has no `user` turn at all.
+/// A session whose `user` turns are all scaffolding is absent from the map.
 async fn first_prompts(ds: &Dataset, ids: &[String]) -> Result<HashMap<String, String>> {
     if ids.is_empty() {
         return Ok(HashMap::new());
@@ -840,33 +852,47 @@ async fn first_prompts(ds: &Dataset, ids: &[String]) -> Result<HashMap<String, S
     let list: Vec<String> = ids.iter().map(|id| format!("'{}'", esc(id))).collect();
     // Split 0 only: `is_scaffolding` reads a block's start, and a later split begins mid-text.
     let filter = format!(
-        "session_id IN ({}) AND role = 'user' AND block_type = 'text' AND split_idx = 0",
+        "session_id IN ({}) AND block_type = 'text' AND split_idx = 0",
         list.join(", ")
     );
-    let cols = ["session_id", "seq", "block_idx", "text"];
+    let cols = ["session_id", "seq", "block_idx", "role", "text"];
     let batches = dataset::scan_rows(ds, &cols, Some(&filter), None).await?;
-    let mut best: HashMap<String, ((i64, i64), String)> = HashMap::new();
+    // `has_user`: a session whose `user` texts are all scaffolding opens on nothing, not on a reply.
+    #[derive(Default)]
+    struct Opening {
+        user: Option<((i64, i64), String)>,
+        has_user: bool,
+        any: Option<((i64, i64), String)>,
+    }
+    fn earliest(slot: &mut Option<((i64, i64), String)>, key: (i64, i64), body: &str) {
+        if slot.as_ref().is_none_or(|(k, _)| key < *k) {
+            *slot = Some((key, body.to_string()));
+        }
+    }
+    let mut best: HashMap<String, Opening> = HashMap::new();
     for batch in &batches {
-        let (sid, text) = (scol(batch, "session_id"), scol(batch, "text"));
+        let (sid, role, text) = (scol(batch, "session_id"), scol(batch, "role"), scol(batch, "text"));
         let (seq, bi) = (icol(batch, "seq"), icol(batch, "block_idx"));
         for i in 0..batch.num_rows() {
             let body = sval(text, i);
-            if is_scaffolding(&body) {
-                continue;
-            }
             let key = (ival(seq, i), ival(bi, i));
-            match best.entry(sval(sid, i)) {
-                std::collections::hash_map::Entry::Occupied(mut e) if key < e.get().0 => {
-                    e.insert((key, body));
+            let opening = best.entry(sval(sid, i)).or_default();
+            if sval(role, i) == "user" {
+                opening.has_user = true;
+                if !is_scaffolding(&body) {
+                    earliest(&mut opening.user, key, &body);
                 }
-                std::collections::hash_map::Entry::Vacant(e) => {
-                    e.insert((key, body));
-                }
-                _ => {}
             }
+            earliest(&mut opening.any, key, &body);
         }
     }
-    Ok(best.into_iter().map(|(id, (_, text))| (id, text)).collect())
+    Ok(best
+        .into_iter()
+        .filter_map(|(id, o)| {
+            let pick = if o.has_user { o.user } else { o.any };
+            pick.map(|(_, text)| (id, text))
+        })
+        .collect())
 }
 
 /// Fold every row into its session: earliest timestamp, provenance, and distinct turn count. Reads
@@ -1342,7 +1368,10 @@ pub async fn status(memory: Memory) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::traces::{Block, Turn, FORMAT_VERSION};
+    use arrow_array::RecordBatchIterator;
     use chrono::TimeZone;
+    use std::path::Path;
 
     #[test]
     fn is_scaffolding_flags_wrappers_and_headings() {
@@ -1384,6 +1413,60 @@ mod tests {
         assert_eq!(stamp(t, now), "2026-07-07 13:30 UTC (46 hours ago)");
     }
 
+    /// A memory holding `turns`, written to a temp dir.
+    async fn memory_of(turns: &[Turn], dir: &Path) -> Dataset {
+        let chunks = chunk::chunks_from_turns(turns, &chunk::Tier::ALL, true);
+        let vectors = vec![vec![0.0f32; dataset::DIM as usize]; chunks.len()];
+        let batch = dataset::build_batch(&chunks, &vectors).unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], dataset::schema());
+        Dataset::write(reader, dir.to_str().unwrap(), None).await.unwrap()
+    }
+
+    fn text_turn(session: &str, seq: i64, role: &str, text: &str) -> Turn {
+        Turn {
+            format: FORMAT_VERSION,
+            session_id: session.into(),
+            cwd: None,
+            workdir: String::new(),
+            turn_uuid: format!("{session}-{seq}"),
+            parent_uuid: None,
+            seq,
+            ts: "2026-01-01T00:00:00Z".into(),
+            role: role.into(),
+            blocks: vec![Block {
+                block_type: "text".into(),
+                text: text.into(),
+                tool_name: None,
+                tool_use_id: None,
+            }],
+            source_path: String::new(),
+            harness: "t".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn first_prompts_open_on_user_text_else_the_first_text_of_any_role() {
+        let dir = tempfile::tempdir().unwrap();
+        let turns = [
+            // An agent session: the first non-scaffolding user text, not the earlier scaffolding.
+            text_turn("agent", 0, "user", "<system-reminder>…</system-reminder>"),
+            text_turn("agent", 1, "user", "how do we parse transcripts"),
+            text_turn("agent", 2, "assistant", "with serde"),
+            // A tracker thread: no `user` turn at all — the first text block opens it.
+            text_turn("issue", 0, "contributor", "**@someone** opened: build fails on arm64"),
+            text_turn("issue", 1, "member", "reproduced on main"),
+            // Only scaffolding user text: nothing opens it, a reply is not a prompt.
+            text_turn("scaffold", 0, "user", "# skill preamble"),
+            text_turn("scaffold", 1, "assistant", "ok"),
+        ];
+        let ds = memory_of(&turns, dir.path()).await;
+        let ids: Vec<String> = ["agent", "issue", "scaffold"].map(String::from).to_vec();
+        let prompts = first_prompts(&ds, &ids).await.unwrap();
+        assert_eq!(prompts["agent"], "how do we parse transcripts");
+        assert_eq!(prompts["issue"], "**@someone** opened: build fails on arm64");
+        assert!(!prompts.contains_key("scaffold"), "{prompts:?}");
+    }
+
     #[test]
     fn esc_doubles_single_quotes() {
         assert_eq!(esc("o'brien"), "o''brien");
@@ -1401,16 +1484,29 @@ mod tests {
     }
 
     #[test]
+    fn harness_spellings_cover_both_names_of_a_known_agent_and_pass_others_through() {
+        assert_eq!(harness_spellings("claude".into()), ["claude_code", "claude"]);
+        assert_eq!(harness_spellings("claude_code".into()), ["claude_code", "claude"]);
+        assert_eq!(harness_spellings("codex".into()), ["codex"]);
+        assert_eq!(harness_spellings("opencode".into()), ["opencode"]);
+    }
+
+    #[test]
     fn build_where_combines_set_filters() {
-        assert_eq!(build_where(None, None), None);
-        assert_eq!(build_where(Some("text"), None).as_deref(), Some("block_type = 'text'"));
-        assert_eq!(build_where(None, Some("codex")).as_deref(), Some("harness = 'codex'"));
+        let one = |h: &str| vec![h.to_string()];
+        assert_eq!(build_where(None, &[]), None);
+        assert_eq!(build_where(Some("text"), &[]).as_deref(), Some("block_type = 'text'"));
+        assert_eq!(build_where(None, &one("codex")).as_deref(), Some("harness = 'codex'"));
         assert_eq!(
-            build_where(Some("tool_use"), Some("pi")).as_deref(),
+            build_where(Some("tool_use"), &one("pi")).as_deref(),
             Some("block_type = 'tool_use' AND harness = 'pi'")
         );
+        assert_eq!(
+            build_where(None, &harness_spellings("claude".into())).as_deref(),
+            Some("harness IN ('claude_code', 'claude')")
+        );
         // values are escaped against filter-string injection.
-        assert_eq!(build_where(None, Some("a'b")).as_deref(), Some("harness = 'a''b'"));
+        assert_eq!(build_where(None, &one("a'b")).as_deref(), Some("harness = 'a''b'"));
     }
 
     #[test]

@@ -48,7 +48,8 @@ enum Cmd {
         /// Restrict to a block type: text | thinking | tool_use | tool_result.
         #[arg(long = "type", value_name = "BLOCK_TYPE")]
         block_type: Option<String>,
-        /// Restrict to a harness: claude | codex | pi | hermes.
+        /// Restrict to a harness facet: an agent's name (claude | codex | pi | hermes) or any
+        /// harness a turns file carries.
         #[arg(long)]
         harness: Option<String>,
         #[command(flatten)]
@@ -82,14 +83,19 @@ enum Cmd {
     },
     /// Build or update your local memory from session transcripts.
     Index {
-        /// A transcript tree or `.parquet` file, or a Hub trace repo `<org>/<repo>`. Omit — in a
-        /// terminal — to index every known harness dir (~/.claude/projects, ~/.codex/sessions,
-        /// ~/.pi/agent/sessions); `--harness <name>` alone targets one. An automated (non-terminal)
-        /// run must name a target.
+        /// A transcript tree, a `.parquet` file, a `.funes.jsonl` turns file (or a directory of
+        /// them), or a Hub trace repo `<org>/<repo>`. Omit — in a terminal — to index every known
+        /// harness dir (~/.claude/projects, ~/.codex/sessions, ~/.pi/agent/sessions); `--harness
+        /// <name>` alone targets one. An automated (non-terminal) run must name a target.
         path: Option<String>,
-        /// Override harness auto-detection for PATH: claude | codex | pi | hermes.
+        /// Override harness auto-detection for a transcript tree: claude | codex | pi | hermes.
+        /// Refused on a turns file, whose turns name their own.
         #[arg(long)]
         harness: Option<String>,
+        /// Validate PATH without indexing it: parse, count turns and chunks, report rejected files
+        /// and duplicate ids; write nothing. Exits non-zero on any problem.
+        #[arg(long, requires = "path")]
+        check: bool,
         /// Exclude thinking blocks.
         #[arg(long)]
         no_thinking: bool,
@@ -420,11 +426,25 @@ async fn main() -> Result<()> {
         Cmd::Index {
             path,
             harness,
+            check,
             no_thinking,
             limit,
             yes,
         } => {
             let harness = harness.map(|h| Harness::parse(&h)).transpose()?;
+            if check {
+                let path = path.expect("clap requires PATH with --check");
+                let report = index::check(&PathBuf::from(&path), no_thinking, limit, harness)?;
+                print!("{}", report.text);
+                if !report.is_clean() {
+                    return Err(anyhow!(
+                        "{} rejected, {} duplicate id(s)",
+                        report.rejected,
+                        report.duplicate_ids
+                    ));
+                }
+                return Ok(());
+            }
             // A harness-dirs refresh (no explicit path — the per-turn hook and the terminal "keep
             // me fresh" case) is budgeted and text-first; an explicit path or Hub repo is indexed
             // in full.

@@ -360,7 +360,7 @@ pub fn chunks_from_turns(turns: &[Turn], tiers: &[Tier], include_thinking: bool)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::traces::{Block, Turn};
+    use crate::traces::{Block, Turn, FORMAT_VERSION};
 
     fn block(block_type: &str, text: &str, tool_name: Option<&str>) -> Block {
         Block {
@@ -373,7 +373,9 @@ mod tests {
 
     fn turn(blocks: Vec<Block>) -> Turn {
         Turn {
+            format: FORMAT_VERSION,
             session_id: "sess".into(),
+            cwd: None,
             workdir: "proj".into(),
             turn_uuid: "uuid".into(),
             parent_uuid: None,

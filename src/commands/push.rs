@@ -804,7 +804,7 @@ mod tests {
         assert!(note.contains("left untouched"), "note: {note}");
     }
 
-    use crate::traces::{Block, Turn};
+    use crate::traces::{Block, Turn, FORMAT_VERSION};
     use std::process::Command;
 
     /// Mint a throwaway key (never committed, so funes ships no secret) of the given type, or None
@@ -825,7 +825,9 @@ mod tests {
     /// One turn per text, each text its own block — so distinct texts land in distinct blocks.
     fn turn(idx: i64, block_text: &str) -> Turn {
         Turn {
+            format: FORMAT_VERSION,
             session_id: "sess".into(),
+            cwd: None,
             workdir: "proj".into(),
             turn_uuid: format!("turn{idx}"),
             parent_uuid: None,

@@ -1719,6 +1719,252 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(target.search("single")[0]["source_identity"], "one")
         source.close(); target.close(); directory.cleanup()
 
+    def test_bulk_restore_drops_and_rebuilds_secondary_indexes_preserves_unique(self):
+        store = Store(self.tmp.name)
+        store.ingest([
+            {
+                "source_identity": "doc-1",
+                "source_agent": "codex",
+                "role": "user",
+                "source_type": "conversation",
+                "raw_text": "sample text",
+            }
+        ])
+
+        def get_indexes():
+            return {
+                row["name"]
+                for row in store.conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='memories'"
+                )
+            }
+
+        initial_indexes = get_indexes()
+        expected_secondaries = {
+            "memories_source_agent_role_idx",
+            "memories_source_agent_type_idx",
+            "memories_translation_pending_idx",
+            "memories_canonical_pending_idx",
+        }
+        for name in expected_secondaries:
+            self.assertIn(name, initial_indexes)
+        self.assertIn("sqlite_autoindex_memories_1", initial_indexes)
+
+        # 1. begin_bulk_restore drops 4 secondary indexes, preserves UNIQUE
+        store.begin_bulk_restore()
+        bulk_indexes = get_indexes()
+        self.assertIn("sqlite_autoindex_memories_1", bulk_indexes)
+        for name in expected_secondaries:
+            self.assertNotIn(name, bulk_indexes)
+        # Pragmas applied
+        self.assertEqual(store.conn.execute("PRAGMA synchronous").fetchone()[0], 1)
+        self.assertEqual(store.conn.execute("PRAGMA cache_size").fetchone()[0], -64000)
+        self.assertEqual(store.conn.execute("PRAGMA mmap_size").fetchone()[0], 268435456)
+
+        # 2. Nested restore does not repeat drops or prematurely rebuild
+        store.begin_bulk_restore()
+        self.assertEqual(store._bulk_restore_depth, 2)
+        nested_indexes = get_indexes()
+        for name in expected_secondaries:
+            self.assertNotIn(name, nested_indexes)
+
+        store.finish_bulk_restore()
+        self.assertEqual(store._bulk_restore_depth, 1)
+        after_nested_finish = get_indexes()
+        for name in expected_secondaries:
+            self.assertNotIn(name, after_nested_finish)
+
+        # 3. Outermost finish_bulk_restore restores all secondary indexes and pragmas
+        store.finish_bulk_restore()
+        self.assertEqual(store._bulk_restore_depth, 0)
+        final_indexes = get_indexes()
+        for name in expected_secondaries:
+            self.assertIn(name, final_indexes)
+        self.assertIn("sqlite_autoindex_memories_1", final_indexes)
+        # Pragmas restored
+        self.assertEqual(store.conn.execute("PRAGMA synchronous").fetchone()[0], 2)
+        self.assertEqual(store.conn.execute("PRAGMA cache_size").fetchone()[0], -2000)
+        self.assertEqual(store.conn.execute("PRAGMA mmap_size").fetchone()[0], 0)
+        store.close()
+
+    def test_bulk_restore_exception_in_restore_recovers_indexes_and_pragmas(self):
+        store = Store(self.tmp.name)
+        store.ingest([{"source_identity": "doc-err", "raw_text": "failure test"}])
+        expected_secondaries = {
+            "memories_source_agent_role_idx",
+            "memories_source_agent_type_idx",
+            "memories_translation_pending_idx",
+            "memories_canonical_pending_idx",
+        }
+
+        store.begin_bulk_restore()
+        try:
+            try:
+                # Simulate an error during restore
+                raise RuntimeError("restore aborted halfway")
+            finally:
+                store.finish_bulk_restore()
+        except RuntimeError:
+            pass
+
+        current_indexes = {
+            row["name"]
+            for row in store.conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='memories'"
+            )
+        }
+        for name in expected_secondaries:
+            self.assertIn(name, current_indexes)
+        self.assertIn("sqlite_autoindex_memories_1", current_indexes)
+        self.assertEqual(store.conn.execute("PRAGMA synchronous").fetchone()[0], 2)
+        self.assertEqual(store.conn.execute("PRAGMA cache_size").fetchone()[0], -2000)
+        self.assertEqual(store.conn.execute("PRAGMA mmap_size").fetchone()[0], 0)
+        store.close()
+
+    def test_bulk_restore_exception_in_fts_rebuild_still_recovers_indexes_and_pragmas(self):
+        store = Store(self.tmp.name)
+        store.ingest([{"source_identity": "doc-fts-err", "raw_text": "fts error test"}])
+        expected_secondaries = {
+            "memories_source_agent_role_idx",
+            "memories_source_agent_type_idx",
+            "memories_translation_pending_idx",
+            "memories_canonical_pending_idx",
+        }
+
+        store.begin_bulk_restore()
+        with mock.patch.object(
+            store,
+            "_rebuild_native_checkpoint_state_locked",
+            side_effect=sqlite3.OperationalError("simulated rebuild corruption"),
+        ):
+            with self.assertRaises(sqlite3.OperationalError):
+                store.finish_bulk_restore()
+
+        current_indexes = {
+            row["name"]
+            for row in store.conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='memories'"
+            )
+        }
+        for name in expected_secondaries:
+            self.assertIn(name, current_indexes)
+        self.assertIn("sqlite_autoindex_memories_1", current_indexes)
+        self.assertEqual(store.conn.execute("PRAGMA synchronous").fetchone()[0], 2)
+        self.assertEqual(store.conn.execute("PRAGMA cache_size").fetchone()[0], -2000)
+        self.assertEqual(store.conn.execute("PRAGMA mmap_size").fetchone()[0], 0)
+        store.close()
+
+    def test_bulk_restore_custom_pragmas_honored_and_restored(self):
+        store = Store(self.tmp.name)
+        with mock.patch.dict(
+            os.environ,
+            {
+                "FUNES_BULK_RESTORE_SYNCHRONOUS": "OFF",
+                "FUNES_BULK_RESTORE_CACHE_SIZE": "-32000",
+                "FUNES_BULK_RESTORE_MMAP_SIZE": "134217728",
+            },
+        ):
+            store.begin_bulk_restore()
+            self.assertEqual(store.conn.execute("PRAGMA synchronous").fetchone()[0], 0)
+            self.assertEqual(store.conn.execute("PRAGMA cache_size").fetchone()[0], -32000)
+            self.assertEqual(store.conn.execute("PRAGMA mmap_size").fetchone()[0], 134217728)
+            store.finish_bulk_restore()
+
+        self.assertEqual(store.conn.execute("PRAGMA synchronous").fetchone()[0], 2)
+        self.assertEqual(store.conn.execute("PRAGMA cache_size").fetchone()[0], -2000)
+        self.assertEqual(store.conn.execute("PRAGMA mmap_size").fetchone()[0], 0)
+        store.close()
+
+    def test_snapshot_large_dataset_streaming_preserves_byte_and_record_semantics(self):
+        source = Store(self.tmp.name)
+        docs = [
+            {
+                "source_identity": f"bulk-stream-{index}",
+                "source_version": f"v-{index}",
+                "raw_text": f"Raw payload number {index} with unicode 测试 and technical terms func_{index}()",
+                "role": "user" if index % 2 == 0 else "assistant",
+                "source_agent": "codex" if index % 3 == 0 else "claude",
+                "source_type": "conversation",
+                "metadata": {"batch": index // 100, "tag": f"item-{index}"},
+            }
+            for index in range(500)
+        ]
+        source.ingest(docs)
+        for i in range(20):
+            source.translation_put(f"query-{i}", f"rewritten-{i}")
+        for i in range(5):
+            source.record_reindex_control({"generation": i + 1, "scope": "all", "created_at": "2026-09-18T00:00:00Z"})
+
+        connection = source.conn
+        iterated = False
+
+        class StreamingCursor:
+            def __init__(self, cursor):
+                self.cursor = cursor
+
+            def __iter__(self):
+                nonlocal iterated
+                iterated = True
+                return iter(self.cursor)
+
+            def fetchall(self):
+                raise AssertionError("snapshot must not materialize via fetchall")
+
+        class ConnectionProbe:
+            def execute(self, sql, *args):
+                cursor = connection.execute(sql, *args)
+                if "SELECT * FROM memories ORDER BY id" in " ".join(sql.split()):
+                    return StreamingCursor(cursor)
+                return cursor
+
+            def __getattr__(self, name):
+                return getattr(connection, name)
+
+        snapshot_path = Path(self.tmp.name) / "large-streamed.jsonl.gz"
+        source.conn = ConnectionProbe()
+        try:
+            source.snapshot(snapshot_path)
+        finally:
+            source.conn = connection
+
+        self.assertTrue(iterated)
+
+        # Verify exact line by line content and ordering semantics
+        memory_records = []
+        translation_records = []
+        control_records = []
+        with gzip.open(snapshot_path, "rt", encoding="utf-8") as stream:
+            for line in stream:
+                rec = json.loads(line)
+                rec_type = rec.get("_funes_record")
+                if rec_type == "memory":
+                    memory_records.append(rec)
+                elif rec_type == "translation_cache":
+                    translation_records.append(rec)
+                elif rec_type == "reindex_control":
+                    control_records.append(rec)
+
+        self.assertEqual(len(memory_records), 500)
+        self.assertEqual(len(translation_records), 20)
+        self.assertEqual(len(control_records), 5)
+        ids = [r["id"] for r in memory_records]
+        self.assertEqual(ids, sorted(ids))
+        self.assertEqual([r["source_identity"] for r in memory_records[:3]], ["bulk-stream-0", "bulk-stream-1", "bulk-stream-2"])
+
+        target_dir = tempfile.TemporaryDirectory()
+        target = Store(target_dir.name)
+        restored = target.restore(snapshot_path, apply_controls=False)
+        self.assertEqual(restored, 500)
+        self.assertEqual(target.count(), 500)
+        item = target.get("bulk-stream-42")
+        self.assertIsNotNone(item)
+        self.assertIn("func_42()", item["raw_text"])
+        self.assertEqual(target.translation_get("query-5"), "rewritten-5")
+
+        source.close()
+        target.close()
+        target_dir.cleanup()
+
     def test_canonical_checkpoint_rebuilds_profile_mismatch_including_session(self):
         store = Store(self.tmp.name)
         store.ingest(

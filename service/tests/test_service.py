@@ -1901,7 +1901,7 @@ class ServiceTests(unittest.TestCase):
             ).fetchone()[0]
             self.assertEqual(val, 5)
 
-            # Normal ingest of new row fetches default generation lazily
+            # Normal ingest of batch of new legacy rows fetches default generation lazily ONCE per batch
             with mock.patch.object(
                 store,
                 "_latest_embedding_generation_locked",
@@ -1909,16 +1909,133 @@ class ServiceTests(unittest.TestCase):
             ) as spy_gen:
                 store.ingest([
                     {
-                        "source_identity": "doc-normal-new",
-                        "raw_text": "new normal row",
+                        "source_identity": f"doc-normal-legacy-{i}",
+                        "raw_text": f"new normal legacy row {i}",
                     }
+                    for i in range(5)
                 ])
                 self.assertEqual(spy_gen.call_count, 1)
 
             val = store.conn.execute(
-                "SELECT embedding_generation FROM memories WHERE source_identity='doc-normal-new'"
+                "SELECT embedding_generation FROM memories WHERE source_identity='doc-normal-legacy-0'"
             ).fetchone()[0]
             self.assertEqual(val, 5)
+
+            # Normal ingest of new row with explicit embedding_generation:
+            # Does NOT call _latest_embedding_generation_locked (0 calls).
+            with mock.patch.object(
+                store,
+                "_latest_embedding_generation_locked",
+                wraps=store._latest_embedding_generation_locked,
+            ) as spy_gen:
+                store.ingest([
+                    {
+                        "source_identity": "doc-normal-explicit",
+                        "raw_text": "new normal explicit row",
+                        "embedding_generation": 7,
+                    }
+                ])
+                self.assertEqual(spy_gen.call_count, 0)
+
+            val = store.conn.execute(
+                "SELECT embedding_generation FROM memories WHERE source_identity='doc-normal-explicit'"
+            ).fetchone()[0]
+            self.assertEqual(val, 7)
+        finally:
+            store.close()
+
+    def test_generation_indexes_and_covering_query_plans(self):
+        store = Store(self.tmp.name)
+        try:
+            # 1. Generation indexes exist initially
+            index_names = {
+                row["name"]
+                for row in store.conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='memories'"
+                )
+            }
+            self.assertIn("memories_retrieval_generation_idx", index_names)
+            self.assertIn("memories_native_generation_idx", index_names)
+            self.assertIn("memories_embedding_generation_idx", index_names)
+
+            # 2. Query plans use covering indexes for max() generation queries
+            plans_reindex = [
+                row[3]
+                for row in store.conn.execute(
+                    """EXPLAIN QUERY PLAN SELECT max(value) FROM (
+                    SELECT COALESCE(max(generation), 0) AS value FROM reindex_controls
+                    UNION ALL SELECT COALESCE(max(retrieval_generation), 0) FROM memories
+                    UNION ALL SELECT COALESCE(max(native_generation), 0) FROM memories
+                    UNION ALL SELECT COALESCE(max(embedding_generation), 0) FROM memories
+                    )"""
+                ).fetchall()
+            ]
+            self.assertTrue(any("COVERING INDEX memories_retrieval_generation_idx" in p for p in plans_reindex))
+            self.assertTrue(any("COVERING INDEX memories_native_generation_idx" in p for p in plans_reindex))
+            self.assertTrue(any("COVERING INDEX memories_embedding_generation_idx" in p for p in plans_reindex))
+
+            plans_embedding = [
+                row[3]
+                for row in store.conn.execute(
+                    """EXPLAIN QUERY PLAN SELECT max(value) FROM (
+                    SELECT COALESCE(max(generation), 0) AS value
+                    FROM reindex_controls WHERE scope='all'
+                    UNION ALL
+                    SELECT COALESCE(max(embedding_generation), 0) FROM memories
+                    )"""
+                ).fetchall()
+            ]
+            self.assertTrue(any("COVERING INDEX memories_embedding_generation_idx" in p for p in plans_embedding))
+
+            plans_single = [
+                row[3]
+                for row in store.conn.execute(
+                    "EXPLAIN QUERY PLAN SELECT COALESCE(max(embedding_generation), 0) FROM memories"
+                ).fetchall()
+            ]
+            self.assertTrue(any("COVERING INDEX memories_embedding_generation_idx" in p for p in plans_single))
+
+            # 3. Generation indexes are NOT dropped by begin_bulk_restore()
+            store.begin_bulk_restore()
+            bulk_index_names = {
+                row["name"]
+                for row in store.conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='memories'"
+                )
+            }
+            self.assertIn("memories_retrieval_generation_idx", bulk_index_names)
+            self.assertIn("memories_native_generation_idx", bulk_index_names)
+            self.assertIn("memories_embedding_generation_idx", bulk_index_names)
+            # Secondary indexes are dropped as expected
+            self.assertNotIn("memories_source_agent_role_idx", bulk_index_names)
+
+            # Query plan inside bulk restore still uses covering index
+            plans_bulk = [
+                row[3]
+                for row in store.conn.execute(
+                    "EXPLAIN QUERY PLAN SELECT COALESCE(max(embedding_generation), 0) FROM memories"
+                ).fetchall()
+            ]
+            self.assertTrue(any("COVERING INDEX memories_embedding_generation_idx" in p for p in plans_bulk))
+
+            store.finish_bulk_restore()
+
+            # 4. prepare_ingest_documents supplies embedding_generation so Store.ingest skips lookup
+            app = App()
+            try:
+                prepared = prepare_ingest_documents(app, [{"raw_text": "hello from prepared pipeline"}])
+                self.assertTrue(all("embedding_generation" in doc for doc in prepared))
+
+                with mock.patch.object(
+                    app.store,
+                    "_latest_embedding_generation_locked",
+                    wraps=app.store._latest_embedding_generation_locked,
+                ) as spy_gen:
+                    res = app.store.ingest(prepared)
+                    self.assertEqual(res["created"], 1)
+                    self.assertEqual(spy_gen.call_count, 0)
+            finally:
+                app.close()
         finally:
             store.close()
 
@@ -2362,6 +2479,7 @@ class ServiceTests(unittest.TestCase):
         connection = sqlite3.connect(Path(self.tmp.name) / "funes.sqlite3")
         with connection:
             connection.execute("DROP TRIGGER memories_native_au")
+            connection.execute("DROP INDEX IF EXISTS memories_embedding_generation_idx")
             connection.execute("ALTER TABLE memories DROP COLUMN embedding_generation")
         connection.close()
 
@@ -2372,6 +2490,12 @@ class ServiceTests(unittest.TestCase):
             }
             self.assertIn("embedding_generation", columns)
             self.assertEqual(migrated.get("legacy")["embedding_generation"], 0)
+            index_names = {
+                row["name"] for row in migrated.conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='memories'"
+                )
+            }
+            self.assertIn("memories_embedding_generation_idx", index_names)
         finally:
             migrated.close()
 

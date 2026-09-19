@@ -260,6 +260,33 @@ def stable_rrf(
     return [items[key] for key in ordered[:limit]]
 
 
+MEMORIES_SECONDARY_INDEXES: tuple[tuple[str, str], ...] = (
+    (
+        "memories_source_agent_role_idx",
+        "CREATE INDEX IF NOT EXISTS memories_source_agent_role_idx ON memories(source_agent, role)",
+    ),
+    (
+        "memories_source_agent_type_idx",
+        "CREATE INDEX IF NOT EXISTS memories_source_agent_type_idx ON memories(source_agent, source_type)",
+    ),
+    (
+        "memories_translation_pending_idx",
+        """CREATE INDEX IF NOT EXISTS memories_translation_pending_idx
+        ON memories(updated_at,id)
+        WHERE translation_status='pending_provider'
+        AND COALESCE(native_index_status, '') != 'waiting_durability'""",
+    ),
+    (
+        "memories_canonical_pending_idx",
+        """CREATE INDEX IF NOT EXISTS memories_canonical_pending_idx
+        ON memories(
+            CASE WHEN native_index_status='retry' THEN 1 ELSE 0 END,
+            COALESCE(retrieval_updated_at,updated_at),id)
+        WHERE native_index_pending=1""",
+    ),
+)
+
+
 class Store:
     def __init__(self, data_dir: str):
         self.data_dir = Path(data_dir)
@@ -274,6 +301,7 @@ class Store:
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA busy_timeout=5000")
         self._bulk_restore_depth = 0
+        self._bulk_restore_prev_pragmas: dict[str, Any] | None = None
         self._init_schema()
 
     def _read_connection(self) -> sqlite3.Connection:
@@ -360,10 +388,6 @@ class Store:
                     row_cursor INTEGER NOT NULL DEFAULT 0,
                     applied_at TEXT
                 );
-                CREATE INDEX IF NOT EXISTS memories_source_agent_role_idx
-                    ON memories(source_agent, role);
-                CREATE INDEX IF NOT EXISTS memories_source_agent_type_idx
-                    ON memories(source_agent, source_type);
                 """
             )
             # Upgrades from the first HTTP prototype are additive and safe on a
@@ -534,19 +558,61 @@ class Store:
                     profile, memory, initialize=True
                 )
             self._create_native_state_triggers_locked()
-            self.conn.execute(
-                """CREATE INDEX IF NOT EXISTS memories_translation_pending_idx
-                ON memories(updated_at,id)
-                WHERE translation_status='pending_provider'
-                AND COALESCE(native_index_status, '') != 'waiting_durability'"""
-            )
-            self.conn.execute(
-                """CREATE INDEX IF NOT EXISTS memories_canonical_pending_idx
-                ON memories(
-                    CASE WHEN native_index_status='retry' THEN 1 ELSE 0 END,
-                    COALESCE(retrieval_updated_at,updated_at),id)
-                WHERE native_index_pending=1"""
-            )
+            self._create_secondary_indexes_locked()
+
+    def _drop_secondary_indexes_locked(self) -> None:
+        for name, _ in MEMORIES_SECONDARY_INDEXES:
+            self.conn.execute(f"DROP INDEX IF EXISTS {name}")
+
+    def _create_secondary_indexes_locked(self) -> None:
+        for _name, sql in MEMORIES_SECONDARY_INDEXES:
+            self.conn.execute(sql)
+
+    def _save_and_apply_bulk_pragmas_locked(self) -> None:
+        if self._bulk_restore_prev_pragmas is None:
+            prev_sync = self.conn.execute("PRAGMA synchronous").fetchone()[0]
+            prev_cache = self.conn.execute("PRAGMA cache_size").fetchone()[0]
+            prev_mmap = self.conn.execute("PRAGMA mmap_size").fetchone()[0]
+            self._bulk_restore_prev_pragmas = {
+                "synchronous": prev_sync,
+                "cache_size": prev_cache,
+                "mmap_size": prev_mmap,
+            }
+
+        sync_val = os.getenv("FUNES_BULK_RESTORE_SYNCHRONOUS", "NORMAL").strip().upper()
+        if sync_val in ("OFF", "0"):
+            self.conn.execute("PRAGMA synchronous = OFF")
+        elif sync_val in ("NORMAL", "1"):
+            self.conn.execute("PRAGMA synchronous = NORMAL")
+        elif sync_val in ("FULL", "2"):
+            self.conn.execute("PRAGMA synchronous = FULL")
+        elif sync_val:
+            self.conn.execute(f"PRAGMA synchronous = {sync_val}")
+
+        cache_val = os.getenv("FUNES_BULK_RESTORE_CACHE_SIZE", "-64000").strip()
+        try:
+            self.conn.execute(f"PRAGMA cache_size = {int(cache_val)}")
+        except (ValueError, sqlite3.OperationalError):
+            self.conn.execute("PRAGMA cache_size = -64000")
+
+        mmap_val = os.getenv("FUNES_BULK_RESTORE_MMAP_SIZE", str(256 * 1024 * 1024)).strip()
+        try:
+            self.conn.execute(f"PRAGMA mmap_size = {int(mmap_val)}")
+        except (ValueError, sqlite3.OperationalError):
+            self.conn.execute("PRAGMA mmap_size = 268435456")
+
+    def _restore_pragmas_locked(self) -> None:
+        prev = self._bulk_restore_prev_pragmas
+        self._bulk_restore_prev_pragmas = None
+        if not prev:
+            return
+        if "synchronous" in prev:
+            self.conn.execute(f"PRAGMA synchronous = {prev['synchronous']}")
+        if "cache_size" in prev:
+            self.conn.execute(f"PRAGMA cache_size = {prev['cache_size']}")
+        if "mmap_size" in prev:
+            self.conn.execute(f"PRAGMA mmap_size = {prev['mmap_size']}")
+        self.conn.execute("PRAGMA shrink_memory")
 
     def _drop_fts_triggers_locked(self) -> None:
         for trigger in ("memories_ai", "memories_ad", "memories_au"):
@@ -2361,10 +2427,23 @@ class Store:
 
     def begin_bulk_restore(self) -> None:
         """Suspend per-row indexes while one logical restore is in flight."""
-        with self.lock, self.conn:
+        with self.lock:
             if self._bulk_restore_depth == 0:
-                self._drop_fts_triggers_locked()
-                self._drop_native_state_triggers_locked()
+                self._save_and_apply_bulk_pragmas_locked()
+                try:
+                    with self.conn:
+                        self._drop_fts_triggers_locked()
+                        self._drop_native_state_triggers_locked()
+                        self._drop_secondary_indexes_locked()
+                except Exception:
+                    try:
+                        with self.conn:
+                            self._create_secondary_indexes_locked()
+                            self._create_fts_triggers_locked()
+                            self._create_native_state_triggers_locked()
+                    finally:
+                        self._restore_pragmas_locked()
+                    raise
             self._bulk_restore_depth += 1
 
     def finish_bulk_restore(self) -> None:
@@ -2375,22 +2454,33 @@ class Store:
             self._bulk_restore_depth -= 1
             if self._bulk_restore_depth:
                 return
-            with self.conn:
-                state = self.conn.execute(
-                    """SELECT native_checkpoint_profile,native_checkpoint_memory
-                    FROM sync_state WHERE id=1"""
-                ).fetchone()
-                self._rebuild_native_checkpoint_state_locked(
-                    str(state["native_checkpoint_profile"] or ""),
-                    str(state["native_checkpoint_memory"] or ""),
-                )
-                # FTS5 external-content tables need an explicit rebuild after
-                # restoring rows from a JSONL snapshot.
-                self.conn.execute(
-                    "INSERT INTO memories_fts(memories_fts) VALUES('rebuild')"
-                )
-                self._create_fts_triggers_locked()
-                self._create_native_state_triggers_locked()
+            try:
+                with self.conn:
+                    try:
+                        state = self.conn.execute(
+                            """SELECT native_checkpoint_profile,native_checkpoint_memory
+                            FROM sync_state WHERE id=1"""
+                        ).fetchone()
+                        if state is not None:
+                            self._rebuild_native_checkpoint_state_locked(
+                                str(state["native_checkpoint_profile"] or ""),
+                                str(state["native_checkpoint_memory"] or ""),
+                            )
+                        # FTS5 external-content tables need an explicit rebuild after
+                        # restoring rows from a JSONL snapshot.
+                        self.conn.execute(
+                            "INSERT INTO memories_fts(memories_fts) VALUES('rebuild')"
+                        )
+                    finally:
+                        try:
+                            self._create_secondary_indexes_locked()
+                        finally:
+                            try:
+                                self._create_fts_triggers_locked()
+                            finally:
+                                self._create_native_state_triggers_locked()
+            finally:
+                self._restore_pragmas_locked()
 
 
 class Translator:

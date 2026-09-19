@@ -1,11 +1,11 @@
 //! funes — recall over your past AI Agent sessions.
 //!
-//! `recall` reads the index (hybrid → rerank → recency); `index` builds/updates it from the local
+//! `recall` reads the index (hybrid → optional rerank → recency); `index` builds/updates it from the local
 //! harness session dirs (Claude Code, Codex, pi) or an explicit path/parquet/repo. funes's home is
 //! `$FUNES_HOME` or `~/.funes`.
 
 use funes::agents::{claude, codex, hermes, pi};
-use funes::commands::{ask, index, mcp, push, recall, scrub, sketch, update};
+use funes::commands::{ask, index, ingest_docs, mcp, push, recall, scrub, sketch, update};
 use funes::hub;
 use funes::memory;
 use funes::scan;
@@ -27,8 +27,11 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+// Parsed once at process startup; keeping recall's filters flat gives CLI/MCP users one stable
+// surface and avoids boxing individual optional strings only to shrink this transient enum.
+#[allow(clippy::large_enum_variant)]
 enum Cmd {
-    /// Recall passages from past sessions (hybrid → rerank → recency → neighbors).
+    /// Recall passages from past sessions (hybrid → optional rerank → recency → neighbors).
     Recall {
         /// What to recall (free text).
         #[arg(required = true, num_args = 1..)]
@@ -36,7 +39,7 @@ enum Cmd {
         /// How many results to show.
         #[arg(short, long, default_value_t = recall::DEFAULT_K)]
         k: usize,
-        /// How many fused candidates to rerank.
+        /// How many fused candidates to retain before optional reranking.
         #[arg(long, default_value_t = recall::DEFAULT_CANDIDATES)]
         candidates: usize,
         /// Recency half-life in days (a hit this old keeps half its weight). 0 disables.
@@ -51,6 +54,39 @@ enum Cmd {
         /// Restrict to a harness: claude | codex | pi | hermes.
         #[arg(long)]
         harness: Option<String>,
+        /// Restrict to one canonical source identity.
+        #[arg(long)]
+        source_identity: Option<String>,
+        /// Restrict to one canonical source revision.
+        #[arg(long)]
+        source_version: Option<String>,
+        /// Restrict to one canonical source content hash.
+        #[arg(long)]
+        content_hash: Option<String>,
+        /// Restrict to an exact canonical revision timestamp.
+        #[arg(long)]
+        updated_at: Option<String>,
+        /// Restrict to the source agent facet.
+        #[arg(long)]
+        source_agent: Option<String>,
+        /// Restrict to the source type facet.
+        #[arg(long)]
+        source_type: Option<String>,
+        /// Restrict to the project facet.
+        #[arg(long)]
+        project: Option<String>,
+        /// Restrict to the repo facet.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Restrict to the device id facet.
+        #[arg(long)]
+        device_id: Option<String>,
+        /// Restrict to the canonical content type.
+        #[arg(long)]
+        content_type: Option<String>,
+        /// Restrict to present (`false`) or soft-missing (`true`) canonical sources.
+        #[arg(long)]
+        source_missing: Option<bool>,
         #[command(flatten)]
         memory: MemoryOpts,
     },
@@ -100,6 +136,20 @@ enum Cmd {
         /// an explicit path skips the first-index size confirmation.
         #[arg(long)]
         yes: bool,
+    },
+    /// Ingest canonical document JSONL directly into a memory, replacing each source revision.
+    IngestDocs {
+        /// Canonical JSONL containing source identity, revision, raw text, and metadata.
+        #[arg(value_name = "JSONL")]
+        path: PathBuf,
+        #[command(flatten)]
+        memory: MemoryOpts,
+    },
+    /// Refresh a remote memory's Lance indexes without reading a local memory.
+    #[command(hide = true)]
+    OptimizeIndex {
+        #[arg(value_name = "MEMORY")]
+        memory: String,
     },
     /// Find a literal string everywhere in one session — exhaustive, unranked.
     Scan {
@@ -231,6 +281,24 @@ enum Cmd {
         #[command(subcommand)]
         agent: RemoveAgent,
     },
+    /// Run the unified local Codex/Pi/Claude sync daemon (`funes-sync`).
+    Sync {
+        #[command(subcommand)]
+        command: SyncCommand,
+    },
+    /// Diagnose the unified sync bridge without printing credentials.
+    Doctor,
+    /// List discovered Codex/Pi/Claude sessions and memory files.
+    Sources,
+    /// Rebuild derived retrieval state from the authoritative encrypted source store.
+    Reindex {
+        /// Regenerate retrieval shadows from raw source text.
+        #[arg(long, required_unless_present = "all", conflicts_with = "all")]
+        retrieval_text: bool,
+        /// Regenerate retrieval shadows and force all eligible canonical rows through indexing.
+        #[arg(long, required_unless_present = "retrieval_text", conflicts_with = "retrieval_text")]
+        all: bool,
+    },
 }
 
 // Flattened into every agent so they share one optional `[MEMORY]` positional; the user-facing help
@@ -271,6 +339,22 @@ enum RemoveAgent {
     Codex,
     Pi,
     Hermes,
+}
+
+#[derive(Subcommand)]
+enum SyncCommand {
+    Status,
+    Sources,
+    Doctor,
+    Backfill,
+    Run,
+    Install,
+    Uninstall,
+    Start,
+    Stop,
+    Restart,
+    Logs,
+    Mcp,
 }
 
 /// The memory to bake into an agent's `funes mcp` registration: `None`/blank/`local` → the local
@@ -331,6 +415,17 @@ async fn main() -> Result<()> {
             neighbors,
             block_type,
             harness,
+            source_identity,
+            source_version,
+            content_hash,
+            updated_at,
+            source_agent,
+            source_type,
+            project,
+            repo,
+            device_id,
+            content_type,
+            source_missing,
             memory,
         } => {
             let memory = memory.resolve();
@@ -341,8 +436,29 @@ async fn main() -> Result<()> {
                     s.set(label);
                 }
             };
-            let (note, memory_label, hits) = recall::recall_hits(
-                memory, query, k, candidates, half_life, neighbors, block_type, harness, &progress,
+            let (note, memory_label, hits) = recall::recall_hits_filtered(
+                memory,
+                query,
+                k,
+                candidates,
+                half_life,
+                neighbors,
+                recall::FacetFilter {
+                    block_type,
+                    harness,
+                    source_identity,
+                    source_version,
+                    content_hash,
+                    updated_at,
+                    source_agent,
+                    source_type,
+                    project,
+                    repo,
+                    device_id,
+                    content_type,
+                    source_missing,
+                },
+                &progress,
             )
             .await?;
             drop(spinner);
@@ -483,6 +599,14 @@ async fn main() -> Result<()> {
                 index::run_index_roots(&roots, no_thinking, limit, yes).await
             }
         }
+        Cmd::IngestDocs { path, memory } => {
+            print!("{}", ingest_docs::run(&path, memory.resolve()).await?);
+            Ok(())
+        }
+        Cmd::OptimizeIndex { memory: target } => {
+            print!("{}", push::run_reindex_only(memory::Memory::parse(&target)).await?);
+            Ok(())
+        }
         Cmd::Status { memory } => {
             print!("{}", recall::status(memory::Memory::resolve(memory)).await?);
             // Show the status body before the (bounded, best-effort) update check, so a slow or
@@ -560,6 +684,46 @@ async fn main() -> Result<()> {
             RemoveAgent::Pi => pi::uninstall(),
             RemoveAgent::Hermes => hermes::uninstall(),
         },
+        Cmd::Sync { command } => run_sync_command(command),
+        Cmd::Doctor => run_sync_command(SyncCommand::Doctor),
+        Cmd::Sources => run_sync_command(SyncCommand::Sources),
+        Cmd::Reindex { retrieval_text: _, all } => {
+            run_sync_args(&["reindex", if all { "--all" } else { "--retrieval-text" }])
+        }
+    }
+}
+
+/// Delegate the long-lived bridge to the separately testable Python package.  Keeping
+/// discovery/queue state out of the Rust Lance process means a Space restart or a
+/// client upgrade cannot strand a pending upload.
+fn run_sync_command(command: SyncCommand) -> Result<()> {
+    let name = match command {
+        SyncCommand::Status => "status",
+        SyncCommand::Sources => "sources",
+        SyncCommand::Doctor => "doctor",
+        SyncCommand::Backfill => "backfill",
+        SyncCommand::Run => "run",
+        SyncCommand::Install => "install",
+        SyncCommand::Uninstall => "uninstall",
+        SyncCommand::Start => "start",
+        SyncCommand::Stop => "stop",
+        SyncCommand::Restart => "restart",
+        SyncCommand::Logs => "logs",
+        SyncCommand::Mcp => "mcp",
+    };
+    run_sync_args(&[name])
+}
+
+fn run_sync_args(args: &[&str]) -> Result<()> {
+    let mut child = std::process::Command::new(std::env::var("FUNES_SYNC_BIN").unwrap_or_else(|_| "funes-sync".into()));
+    let status = child
+        .args(args)
+        .status()
+        .context("running funes-sync (set FUNES_SYNC_BIN to its absolute path)")?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(anyhow!("funes-sync exited with {:?}", status.code()))
     }
 }
 

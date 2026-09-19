@@ -12,3 +12,7 @@
 # Local-only files — never committed. Give any machine-local file (secrets,
 # scratch, personal config) a `.local` suffix, e.g. hf_funes_release_token.local.
 *.local
+
+# Python test/runtime caches
+__pycache__/
+*.pyc

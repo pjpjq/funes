@@ -144,23 +144,24 @@ try:
 except ValueError:
     CJK_NATIVE_TIMEOUT = min(HTTP_NATIVE_TIMEOUT, 5.0)
 try:
-    # Leave enough of the Space ingress window for a raw BM25 fallback.  This
-    # is a hard cap: an operator may lower it, but cannot accidentally restore
-    # an unbounded provider wait by raising an environment value.
+    # A Voyage query includes provider RTT plus Lance vector/BM25 fusion.  The
+    # production 3M-row index normally needs 4-5s, so the former 4s cap killed
+    # an otherwise healthy warm worker.  Stay below the clients' 8s per-attempt
+    # budget while retaining a hard operator cap.
     VOYAGE_NATIVE_TIMEOUT = min(
-        4.0,
+        6.8,
         HTTP_NATIVE_TIMEOUT,
-        max(0.1, float(os.getenv("FUNES_VOYAGE_NATIVE_TIMEOUT", "4"))),
+        max(0.1, float(os.getenv("FUNES_VOYAGE_NATIVE_TIMEOUT", "6"))),
     )
 except ValueError:
-    VOYAGE_NATIVE_TIMEOUT = min(HTTP_NATIVE_TIMEOUT, 4.0)
+    VOYAGE_NATIVE_TIMEOUT = min(HTTP_NATIVE_TIMEOUT, 6.0)
 try:
     VOYAGE_HTTP_TIMEOUT = min(
-        4.5,
-        max(0.2, float(os.getenv("FUNES_VOYAGE_HTTP_TIMEOUT", "4.5"))),
+        7.5,
+        max(0.2, float(os.getenv("FUNES_VOYAGE_HTTP_TIMEOUT", "7.4"))),
     )
 except ValueError:
-    VOYAGE_HTTP_TIMEOUT = 4.5
+    VOYAGE_HTTP_TIMEOUT = 7.4
 try:
     VOYAGE_FALLBACK_TIMEOUT = min(
         HTTP_NATIVE_TIMEOUT,
@@ -918,6 +919,13 @@ def request_warm(*, force: bool = False) -> dict[str, object]:
         daemon=True,
     ).start()
     return warm_state()
+
+
+def request_native_recovery() -> None:
+    """Rebuild a failed active MCP child outside the current HTTP request."""
+    if isinstance(MCP_WORKER, NativeMcpWorker):
+        request_warm(force=True)
+
 
 # The default Funes embedding model is English-oriented.  Keep this small,
 # deterministic fallback for installations without a translation provider so
@@ -3264,6 +3272,14 @@ class Handler(BaseHTTPRequestHandler):
                         if embedding_provider == "voyage"
                         else "native_mcp_busy"
                     )
+                except NativeMcpTimeoutError:
+                    results = []
+                    native_failure = "timeout"
+                    retrieval_degraded = (
+                        "voyage_unavailable"
+                        if embedding_provider == "voyage"
+                        else "native_mcp_unavailable"
+                    )
                 except NativeMcpError:
                     results = []
                     native_failure = "unavailable"
@@ -3309,25 +3325,33 @@ class Handler(BaseHTTPRequestHandler):
                                     limit,
                                 )
                 if native_failure and voyage_hot_path and not source_restore_error:
-                    fallback_deadline = min(
-                        time.monotonic() + VOYAGE_FALLBACK_TIMEOUT,
-                        search_started + HTTP_NATIVE_TIMEOUT,
-                    )
-                    try:
-                        source_rankings, session_fallback_rankings = (
-                            _run_before_deadline(
-                                lambda: search_source_bm25_rankings(
-                                    raw_query, limit, filters, harness
-                                ),
-                                fallback_deadline,
-                                thread_name="funes-http-sidecar-bm25",
-                            )
+                    if native_failure in {"timeout", "unavailable"}:
+                        request_native_recovery()
+                    # A native timeout has already consumed the useful client
+                    # budget. Starting an uncancellable multi-million-row FTS
+                    # thread here only burns CPU after the caller disconnects.
+                    # Immediate provider/process failures retain most of the
+                    # bounded Voyage window and may still use local BM25.
+                    if native_failure != "timeout":
+                        fallback_deadline = min(
+                            time.monotonic() + VOYAGE_FALLBACK_TIMEOUT,
+                            search_started + VOYAGE_HTTP_TIMEOUT,
                         )
-                    except Exception:
-                        # A degraded lookup must not turn a provider outage
-                        # into an unbounded or disconnected HTTP request.
-                        source_rankings = []
-                        session_fallback_rankings = []
+                        try:
+                            source_rankings, session_fallback_rankings = (
+                                _run_before_deadline(
+                                    lambda: search_source_bm25_rankings(
+                                        raw_query, limit, filters, harness
+                                    ),
+                                    fallback_deadline,
+                                    thread_name="funes-http-sidecar-bm25",
+                                )
+                            )
+                        except Exception:
+                            # A degraded lookup must not turn a provider outage
+                            # into an unbounded or disconnected HTTP request.
+                            source_rankings = []
+                            session_fallback_rankings = []
                     sidecar_results = stable_rrf(source_rankings, limit)
                 if native_failure == "busy":
                     if not any(source_rankings) and not any(session_fallback_rankings):
@@ -3343,7 +3367,7 @@ class Handler(BaseHTTPRequestHandler):
                             {"Retry-After": "3"},
                         )
                         return
-                elif native_failure == "unavailable":
+                elif native_failure in {"unavailable", "timeout"}:
                     if not any(source_rankings) and not any(session_fallback_rankings):
                         unavailable = retrieval_degraded
                         self.send_json(

@@ -600,6 +600,7 @@ def test_upgrade_preserves_only_allowlisted_nonsecret_tuning(tmp_path, monkeypat
             "FUNES_STATE_DIR": str(config.state_dir),
             "FUNES_SYNC_BATCH": "5",
             "FUNES_REMOTE_TIMEOUT": "180",
+            "FUNES_REMOTE_ATTEMPT_TIMEOUT": "40",
             "FUNES_REMOTE_TRANSIENT_RETRIES": "25",
             "FUNES_API_TOKEN": "old-api-secret",
         },
@@ -621,6 +622,7 @@ def test_upgrade_preserves_only_allowlisted_nonsecret_tuning(tmp_path, monkeypat
     native = plistlib.loads(native_plist_path(config.home).read_bytes())["EnvironmentVariables"]
     assert main["FUNES_SYNC_BATCH"] == "5"
     assert main["FUNES_REMOTE_TIMEOUT"] == "180"
+    assert main["FUNES_REMOTE_ATTEMPT_TIMEOUT"] == "40"
     assert main["FUNES_REMOTE_TRANSIENT_RETRIES"] == "25"
     assert native["FUNES_NATIVE_BACKFILL_PUSH_EVERY"] == "20"
     assert native["FUNES_NATIVE_BACKFILL_SLEEP"] == "9"
@@ -646,6 +648,7 @@ def test_explicit_tuning_overrides_previous_plist(tmp_path, monkeypatch):
     )
     monkeypatch.setenv("FUNES_SYNC_BATCH", "11")
     monkeypatch.setenv("FUNES_REMOTE_TIMEOUT", "44")
+    monkeypatch.setenv("FUNES_REMOTE_ATTEMPT_TIMEOUT", "35")
     monkeypatch.setenv("FUNES_REMOTE_TRANSIENT_RETRIES", "77")
     monkeypatch.setenv("FUNES_NATIVE_BACKFILL_PUSH_EVERY", "3")
     monkeypatch.setenv("FUNES_NATIVE_BACKFILL_SLEEP", "4")
@@ -660,6 +663,7 @@ def test_explicit_tuning_overrides_previous_plist(tmp_path, monkeypatch):
     native = plistlib.loads(native_plist_path(config.home).read_bytes())["EnvironmentVariables"]
     assert main["FUNES_SYNC_BATCH"] == "11"
     assert main["FUNES_REMOTE_TIMEOUT"] == "44"
+    assert main["FUNES_REMOTE_ATTEMPT_TIMEOUT"] == "35"
     assert main["FUNES_REMOTE_TRANSIENT_RETRIES"] == "77"
     assert native["FUNES_NATIVE_BACKFILL_PUSH_EVERY"] == "3"
     assert native["FUNES_NATIVE_BACKFILL_SLEEP"] == "4"
@@ -671,6 +675,7 @@ def test_configured_tuning_overrides_previous_plist(tmp_path, monkeypatch):
         "[sync]\n"
         "batch_size = 13\n"
         "remote_timeout = 91\n"
+        "remote_attempt_timeout = 20\n"
         "remote_transient_retries = 42\n"
         "native_backfill_push_every = 6\n"
         "native_backfill_sleep = 8\n",
@@ -701,6 +706,7 @@ def test_configured_tuning_overrides_previous_plist(tmp_path, monkeypatch):
     native = plistlib.loads(native_plist_path(config.home).read_bytes())["EnvironmentVariables"]
     assert main["FUNES_SYNC_BATCH"] == "13"
     assert main["FUNES_REMOTE_TIMEOUT"] == "91"
+    assert main["FUNES_REMOTE_ATTEMPT_TIMEOUT"] == "20"
     assert main["FUNES_REMOTE_TRANSIENT_RETRIES"] == "42"
     assert native["FUNES_NATIVE_BACKFILL_PUSH_EVERY"] == "6"
     assert native["FUNES_NATIVE_BACKFILL_SLEEP"] == "8"
@@ -940,25 +946,30 @@ def test_render_plist_preserves_remote_transient_retries_and_prunes_secrets(tmp_
     env_default = render_plist(config=config)["EnvironmentVariables"]
     assert "FUNES_REMOTE_TRANSIENT_RETRIES" not in env_default
     assert "FUNES_REMOTE_TIMEOUT" not in env_default
+    assert "FUNES_REMOTE_ATTEMPT_TIMEOUT" not in env_default
 
     # 2. Inherited from previous_env -> preserved, secret pruned
     prev_env = {
         "FUNES_REMOTE_TRANSIENT_RETRIES": "50",
         "FUNES_REMOTE_TIMEOUT": "120",
+        "FUNES_REMOTE_ATTEMPT_TIMEOUT": "25",
         "FUNES_API_TOKEN": "secret-token",
     }
     env_prev = render_plist(config=config, previous_env=prev_env)["EnvironmentVariables"]
     assert env_prev["FUNES_REMOTE_TRANSIENT_RETRIES"] == "50"
     assert env_prev["FUNES_REMOTE_TIMEOUT"] == "120"
+    assert env_prev["FUNES_REMOTE_ATTEMPT_TIMEOUT"] == "25"
     assert "FUNES_API_TOKEN" not in env_prev
 
     # 3. Configured in config.toml -> overrides previous_env
     config.config_path.write_text(
         "[sync]\n"
         "remote_transient_retries = 33\n"
-        "remote_timeout = 88\n",
+        "remote_timeout = 88\n"
+        "remote_attempt_timeout = 22\n",
         encoding="utf-8",
     )
     env_cfg = render_plist(config=config, previous_env=prev_env)["EnvironmentVariables"]
     assert env_cfg["FUNES_REMOTE_TRANSIENT_RETRIES"] == "33"
     assert env_cfg["FUNES_REMOTE_TIMEOUT"] == "88"
+    assert env_cfg["FUNES_REMOTE_ATTEMPT_TIMEOUT"] == "22"

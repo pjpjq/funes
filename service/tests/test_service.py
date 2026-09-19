@@ -32,6 +32,17 @@ class ServiceTests(unittest.TestCase):
                 os.environ[k] = v
         self.tmp.cleanup()
 
+    @staticmethod
+    def trace_read_connections(store, statements):
+        original = store._read_connection
+
+        def traced():
+            connection = original()
+            connection.set_trace_callback(statements.append)
+            return connection
+
+        return mock.patch.object(store, "_read_connection", side_effect=traced)
+
     def test_dedupe_and_update(self):
         store = Store(self.tmp.name)
         first = {"source_path": "a.md", "source_version": "1", "raw_text": "hello world", "project": "p"}
@@ -219,25 +230,24 @@ class ServiceTests(unittest.TestCase):
             ]
         )
         statements = []
-        store.conn.set_trace_callback(statements.append)
         try:
-            self.assertEqual(
-                store.search("primaryneedle", allow_broad_scan=False)[0][
-                    "source_identity"
-                ],
-                "raw-hit",
-            )
-            self.assertEqual(
-                store.search(
-                    "之前的 Tailscale 延迟", allow_broad_scan=False
-                )[0]["source_identity"],
-                "identifier-hit",
-            )
-            self.assertEqual(
-                store.search('没有匹配 "', allow_broad_scan=False), []
-            )
+            with self.trace_read_connections(store, statements):
+                self.assertEqual(
+                    store.search("primaryneedle", allow_broad_scan=False)[0][
+                        "source_identity"
+                    ],
+                    "raw-hit",
+                )
+                self.assertEqual(
+                    store.search(
+                        "之前的 Tailscale 延迟", allow_broad_scan=False
+                    )[0]["source_identity"],
+                    "identifier-hit",
+                )
+                self.assertEqual(
+                    store.search('没有匹配 "', allow_broad_scan=False), []
+                )
         finally:
-            store.conn.set_trace_callback(None)
             store.close()
         self.assertFalse(any(" LIKE " in sql.upper() for sql in statements))
 
@@ -978,6 +988,59 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(store.get("1")["raw_text"], "numeric identity")
         store.close()
 
+    def test_get_and_search_do_not_wait_for_writer_python_lock(self):
+        store = Store(self.tmp.name)
+        store.ingest(
+            [
+                {
+                    "source_identity": "read-target",
+                    "raw_text": "independent-reader-marker",
+                },
+                {"source_identity": "write-target", "raw_text": "writer row"},
+            ]
+        )
+        writer_ready = threading.Event()
+        release_writer = threading.Event()
+        read_done = threading.Event()
+        result = {}
+
+        def hold_uncommitted_write():
+            with store.lock:
+                store.conn.execute("BEGIN IMMEDIATE")
+                try:
+                    store.conn.execute(
+                        "UPDATE memories SET project='in-flight' WHERE source_identity='write-target'"
+                    )
+                    writer_ready.set()
+                    release_writer.wait(5)
+                finally:
+                    store.conn.rollback()
+
+        def read_while_writer_is_active():
+            result["get"] = store.get("read-target")
+            result["search"] = store.search("independent-reader-marker")
+            read_done.set()
+
+        writer = threading.Thread(target=hold_uncommitted_write)
+        reader = threading.Thread(target=read_while_writer_is_active)
+        writer.start()
+        self.assertTrue(writer_ready.wait(2))
+        reader.start()
+        try:
+            self.assertTrue(
+                read_done.wait(2),
+                "read-only get/search waited behind the writer Python lock",
+            )
+        finally:
+            release_writer.set()
+            writer.join(5)
+            reader.join(5)
+            store.close()
+        self.assertEqual(result["get"]["raw_text"], "independent-reader-marker")
+        self.assertEqual(
+            result["search"][0]["source_identity"], "read-target"
+        )
+
     def test_existing_identities_is_ordered_chunked_and_selects_no_raw_payload(self):
         store = Store(self.tmp.name)
         store.ingest(
@@ -1225,26 +1288,22 @@ class ServiceTests(unittest.TestCase):
             ]
         )
         statements = []
-        store.conn.set_trace_callback(statements.append)
-
-        results = store.search(
-            "之前 Pi 里讨论过的 Tailscale 延迟",
-            filters={"source_agent": "pi", "role": "user"},
-        )
-
-        store.conn.set_trace_callback(None)
+        with self.trace_read_connections(store, statements):
+            results = store.search(
+                "之前 Pi 里讨论过的 Tailscale 延迟",
+                filters={"source_agent": "pi", "role": "user"},
+            )
         self.assertEqual([item["source_identity"] for item in results], ["target"])
         traced = "\n".join(statements).upper()
         self.assertIn("MATCH '\"TAILSCALE\"'", traced)
         self.assertNotIn(" LIKE ", traced)
 
         statements.clear()
-        store.conn.set_trace_callback(statements.append)
-        malformed_results = store.search(
-            '之前 Tailscale "',
-            filters={"source_agent": "pi", "role": "user"},
-        )
-        store.conn.set_trace_callback(None)
+        with self.trace_read_connections(store, statements):
+            malformed_results = store.search(
+                '之前 Tailscale "',
+                filters={"source_agent": "pi", "role": "user"},
+            )
         self.assertEqual(
             [item["source_identity"] for item in malformed_results], ["target"]
         )
@@ -1272,14 +1331,11 @@ class ServiceTests(unittest.TestCase):
             ]
         )
         statements = []
-        store.conn.set_trace_callback(statements.append)
-
-        results = store.search(
-            "之前 Pi Tailscale 的延迟",
-            filters={"project": "fast"},
-        )
-
-        store.conn.set_trace_callback(None)
+        with self.trace_read_connections(store, statements):
+            results = store.search(
+                "之前 Pi Tailscale 的延迟",
+                filters={"project": "fast"},
+            )
         self.assertEqual([item["source_identity"] for item in results], ["fast-target"])
         self.assertFalse(any(" LIKE " in statement.upper() for statement in statements))
         store.close()

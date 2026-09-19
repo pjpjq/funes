@@ -286,6 +286,21 @@ MEMORIES_SECONDARY_INDEXES: tuple[tuple[str, str], ...] = (
     ),
 )
 
+MEMORIES_GENERATION_INDEXES: tuple[tuple[str, str], ...] = (
+    (
+        "memories_retrieval_generation_idx",
+        "CREATE INDEX IF NOT EXISTS memories_retrieval_generation_idx ON memories(retrieval_generation)",
+    ),
+    (
+        "memories_native_generation_idx",
+        "CREATE INDEX IF NOT EXISTS memories_native_generation_idx ON memories(native_generation)",
+    ),
+    (
+        "memories_embedding_generation_idx",
+        "CREATE INDEX IF NOT EXISTS memories_embedding_generation_idx ON memories(embedding_generation)",
+    ),
+)
+
 
 class Store:
     def __init__(self, data_dir: str):
@@ -429,6 +444,7 @@ class Store:
                     self.conn.execute(
                         f"ALTER TABLE memories ADD COLUMN {name} INTEGER NOT NULL DEFAULT 0"
                     )
+            self._create_generation_indexes_locked()
             cache_columns = {row[1] for row in self.conn.execute("PRAGMA table_info(translation_cache)")}
             for name in ("translation_hash", "translation_version", "translation_status"):
                 if name not in cache_columns:
@@ -563,6 +579,10 @@ class Store:
     def _drop_secondary_indexes_locked(self) -> None:
         for name, _ in MEMORIES_SECONDARY_INDEXES:
             self.conn.execute(f"DROP INDEX IF EXISTS {name}")
+
+    def _create_generation_indexes_locked(self) -> None:
+        for _name, sql in MEMORIES_GENERATION_INDEXES:
+            self.conn.execute(sql)
 
     def _create_secondary_indexes_locked(self) -> None:
         for _name, sql in MEMORIES_SECONDARY_INDEXES:
@@ -949,7 +969,7 @@ class Store:
                         else int(row["embedding_generation"] or 0),
                         int(row["embedding_generation"] or 0),
                     )
-                elif self._bulk_restore_depth and embedding_generation_supplied:
+                elif embedding_generation_supplied:
                     pass
                 else:
                     incoming_embedding_generation = max(

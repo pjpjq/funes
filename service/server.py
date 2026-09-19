@@ -866,7 +866,16 @@ class Store:
         created = updated = deduped = 0
         results = []
         with self.lock, self.conn:
-            default_embedding_generation = self._latest_embedding_generation_locked()
+            default_embedding_generation: int | None = None
+
+            def get_default_embedding_generation() -> int:
+                nonlocal default_embedding_generation
+                if default_embedding_generation is None:
+                    default_embedding_generation = (
+                        self._latest_embedding_generation_locked()
+                    )
+                return default_embedding_generation
+
             for doc in docs:
                 raw = str(doc.get("raw_text", doc.get("text", "")))
                 if not raw:
@@ -940,9 +949,12 @@ class Store:
                         else int(row["embedding_generation"] or 0),
                         int(row["embedding_generation"] or 0),
                     )
+                elif self._bulk_restore_depth and embedding_generation_supplied:
+                    pass
                 else:
                     incoming_embedding_generation = max(
-                        incoming_embedding_generation, default_embedding_generation
+                        incoming_embedding_generation,
+                        get_default_embedding_generation(),
                     )
                 values["embedding_generation"] = incoming_embedding_generation
                 if row and row["content_hash"] == content_hash and row["source_version"] == source_version:
@@ -2355,60 +2367,64 @@ class Store:
         self, documents: Any, batch_size: int = 500, *, apply_controls: bool = True
     ) -> int:
         """Restore a stream without materialising a multi-gigabyte snapshot."""
-        total = 0
-        batch: list[dict[str, Any]] = []
-        for item in documents:
-            if not isinstance(item, dict):
-                continue
-            item = dict(item)
-            record_type = item.pop("_funes_record", "memory")
-            if record_type == "reindex_control":
-                if batch:
+        self.begin_bulk_restore()
+        try:
+            total = 0
+            batch: list[dict[str, Any]] = []
+            for item in documents:
+                if not isinstance(item, dict):
+                    continue
+                item = dict(item)
+                record_type = item.pop("_funes_record", "memory")
+                if record_type == "reindex_control":
+                    if batch:
+                        result = self.ingest(batch)
+                        total += result["created"] + result["updated"]
+                        batch = []
+                    self.record_reindex_control(item)
+                    continue
+                if record_type == "native_optimize_checkpoint":
+                    if batch:
+                        result = self.ingest(batch)
+                        total += result["created"] + result["updated"]
+                        batch = []
+                    self.set_native_optimize_checkpoint(item)
+                    continue
+                if record_type == "native_index_state":
+                    if batch:
+                        result = self.ingest(batch)
+                        total += result["created"] + result["updated"]
+                        batch = []
+                    self.set_native_index_state(item)
+                    continue
+                if record_type == "translation_cache":
+                    query = str(item.get("query", ""))
+                    rewritten = str(item.get("rewritten", ""))
+                    if query and rewritten:
+                        self.translation_put(
+                            query,
+                            rewritten,
+                            status=str(item.get("translation_status") or "ok"),
+                            translation_hash=str(item.get("translation_hash") or ""),
+                            translation_version=str(item.get("translation_version") or PROMPT_VERSION),
+                        )
+                    continue
+                if record_type != "memory":
+                    continue
+                item["metadata"] = item.pop("metadata", item.pop("metadata_json", {}))
+                batch.append(item)
+                if len(batch) >= batch_size:
                     result = self.ingest(batch)
                     total += result["created"] + result["updated"]
                     batch = []
-                self.record_reindex_control(item)
-                continue
-            if record_type == "native_optimize_checkpoint":
-                if batch:
-                    result = self.ingest(batch)
-                    total += result["created"] + result["updated"]
-                    batch = []
-                self.set_native_optimize_checkpoint(item)
-                continue
-            if record_type == "native_index_state":
-                if batch:
-                    result = self.ingest(batch)
-                    total += result["created"] + result["updated"]
-                    batch = []
-                self.set_native_index_state(item)
-                continue
-            if record_type == "translation_cache":
-                query = str(item.get("query", ""))
-                rewritten = str(item.get("rewritten", ""))
-                if query and rewritten:
-                    self.translation_put(
-                        query,
-                        rewritten,
-                        status=str(item.get("translation_status") or "ok"),
-                        translation_hash=str(item.get("translation_hash") or ""),
-                        translation_version=str(item.get("translation_version") or PROMPT_VERSION),
-                    )
-                continue
-            if record_type != "memory":
-                continue
-            item["metadata"] = item.pop("metadata", item.pop("metadata_json", {}))
-            batch.append(item)
-            if len(batch) >= batch_size:
+            if batch:
                 result = self.ingest(batch)
                 total += result["created"] + result["updated"]
-                batch = []
-        if batch:
-            result = self.ingest(batch)
-            total += result["created"] + result["updated"]
-        if apply_controls:
-            self.drain_reindex_controls(batch_size)
-        return total
+            if apply_controls:
+                self.drain_reindex_controls(batch_size)
+            return total
+        finally:
+            self.finish_bulk_restore()
 
     def restore(self, path: Path, *, apply_controls: bool = True) -> int:
         if not path.exists():

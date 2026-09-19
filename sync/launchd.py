@@ -149,6 +149,7 @@ def render_plist(python=None, config=None, previous_env=None):
     # persist the bearer token in a world-readable plist.
     for key, config_key in (
         ("FUNES_REMOTE_TIMEOUT", "remote_timeout"),
+        ("FUNES_REMOTE_ATTEMPT_TIMEOUT", "remote_attempt_timeout"),
         ("FUNES_REMOTE_TRANSIENT_RETRIES", "remote_transient_retries"),
     ):
         value=_tuning(config, key, previous_env, config_key)

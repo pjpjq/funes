@@ -118,6 +118,7 @@ environment: never commit it, write it into these files, or include it in logs.
 | `FUNES_SYNC_BATCH` | Maximum records per HTTP ingest segment; default `50`. |
 | `FUNES_SYNC_MAX_BATCH_BYTES` | Maximum serialized source bytes per ingest segment; default `16777216` (16 MiB). A single already-chunked record is never dropped. |
 | `FUNES_REMOTE_TIMEOUT` | Total deadline for starting and polling one durable ingest operation; default `900` seconds. |
+| `FUNES_REMOTE_ATTEMPT_TIMEOUT` | Bounded per-request network attempt timeout for ingest POST and polling requests; default `30` seconds (safe range `1..55`s). |
 | `FUNES_REMOTE_MAX_RESPONSE_BYTES` | Maximum ingest/status response body; default `1048576` (1 MiB). |
 | `FUNES_HTTP_GZIP` | Compress HTTP ingest bodies when beneficial; enabled by default. |
 | `FUNES_INGEST_OPERATION_TIMEOUT` | Space-side durable worker deadline; default `1800` seconds. A stall fail-stops the process for platform restart without ACKing local data. |

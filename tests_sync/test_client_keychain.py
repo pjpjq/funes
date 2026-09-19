@@ -705,3 +705,102 @@ def test_ingest_repeated_429_exhausts_transient_retries_without_unbounded_loop(t
     assert len(requests) == 5
     assert len(sleeps) == 4
     assert clock[0] == 8.0
+
+
+def test_ingest_bounds_per_attempt_timeout_with_default_and_safe_clamping(tmp_path, monkeypatch):
+    _async_client_environment(monkeypatch, timeout="900")
+    clock = [100.0]
+    timeouts = []
+
+    response = _IngestResponse(200, {"durable": True, "accepted": 1})
+
+    def urlopen(req, timeout):
+        timeouts.append(timeout)
+        return response
+
+    monkeypatch.setattr(client_module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(client_module, "open_no_redirect", urlopen)
+
+    client = SyncClient(cfg(tmp_path))
+
+    # 1. Default when unset: 30.0s, not the 900s durable deadline
+    client.ingest([{"raw_text": "one"}])
+    assert timeouts[-1] == 30.0
+
+    # 2. Configurable via FUNES_REMOTE_ATTEMPT_TIMEOUT
+    monkeypatch.setenv("FUNES_REMOTE_ATTEMPT_TIMEOUT", "45")
+    client.ingest([{"raw_text": "two"}])
+    assert timeouts[-1] == 45.0
+
+    # 3. Clamped to safe range: below 1s clamped to 1.0s
+    monkeypatch.setenv("FUNES_REMOTE_ATTEMPT_TIMEOUT", "0.2")
+    client.ingest([{"raw_text": "three"}])
+    assert timeouts[-1] == 1.0
+
+    # 4. Clamped to safe range: above 55s clamped to 55.0s
+    monkeypatch.setenv("FUNES_REMOTE_ATTEMPT_TIMEOUT", "80")
+    client.ingest([{"raw_text": "four"}])
+    assert timeouts[-1] == 55.0
+
+    # 5. Invalid string falls back to default 30.0s
+    monkeypatch.setenv("FUNES_REMOTE_ATTEMPT_TIMEOUT", "invalid")
+    client.ingest([{"raw_text": "five"}])
+    assert timeouts[-1] == 30.0
+
+
+def test_ingest_hanging_attempt_bounds_opener_budget_and_retries(tmp_path, monkeypatch):
+    _async_client_environment(monkeypatch, timeout="900")
+    clock = [0.0]
+    sleeps = []
+    recorded_timeouts = []
+
+    operation_id = "op-hang-retry"
+    calls = 0
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        clock[0] += seconds
+
+    def urlopen(req, timeout):
+        nonlocal calls
+        calls += 1
+        recorded_timeouts.append(timeout)
+        if calls == 1:
+            # Simulate a broken TLS/proxy attempt timing out at the attempt budget
+            clock[0] += timeout
+            raise TimeoutError("connection attempt timed out")
+        return _IngestResponse(
+            200,
+            {"operation_id": operation_id, "durable": True, "accepted": 1},
+        )
+
+    monkeypatch.setattr(client_module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(client_module.time, "sleep", sleep)
+    monkeypatch.setattr(client_module, "open_no_redirect", urlopen)
+
+    result = SyncClient(cfg(tmp_path)).ingest([{"raw_text": "survives broken attempt"}])
+
+    assert result["durable"] is True
+    assert result["accepted"] == 1
+    # Attempt timeout was 30.0s, not 900.0s
+    assert recorded_timeouts == [30.0, 30.0]
+    # Clock advanced by 30s timeout + 1s backoff = 31s, well under 900s deadline
+    assert clock[0] == 31.0
+    assert sleeps == [1.0]
+
+
+def test_ingest_attempt_timeout_bounded_by_remaining_deadline(tmp_path, monkeypatch):
+    # When remaining durable deadline is smaller than attempt timeout (e.g. 5s < 30s)
+    _async_client_environment(monkeypatch, timeout="5")
+    recorded_timeouts = []
+
+    def urlopen(req, timeout):
+        recorded_timeouts.append(timeout)
+        return _IngestResponse(200, {"durable": True, "accepted": 1})
+
+    monkeypatch.setattr(client_module, "open_no_redirect", urlopen)
+
+    SyncClient(cfg(tmp_path)).ingest([{"raw_text": "tight deadline"}])
+
+    assert len(recorded_timeouts) == 1
+    assert recorded_timeouts[0] <= 5.0

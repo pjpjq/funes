@@ -1,6 +1,6 @@
 from __future__ import annotations
 import gzip
-import json, os, subprocess, sys, time
+import json, math, os, subprocess, sys, time
 from email.utils import parsedate_to_datetime
 from urllib import error, parse, request
 from .config import Config
@@ -85,6 +85,20 @@ class SyncClient:
         if timeout <= 0:
             raise RuntimeError("FUNES_REMOTE_TIMEOUT must be greater than zero")
         try:
+            raw_attempt = os.environ.get("FUNES_REMOTE_ATTEMPT_TIMEOUT")
+            if raw_attempt is None or not str(raw_attempt).strip():
+                raw_attempt = getattr(self.config, "remote_attempt_timeout", None)
+            if raw_attempt is not None and str(raw_attempt).strip():
+                attempt_val = float(raw_attempt)
+                if math.isnan(attempt_val) or math.isinf(attempt_val):
+                    attempt_timeout = 30.0
+                else:
+                    attempt_timeout = min(55.0, max(1.0, attempt_val))
+            else:
+                attempt_timeout = 30.0
+        except (TypeError, ValueError):
+            attempt_timeout = 30.0
+        try:
             max_response_bytes = max(
                 1, int(os.environ.get("FUNES_REMOTE_MAX_RESPONSE_BYTES", "1048576"))
             )
@@ -109,6 +123,9 @@ class SyncClient:
             if value <= 0:
                 raise RuntimeError("remote ingest timed out before durable confirmation") from last
             return value
+
+        def attempt_budget() -> float:
+            return min(attempt_timeout, remaining())
 
         def response_header(response, name: str) -> str:
             response_headers = getattr(response, "headers", None)
@@ -182,7 +199,7 @@ class SyncClient:
             chunks = bytearray()
             one_shot = False
             while True:
-                budget = remaining()
+                budget = attempt_budget()
                 set_response_timeout(response, budget)
                 read_size = min(65536, max_response_bytes + 1 - len(chunks))
                 try:
@@ -267,7 +284,7 @@ class SyncClient:
                 method="GET" if polling else "POST",
             )
             try:
-                with open_no_redirect(req,timeout=remaining()) as response:
+                with open_no_redirect(req, timeout=attempt_budget()) as response:
                     status = int(getattr(response, "status", 0))
                     result = None
                     if status in (200, 202):

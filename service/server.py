@@ -276,6 +276,24 @@ class Store:
         self._bulk_restore_depth = 0
         self._init_schema()
 
+    def _read_connection(self) -> sqlite3.Connection:
+        """Open a short-lived WAL reader that never waits on ``self.lock``.
+
+        The main connection and Python lock serialize durable writes.  Recall
+        and get are read-only and SQLite WAL can safely serve their last
+        committed snapshot while an ingest transaction is active.
+        """
+        conn = sqlite3.connect(
+            f"file:{self.db_path}?mode=ro",
+            uri=True,
+            check_same_thread=False,
+            timeout=5,
+        )
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA query_only=ON")
+        conn.execute("PRAGMA busy_timeout=5000")
+        return conn
+
     def _init_schema(self) -> None:
         with self.conn:
             self.conn.executescript(
@@ -1367,14 +1385,19 @@ class Store:
         return out
 
     def get(self, ident: str | int) -> dict[str, Any] | None:
-        with self.lock:
-            row = self.conn.execute(
+        reader = self._read_connection()
+        try:
+            row = reader.execute(
                 "SELECT * FROM memories WHERE source_identity=? ORDER BY id LIMIT 1",
                 (str(ident),),
             ).fetchone()
             if row is None:
-                row = self.conn.execute("SELECT * FROM memories WHERE id=?", (str(ident),)).fetchone()
+                row = reader.execute(
+                    "SELECT * FROM memories WHERE id=?", (str(ident),)
+                ).fetchone()
             return self._row(row) if row else None
+        finally:
+            reader.close()
 
     def get_many(self, identities: list[str]) -> list[dict[str, Any]]:
         """Return canonical stored rows without exceeding SQLite's bind limit."""
@@ -2052,10 +2075,11 @@ class Store:
         if filters.get("until"):
             clauses.append("m.timestamp <= ?"); params.append(str(filters["until"]))
         facet = (" AND " + " AND ".join(clauses)) if clauses else ""
-        with self.lock:
+        reader = self._read_connection()
+        try:
             strict_fts_failed = False
             try:
-                rows = self.conn.execute(
+                rows = reader.execute(
                     """SELECT m.*, bm25(memories_fts, 5.0, 1.0, 2.0) AS score FROM memories_fts
                     JOIN memories m ON m.id=memories_fts.rowid WHERE memories_fts MATCH ?""" + facet +
                     " ORDER BY score LIMIT ?", [query, *params, limit]
@@ -2079,7 +2103,7 @@ class Store:
                     term for term in technical_terms if term.casefold() not in facet_terms
                 ] or technical_terms
                 if technical_terms:
-                    technical_rows = self.conn.execute(
+                    technical_rows = reader.execute(
                         """SELECT m.*, bm25(memories_fts, 5.0, 1.0, 2.0) AS score FROM memories_fts
                         JOIN memories m ON m.id=memories_fts.rowid WHERE memories_fts MATCH ?"""
                         + facet
@@ -2129,7 +2153,7 @@ class Store:
                         pattern = f"%{escaped}%"
                         technical_params.extend((pattern, pattern))
                         score_params.extend((pattern, pattern, min(32, len(term))))
-                    technical_rows = self.conn.execute(
+                    technical_rows = reader.execute(
                         f"SELECT m.*, 0.0 AS score FROM memories m WHERE ({technical_clauses}){facet} ORDER BY ({technical_score}) DESC, m.updated_at DESC LIMIT ?",
                         [
                             *technical_params,
@@ -2165,7 +2189,7 @@ class Store:
             if allow_broad_scan and not rows and strict_fts_failed:
                 # FTS MATCH is intentionally strict; a plain substring fallback keeps recall useful.
                 like = "%" + query.replace("%", "\\%") + "%"
-                rows = self.conn.execute("SELECT m.*, 0.0 AS score FROM memories m WHERE (m.retrieval_text LIKE ? ESCAPE '\\' OR m.raw_text LIKE ? ESCAPE '\\')" + facet.replace("m.", "m.") + " ORDER BY m.updated_at DESC LIMIT ?", [like, like, *params, limit]).fetchall()
+                rows = reader.execute("SELECT m.*, 0.0 AS score FROM memories m WHERE (m.retrieval_text LIKE ? ESCAPE '\\' OR m.raw_text LIKE ? ESCAPE '\\')" + facet.replace("m.", "m.") + " ORDER BY m.updated_at DESC LIMIT ?", [like, like, *params, limit]).fetchall()
             if allow_broad_scan and not rows and cjk_ratio(query) > 0:
                 # unicode61 does not segment every CJK script consistently;
                 # retain a character-level shadow fallback for Chinese recall.
@@ -2173,13 +2197,15 @@ class Store:
                 if chars:
                     text_clauses = " OR ".join("(m.retrieval_text LIKE ? OR m.raw_text LIKE ?)" for _ in chars)
                     text_params = [v for c in chars for v in (f"%{c}%", f"%{c}%")]
-                    rows = self.conn.execute(f"SELECT m.*, 0.0 AS score FROM memories m WHERE ({text_clauses}){facet} ORDER BY m.updated_at DESC LIMIT ?", [*text_params, *params, limit]).fetchall()
+                    rows = reader.execute(f"SELECT m.*, 0.0 AS score FROM memories m WHERE ({text_clauses}){facet} ORDER BY m.updated_at DESC LIMIT ?", [*text_params, *params, limit]).fetchall()
             results = [self._row(r) for r in rows]
-            # Optional embedding/rerank integrations can be injected by callers
-            # without making the durable store depend on a model runtime.
-            if rerank is not None:
-                results = list(rerank(query, results))
-            return results
+        finally:
+            reader.close()
+        # Optional embedding/rerank integrations can be injected by callers
+        # without making the durable store depend on a model runtime.
+        if rerank is not None:
+            results = list(rerank(query, results))
+        return results
 
     def sources(self) -> list[dict[str, Any]]:
         with self.lock:

@@ -8,6 +8,7 @@ pub mod ask;
 pub mod bind;
 pub mod compact;
 pub mod index;
+pub mod ingest_docs;
 pub mod mcp;
 pub mod push;
 pub mod recall;

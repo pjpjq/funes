@@ -30,7 +30,7 @@ use crate::memory::remote::{self, Appended, Compacted};
 use crate::memory::{Memory, MemoryState};
 use crate::ui::prompt::confirm;
 use crate::{chunk, scan, ui};
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use bytes::Bytes;
 use chrono::Utc;
 use lance::Dataset;
@@ -280,6 +280,56 @@ fn disjoint_refusal(label: &str, chunks: usize, why: Disjoint) -> String {
     )
 }
 
+/// Refresh one remote memory's existing Lance indexes without opening or scanning local memory.
+/// Used by the durable raw-source rebuild after its last embedding batch is committed.
+pub async fn run_reindex_only(target: Memory) -> Result<String> {
+    let uri = match &target {
+        Memory::Remote { uri } => uri.clone(),
+        Memory::Local { .. } => bail!("optimize-index target must be a remote memory"),
+    };
+    match target.state().await? {
+        MemoryState::Ready(_) => {}
+        MemoryState::Offline => bail!("{uri} is unreachable — cannot refresh its indexes"),
+        MemoryState::Missing => return Err(target.missing_error()),
+        MemoryState::Unauthorized => return Err(target.unauthorized_error()),
+        MemoryState::Empty => bail!("{uri} has no memory dataset to optimize"),
+    }
+
+    let (owner, name, _) = hub::parse_hf(&uri)?;
+    let token = hub::hf_token().context("no HF token (set HF_TOKEN) — required to optimize")?;
+    let repo = hub::client(Some(token.as_str()), true)?.dataset(owner, name);
+    let revision = "main".to_string();
+    let dataset_uri = dataset::table_uri(&uri);
+    let opts = HashMap::from([
+        ("hf_token".to_string(), token),
+        ("revision".to_string(), revision.clone()),
+    ]);
+    let mut report = None;
+    for _ in 0..=remote::MAX_COMMIT_RETRIES {
+        match remote::reindex(
+            &repo,
+            &dataset_uri,
+            opts.clone(),
+            &revision,
+            "funes optimize-index".into(),
+        )
+        .await?
+        {
+            remote::Reindexed::Committed(oid) => {
+                report = Some(format!("reindexed (commit {oid})"));
+                break;
+            }
+            remote::Reindexed::AlreadyCurrent => {
+                report = Some("index already current".into());
+                break;
+            }
+            remote::Reindexed::Conflict => continue,
+        }
+    }
+    let report = report.context("index refresh kept conflicting; retry optimize-index")?;
+    Ok(format!("{}: index refresh complete\n{report}", target.label()))
+}
+
 /// Publish the local memory's new embedded chunks to `target` (a remote memory on the HF Hub). With
 /// `compact`, compact the remote after the data commit (retrying until it goes through) even if
 /// the unindexed backlog is below [`COMPACT_THRESHOLD`]. With no new chunks pending, it only
@@ -441,12 +491,12 @@ pub async fn run_push(target: Memory, compact: bool, confirm: Confirm, sessions:
     // (and two stores sharing a repo would fight over one card's stats) — under a prefix it's
     // the owner's. The chunk count is the post-push total — best-effort: rows another writer
     // lands concurrently are missed until the next push refreshes the card.
-    let model = dataset::embedding_model(&local)?;
+    let profile = dataset::embedding_profile(&local)?;
     let date = Utc::now().format("%Y-%m-%d").to_string();
     let ctx = CardCtx {
         repo: &w.repo_id,
         chunks: remote_ids.len() as u64 + n_chunks as u64,
-        embedding_model: model.id(),
+        embedding_model: &profile.model,
         date: &date,
     };
     let (card_body, card_note) = if w.prefix.is_empty() {
@@ -481,7 +531,7 @@ pub async fn run_push(target: Memory, compact: bool, confirm: Confirm, sessions:
         };
         receipt::record(&uri, &pushed_ids)?;
         let pushed = match n_chunks {
-            0 => format!("created with {}, no chunks yet", model.id()),
+            0 => format!("created with {}, no chunks yet", profile.model),
             n => format!("pushed {n} chunks"),
         };
         return Ok(format!(
@@ -670,12 +720,12 @@ async fn compact_auto(w: &remote::Writable) -> String {
 }
 
 fn same_model(local: &Dataset, remote: &Dataset, label: &str) -> Result<()> {
-    let (here, there) = (dataset::embedding_model(local)?, dataset::embedding_model(remote)?);
+    let (here, there) = (dataset::embedding_profile(local)?, dataset::embedding_profile(remote)?);
     if here != there {
         bail!(
             "{label} is embedded with {}, and the local memory with {}: a memory takes one embedding model",
-            there.id(),
-            here.id()
+            there.model,
+            here.model
         );
     }
     Ok(())

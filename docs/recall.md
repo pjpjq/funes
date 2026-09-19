@@ -10,7 +10,7 @@ funes recall "why did we switch off the streaming parser"
 ```
 
 Retrieval is one pipeline: hybrid search (vector + BM25, fused by reciprocal rank) → neighbor
-expansion, with a cross-encoder rerank of the pool before the cut when the pool holds more rows
+expansion, with the configured optional reranker on the pool before the cut when the pool holds more rows
 than the hits asked for. What comes back is the **actual passage from the actual turn**, not a
 summary written about it.
 
@@ -19,6 +19,15 @@ languages a memory's sessions are written in.
 
 Passages are searchable by their words as soon as their text is indexed, even while embeddings
 are pending. If text search fails, recall reports an error.
+
+The embedding provider is selected at runtime with `FUNES_EMBEDDING_PROVIDER=local|voyage`.
+`local` uses the stored BGE or multilingual E5 model. `voyage` sends original multilingual passages
+with `input_type=document` at index time and the original query with `input_type=query` at recall
+time. Production sets `FUNES_RETRIEVAL_LANGUAGE_MODE=raw`, so there is no translation or English
+shadow-text path. Reranking is independently selected with
+`FUNES_RERANK_PROVIDER=none|local|voyage`; production defaults to `none`, retaining the fused RRF
+order. See [configuration](configuration.md#retrieval-providers) for the
+full profile and credential contract.
 
 `funes recall` prints one stable, parseable layout — the **agent format** — everywhere, terminal or
 pipe. It's shaped for an agent to read, but it's the raw evidence for you too. If you want an
@@ -57,7 +66,7 @@ otherwise (see `--candidates` below).
 | Flag | Default | Meaning |
 | --- | --- | --- |
 | `-k` | 8 | hits returned, each a passage to read |
-| `--candidates` | 30 | fused pool the hits are cut from, reranked by the cross-encoder before the cut when it holds more than `-k` rows |
+| `--candidates` | 30 | fused pool the hits are cut from, reranked by the configured reranker before the cut when it holds more than `-k` rows |
 | `--neighbors` | 1 | adjacent chunks (by seq) attached per hit; 0 disables |
 | `--type` | — | restrict to `text \| thinking \| tool_use \| tool_result` |
 | `--role` | — | restrict to one role, as the turns carry it (an agent's turns say `user \| assistant \| tool \| system`) |
@@ -128,6 +137,10 @@ funes recall "why is funes append-only" --memory huggingface/funes-memory
 Recall over a remote caches whole files to local disk, so warm calls run at local speed — see
 [hub-caching.md](hub-caching.md). Publishing your own memory to read this way is covered in
 [push.md](push.md).
+
+By default, an unreachable remote may fall back to the local memory for offline use. Set
+`FUNES_NATIVE_FALLBACK=false` to disable that substitution and surface the remote error instead;
+production uses this setting so a requested remote is never silently replaced by local data.
 
 ## See also
 

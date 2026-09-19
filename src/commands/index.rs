@@ -11,8 +11,8 @@
 use super::compact;
 use crate::chunk::{self, Tier};
 use crate::home;
-use crate::inference::{self, embed_batched, Embedder};
-use crate::memory::dataset::{self, build_batch, model};
+use crate::inference::{self, embed_batched, Embedder, EmbeddingProfile};
+use crate::memory::dataset::{self, model};
 use crate::memory::lock;
 use crate::memory::Memory;
 use crate::scan;
@@ -26,6 +26,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{IsTerminal, Write as _};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Take the memory lock. An interactive caller (a human at `funes index`/`funes add`) waits out a
@@ -119,7 +120,7 @@ pub async fn run(args: IndexArgs) -> Result<()> {
         }
     };
     if multilingual {
-        ensure_local_memory(model::MULTILINGUAL).await?;
+        ensure_local_memory(&inference::EmbeddingProfile::local_model(model::MULTILINGUAL)).await?;
     }
     if roots.is_empty() {
         println!(
@@ -137,26 +138,28 @@ pub async fn run(args: IndexArgs) -> Result<()> {
 }
 
 /// The embedding model the local memory records, `None` when there is no local memory yet.
-pub async fn local_memory_model() -> Result<Option<inference::EmbeddingModel>> {
+pub async fn local_memory_profile() -> Result<Option<inference::EmbeddingProfile>> {
     Memory::local()
         .dataset()
         .await?
-        .map(|ds| dataset::embedding_model(&ds))
+        .map(|ds| dataset::embedding_profile(&ds))
         .transpose()
 }
 
-pub async fn ensure_local_memory(model: inference::EmbeddingModel) -> Result<()> {
+pub async fn ensure_local_memory(profile: &inference::EmbeddingProfile) -> Result<()> {
+    profile.validate()?;
     std::fs::create_dir_all(home::dir())?;
     let _lock = acquire_lock(std::io::stdin().is_terminal()).await?;
-    match local_memory_model().await? {
-        Some(current) if current != model => Err(anyhow!(
+    match local_memory_profile().await? {
+        Some(current) if &current != profile => Err(anyhow!(
             "the local memory is embedded with {}, not {}: a memory keeps the model it was created with",
-            current.id(),
-            model.id()
+            current.model,
+            profile.model
         )),
         Some(_) => Ok(()),
         None => {
-            dataset::create_empty(&dataset::table_uri(home::memory_dir()), model).await?;
+            let batch = dataset::build_batch_for_schema(&[], &[], dataset::schema_for(profile))?;
+            dataset::create(&dataset::table_uri(home::memory_dir()), batch).await?;
             Ok(())
         }
     }
@@ -465,6 +468,7 @@ pub(crate) fn local_index_coverage() -> Option<IndexCoverage> {
 struct Indexer {
     uri: String,
     ds: Option<Dataset>,
+    profile: EmbeddingProfile,
     /// [`stored_ids`] at open plus everything written this run — the dedup baseline for new chunks.
     existing: HashSet<String>,
     embedder: Box<dyn Embedder>,
@@ -540,11 +544,14 @@ impl Indexer {
         let _lock = acquire_lock(interactive).await?;
 
         let uri = dataset::table_uri(home::memory_dir());
-        let ds = Memory::local().dataset().await?;
+        let mut ds = Memory::local().dataset().await?;
+        if let Some(ds) = &mut ds {
+            dataset::ensure_canonical_columns(ds).await?;
+        }
 
-        let model = match &ds {
-            Some(ds) => dataset::embedding_model(ds)?,
-            None => model::ENGLISH,
+        let profile = match &ds {
+            Some(ds) => dataset::embedding_profile(ds)?,
+            None => inference::embedding_profile()?,
         };
         // Re-indexing keeps only the chunks whose id isn't stored, so a grown session contributes
         // just its new turns — nothing is re-embedded or deleted (a rewritten turn arrives under
@@ -570,7 +577,7 @@ impl Indexer {
                 .unwrap_or_default()
         };
 
-        let embedder: Box<dyn Embedder> = inference::embedder(model)?;
+        let embedder: Box<dyn Embedder> = inference::embedder_for(&profile)?;
         let scanner = find_scanner();
 
         let units = collect_units(&sources)?;
@@ -591,6 +598,7 @@ impl Indexer {
         Ok(Indexer {
             uri,
             ds,
+            profile,
             existing,
             embedder,
             scanner,
@@ -717,7 +725,7 @@ impl Indexer {
         }
         for c in &mut chunks {
             if let Some(repo) = repo_by_turn.get(&(c.session_id.as_str(), c.turn_uuid.as_str())) {
-                c.repo.clone_from(repo);
+                c.repo = Some(repo.clone());
             }
         }
         let total_chunks = chunks.len();
@@ -790,7 +798,12 @@ impl Indexer {
         if chunks.is_empty() {
             return Ok(0);
         }
-        let batch = build_batch(self.embedder.model(), chunks, None)?;
+        let target_schema = self
+            .ds
+            .as_ref()
+            .map(|ds| Arc::new(arrow_schema::Schema::from(ds.schema())))
+            .unwrap_or_else(|| dataset::schema_for(&self.profile));
+        let batch = dataset::build_batch_optional_for_schema(chunks, None, target_schema)?;
         if let Some(languages) = &mut self.languages {
             languages.add(&batch);
         }
@@ -823,15 +836,18 @@ impl Indexer {
         Ok(embedded)
     }
 
+    /// Build or repair the FTS + IVF_PQ indexes, reap superseded versions, and print the run summary.
     /// Consumes the indexer, releasing the memory lock.
     async fn finalize(mut self) -> Result<()> {
         if let Some(d) = &mut self.ds {
             record_languages(d, self.languages.as_ref()).await?;
+            // A crash after append can leave state.json current even though FTS/IVF creation never
+            // completed. Check stored index health even on a no-new-chunk retry.
             // Retry incomplete FTS coverage, and compact a fragmented memory, even when no rows or
             // vectors were written.
             if self.n_chunks > 0
                 || self.n_embedded > 0
-                || dataset::fts_needs_refresh(d).await?
+                || dataset::indexes_need_rebuild(d).await?
                 || dataset::fragments_to_compact(d).await? > 0
             {
                 compact::compact_local(d).await?;
@@ -1315,8 +1331,8 @@ mod tests {
     }
 
     impl Embedder for TestEmbedder {
-        fn model(&self) -> inference::EmbeddingModel {
-            model::ENGLISH
+        fn model(&self) -> Option<inference::EmbeddingModel> {
+            Some(model::ENGLISH)
         }
 
         fn encode(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
@@ -1345,13 +1361,24 @@ mod tests {
                     block_idx: 0,
                     split_idx: 0,
                     harness: "test".into(),
-                    repo: String::new(),
+                    repo: None,
+                    source_identity: None,
+                    source_version: None,
+                    content_hash: None,
+                    updated_at: None,
+                    source_agent: None,
+                    source_type: None,
+                    project: None,
+                    device_id: None,
+                    content_type: None,
+                    source_missing: None,
+                    metadata_json: None,
                 })
             })
             .collect();
         dataset::create(
             path.to_str().unwrap(),
-            build_batch(model::ENGLISH, &chunks, None).unwrap(),
+            dataset::build_batch(model::ENGLISH, &chunks, None).unwrap(),
         )
         .await
         .unwrap()

@@ -7,7 +7,7 @@
 use super::push;
 use super::target::Target;
 use crate::chunk;
-use crate::inference::{self, Embedder, EmbeddingModel, Reranker};
+use crate::inference::{self, Embedder, EmbeddingProfile, RerankScoreKind, Reranker};
 use crate::memory::dataset::{self, RecordBatch};
 use crate::memory::{Memory, MemoryState};
 use crate::traces;
@@ -63,6 +63,13 @@ pub struct Hit {
     /// none.
     pub memory: String,
     pub fused: f32,
+}
+
+/// One recall pipeline result carried to the MCP adapter as both the stable rendered text and the
+/// raw hits that produced it. CLI callers keep using [`recall`] and see only `text`.
+pub(crate) struct RecallResult {
+    pub text: String,
+    pub hits: Vec<(Hit, f64)>,
 }
 
 /// Matching blocks `scan` lists before it stops. What the cap dropped is always reported.
@@ -261,7 +268,15 @@ fn harness_spellings(h: String) -> Vec<String> {
     }
 }
 
+fn rerank_relevance(kind: RerankScoreKind, score: f32) -> f64 {
+    match kind {
+        RerankScoreKind::Logit => 1.0 / (1.0 + (-(score as f64)).exp()),
+        RerankScoreKind::Relevance => score as f64,
+    }
+}
+
 /// A dataset opened for reading.
+#[derive(Clone)]
 struct Read {
     ds: Dataset,
     /// A degradation note to prepend to the command's output (e.g. the remote was unreachable);
@@ -270,6 +285,14 @@ struct Read {
     /// Label of the memory the dataset actually came from (the requested one, or the local memory
     /// after an offline degrade).
     memory_label: Option<String>,
+}
+
+/// One immutable dataset opened for a long-lived MCP server. The dataset stays opaque here so the
+/// caller cannot bypass the recall pipeline's profile checks, filtering, neighbor expansion, or
+/// rendering contract.
+pub(crate) struct PinnedRead {
+    read: Read,
+    requested_label: String,
 }
 
 /// What a read verb does about the memory's state: query it, degrade to the local index, or point a
@@ -323,9 +346,33 @@ async fn open_read(memory: &Memory) -> Result<Read> {
             note: None,
             memory_label: Some(memory.label()),
         }),
-        ReadOutcome::Offline => degrade_offline(&memory.label()).await,
+        ReadOutcome::Offline if native_fallback_enabled() => degrade_offline(&memory.label()).await,
+        ReadOutcome::Offline => Err(anyhow!(
+            "remote {} unavailable; native fallback is disabled",
+            memory.label()
+        )),
         ReadOutcome::NoIndex => Err(no_index_error()),
     }
+}
+
+/// Open the server's default memory once for immutable, process-lifetime recall. This is an
+/// explicit MCP-only optimization; normal CLI and MCP reads continue through [`open_read`] for
+/// every call and therefore resolve a remote's current head.
+pub(crate) async fn pin_read(memory: Memory) -> Result<PinnedRead> {
+    let requested_label = memory.label();
+    let read = open_read(&memory).await?;
+    Ok(PinnedRead { read, requested_label })
+}
+
+fn native_fallback_enabled() -> bool {
+    !matches!(
+        std::env::var("FUNES_NATIVE_FALLBACK")
+            .unwrap_or_else(|_| "true".to_string())
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "0" | "false" | "no" | "off"
+    )
 }
 
 /// The error a read verb returns when the default local memory has no index yet — points at the
@@ -367,25 +414,25 @@ pub fn memory_hint(read: Option<&str>) -> String {
 /// the work is CPU-bound and the server's calls are serial anyway.
 #[derive(Default)]
 struct Models {
-    embedders: HashMap<EmbeddingModel, Box<dyn Embedder>>,
+    embedders: HashMap<String, Box<dyn Embedder>>,
     reranker: Option<Box<dyn Reranker>>,
 }
 
 impl Models {
-    fn embedder(&mut self, model: EmbeddingModel) -> Result<&mut dyn Embedder> {
-        let embedder = match self.embedders.entry(model) {
+    fn embedder(&mut self, profile: &EmbeddingProfile) -> Result<&mut dyn Embedder> {
+        let embedder = match self.embedders.entry(profile.fingerprint.clone()) {
             Entry::Occupied(e) => e.into_mut(),
-            Entry::Vacant(e) => e.insert(inference::embedder(model)?),
+            Entry::Vacant(e) => e.insert(inference::embedder_for(profile)?),
         };
         Ok(embedder.as_mut())
     }
 
     /// The reranker, built on its first use.
-    fn reranker(&mut self) -> Result<&mut dyn Reranker> {
+    fn reranker(&mut self) -> Result<Option<&mut (dyn Reranker + 'static)>> {
         if self.reranker.is_none() {
-            self.reranker = Some(inference::reranker()?);
+            self.reranker = inference::reranker()?;
         }
-        Ok(self.reranker.as_deref_mut().expect("built above"))
+        Ok(self.reranker.as_deref_mut())
     }
 }
 
@@ -442,6 +489,47 @@ pub async fn recall_with_progress(
     Ok(crate::ui::render::recall_reply(&note, &hits, languages.as_deref()))
 }
 
+/// Recall once while retaining the raw hits for protocol adapters that expose additive structured
+/// data alongside the byte-stable agent rendering.
+pub(crate) async fn recall_filtered_result(
+    target: impl Into<Target>,
+    query: String,
+    k: usize,
+    candidates: usize,
+    neighbors: i64,
+    filter: RecallFilter,
+) -> Result<RecallResult> {
+    let (note, hits) = recall_hits(target, query, k, candidates, neighbors, filter, &|_| ()).await?;
+    Ok(recall_result(note, hits))
+}
+
+fn recall_result(note: String, hits: Vec<(Hit, f64)>) -> RecallResult {
+    let text = rendered(&note, &hits);
+    RecallResult { text, hits }
+}
+
+/// Recall against an already-opened immutable dataset. Only the MCP server's explicit opt-in
+/// default-memory path calls this; call-level overrides and every ordinary read open afresh.
+pub(crate) async fn recall_filtered_pinned(
+    pinned: &PinnedRead,
+    query: String,
+    k: usize,
+    candidates: usize,
+    neighbors: i64,
+    filter: RecallFilter,
+) -> Result<RecallResult> {
+    let progress = &|_: &str| ();
+    let search = Search::new(query, candidates, filter)?;
+    let mut pool = search
+        .candidates_read(pinned.read.clone(), &pinned.requested_label, progress)
+        .await?;
+    if let Some(memory) = pinned.read.memory_label.as_deref() {
+        pool.hint(memory);
+    }
+    let (note, hits) = search.rank(vec![pool], k, neighbors, progress).await?;
+    Ok(recall_result(note, hits))
+}
+
 /// Run the recall pipeline over what `target` reads: hybrid retrieval, pooled with this host's
 /// unpushed turns for the bound memory → rank, reranked when the pool holds more rows than `k` →
 /// neighbor expansion.
@@ -463,7 +551,7 @@ pub async fn recall_hits(
 }
 
 /// What narrows a search.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct RecallFilter {
     /// Keep chunks of this block type: `text`, `thinking`, `tool_use` or `tool_result`.
     pub block_type: Option<String>,
@@ -477,9 +565,43 @@ pub struct RecallFilter {
     pub since: Option<String>,
     /// Keep turns on or before this `YYYY-MM-DD`.
     pub until: Option<String>,
+    /// Exact canonical provenance; absent columns match no rows.
+    pub source_identity: Option<String>,
+    pub source_version: Option<String>,
+    pub content_hash: Option<String>,
+    pub updated_at: Option<String>,
+    pub source_agent: Option<String>,
+    pub source_type: Option<String>,
+    pub project: Option<String>,
+    pub device_id: Option<String>,
+    pub content_type: Option<String>,
+    pub source_missing: Option<bool>,
 }
 
 impl RecallFilter {
+    fn canonical_predicates(&self) -> Vec<(&'static str, String)> {
+        let mut clauses = Vec::new();
+        for (name, value) in [
+            ("source_identity", self.source_identity.as_deref()),
+            ("source_version", self.source_version.as_deref()),
+            ("content_hash", self.content_hash.as_deref()),
+            ("updated_at", self.updated_at.as_deref()),
+            ("source_agent", self.source_agent.as_deref()),
+            ("source_type", self.source_type.as_deref()),
+            ("project", self.project.as_deref()),
+            ("device_id", self.device_id.as_deref()),
+            ("content_type", self.content_type.as_deref()),
+        ] {
+            if let Some(value) = value {
+                clauses.push((name, dataset::eq(name, value)));
+            }
+        }
+        if let Some(value) = self.source_missing {
+            clauses.push(("source_missing", format!("source_missing = {value}")));
+        }
+        clauses
+    }
+
     fn days(&self) -> DayRange<'_> {
         DayRange {
             since: self.since.as_deref(),
@@ -492,10 +614,11 @@ impl RecallFilter {
 /// [`Search::candidates`] from one or more memories, pooled into a single [`Search::rank`].
 pub struct Search {
     query: String,
-    qv: OnceCell<(EmbeddingModel, Vec<f32>)>,
+    qv: OnceCell<(String, Vec<f32>)>,
     candidates: usize,
     /// The columns `where_clause` reads that a migration added, which an older memory lacks.
     migrated: Vec<&'static str>,
+    canonical_columns: Vec<&'static str>,
     where_clause: Option<String>,
 }
 
@@ -536,15 +659,22 @@ impl Search {
         if filter.repo.is_some() {
             migrated.push("repo");
         }
+        let predicates = filter.canonical_predicates();
+        let canonical_columns = predicates.iter().map(|(name, _)| *name).collect();
+        let mut clauses: Vec<String> = build_where(
+            filter.block_type.as_deref(),
+            filter.role.as_deref(),
+            &harness,
+            filter.repo.as_deref(),
+            &filter.days(),
+        )?
+        .into_iter()
+        .collect();
+        clauses.extend(predicates.into_iter().map(|(_, clause)| clause));
         Ok(Self {
-            where_clause: build_where(
-                filter.block_type.as_deref(),
-                filter.role.as_deref(),
-                &harness,
-                filter.repo.as_deref(),
-                &filter.days(),
-            )?,
+            where_clause: (!clauses.is_empty()).then(|| clauses.join(" AND ")),
             migrated,
+            canonical_columns,
             query,
             qv: OnceCell::new(),
             candidates,
@@ -556,29 +686,48 @@ impl Search {
     pub async fn candidates(&self, memory: &Memory, progress: &(dyn Fn(&str) + Sync)) -> Result<Candidates> {
         progress(&format!("searching {}…", memory.label()));
         let read = open_read(memory).await?;
+        self.candidates_read(read, &memory.label(), progress).await
+    }
+
+    async fn candidates_read(&self, read: Read, label: &str, progress: &(dyn Fn(&str) + Sync)) -> Result<Candidates> {
+        // An older transcript memory has no canonical provenance to match.
+        if self
+            .canonical_columns
+            .iter()
+            .any(|column| !dataset::has_column(&read.ds, column))
+        {
+            return Ok(Candidates {
+                ds: read.ds,
+                note: read.note.unwrap_or_default(),
+                hits: Vec::new(),
+            });
+        }
         // A filter on a migrated column needs the column. On an un-migrated memory it would fail
         // deep inside Lance with an opaque schema error, so refuse with a clear message instead.
         if let Some(column) = self.migrated.iter().find(|c| !dataset::has_column(&read.ds, c)) {
             bail!("this memory predates the {column} facet — reindex it, or drop --{column}");
         }
-        let model = dataset::embedding_model(&read.ds)?;
+        let profile = dataset::embedding_profile(&read.ds)?;
         let (embedded_by, qv) = self
             .qv
             .get_or_try_init(|| async {
                 progress("loading model…");
-                let qv = models().await.lock().await.embedder(model)?.embed_query(&self.query)?;
-                Ok::<_, anyhow::Error>((model, qv))
+                let qv = models()
+                    .await
+                    .lock()
+                    .await
+                    .embedder(&profile)?
+                    .embed_query(&self.query)?;
+                Ok::<_, anyhow::Error>((profile.fingerprint.clone(), qv))
             })
             .await?;
-        if *embedded_by != model {
+        if embedded_by != &profile.fingerprint {
             bail!(
-                "{} is embedded with {}, and the other memory of this search with {}",
-                memory.label(),
-                model.id(),
-                embedded_by.id()
+                "{} and the other memory of this search use different embedding profiles",
+                label
             );
         }
-        progress(&format!("searching {}…", memory.label()));
+        progress(&format!("searching {label}…"));
         let hits = hybrid_candidates(&read.ds, qv, &self.query, self.candidates, self.where_clause.as_deref()).await?;
         Ok(Candidates {
             ds: read.ds,
@@ -618,22 +767,32 @@ impl Search {
             return Ok((note, Vec::new()));
         }
 
-        let mut scored: Vec<(usize, f64)> = if reranks(k, hits.len()) {
-            let docs: Vec<&str> = hits.iter().map(|(_, h)| h.text.as_str()).collect();
-            progress(&format!("reranking {} candidates…", docs.len()));
-            let scores = models()
-                .await
-                .lock()
-                .await
-                .reranker()?
-                .rerank(self.query.as_str(), &docs)?;
-            scores
-                .iter()
+        let rank_scores = || {
+            hits.iter()
                 .enumerate()
-                .map(|(i, &s)| (i, 1.0 / (1.0 + (-(s as f64)).exp())))
-                .collect()
+                .map(|(i, (_, h))| (i, h.fused as f64))
+                .collect::<Vec<_>>()
+        };
+        let mut scored = if reranks(k, hits.len()) {
+            let mut models = models().await.lock().await;
+            if let Some(reranker) = models.reranker()? {
+                let docs: Vec<&str> = hits.iter().map(|(_, hit)| hit.text.as_str()).collect();
+                progress(&format!("reranking {} candidates…", docs.len()));
+                let kind = reranker.score_kind();
+                match reranker.rerank(&self.query, &docs) {
+                    Ok(scores) if scores.len() == hits.len() => scores
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &score)| (i, rerank_relevance(kind, score)))
+                        .collect(),
+                    // Reranking is optional; retain the existing RRF result on provider failure.
+                    Ok(_) | Err(_) => rank_scores(),
+                }
+            } else {
+                rank_scores()
+            }
         } else {
-            hits.iter().enumerate().map(|(i, (_, h))| (i, h.fused as f64)).collect()
+            rank_scores()
         };
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         scored.truncate(k);
@@ -875,7 +1034,12 @@ pub async fn get_turns(memory: Memory, session_id: String, range: TurnRange) -> 
 
     let cols = ["turn_uuid", "seq", "ts", "role", "text", "block_idx", "split_idx"];
     let filter = dataset::eq("session_id", &session_id);
-    let batches = dataset::scan_rows(ds, &cols, Some(filter.as_str()), None).await?;
+    let mut batches = dataset::scan_rows(ds, &cols, Some(filter.as_str()), None).await?;
+    // Canonical documents can retain their original session id; the source identity is also addressable.
+    if batches.iter().all(|batch| batch.num_rows() == 0) && dataset::has_column(ds, "source_identity") {
+        let filter = dataset::eq("source_identity", &session_id);
+        batches = dataset::scan_rows(ds, &cols, Some(filter.as_str()), None).await?;
+    }
 
     // `text` is already the rendered chunk as stored by the indexer — do not re-render.
     let mut rows: Vec<TurnRow> = Vec::new();
@@ -1695,6 +1859,23 @@ mod tests {
     use chrono::TimeZone;
     use std::path::Path;
 
+    fn hit(text: &str) -> Hit {
+        Hit {
+            id: text.to_string(),
+            memory: String::new(),
+            fused: 0.0,
+            text: text.to_string(),
+            session_id: String::new(),
+            workdir: String::new(),
+            turn_uuid: String::new(),
+            seq: 0,
+            ts: "2026-01-31T00:00:00Z".to_string(),
+            block_type: "text".to_string(),
+            harness: String::new(),
+            neighbors: Vec::new(),
+        }
+    }
+
     #[test]
     fn age_picks_the_coarsest_readable_unit() {
         let now = Utc.with_ymd_and_hms(2026, 7, 9, 12, 0, 0).unwrap();
@@ -1945,6 +2126,26 @@ mod tests {
     }
 
     #[test]
+    fn canonical_filter_port_escapes_values_and_tracks_missing_columns() {
+        let search = Search::new(
+            "query".into(),
+            4,
+            RecallFilter {
+                source_agent: Some("codex".into()),
+                project: Some("owner's repo".into()),
+                source_missing: Some(false),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            search.where_clause.as_deref(),
+            Some("source_agent = 'codex' AND project = 'owner''s repo' AND source_missing = false")
+        );
+        assert_eq!(search.canonical_columns, ["source_agent", "project", "source_missing"]);
+    }
+
+    #[test]
     fn build_where_combines_set_filters() {
         let one = |h: &str| vec![h.to_string()];
         let any = DayRange::default();
@@ -2035,7 +2236,7 @@ mod tests {
         let mut chunks = chunk::chunks_from_turns(&turns, true);
         for c in &mut chunks {
             let (_, repo) = repos.iter().find(|(session, _)| *session == c.session_id).unwrap();
-            c.repo = repo.to_string();
+            c.repo = Some(repo.to_string());
         }
         let vectors = vec![vec![0.0f32; dataset::DIM as usize]; chunks.len()];
         let batch = dataset::build_batch(dataset::model::ENGLISH, &chunks, Some(&vectors)).unwrap();
@@ -2128,5 +2329,31 @@ mod tests {
         ] {
             assert_eq!(week.holds(ts), ("2026-09-14".."2026-09-21").contains(&ts), "{ts}");
         }
+    }
+
+    #[test]
+    fn rrf_keeps_the_true_fused_score_for_recency_weighting() {
+        let fused = rrf_fuse(
+            vec![(1, hit("vector-only")), (2, hit("shared"))],
+            vec![(2, hit("shared")), (3, hit("fts-only"))],
+            3,
+        );
+
+        assert_eq!(fused[0].text, "shared");
+        assert!((fused[0].fused as f64 - (1.0 / 60.0 + 1.0 / 61.0)).abs() < 1e-7);
+        for hit in &fused[1..] {
+            let score = hit.fused as f64;
+            assert!(
+                (score - 1.0 / 60.0).abs() < 1e-7 || (score - 1.0 / 61.0).abs() < 1e-7,
+                "{} kept an invented rank score: {score}",
+                hit.text
+            );
+        }
+    }
+
+    #[test]
+    fn reranker_score_contract_only_sigmoids_local_logits() {
+        assert!((rerank_relevance(RerankScoreKind::Logit, 0.0) - 0.5).abs() < f64::EPSILON);
+        assert!((rerank_relevance(RerankScoreKind::Relevance, 0.1) - 0.1).abs() < 1e-7);
     }
 }

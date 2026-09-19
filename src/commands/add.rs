@@ -7,7 +7,7 @@ use super::bind::{self, Resolved};
 use super::index;
 use crate::agents::registry;
 use crate::hub;
-use crate::inference::EmbeddingModel;
+use crate::inference::{self, EmbeddingModel, EmbeddingProfile};
 use crate::memory::dataset::model;
 use crate::memory::{self, Memory, MemoryState, Reachability};
 use crate::traces::spool;
@@ -290,19 +290,19 @@ where
     F: FnOnce(Option<String>) -> Fut,
     Fut: std::future::Future<Output = Result<()>>,
 {
-    let local = index::local_memory_model().await?;
+    let local = index::local_memory_profile().await?;
     let bound = match &resolved {
-        Some(Resolved { memory, .. }) => bind::bound_model(memory, local.is_none())
+        Some(Resolved { memory, .. }) => bind::bound_profile(memory, local.is_none())
             .await?
             .map(|model| (memory.as_str(), model)),
         None => None,
     };
-    if let (Some((memory, there)), Some(here)) = (bound, local) {
+    if let (Some((memory, there)), Some(here)) = (&bound, &local) {
         if there != here {
             bail!(
                 "{memory} is embedded with {}, and the local memory with {}: a memory takes one embedding model",
-                there.id(),
-                here.id()
+                there.model,
+                here.model
             );
         }
     }
@@ -317,25 +317,27 @@ where
         return Ok(());
     }
     if local.is_none() {
+        let configured = inference::embedding_profile()?;
         let model = match bound {
             Some((memory, model)) => {
                 eprintln!(
                     "funes: embedding the local memory with {}, the model of {memory}.",
-                    model.id()
+                    model.model
                 );
                 model
             }
-            None if std::io::stdin().is_terminal() => ask_model(host_model()),
+            None if configured.provider != "local" => configured,
+            None if std::io::stdin().is_terminal() => EmbeddingProfile::local_model(ask_model(host_model())),
             None => {
                 let model = host_model();
                 eprintln!(
                     "funes: embedding the local memory with {}, this host's default off a terminal.",
                     model.id()
                 );
-                model
+                EmbeddingProfile::local_model(model)
             }
         };
-        index::ensure_local_memory(model).await?;
+        index::ensure_local_memory(&model).await?;
     }
     if binds {
         bind::bind_host(resolved.clone(), Some(agent)).await?;

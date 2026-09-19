@@ -7,14 +7,15 @@
 
 use funes::agents;
 use funes::commands::target::Target;
-use funes::commands::{add, ask, bind, compact, index, mcp, push, recall, scrub, sketch, update};
+use funes::commands::{add, ask, bind, compact, index, ingest_docs, mcp, push, recall, scrub, sketch, update};
 use funes::hub;
 use funes::memory;
 use funes::ui::banner::Banner;
 
-use anyhow::Result;
+use anyhow::{anyhow, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use std::io::Write;
+use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(name = "funes", version, about = "Recall over your past AI agent sessions.")]
@@ -24,6 +25,9 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+// Parsed once at process startup; keeping recall's filters flat gives CLI/MCP users one stable
+// surface and avoids boxing individual optional strings only to shrink this transient enum.
+#[allow(clippy::large_enum_variant)]
 enum Cmd {
     /// Recall passages from past sessions (hybrid → reranked when the pool exceeds -k → neighbors).
     Recall {
@@ -61,6 +65,36 @@ enum Cmd {
         /// Restrict to turns on or before this date (`YYYY-MM-DD`).
         #[arg(long, value_name = "DATE")]
         until: Option<String>,
+        /// Restrict to one canonical source identity.
+        #[arg(long)]
+        source_identity: Option<String>,
+        /// Restrict to one canonical source revision.
+        #[arg(long)]
+        source_version: Option<String>,
+        /// Restrict to one canonical source content hash.
+        #[arg(long)]
+        content_hash: Option<String>,
+        /// Restrict to an exact canonical revision timestamp.
+        #[arg(long)]
+        updated_at: Option<String>,
+        /// Restrict to the source agent facet.
+        #[arg(long)]
+        source_agent: Option<String>,
+        /// Restrict to the source type facet.
+        #[arg(long)]
+        source_type: Option<String>,
+        /// Restrict to the project facet.
+        #[arg(long)]
+        project: Option<String>,
+        /// Restrict to the device id facet.
+        #[arg(long)]
+        device_id: Option<String>,
+        /// Restrict to the canonical content type.
+        #[arg(long)]
+        content_type: Option<String>,
+        /// Restrict to present (`false`) or soft-missing (`true`) canonical sources.
+        #[arg(long)]
+        source_missing: Option<bool>,
         #[command(flatten)]
         memory: MemoryOpts,
     },
@@ -118,6 +152,20 @@ enum Cmd {
         /// A memory keeps the model it was created with, so an existing English memory refuses it.
         #[arg(long, conflicts_with = "check")]
         multilingual: bool,
+    },
+    /// Ingest canonical document JSONL directly into a memory, replacing each source revision.
+    IngestDocs {
+        /// Canonical JSONL containing source identity, revision, raw text, and metadata.
+        #[arg(value_name = "JSONL")]
+        path: PathBuf,
+        #[command(flatten)]
+        memory: MemoryOpts,
+    },
+    /// Refresh a remote memory's Lance indexes without reading a local memory.
+    #[command(hide = true)]
+    OptimizeIndex {
+        #[arg(value_name = "MEMORY")]
+        memory: String,
     },
     /// Find a literal string everywhere in one session — exhaustive, unranked.
     Scan {
@@ -262,6 +310,24 @@ enum Cmd {
         #[arg(value_name = "AGENT")]
         agent: String,
     },
+    /// Run the unified local Codex/Pi/Claude sync daemon (`funes-sync`).
+    Sync {
+        #[command(subcommand)]
+        command: SyncCommand,
+    },
+    /// Diagnose the unified sync bridge without printing credentials.
+    Doctor,
+    /// List discovered Codex/Pi/Claude sessions and memory files.
+    Sources,
+    /// Rebuild derived retrieval state from the authoritative encrypted source store.
+    Reindex {
+        /// Regenerate retrieval shadows from raw source text.
+        #[arg(long, required_unless_present = "all", conflicts_with = "all")]
+        retrieval_text: bool,
+        /// Regenerate retrieval shadows and force all eligible canonical rows through indexing.
+        #[arg(long, required_unless_present = "retrieval_text", conflicts_with = "retrieval_text")]
+        all: bool,
+    },
 }
 
 // The `[MEMORY]` positional of `add`; the user-facing help comes from the field doc below.
@@ -271,6 +337,22 @@ struct AddMemory {
     /// `local`. Omitted, the agent takes the memory the host is bound to.
     #[arg(value_name = "MEMORY")]
     memory: Option<String>,
+}
+
+#[derive(Subcommand)]
+enum SyncCommand {
+    Status,
+    Sources,
+    Doctor,
+    Backfill,
+    Run,
+    Install,
+    Uninstall,
+    Start,
+    Stop,
+    Restart,
+    Logs,
+    Mcp,
 }
 
 // Flattened into every ask agent so they share the question positional and the read `--memory`
@@ -347,6 +429,16 @@ async fn run() -> Result<()> {
             repo,
             since,
             until,
+            source_identity,
+            source_version,
+            content_hash,
+            updated_at,
+            source_agent,
+            source_type,
+            project,
+            device_id,
+            content_type,
+            source_missing,
             memory,
         } => {
             let memory = memory.resolve()?;
@@ -365,6 +457,16 @@ async fn run() -> Result<()> {
                     repo,
                     since,
                     until,
+                    source_identity,
+                    source_version,
+                    content_hash,
+                    updated_at,
+                    source_agent,
+                    source_type,
+                    project,
+                    device_id,
+                    content_type,
+                    source_missing,
                 },
                 &|label| spinner.set(label),
             )
@@ -454,6 +556,17 @@ async fn run() -> Result<()> {
             })
             .await
         }
+        Cmd::IngestDocs { path, memory } => {
+            print!(
+                "{}",
+                ingest_docs::run(&path, memory::Memory::resolve(memory.memory)).await?
+            );
+            Ok(())
+        }
+        Cmd::OptimizeIndex { memory: target } => {
+            print!("{}", push::run_reindex_only(memory::Memory::parse(&target)).await?);
+            Ok(())
+        }
         Cmd::Status => {
             let bound = memory::binding()?;
             let note = bind::legacy_note(bound.as_deref())?;
@@ -490,6 +603,46 @@ async fn run() -> Result<()> {
         Cmd::Bind { memory } => bind::run(&memory).await,
         Cmd::Add { agent, memory, from } => add::run(&agent, memory.memory.as_deref(), from.as_deref()).await,
         Cmd::Remove { agent } => add::remove(&agent).await,
+        Cmd::Sync { command } => run_sync_command(command),
+        Cmd::Doctor => run_sync_command(SyncCommand::Doctor),
+        Cmd::Sources => run_sync_command(SyncCommand::Sources),
+        Cmd::Reindex { retrieval_text: _, all } => {
+            run_sync_args(&["reindex", if all { "--all" } else { "--retrieval-text" }])
+        }
+    }
+}
+
+/// Delegate the long-lived bridge to the separately testable Python package.  Keeping
+/// discovery/queue state out of the Rust Lance process means a Space restart or a
+/// client upgrade cannot strand a pending upload.
+fn run_sync_command(command: SyncCommand) -> Result<()> {
+    let name = match command {
+        SyncCommand::Status => "status",
+        SyncCommand::Sources => "sources",
+        SyncCommand::Doctor => "doctor",
+        SyncCommand::Backfill => "backfill",
+        SyncCommand::Run => "run",
+        SyncCommand::Install => "install",
+        SyncCommand::Uninstall => "uninstall",
+        SyncCommand::Start => "start",
+        SyncCommand::Stop => "stop",
+        SyncCommand::Restart => "restart",
+        SyncCommand::Logs => "logs",
+        SyncCommand::Mcp => "mcp",
+    };
+    run_sync_args(&[name])
+}
+
+fn run_sync_args(args: &[&str]) -> Result<()> {
+    let mut child = std::process::Command::new(std::env::var("FUNES_SYNC_BIN").unwrap_or_else(|_| "funes-sync".into()));
+    let status = child
+        .args(args)
+        .status()
+        .context("running funes-sync (set FUNES_SYNC_BIN to its absolute path)")?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(anyhow!("funes-sync exited with {:?}", status.code()))
     }
 }
 

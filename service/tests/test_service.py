@@ -1787,6 +1787,141 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(store.conn.execute("PRAGMA mmap_size").fetchone()[0], 0)
         store.close()
 
+    def test_bulk_restore_skips_embedding_generation_scan_for_explicit_generations(self):
+        store = Store(self.tmp.name)
+        try:
+            # 1. Bulk restore with explicit embedding_generation across multiple batches:
+            # Table scan (_latest_embedding_generation_locked) must be skipped entirely (0 calls).
+            docs = [
+                {
+                    "source_identity": f"doc-explicit-{i}",
+                    "raw_text": f"explicit generation {i}",
+                    "embedding_generation": 2,
+                }
+                for i in range(10)
+            ]
+            with mock.patch.object(
+                store,
+                "_latest_embedding_generation_locked",
+                wraps=store._latest_embedding_generation_locked,
+            ) as spy_gen:
+                total = store.restore_documents(docs, batch_size=3)
+                self.assertEqual(total, 10)
+                self.assertEqual(spy_gen.call_count, 0)
+
+            # All rows have their explicit generation preserved
+            rows = store.conn.execute(
+                "SELECT embedding_generation FROM memories WHERE source_identity LIKE 'doc-explicit-%'"
+            ).fetchall()
+            self.assertEqual(len(rows), 10)
+            self.assertTrue(all(r[0] == 2 for r in rows))
+
+            # Bulk restore lifecycle restored secondary indexes and depth
+            self.assertEqual(store._bulk_restore_depth, 0)
+            index_names = {
+                r["name"]
+                for r in store.conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='memories'"
+                )
+            }
+            self.assertIn("memories_source_agent_role_idx", index_names)
+
+            # 2. Bulk restore of legacy docs (missing embedding_generation) evaluates lazily
+            # once per batch, not once per document.
+            legacy_docs = [
+                {
+                    "source_identity": f"doc-legacy-{i}",
+                    "raw_text": f"legacy document {i}",
+                }
+                for i in range(6)
+            ]
+            with mock.patch.object(
+                store,
+                "_latest_embedding_generation_locked",
+                wraps=store._latest_embedding_generation_locked,
+            ) as spy_gen:
+                total = store.restore_documents(legacy_docs, batch_size=2)
+                self.assertEqual(total, 6)
+                self.assertEqual(spy_gen.call_count, 3)
+
+            legacy_rows = store.conn.execute(
+                "SELECT embedding_generation FROM memories WHERE source_identity LIKE 'doc-legacy-%'"
+            ).fetchall()
+            self.assertEqual(len(legacy_rows), 6)
+            self.assertTrue(all(r[0] == 2 for r in legacy_rows))
+
+            # 3. Normal ingest lazy evaluation and dedupe / update / CAS semantics
+            # Ingesting empty list does not call generation lookup
+            with mock.patch.object(
+                store,
+                "_latest_embedding_generation_locked",
+                wraps=store._latest_embedding_generation_locked,
+            ) as spy_gen:
+                store.ingest([])
+                self.assertEqual(spy_gen.call_count, 0)
+
+            # Ingesting existing row (dedupe / update) does not call generation lookup
+            with mock.patch.object(
+                store,
+                "_latest_embedding_generation_locked",
+                wraps=store._latest_embedding_generation_locked,
+            ) as spy_gen:
+                res = store.ingest([
+                    {
+                        "source_identity": "doc-explicit-0",
+                        "raw_text": "explicit generation 0",
+                    }
+                ])
+                self.assertEqual(res["deduped"], 1)
+                self.assertEqual(spy_gen.call_count, 0)
+
+            # Updating existing row preserves higher existing generation
+            store.ingest([
+                {
+                    "source_identity": "doc-explicit-0",
+                    "raw_text": "updated text",
+                    "embedding_generation": 1,
+                }
+            ])
+            val = store.conn.execute(
+                "SELECT embedding_generation FROM memories WHERE source_identity='doc-explicit-0'"
+            ).fetchone()[0]
+            self.assertEqual(val, 2)
+
+            # Updating existing row advances to higher incoming generation
+            store.ingest([
+                {
+                    "source_identity": "doc-explicit-0",
+                    "raw_text": "advanced text",
+                    "embedding_generation": 5,
+                }
+            ])
+            val = store.conn.execute(
+                "SELECT embedding_generation FROM memories WHERE source_identity='doc-explicit-0'"
+            ).fetchone()[0]
+            self.assertEqual(val, 5)
+
+            # Normal ingest of new row fetches default generation lazily
+            with mock.patch.object(
+                store,
+                "_latest_embedding_generation_locked",
+                wraps=store._latest_embedding_generation_locked,
+            ) as spy_gen:
+                store.ingest([
+                    {
+                        "source_identity": "doc-normal-new",
+                        "raw_text": "new normal row",
+                    }
+                ])
+                self.assertEqual(spy_gen.call_count, 1)
+
+            val = store.conn.execute(
+                "SELECT embedding_generation FROM memories WHERE source_identity='doc-normal-new'"
+            ).fetchone()[0]
+            self.assertEqual(val, 5)
+        finally:
+            store.close()
+
     def test_bulk_restore_exception_in_restore_recovers_indexes_and_pragmas(self):
         store = Store(self.tmp.name)
         store.ingest([{"source_identity": "doc-err", "raw_text": "failure test"}])

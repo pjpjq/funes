@@ -1848,7 +1848,9 @@ def test_canonical_jsonl_sends_raw_and_profile_checkpoint_is_durable(monkeypatch
     )
     assert durable_records[-1]["_funes_record"] == "native_index_state"
     assert "raw_text" not in durable_records[-1]
-    assert warm == [{"force": True}]
+    # A canonical batch commit must not cold-refresh the active worker.  The
+    # refresh is deferred until the derived index is optimized.
+    assert warm == []
 
 
 def test_profile_change_rebuilds_durable_session_without_client_reupload(monkeypatch, tmp_path):
@@ -2093,7 +2095,7 @@ def test_canonical_held_batch_is_bisected_and_source_revision_retries(monkeypatc
     assert second["attempted"] == 0
     assert third["indexed"] == 1
     assert revised["native_index_status"] == "indexed"
-    assert len(warm) == 2
+    assert warm == []
 
 
 def test_canonical_failure_persists_retry_and_next_pass_succeeds(monkeypatch, tmp_path):

@@ -1199,12 +1199,11 @@ def reconcile_canonical_index(app) -> dict[str, object]:
         if durable:
             optimize_canonical_index(app, profile, memory)
         return {"attempted": 0, "indexed": 0, "held": 0, "durable": durable}
-    if (
-        committed
-        and memory == REMOTE
-        and profile["fingerprint"] == embedding_profile()["fingerprint"]
-    ):
-        request_warm(force=True)
+    # Do not refresh the active native worker after every canonical batch.
+    # Canonical reconciliation runs continuously while a rebuild is catching
+    # up; forcing a cold refresh here keeps the Space in ``warming`` and
+    # makes concurrent recall return busy/unavailable.  The active worker is
+    # refreshed once after optimize_native_index() completes instead.
     status_documents = []
     valid_updates = []
     for update in updates:

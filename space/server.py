@@ -330,6 +330,8 @@ def source_readiness_state() -> dict[str, object]:
         "restoring": restoring,
         "restored": app.restore_result,
     }
+    if restoring:
+        state["progress"] = getattr(app.syncer, "progress", {})
     if restore_failed:
         state["error"] = "restore_failed"
     return state
@@ -2860,6 +2862,17 @@ def sync_status_payload() -> tuple[int, dict[str, object]]:
             "ok": False,
             "error": "FUNES_MEMORY is not configured",
             "native_warm": warm_state(),
+        }
+    source_readiness = source_readiness_state()
+    if source_readiness.get("restoring"):
+        return 503, {
+            "ok": False,
+            "remote": REMOTE,
+            "status": "",
+            "error": "restore_in_progress",
+            "native_warm": warm_state(),
+            "source_store": source_readiness,
+            "embedding_profile": embedding_profile(),
         }
     try:
         code, out, err = run("status", REMOTE, timeout=30)

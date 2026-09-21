@@ -5096,5 +5096,276 @@ class ServiceTests(unittest.TestCase):
             self.assertFalse(syncer.restore_failed)
         store.close()
 
+    def test_restore_progress_phases_and_counters(self):
+        from service.server import SnapshotSync
+
+        store = Store(self.tmp.name)
+        syncer = SnapshotSync(store)
+        syncer.repo = "owner/private"
+        syncer.token = "test-token"
+
+        # 1. Initial idle state
+        initial = syncer.progress
+        self.assertEqual(initial["phase"], "idle")
+        self.assertIsNone(initial["current"])
+        self.assertEqual(initial["completed"], 0)
+        self.assertEqual(initial["total"], 0)
+        self.assertEqual(initial["rows"], 0)
+        self.assertEqual(initial["bytes"], 0)
+
+        files = [
+            "funes-snapshot.jsonl.gz.enc",
+            "funes-delta-1.jsonl.gz.enc",
+        ]
+        manifest = {
+            "version": 1,
+            "snapshot": "funes-snapshot.jsonl.gz.enc",
+            "deltas": ["funes-delta-1.jsonl.gz.enc"],
+            "controls": [],
+        }
+        revision = "rev-progress-check"
+
+        history = []
+        original_update = syncer._update_restore_progress
+
+        def track_update(**kwargs):
+            original_update(**kwargs)
+            history.append(dict(syncer.progress))
+
+        def mock_restore_file(filename):
+            with syncer._progress_lock:
+                syncer._restore_progress["bytes"] += 512
+            return 3
+
+        syncer._update_restore_progress = track_update
+
+        with mock.patch.object(
+            syncer, "_repo_files_metadata", return_value=(files, manifest, revision)
+        ), mock.patch.object(
+            syncer, "_prefetch_restore_files", return_value=None
+        ), mock.patch.object(
+            syncer, "_restore_file", side_effect=mock_restore_file
+        ):
+            result = syncer.restore()
+
+        self.assertEqual(result, 6)
+        self.assertFalse(syncer.restore_failed)
+        self.assertTrue(syncer.restored)
+
+        # Verify phase progression and counters in recorded history
+        phases = [h["phase"] for h in history]
+        self.assertIn("listing", phases)
+        self.assertIn("prefetching", phases)
+        self.assertIn("restoring", phases)
+        self.assertIn("indexing", phases)
+        self.assertIn("completed", phases)
+
+        # Verify restoring phase records file names and increments
+        restoring_snapshots = [h for h in history if h["phase"] == "restoring"]
+        current_files = [h["current"] for h in restoring_snapshots if h["current"] is not None]
+        self.assertEqual(current_files, files)
+
+        # Final progress counters
+        final_progress = syncer.progress
+        self.assertEqual(final_progress["phase"], "completed")
+        self.assertIsNone(final_progress["current"])
+        self.assertEqual(final_progress["completed"], 2)
+        self.assertEqual(final_progress["total"], 2)
+        self.assertEqual(final_progress["rows"], 6)
+        self.assertEqual(final_progress["bytes"], 1024)
+
+        # Test failure transition
+        syncer_fail = SnapshotSync(store)
+        syncer_fail.repo = "owner/private"
+        syncer_fail.token = "test-token"
+
+        def mock_restore_raise(filename):
+            raise RuntimeError("simulated download failure")
+
+        with mock.patch.object(
+            syncer_fail, "_repo_files_metadata", return_value=(files, manifest, revision)
+        ), mock.patch.object(
+            syncer_fail, "_prefetch_restore_files", return_value=None
+        ), mock.patch.object(
+            syncer_fail, "_restore_file", side_effect=mock_restore_raise
+        ):
+            fail_res = syncer_fail.restore()
+
+        self.assertEqual(fail_res, -1)
+        self.assertTrue(syncer_fail.restore_failed)
+        fail_progress = syncer_fail.progress
+        self.assertEqual(fail_progress["phase"], "failed")
+        self.assertIsNone(fail_progress["current"])
+        self.assertEqual(fail_progress.get("error"), "RuntimeError")
+
+        store.close()
+
+    def test_restore_progress_endpoints(self):
+        app = mock.Mock()
+        app.store = Store(self.tmp.name)
+        app.syncer = mock.Mock()
+        app.syncer.restoring = True
+        app.syncer.restore_failed = False
+        app.syncer.progress = {
+            "phase": "restoring",
+            "current": "funes-delta-1.jsonl.gz.enc",
+            "completed": 1,
+            "total": 3,
+            "rows": 42,
+            "bytes": 2048,
+        }
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(app))
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            # During restore: /ready returns 503 with progress breakdown
+            status, body = self._request(server, "GET", "/ready")
+            self.assertEqual(status, 503)
+            self.assertEqual(body["status"], "restoring")
+            self.assertEqual(body["phase"], "restoring")
+            self.assertEqual(body["current"], "funes-delta-1.jsonl.gz.enc")
+            self.assertEqual(body["completed"], 1)
+            self.assertEqual(body["total"], 3)
+            self.assertEqual(body["rows"], 42)
+            self.assertEqual(body["bytes"], 2048)
+            self.assertEqual(body["progress"], app.syncer.progress)
+
+            # When restoring: /sync/status returns 503 with restore_progress
+            status, body = self._request(server, "GET", "/sync/status")
+            self.assertEqual(status, 503)
+            self.assertEqual(body.get("status"), "restoring")
+            self.assertEqual(body.get("restore_progress"), app.syncer.progress)
+
+            # POST must use the same non-blocking restore short-circuit.
+            status, body = self._request(server, "POST", "/sync/status", {})
+            self.assertEqual(status, 503)
+            self.assertEqual(body.get("status"), "restoring")
+            self.assertEqual(body.get("restore_progress"), app.syncer.progress)
+
+            # Once ready: /ready returns 200 with progress info
+            app.syncer.restoring = False
+            app.restore_result = 42
+            status, body = self._request(server, "GET", "/ready")
+            self.assertEqual(status, 200)
+            self.assertEqual(body["status"], "ready")
+            self.assertEqual(body["restored"], 42)
+            self.assertEqual(body["progress"], app.syncer.progress)
+
+            # Once ready: /sync/status returns 200 with restore_progress
+            status, body = self._request(server, "GET", "/sync/status")
+            self.assertEqual(status, 200)
+            self.assertEqual(body.get("restore_progress"), app.syncer.progress)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+            app.store.close()
+
+    def test_restore_checkpoint_resume_without_remaining_skips_bulk_rebuild(self):
+        from service.server import SnapshotSync
+
+        store = Store(self.tmp.name)
+        syncer = SnapshotSync(store)
+        syncer.repo = "owner/private"
+        syncer.token = "test-token"
+        files = [
+            "funes-snapshot.jsonl.gz.enc",
+            "funes-delta-1.jsonl.gz.enc",
+            "funes-delta-2.jsonl.gz.enc",
+        ]
+        manifest = {
+            "version": 1,
+            "snapshot": "funes-snapshot.jsonl.gz.enc",
+            "deltas": ["funes-delta-1.jsonl.gz.enc", "funes-delta-2.jsonl.gz.enc"],
+            "controls": [],
+        }
+        revision = "sha-resume-skip-1"
+
+        # Case 1: Checkpoint covers all manifest files AND derived_ready=True
+        # Must skip begin_bulk_restore and finish_bulk_restore
+        syncer._record_restore_checkpoint(
+            revision,
+            manifest,
+            files,
+            files,
+            derived_ready=True,
+        )
+        self.assertTrue(syncer.restore_checkpoint_path.is_file())
+
+        with mock.patch.object(
+            syncer, "_repo_files_metadata", return_value=(files, manifest, revision)
+        ), mock.patch.object(
+            syncer, "_prefetch_restore_files", return_value=None
+        ), mock.patch.object(
+            syncer, "_restore_file"
+        ) as mock_restore_file, mock.patch.object(
+            store, "begin_bulk_restore"
+        ) as mock_begin_bulk, mock.patch.object(
+            store, "finish_bulk_restore"
+        ) as mock_finish_bulk, mock.patch.object(
+            store, "compact_reindex_controls"
+        ) as mock_compact, mock.patch.object(
+            store, "drain_reindex_controls"
+        ) as mock_drain:
+            result = syncer.restore()
+
+        self.assertEqual(result, 0)
+        mock_restore_file.assert_not_called()
+        mock_begin_bulk.assert_not_called()
+        mock_finish_bulk.assert_not_called()
+        mock_compact.assert_called_once_with(replay=True)
+        mock_drain.assert_called_once_with(syncer.restore_batch)
+        self.assertFalse(syncer.restore_checkpoint_path.exists())
+        self.assertFalse(syncer.restore_failed)
+        self.assertTrue(syncer.restored)
+        self.assertEqual(syncer.covered_revision, revision)
+        self.assertEqual(syncer.progress["phase"], "completed")
+        self.assertEqual(syncer.progress["completed"], len(files))
+        self.assertEqual(syncer.progress["total"], len(files))
+
+        # Case 2: Checkpoint covers all files BUT derived_ready=False
+        # Must execute bulk rebuild (begin/finish_bulk_restore + controls drain) to ensure durability
+        syncer2 = SnapshotSync(store)
+        syncer2.repo = "owner/private"
+        syncer2.token = "test-token"
+        syncer2._record_restore_checkpoint(
+            revision,
+            manifest,
+            files,
+            files,
+            derived_ready=False,
+        )
+        self.assertTrue(syncer2.restore_checkpoint_path.is_file())
+
+        with mock.patch.object(
+            syncer2, "_repo_files_metadata", return_value=(files, manifest, revision)
+        ), mock.patch.object(
+            syncer2, "_prefetch_restore_files", return_value=None
+        ), mock.patch.object(
+            syncer2, "_restore_file"
+        ) as mock_restore_file2, mock.patch.object(
+            store, "begin_bulk_restore"
+        ) as mock_begin_bulk2, mock.patch.object(
+            store, "finish_bulk_restore"
+        ) as mock_finish_bulk2, mock.patch.object(
+            store, "compact_reindex_controls"
+        ) as mock_compact2, mock.patch.object(
+            store, "drain_reindex_controls"
+        ) as mock_drain2:
+            result2 = syncer2.restore()
+
+        self.assertEqual(result2, 0)
+        mock_restore_file2.assert_not_called()
+        mock_begin_bulk2.assert_called_once()
+        mock_finish_bulk2.assert_called_once()
+        mock_compact2.assert_called_once_with(replay=True)
+        mock_drain2.assert_called_once_with(syncer2.restore_batch)
+        self.assertFalse(syncer2.restore_checkpoint_path.exists())
+        self.assertFalse(syncer2.restore_failed)
+        self.assertTrue(syncer2.restored)
+
+        store.close()
+
 if __name__ == "__main__":
     unittest.main()

@@ -2728,6 +2728,15 @@ class SnapshotSync:
         self.restore_error = None
         self.restored = False
         self.restoring = False
+        self._progress_lock = threading.Lock()
+        self._restore_progress: dict[str, Any] = {
+            "phase": "idle",
+            "current": None,
+            "completed": 0,
+            "total": 0,
+            "rows": 0,
+            "bytes": 0,
+        }
         self.storage_key = (
             os.getenv("FUNES_STORAGE_KEY")
             or os.getenv("FUNES_API_TOKEN")
@@ -2744,7 +2753,17 @@ class SnapshotSync:
         self.restore_failed = True
         self.restore_error = type(exc).__name__
         self.store.set_sync(last_error=self.restore_error)
+        self._update_restore_progress(phase="failed", current=None, error=self.restore_error)
         return -1
+
+    def _update_restore_progress(self, **values: Any) -> None:
+        with self._progress_lock:
+            self._restore_progress.update(values)
+
+    @property
+    def progress(self) -> dict[str, Any]:
+        with self._progress_lock:
+            return dict(self._restore_progress)
 
     @property
     def restore_checkpoint_path(self) -> Path:
@@ -3136,40 +3155,7 @@ class SnapshotSync:
         manifest: dict[str, Any] | None,
         files: list[str],
     ) -> set[str]:
-        path = self.restore_checkpoint_path
-        if not path.is_file():
-            return set()
-        try:
-            raw = json.loads(path.read_text(encoding="utf-8"))
-            if not isinstance(raw, dict):
-                return set()
-            if raw.get("version") != 1:
-                return set()
-            if "revision" not in raw or raw["revision"] != revision:
-                return set()
-            manifest_digest = (
-                self._canonical_digest(manifest) if manifest is not None else None
-            )
-            if "manifest_digest" not in raw or raw["manifest_digest"] != manifest_digest:
-                return set()
-            files_list = list(files)
-            if raw.get("files") != files_list:
-                return set()
-            files_digest = self._canonical_digest(files_list)
-            if "files_digest" not in raw or raw["files_digest"] != files_digest:
-                return set()
-            completed = raw.get("completed")
-            if (
-                not isinstance(completed, list)
-                or len(completed) > len(files_list)
-                or len(completed) != len(set(completed))
-                or any(not isinstance(f, str) for f in completed)
-                or files_list[: len(completed)] != completed
-            ):
-                return set()
-            return set(completed)
-        except Exception:
-            return set()
+        return self._load_restore_checkpoint_state(revision, manifest, files)[0]
 
     def _record_restore_checkpoint(
         self,
@@ -3177,6 +3163,8 @@ class SnapshotSync:
         manifest: dict[str, Any] | None,
         files: list[str],
         completed: list[str],
+        *,
+        derived_ready: bool = False,
     ) -> None:
         target = self.restore_checkpoint_path
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -3191,6 +3179,7 @@ class SnapshotSync:
             "files_digest": files_digest,
             "files": list(files),
             "completed": list(completed),
+            "derived_ready": bool(derived_ready),
         }
         encoded = self._canonical_json_bytes(data)
         fd, tmp = tempfile.mkstemp(
@@ -3210,6 +3199,52 @@ class SnapshotSync:
             except OSError:
                 pass
             raise
+
+    def _load_restore_checkpoint_state(
+        self,
+        revision: str | None,
+        manifest: dict[str, Any] | None,
+        files: list[str],
+    ) -> tuple[set[str], bool]:
+        """Return the completed prefix and whether derived indexes are durable.
+
+        Older checkpoint files intentionally default to ``False`` for the
+        derived marker.  That makes a pre-upgrade or crash-interrupted restore
+        rebuild FTS and secondary indexes once instead of risking silent misses.
+        """
+        path = self.restore_checkpoint_path
+        if not path.is_file():
+            return set(), False
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict):
+                return set(), False
+            if raw.get("version") != 1:
+                return set(), False
+            if raw.get("revision") != revision:
+                return set(), False
+            manifest_digest = (
+                self._canonical_digest(manifest) if manifest is not None else None
+            )
+            if raw.get("manifest_digest") != manifest_digest:
+                return set(), False
+            files_list = list(files)
+            if raw.get("files") != files_list:
+                return set(), False
+            if raw.get("files_digest") != self._canonical_digest(files_list):
+                return set(), False
+            completed = raw.get("completed")
+            if (
+                not isinstance(completed, list)
+                or len(completed) > len(files_list)
+                or len(completed) != len(set(completed))
+                or any(not isinstance(f, str) for f in completed)
+                or files_list[: len(completed)] != completed
+            ):
+                return set(), False
+            return set(completed), bool(raw.get("derived_ready", False))
+        except Exception:
+            return set(), False
 
     def _remove_restore_checkpoint(self) -> None:
         try:
@@ -3286,6 +3321,13 @@ class SnapshotSync:
                 local_dir=str(self.store.data_dir / "remote"),
             )
             encrypted = Path(downloaded)
+        try:
+            file_bytes = encrypted.stat().st_size if encrypted.is_file() else 0
+        except OSError:
+            file_bytes = 0
+        if file_bytes:
+            with self._progress_lock:
+                self._restore_progress["bytes"] += file_bytes
         if not filename.endswith(".enc"):
             if not self._truth("FUNES_ALLOW_PLAINTEXT_SOURCE_RESTORE"):
                 raise RuntimeError("plaintext source snapshot restore is disabled")
@@ -3337,7 +3379,16 @@ class SnapshotSync:
                     self._restore_manifest = None
                     self.covered_revision = None
                     restored_revision = None
-                    self.store.begin_bulk_restore()
+                    self._update_restore_progress(
+                        phase="listing",
+                        current=None,
+                        completed=0,
+                        total=0,
+                        rows=0,
+                        bytes=0,
+                    )
+                    bulk_active = False
+                    restore_completed = False
                     try:
                         files, manifest, restored_revision = self._repo_files_metadata()
                         self._restore_revision = restored_revision
@@ -3345,12 +3396,24 @@ class SnapshotSync:
                         if not files:
                             # Backwards-compatible single-file snapshot lookup.
                             files = [self.filename + ".enc"]
-                        completed_files = self._load_restore_checkpoint(
+                        completed_files, derived_ready = self._load_restore_checkpoint_state(
                             restored_revision, manifest, list(files)
                         )
                         completed_order = [f for f in files if f in completed_files]
                         restored = 0
                         remaining_files = [f for f in files if f not in completed_files]
+                        self._update_restore_progress(
+                            phase="prefetching" if remaining_files else "indexing",
+                            current=None,
+                            completed=len(completed_order),
+                            total=len(files),
+                        )
+                        # A fully completed checkpoint is safe to skip only when
+                        # the previous run recorded the derived-index commit.
+                        # Older checkpoints and crash-interrupted restores rebuild.
+                        if remaining_files or not derived_ready:
+                            self.store.begin_bulk_restore()
+                            bulk_active = True
                         self._restore_prefetch_root = self._prefetch_restore_files(
                             remaining_files
                         )
@@ -3358,6 +3421,9 @@ class SnapshotSync:
                             for filename in files:
                                 if filename in completed_files:
                                     continue
+                                self._update_restore_progress(
+                                    phase="restoring", current=filename
+                                )
                                 restored += self._restore_file(filename)
                                 completed_order.append(filename)
                                 self._record_restore_checkpoint(
@@ -3366,16 +3432,37 @@ class SnapshotSync:
                                     list(files),
                                     completed_order,
                                 )
+                                self._update_restore_progress(
+                                    completed=len(completed_order),
+                                    rows=restored,
+                                    current=None,
+                                )
                         finally:
                             self._restore_prefetch_root = None
                         # A complete Hub restore can replay an old generation-zero
                         # revision into an id below a partially persisted row cursor.
                         # Rewind only here; ordinary local restarts keep their cursor.
+                        self._update_restore_progress(
+                            phase="indexing", current="reindex_controls"
+                        )
                         self.store.compact_reindex_controls(replay=True)
                         self.store.drain_reindex_controls(self.restore_batch)
-                        self._remove_restore_checkpoint()
+                        restore_completed = True
                     finally:
-                        self.store.finish_bulk_restore()
+                        if bulk_active:
+                            self._update_restore_progress(
+                                phase="indexing", current="memories_fts"
+                            )
+                            self.store.finish_bulk_restore()
+                            self._record_restore_checkpoint(
+                                restored_revision,
+                                manifest,
+                                list(files),
+                                completed_order,
+                                derived_ready=True,
+                            )
+                        if restore_completed:
+                            self._remove_restore_checkpoint()
                     self.covered_revision = restored_revision
                     self._restore_revision = None
                     self._restore_manifest = None
@@ -3383,6 +3470,13 @@ class SnapshotSync:
                     self.restore_error = None
                     self.store.set_sync(last_error=None)
                     self.restored = True
+                    self._update_restore_progress(
+                        phase="completed",
+                        current=None,
+                        completed=len(files),
+                        total=len(files),
+                        rows=restored,
+                    )
                     return restored
                 except Exception as exc:  # optional recovery must never stop serving
                     self._restore_revision = None
@@ -3401,15 +3495,36 @@ class SnapshotSync:
                 self.restore_error = None
                 self.store.set_sync(last_error=None)
                 self.restored = True
+                self._update_restore_progress(
+                    phase="completed", current=None, completed=0, total=0, rows=0, bytes=0
+                )
                 return 0
             try:
+                local_bytes = local.stat().st_size if local.is_file() else 0
+                self._update_restore_progress(
+                    phase="restoring",
+                    current=local.name,
+                    completed=0,
+                    total=1,
+                    rows=0,
+                    bytes=local_bytes,
+                )
                 restored = self.store.restore(local, apply_controls=False)
+                self._update_restore_progress(phase="indexing", current="reindex_controls")
                 self.store.compact_reindex_controls()
                 self.store.drain_reindex_controls(self.restore_batch)
                 self.restore_failed = False
                 self.restore_error = None
                 self.store.set_sync(last_error=None)
                 self.restored = True
+                self._update_restore_progress(
+                    phase="completed",
+                    current=None,
+                    completed=1,
+                    total=1,
+                    rows=restored,
+                    bytes=local_bytes,
+                )
                 return restored
             except Exception as exc:
                 return self._fail_restore(exc)
@@ -4407,18 +4522,51 @@ def make_handler(app: App):
             if route == "/ready":
                 try:
                     if app.syncer.restoring:
-                        return self._json(503, {"status": "restoring"})
+                        progress = getattr(app.syncer, "progress", {})
+                        return self._json(
+                            503,
+                            {
+                                "status": "restoring",
+                                "phase": progress.get("phase", "restoring"),
+                                "current": progress.get("current"),
+                                "completed": progress.get("completed", 0),
+                                "total": progress.get("total", 0),
+                                "rows": progress.get("rows", 0),
+                                "bytes": progress.get("bytes", 0),
+                                "progress": progress,
+                            },
+                        )
                     if app.syncer.restore_failed:
                         return self._json(503, {"status": "not_ready", "error": "restore_failed"})
                     count = app.store.count()
-                    return self._json(200, {"status": "ready", "documents": count, "restored": app.restore_result})
+                    return self._json(
+                        200,
+                        {
+                            "status": "ready",
+                            "documents": count,
+                            "restored": app.restore_result,
+                            "progress": getattr(app.syncer, "progress", {}),
+                        },
+                    )
                 except Exception as exc:
                     return self._json(503, {"status": "not_ready", "error": type(exc).__name__})
             if route in PROTECTED and self._authorized():
                 if route == "/sources":
                     return self._json(200, {"sources": app.store.sources()})
                 if route == "/sync/status":
-                    return self._json(200, app.store.sync_status())
+                    if app.syncer.restoring:
+                        return self._json(
+                            503,
+                            {
+                                "status": "restoring",
+                                "restore_progress": getattr(
+                                    app.syncer, "progress", {}
+                                ),
+                            },
+                        )
+                    status = app.store.sync_status()
+                    status["restore_progress"] = getattr(app.syncer, "progress", {})
+                    return self._json(200, status)
                 if route == "/get":
                     params = parse_qs(urlparse(self.path).query)
                     ident = params.get("source_identity", params.get("id", [""]))[0]
@@ -4503,6 +4651,16 @@ def make_handler(app: App):
                     result = app.syncer.upload()
                     return self._json(200 if result.get("durable") else 503, result)
                 if self.path == "/sync/status":
+                    if app.syncer.restoring:
+                        return self._json(
+                            503,
+                            {
+                                "status": "restoring",
+                                "restore_progress": getattr(
+                                    app.syncer, "progress", {}
+                                ),
+                            },
+                        )
                     return self._json(200, app.store.sync_status())
             except (ValueError, json.JSONDecodeError) as exc:
                 return self._json(400, {"error": str(exc)})

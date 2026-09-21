@@ -2675,6 +2675,20 @@ class Translator:
         return self.normalize_document(raw)[0]
 
 
+class RestoreFiles(list):
+    """File list returned by restore file enumeration carrying Hub metadata."""
+
+    def __init__(
+        self,
+        files: list[str],
+        manifest: dict[str, Any] | None = None,
+        revision: str | None = None,
+    ):
+        super().__init__(files)
+        self.manifest = manifest
+        self.revision = revision
+
+
 class SnapshotSync:
     def __init__(self, store: Store):
         self.store = store
@@ -2692,6 +2706,12 @@ class SnapshotSync:
         self.manifest_filename = os.getenv(
             "FUNES_RESTORE_MANIFEST_FILE", "funes-restore-manifest-v1.json"
         )
+        checkpoint_filename = os.getenv(
+            "FUNES_RESTORE_CHECKPOINT_FILE", "funes-restore-checkpoint-v1.json"
+        )
+        if not self._safe_repo_filename(checkpoint_filename):
+            raise ValueError("invalid restore checkpoint filename")
+        self.restore_checkpoint_filename = checkpoint_filename
         self.restore_batch = max(50, int(os.getenv("FUNES_RESTORE_BATCH", "500")))
         try:
             restore_download_workers = int(
@@ -2702,6 +2722,7 @@ class SnapshotSync:
         self.restore_download_workers = max(1, min(restore_download_workers, 32))
         self._restore_prefetch_root: Path | None = None
         self._restore_revision: str | None = None
+        self._restore_manifest: dict[str, Any] | None = None
         self.covered_revision: str | None = None
         self.restore_failed = False
         self.restore_error = None
@@ -2724,6 +2745,25 @@ class SnapshotSync:
         self.restore_error = type(exc).__name__
         self.store.set_sync(last_error=self.restore_error)
         return -1
+
+    @property
+    def restore_checkpoint_path(self) -> Path:
+        if not self._safe_repo_filename(self.restore_checkpoint_filename):
+            raise ValueError("invalid restore checkpoint filename")
+        return self.store.data_dir / self.restore_checkpoint_filename
+
+    @staticmethod
+    def _canonical_json_bytes(data: Any) -> bytes:
+        return json.dumps(
+            data,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+
+    @classmethod
+    def _canonical_digest(cls, data: Any) -> str:
+        return hashlib.sha256(cls._canonical_json_bytes(data)).hexdigest()
 
     def snapshot_path(self) -> Path:
         return self.store.data_dir / self.filename
@@ -3090,6 +3130,95 @@ class SnapshotSync:
                 state = latest
         raise RuntimeError("snapshot compaction changed repeatedly") from last_error
 
+    def _load_restore_checkpoint(
+        self,
+        revision: str | None,
+        manifest: dict[str, Any] | None,
+        files: list[str],
+    ) -> set[str]:
+        path = self.restore_checkpoint_path
+        if not path.is_file():
+            return set()
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict):
+                return set()
+            if raw.get("version") != 1:
+                return set()
+            if "revision" not in raw or raw["revision"] != revision:
+                return set()
+            manifest_digest = (
+                self._canonical_digest(manifest) if manifest is not None else None
+            )
+            if "manifest_digest" not in raw or raw["manifest_digest"] != manifest_digest:
+                return set()
+            files_list = list(files)
+            if raw.get("files") != files_list:
+                return set()
+            files_digest = self._canonical_digest(files_list)
+            if "files_digest" not in raw or raw["files_digest"] != files_digest:
+                return set()
+            completed = raw.get("completed")
+            if (
+                not isinstance(completed, list)
+                or len(completed) > len(files_list)
+                or len(completed) != len(set(completed))
+                or any(not isinstance(f, str) for f in completed)
+                or files_list[: len(completed)] != completed
+            ):
+                return set()
+            return set(completed)
+        except Exception:
+            return set()
+
+    def _record_restore_checkpoint(
+        self,
+        revision: str | None,
+        manifest: dict[str, Any] | None,
+        files: list[str],
+        completed: list[str],
+    ) -> None:
+        target = self.restore_checkpoint_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        manifest_digest = (
+            self._canonical_digest(manifest) if manifest is not None else None
+        )
+        files_digest = self._canonical_digest(list(files))
+        data = {
+            "version": 1,
+            "revision": revision,
+            "manifest_digest": manifest_digest,
+            "files_digest": files_digest,
+            "files": list(files),
+            "completed": list(completed),
+        }
+        encoded = self._canonical_json_bytes(data)
+        fd, tmp = tempfile.mkstemp(
+            prefix="funes-checkpoint-",
+            dir=str(target.parent),
+        )
+        try:
+            os.chmod(tmp, 0o600)
+            with os.fdopen(fd, "wb") as f:
+                f.write(encoded)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, target)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+
+    def _remove_restore_checkpoint(self) -> None:
+        try:
+            target = self.restore_checkpoint_path
+            if target.exists():
+                target.unlink()
+        except (OSError, ValueError):
+            pass
+
     def _repo_files(self) -> list[str]:
         """List snapshot and delta objects without exposing repository contents."""
         from huggingface_hub import HfApi
@@ -3097,13 +3226,18 @@ class SnapshotSync:
         state = self._remote_restore_state(api)
         self._restore_revision = state["head"]
         manifest = state["manifest"]
+        self._restore_manifest = manifest
         repo_files = state["repo_files"]
         if manifest is not None:
-            return [
-                manifest["snapshot"],
-                *manifest["deltas"],
-                *manifest["controls"],
-            ]
+            return RestoreFiles(
+                [
+                    manifest["snapshot"],
+                    *manifest["deltas"],
+                    *manifest["controls"],
+                ],
+                manifest=manifest,
+                revision=state["head"],
+            )
         files = list(self._source_artifact_names(repo_files))
         snapshots = sorted(name for name in files if name == self.filename + ".enc" or name.startswith(self.prefix))
         deltas = sorted(
@@ -3113,7 +3247,21 @@ class SnapshotSync:
         controls = sorted(name for name in files if name.startswith(self.control_prefix))
         # Controls replay last and carry monotonic per-derived-field generations.
         # This makes immutable hash-named deltas safe regardless of their order.
-        return snapshots + deltas + controls
+        return RestoreFiles(
+            snapshots + deltas + controls,
+            manifest=None,
+            revision=state["head"],
+        )
+
+    def _repo_files_metadata(
+        self,
+    ) -> tuple[list[str], dict[str, Any] | None, str | None]:
+        files = self._repo_files()
+        return (
+            list(files),
+            getattr(files, "manifest", self._restore_manifest),
+            getattr(files, "revision", self._restore_revision),
+        )
 
     def _restore_file(self, filename: str) -> int:
         encrypted = None
@@ -3182,55 +3330,89 @@ class SnapshotSync:
                     yield json.loads(line)
 
     def restore(self) -> int:
-        if self.repo and self.token:
-            try:
-                self._restore_revision = None
-                self.covered_revision = None
-                restored_revision = None
-                self.store.begin_bulk_restore()
+        with self.upload_lock:
+            if self.repo and self.token:
                 try:
-                    files = self._repo_files()
-                    restored_revision = self._restore_revision
-                    if not files:
-                        # Backwards-compatible single-file snapshot lookup.
-                        files = [self.filename + ".enc"]
-                    restored = 0
-                    self._restore_prefetch_root = self._prefetch_restore_files(files)
+                    self._restore_revision = None
+                    self._restore_manifest = None
+                    self.covered_revision = None
+                    restored_revision = None
+                    self.store.begin_bulk_restore()
                     try:
-                        for filename in files:
-                            restored += self._restore_file(filename)
+                        files, manifest, restored_revision = self._repo_files_metadata()
+                        self._restore_revision = restored_revision
+                        self._restore_manifest = manifest
+                        if not files:
+                            # Backwards-compatible single-file snapshot lookup.
+                            files = [self.filename + ".enc"]
+                        completed_files = self._load_restore_checkpoint(
+                            restored_revision, manifest, list(files)
+                        )
+                        completed_order = [f for f in files if f in completed_files]
+                        restored = 0
+                        remaining_files = [f for f in files if f not in completed_files]
+                        self._restore_prefetch_root = self._prefetch_restore_files(
+                            remaining_files
+                        )
+                        try:
+                            for filename in files:
+                                if filename in completed_files:
+                                    continue
+                                restored += self._restore_file(filename)
+                                completed_order.append(filename)
+                                self._record_restore_checkpoint(
+                                    restored_revision,
+                                    manifest,
+                                    list(files),
+                                    completed_order,
+                                )
+                        finally:
+                            self._restore_prefetch_root = None
+                        # A complete Hub restore can replay an old generation-zero
+                        # revision into an id below a partially persisted row cursor.
+                        # Rewind only here; ordinary local restarts keep their cursor.
+                        self.store.compact_reindex_controls(replay=True)
+                        self.store.drain_reindex_controls(self.restore_batch)
+                        self._remove_restore_checkpoint()
                     finally:
-                        self._restore_prefetch_root = None
-                    # A complete Hub restore can replay an old generation-zero
-                    # revision into an id below a partially persisted row cursor.
-                    # Rewind only here; ordinary local restarts keep their cursor.
-                    self.store.compact_reindex_controls(replay=True)
-                    self.store.drain_reindex_controls(self.restore_batch)
-                finally:
-                    self.store.finish_bulk_restore()
-                self.covered_revision = restored_revision
-                self._restore_revision = None
+                        self.store.finish_bulk_restore()
+                    self.covered_revision = restored_revision
+                    self._restore_revision = None
+                    self._restore_manifest = None
+                    self.restore_failed = False
+                    self.restore_error = None
+                    self.store.set_sync(last_error=None)
+                    self.restored = True
+                    return restored
+                except Exception as exc:  # optional recovery must never stop serving
+                    self._restore_revision = None
+                    self._restore_manifest = None
+                    status = getattr(getattr(exc, "response", None), "status_code", None)
+                    if status == 404 and self._truth("FUNES_ALLOW_EMPTY_REMOTE"):
+                        self.restore_failed = False
+                        self.restore_error = None
+                        self.store.set_sync(last_error=None)
+                        self.restored = True
+                        return 0
+                    return self._fail_restore(exc)
+            local = self.snapshot_path()
+            if not local.exists():
+                self.restore_failed = False
+                self.restore_error = None
+                self.store.set_sync(last_error=None)
+                self.restored = True
+                return 0
+            try:
+                restored = self.store.restore(local, apply_controls=False)
+                self.store.compact_reindex_controls()
+                self.store.drain_reindex_controls(self.restore_batch)
+                self.restore_failed = False
+                self.restore_error = None
+                self.store.set_sync(last_error=None)
                 self.restored = True
                 return restored
-            except Exception as exc:  # optional recovery must never stop serving
-                self._restore_revision = None
-                status = getattr(getattr(exc, "response", None), "status_code", None)
-                if status == 404 and self._truth("FUNES_ALLOW_EMPTY_REMOTE"):
-                    self.restored = True
-                    return 0
+            except Exception as exc:
                 return self._fail_restore(exc)
-        local = self.snapshot_path()
-        if not local.exists():
-            self.restored = True
-            return 0
-        try:
-            restored = self.store.restore(local, apply_controls=False)
-            self.store.compact_reindex_controls()
-            self.store.drain_reindex_controls(self.restore_batch)
-            self.restored = True
-            return restored
-        except Exception as exc:
-            return self._fail_restore(exc)
 
     def _secret_gate(self, path: Path) -> tuple[bool, str]:
         """Run the same TruffleHog CLI contract used by native `funes push`.
@@ -4315,6 +4497,9 @@ def make_handler(app: App):
                     result = queue_reindex(app, str(body.get("scope", "")))
                     return self._json(202 if result.get("durable") else 503, result)
                 if self.path == "/sync":
+                    if app.syncer.restoring or app.syncer.restore_failed:
+                        error = "restore_in_progress" if app.syncer.restoring else "restore_failed"
+                        return self._json(503, {"error": error, "durable": False})
                     result = app.syncer.upload()
                     return self._json(200 if result.get("durable") else 503, result)
                 if self.path == "/sync/status":

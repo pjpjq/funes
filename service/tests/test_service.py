@@ -4634,5 +4634,467 @@ class ServiceTests(unittest.TestCase):
             )
         store.close()
 
+    def test_restore_checkpoint_filename_security(self):
+        from service.server import SnapshotSync
+
+        store = Store(self.tmp.name)
+        for bad in (
+            "../checkpoint.json",
+            "/tmp/bad.json",
+            "sub/cp.json",
+            "..",
+        ):
+            with mock.patch.dict(os.environ, {"FUNES_RESTORE_CHECKPOINT_FILE": bad}):
+                with self.assertRaises(ValueError):
+                    SnapshotSync(store)
+        self.assertFalse(SnapshotSync._safe_repo_filename("cp\x00.json"))
+
+        syncer = SnapshotSync(store)
+        syncer.restore_checkpoint_filename = "../escape.json"
+        with self.assertRaises(ValueError):
+            _ = syncer.restore_checkpoint_path
+        store.close()
+
+    def test_restore_checkpoint_lifecycle_and_resume_skip(self):
+        from service.server import SnapshotSync
+
+        store = Store(self.tmp.name)
+        syncer = SnapshotSync(store)
+        syncer.repo = "owner/private"
+        syncer.token = "test-token"
+        files = [
+            "funes-snapshot.jsonl.gz.enc",
+            "funes-delta-1.jsonl.gz.enc",
+            "funes-delta-2.jsonl.gz.enc",
+        ]
+        manifest = {
+            "version": 1,
+            "snapshot": "funes-snapshot.jsonl.gz.enc",
+            "deltas": ["funes-delta-1.jsonl.gz.enc", "funes-delta-2.jsonl.gz.enc"],
+            "controls": [],
+        }
+        revision = "sha-rev-1"
+        restored_files = []
+
+        def mock_restore_file(filename):
+            restored_files.append(filename)
+            return 1
+
+        checkpoint_path = syncer.restore_checkpoint_path
+        syncer._record_restore_checkpoint(
+            revision,
+            manifest,
+            files,
+            ["funes-snapshot.jsonl.gz.enc", "funes-delta-1.jsonl.gz.enc"],
+        )
+        self.assertTrue(checkpoint_path.is_file())
+
+        with mock.patch.object(
+            syncer, "_repo_files_metadata", return_value=(files, manifest, revision)
+        ), mock.patch.object(
+            syncer, "_prefetch_restore_files", return_value=None
+        ), mock.patch.object(
+            syncer, "_restore_file", side_effect=mock_restore_file
+        ):
+            result = syncer.restore()
+
+        self.assertEqual(result, 1)
+        self.assertEqual(restored_files, ["funes-delta-2.jsonl.gz.enc"])
+        self.assertFalse(checkpoint_path.exists())
+        self.assertFalse(syncer.restore_failed)
+        self.assertIsNone(syncer.restore_error)
+        store.close()
+
+    def test_restore_checkpoint_retained_on_failure_and_resumed(self):
+        from service.server import SnapshotSync
+
+        store = Store(self.tmp.name)
+        syncer = SnapshotSync(store)
+        syncer.repo = "owner/private"
+        syncer.token = "test-token"
+        files = [
+            "funes-snapshot.jsonl.gz.enc",
+            "funes-delta-fail.jsonl.gz.enc",
+            "funes-delta-last.jsonl.gz.enc",
+        ]
+        revision = "sha-fail-1"
+        restored_calls = []
+
+        def mock_restore_fail(filename):
+            restored_calls.append(filename)
+            if filename == "funes-delta-fail.jsonl.gz.enc":
+                raise RuntimeError("simulated download failure")
+            return 10
+
+        with mock.patch.object(
+            syncer, "_repo_files_metadata", return_value=(files, None, revision)
+        ), mock.patch.object(
+            syncer, "_prefetch_restore_files", return_value=None
+        ), mock.patch.object(
+            syncer, "_restore_file", side_effect=mock_restore_fail
+        ):
+            res1 = syncer.restore()
+
+        self.assertEqual(res1, -1)
+        self.assertTrue(syncer.restore_failed)
+        self.assertEqual(syncer.restore_error, "RuntimeError")
+        self.assertEqual(
+            restored_calls,
+            ["funes-snapshot.jsonl.gz.enc", "funes-delta-fail.jsonl.gz.enc"],
+        )
+
+        checkpoint_path = syncer.restore_checkpoint_path
+        self.assertTrue(checkpoint_path.is_file())
+        saved_checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+        self.assertEqual(saved_checkpoint["completed"], ["funes-snapshot.jsonl.gz.enc"])
+
+        restored_calls.clear()
+
+        def mock_restore_success(filename):
+            restored_calls.append(filename)
+            return 5
+
+        with mock.patch.object(
+            syncer, "_repo_files_metadata", return_value=(files, None, revision)
+        ), mock.patch.object(
+            syncer, "_prefetch_restore_files", return_value=None
+        ), mock.patch.object(
+            syncer, "_restore_file", side_effect=mock_restore_success
+        ):
+            res2 = syncer.restore()
+
+        self.assertEqual(res2, 10)
+        self.assertEqual(
+            restored_calls,
+            ["funes-delta-fail.jsonl.gz.enc", "funes-delta-last.jsonl.gz.enc"],
+        )
+        self.assertFalse(checkpoint_path.exists())
+        self.assertFalse(syncer.restore_failed)
+        self.assertIsNone(syncer.restore_error)
+        store.close()
+
+    def test_restore_checkpoint_strict_completed_prefix_validation(self):
+        from service.server import SnapshotSync
+
+        store = Store(self.tmp.name)
+        syncer = SnapshotSync(store)
+        files = ["snap.enc", "delta-1.enc", "delta-2.enc"]
+        revision = "rev-strict"
+        manifest = None
+        checkpoint_path = syncer.restore_checkpoint_path
+
+        def write_cp(completed):
+            syncer._record_restore_checkpoint(revision, manifest, files, completed)
+
+        # Exact prefix match: valid
+        write_cp(["snap.enc", "delta-1.enc"])
+        self.assertEqual(
+            syncer._load_restore_checkpoint(revision, manifest, files),
+            {"snap.enc", "delta-1.enc"},
+        )
+
+        # Gap in sequence (not a prefix)
+        write_cp(["snap.enc", "delta-2.enc"])
+        self.assertEqual(
+            syncer._load_restore_checkpoint(revision, manifest, files), set()
+        )
+
+        # Out of order
+        write_cp(["delta-1.enc", "snap.enc"])
+        self.assertEqual(
+            syncer._load_restore_checkpoint(revision, manifest, files), set()
+        )
+
+        # Missing first item
+        write_cp(["delta-1.enc"])
+        self.assertEqual(
+            syncer._load_restore_checkpoint(revision, manifest, files), set()
+        )
+
+        # Duplicate entries
+        data = {
+            "version": 1,
+            "revision": revision,
+            "manifest_digest": None,
+            "files_digest": syncer._canonical_digest(files),
+            "files": files,
+            "completed": ["snap.enc", "snap.enc"],
+        }
+        checkpoint_path.write_text(json.dumps(data), encoding="utf-8")
+        self.assertEqual(
+            syncer._load_restore_checkpoint(revision, manifest, files), set()
+        )
+
+        # Non-string entries
+        data["completed"] = ["snap.enc", 123]
+        checkpoint_path.write_text(json.dumps(data), encoding="utf-8")
+        self.assertEqual(
+            syncer._load_restore_checkpoint(revision, manifest, files), set()
+        )
+
+        # Completed longer than files
+        data["completed"] = ["snap.enc", "delta-1.enc", "delta-2.enc", "extra.enc"]
+        checkpoint_path.write_text(json.dumps(data), encoding="utf-8")
+        self.assertEqual(
+            syncer._load_restore_checkpoint(revision, manifest, files), set()
+        )
+        store.close()
+
+    def test_restore_checkpoint_metadata_invalidation(self):
+        from service.server import SnapshotSync
+
+        store = Store(self.tmp.name)
+        syncer = SnapshotSync(store)
+        files = ["snap.enc", "delta-1.enc"]
+        manifest = {
+            "version": 1,
+            "snapshot": "snap.enc",
+            "deltas": ["delta-1.enc"],
+            "controls": [],
+        }
+        revision = "rev-1"
+
+        syncer._record_restore_checkpoint(revision, manifest, files, ["snap.enc"])
+
+        # Matches initially
+        self.assertEqual(
+            syncer._load_restore_checkpoint(revision, manifest, files),
+            {"snap.enc"},
+        )
+
+        # Changed revision
+        self.assertEqual(
+            syncer._load_restore_checkpoint("rev-2", manifest, files),
+            set(),
+        )
+
+        # Changed manifest content
+        other_manifest = dict(manifest, deltas=["delta-2.enc"])
+        self.assertEqual(
+            syncer._load_restore_checkpoint(revision, other_manifest, files),
+            set(),
+        )
+
+        # None manifest vs dict manifest
+        self.assertEqual(
+            syncer._load_restore_checkpoint(revision, None, files),
+            set(),
+        )
+
+        # Changed files list
+        other_files = ["snap.enc", "delta-2.enc"]
+        self.assertEqual(
+            syncer._load_restore_checkpoint(revision, manifest, other_files),
+            set(),
+        )
+        store.close()
+
+    def test_restore_checkpoint_corrupted_json_or_invalid_schema(self):
+        from service.server import SnapshotSync
+
+        store = Store(self.tmp.name)
+        syncer = SnapshotSync(store)
+        checkpoint_path = syncer.restore_checkpoint_path
+        files = ["snap.enc"]
+        revision = "rev-1"
+
+        # Not a file
+        self.assertEqual(syncer._load_restore_checkpoint(revision, None, files), set())
+
+        # Corrupted JSON syntax
+        checkpoint_path.write_text("{malformed json: true", encoding="utf-8")
+        self.assertEqual(syncer._load_restore_checkpoint(revision, None, files), set())
+
+        # Non-dict JSON (e.g. list, string, number)
+        checkpoint_path.write_text("[1, 2, 3]", encoding="utf-8")
+        self.assertEqual(syncer._load_restore_checkpoint(revision, None, files), set())
+        checkpoint_path.write_text('"checkpoint"', encoding="utf-8")
+        self.assertEqual(syncer._load_restore_checkpoint(revision, None, files), set())
+
+        # Version mismatch
+        checkpoint_path.write_text(
+            json.dumps({"version": 2, "revision": revision}), encoding="utf-8"
+        )
+        self.assertEqual(syncer._load_restore_checkpoint(revision, None, files), set())
+
+        # Missing digests
+        checkpoint_path.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "revision": revision,
+                    "files": files,
+                    "completed": files,
+                }
+            ),
+            encoding="utf-8",
+        )
+        self.assertEqual(syncer._load_restore_checkpoint(revision, None, files), set())
+        store.close()
+
+    def test_restore_checkpoint_nested_delta(self):
+        from service.server import SnapshotSync
+
+        store = Store(self.tmp.name)
+        syncer = SnapshotSync(store)
+        syncer.repo = "owner/private"
+        syncer.token = "test-token"
+        nested_files = [
+            "funes-snapshot.jsonl.gz.enc",
+            "deltas/4a/funes-delta-4a1b2c3d.jsonl.gz.enc",
+            "deltas/8f/funes-delta-8f9e0a1b.jsonl.gz.enc",
+        ]
+        manifest = {
+            "version": 1,
+            "snapshot": nested_files[0],
+            "deltas": nested_files[1:],
+            "controls": [],
+        }
+        revision = "rev-nested"
+        restored_files = []
+
+        def mock_restore_file(filename):
+            restored_files.append(filename)
+            return 1
+
+        # Record checkpoint with first two (snapshot + 1st nested delta)
+        syncer._record_restore_checkpoint(
+            revision,
+            manifest,
+            nested_files,
+            nested_files[:2],
+        )
+        self.assertEqual(
+            syncer._load_restore_checkpoint(revision, manifest, nested_files),
+            set(nested_files[:2]),
+        )
+
+        with mock.patch.object(
+            syncer,
+            "_repo_files_metadata",
+            return_value=(nested_files, manifest, revision),
+        ), mock.patch.object(
+            syncer, "_prefetch_restore_files", return_value=None
+        ), mock.patch.object(
+            syncer, "_restore_file", side_effect=mock_restore_file
+        ):
+            result = syncer.restore()
+
+        self.assertEqual(result, 1)
+        self.assertEqual(restored_files, [nested_files[2]])
+        self.assertFalse(syncer.restore_checkpoint_path.exists())
+        store.close()
+
+    def test_sync_endpoint_rejects_during_restoring_and_restore_failed(self):
+        app = mock.Mock()
+        app.store = Store(self.tmp.name)
+        app.syncer = mock.Mock()
+        app.syncer.restoring = True
+        app.syncer.restore_failed = False
+        app.syncer.upload = mock.Mock(return_value={"uploaded": True, "durable": True})
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(app))
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            # While restoring: 503 restore_in_progress
+            status, body = self._request(server, "POST", "/sync", {})
+            self.assertEqual(status, 503)
+            self.assertEqual(body, {"error": "restore_in_progress", "durable": False})
+            self.assertEqual(app.syncer.upload.call_count, 0)
+
+            # When restore_failed: 503 restore_failed
+            app.syncer.restoring = False
+            app.syncer.restore_failed = True
+            status, body = self._request(server, "POST", "/sync", {})
+            self.assertEqual(status, 503)
+            self.assertEqual(body, {"error": "restore_failed", "durable": False})
+            self.assertEqual(app.syncer.upload.call_count, 0)
+
+            # When healthy: 200 upload called
+            app.syncer.restore_failed = False
+            status, body = self._request(server, "POST", "/sync", {})
+            self.assertEqual(status, 200)
+            self.assertEqual(body, {"uploaded": True, "durable": True})
+            self.assertEqual(app.syncer.upload.call_count, 1)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+            app.store.close()
+
+    def test_restore_holds_upload_lock_against_concurrent_upload(self):
+        import time
+        from service.server import SnapshotSync
+
+        store = Store(self.tmp.name)
+        syncer = SnapshotSync(store)
+        syncer.repo = "owner/private"
+        syncer.token = "test-token"
+
+        files = ["snap.enc", "delta-1.enc"]
+        restore_started = threading.Event()
+        proceed_restore = threading.Event()
+        upload_attempted = threading.Event()
+        upload_finished = threading.Event()
+
+        def slow_restore_file(filename):
+            restore_started.set()
+            upload_attempted.wait(timeout=2)
+            proceed_restore.wait(timeout=2)
+            return 1
+
+        api = mock.Mock()
+        api.repo_info.return_value = mock.Mock(sha="rev-lock")
+        api.list_repo_tree.return_value = []
+
+        with mock.patch.object(
+            syncer, "_repo_files_metadata", return_value=(files, None, "rev-lock")
+        ), mock.patch.object(
+            syncer, "_prefetch_restore_files", return_value=None
+        ), mock.patch.object(
+            syncer, "_restore_file", side_effect=slow_restore_file
+        ), mock.patch.object(
+            syncer, "_encryption_key", return_value=b"0" * 32
+        ), mock.patch(
+            "huggingface_hub.HfApi", return_value=api
+        ):
+            restore_thread = threading.Thread(target=syncer.restore)
+            restore_thread.start()
+
+            restore_started.wait(timeout=2)
+
+            lock_acquired_by_main = syncer.upload_lock.acquire(blocking=False)
+            self.assertFalse(
+                lock_acquired_by_main,
+                "Main thread should not acquire upload_lock while restore holds it",
+            )
+
+            def run_upload():
+                upload_attempted.set()
+                syncer.upload()
+                upload_finished.set()
+
+            upload_thread = threading.Thread(target=run_upload)
+            upload_thread.start()
+
+            upload_attempted.wait(timeout=2)
+            time.sleep(0.05)
+            self.assertFalse(
+                upload_finished.is_set(),
+                "Upload should be blocked while restore holds upload_lock",
+            )
+
+            proceed_restore.set()
+            restore_thread.join(timeout=2)
+            upload_thread.join(timeout=2)
+
+            self.assertTrue(
+                upload_finished.is_set(),
+                "Upload should finish after restore releases upload_lock",
+            )
+            self.assertFalse(syncer.restore_failed)
+        store.close()
+
 if __name__ == "__main__":
     unittest.main()

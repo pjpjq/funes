@@ -54,7 +54,7 @@ use lance::dataset::{
 };
 use lance::index::DatasetIndexExt;
 use lance_index::optimize::OptimizeOptions;
-use lance_io::object_store::WrappingObjectStore;
+use lance_io::object_store::{ChainedWrappingObjectStore, WrappingObjectStore};
 use object_store::ObjectStore as OSObjectStore;
 
 use super::capture_store::{CaptureStore, Captured};
@@ -101,7 +101,7 @@ pub(crate) enum Replaced {
 pub(crate) async fn append(
     repo: &HFRepository<RepoTypeDataset>,
     dataset_uri: &str,
-    storage_options: HashMap<String, String>,
+    mut storage_options: HashMap<String, String>,
     rev: &str,
     message: String,
     batches: Vec<RecordBatch>,
@@ -109,6 +109,11 @@ pub(crate) async fn append(
     extra_files: &BTreeMap<String, Bytes>,
 ) -> Result<Appended> {
     let parent = head_oid(repo, rev).await?;
+    // Pin every read made by the append to the head we are going to guard.  The fetch
+    // wrapper below serves this immutable revision from the local Hub cache, avoiding a
+    // fresh remote range request for every Lance fragment during the write.
+    storage_options.insert("revision".to_string(), parent.clone());
+    storage_options.insert("hf_revision".to_string(), parent.clone());
     let (mut ds, wrapper) = open_capturing(dataset_uri, storage_options).await?;
     if schema.column_with_name("source_identity").is_some() {
         dataset::ensure_canonical_columns(&mut ds).await?;
@@ -275,11 +280,13 @@ const COMPACT_DELTAS: usize = 8;
 pub(crate) async fn reindex(
     repo: &HFRepository<RepoTypeDataset>,
     dataset_uri: &str,
-    storage_options: HashMap<String, String>,
+    mut storage_options: HashMap<String, String>,
     rev: &str,
     message: String,
 ) -> Result<Reindexed> {
     let parent = head_oid(repo, rev).await?;
+    storage_options.insert("revision".to_string(), parent.clone());
+    storage_options.insert("hf_revision".to_string(), parent.clone());
     let (mut ds, wrapper) = open_capturing(dataset_uri, storage_options).await?;
     dataset::ensure_required_indexes(&mut ds, |_| {}).await?;
 
@@ -317,13 +324,15 @@ pub(crate) async fn reindex(
 pub async fn add_column(
     repo: &HFRepository<RepoTypeDataset>,
     dataset_uri: &str,
-    storage_options: HashMap<String, String>,
+    mut storage_options: HashMap<String, String>,
     rev: &str,
     message: String,
     transform: NewColumnTransform,
     read_columns: Vec<String>,
 ) -> Result<String> {
     let parent = head_oid(repo, rev).await?;
+    storage_options.insert("revision".to_string(), parent.clone());
+    storage_options.insert("hf_revision".to_string(), parent.clone());
     let (mut ds, wrapper) = open_capturing(dataset_uri, storage_options).await?;
     ds.add_columns(transform, Some(read_columns), None)
         .await
@@ -389,13 +398,41 @@ async fn open_capturing(
     let wrapper = Arc::new(CaptureWrapper {
         captured: Captured::default(),
     });
+    let (owner, name, _) = hub::parse_hf(dataset_uri)?;
+    let revision = storage_options
+        .get("hf_revision")
+        .or_else(|| storage_options.get("revision"))
+        .context("remote write requires a pinned Hub revision")?
+        .clone();
+    let token = storage_options
+        .get("hf_token")
+        .cloned()
+        .or_else(hub::hf_token);
+    let fetch = fetch_wrapper_at(&owner, &name, token.as_deref(), &revision)?;
+    // Chaining is installed before DatasetBuilder::load(), so metadata, manifests, fragment
+    // scans, and the subsequent MergeInsert all use the same disk-backed FetchStore.  Capture
+    // remains the outer layer: reads see FetchStore, while writes stop at CaptureStore and are
+    // uploaded in one guarded Hub commit.
+    let chained = capturing_fetch_wrapper(fetch, wrapper.clone());
     let ds = DatasetBuilder::from_uri(dataset_uri)
+        .with_store_params(lance_io::object_store::ObjectStoreParams {
+            object_store_wrapper: Some(chained),
+            ..Default::default()
+        })
         .with_storage_options(storage_options)
         .load()
         .await
         .context("opening the remote dataset")?;
-    let ds = ds.with_object_store_wrappers([wrapper.clone() as Arc<dyn WrappingObjectStore>]);
     Ok((ds, wrapper))
+}
+
+/// Compose the write path as `CaptureStore(FetchStore(remote))`: reads use the pinned local
+/// cache, while writes stop at the capture and never reach the Hub object store directly.
+fn capturing_fetch_wrapper(
+    fetch: Arc<FetchWrapper>,
+    capture: Arc<CaptureWrapper>,
+) -> Arc<dyn WrappingObjectStore> {
+    Arc::new(ChainedWrappingObjectStore::new(vec![fetch, capture]))
 }
 
 /// The captured writes as repo-path → bytes — the files Lance wrote, ready to commit.
@@ -684,6 +721,80 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
     use lance_index::scalar::InvertedIndexParams;
     use lance_index::IndexType;
+    use object_store::memory::InMemory;
+    use object_store::{GetOptions, PutOptions, PutPayload};
+
+    #[derive(Debug)]
+    struct StaticFetcher {
+        dir: tempfile::TempDir,
+        body: Bytes,
+    }
+
+    #[async_trait]
+    impl FileFetcher for StaticFetcher {
+        async fn fetch(&self, _filename: &str) -> Result<PathBuf> {
+            let path = self.dir.path().join("cached");
+            std::fs::write(&path, &self.body)?;
+            Ok(path)
+        }
+
+        async fn discard(&self, path: &Path) -> Result<()> {
+            std::fs::remove_file(path)?;
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn capturing_write_path_reads_fetch_cache_and_never_forwards_writes() {
+        let inner = Arc::new(InMemory::new());
+        let source = object_store::path::Path::from("chunks.lance/data/source.lance");
+        inner
+            .put_opts(
+                &source,
+                PutPayload::from_static(b"remote"),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap();
+
+        let fetch = Arc::new(FetchWrapper {
+            fetcher: Arc::new(StaticFetcher {
+                dir: tempfile::tempdir().unwrap(),
+                body: Bytes::from_static(b"cached"),
+            }),
+        });
+        let capture = Arc::new(CaptureWrapper {
+            captured: Captured::default(),
+        });
+        let store = capturing_fetch_wrapper(fetch, capture.clone()).wrap("", inner.clone());
+
+        let read = store
+            .get_opts(&source, GetOptions::default())
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(read, Bytes::from_static(b"cached"), "reads must use FetchStore");
+
+        let written = object_store::path::Path::from("chunks.lance/data/new.lance");
+        store
+            .put_opts(
+                &written,
+                PutPayload::from_static(b"captured"),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            capture.captured.lock().unwrap().get(&written),
+            Some(&Bytes::from_static(b"captured"))
+        );
+        assert!(
+            inner.get_opts(&written, GetOptions::default()).await.is_err(),
+            "writes must not reach the remote store"
+        );
+    }
 
     /// Pins the Lance behavior [`reindex`] relies on: `append()` adds one delta sub-index per
     /// backlog, and `merge(deltas)` folds the deltas back into one without touching the base.

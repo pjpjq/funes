@@ -1,6 +1,6 @@
 # Northflank PostgreSQL 全量导入演练
 
-**2026-09-23，北京时间；演练进行中，尚未切换生产。**
+**2026-09-23，北京时间；基线 COPY 与全列校验已完成，最终增量捕获进行中，尚未切换生产。**
 
 ## 范围和不可越过的验收边界
 
@@ -20,6 +20,38 @@
 ```text
 8f72d49271e326f30acb489b921c686ac3b4c4186cd991d251475205c4467003
 ```
+
+## 02:59 基线完成；最终增量尚未封存
+
+2026-09-23 02:59:53，北京时间，原 importer 正常退出（exit 0），
+迁移台账为 `phase=verified`，四表实际全列读回摘要与固定源一致：
+
+| 表 | 已验证行数 |
+|---|---:|
+| memories | 3,590,437 |
+| translation_cache | 63 |
+| reindex_controls | 0 |
+| sync_state | 1 |
+
+此时 `migration_ready=false`。PG database 大小为
+17,971,592,215 字节（约 16.74 GiB），尚不包含全部延后构建索引，
+不能当作最终容量。该次主从检查的 replica lag 为 0；不是后续时刻保证。
+
+用户随后授权导入完成后切换 HF。三台来源机器的 connector 已停止，
+冻结清单的 pending 均为 0；队列清零不等于服务器全部版本已持久化。
+2026-09-23 03:52 发起的生产只读 `/sync/status` 返回
+`source_store.documents=3,678,253`，耗时 165.847 秒；HF 仍使用 SQLite。
+
+最后增量捕获必须保留现存源数据。已定位旧运行时的 full `/sync`
+返回 `remote_history_not_restored`：进程内覆盖版本和整个源仓库 HEAD
+比较，外部非 source 提交也可能使其失配。普通追加提交不会修复这一
+覆盖证明；不能以重启、伪造时间戳 replay 或清空 Hub 活跃清单绕过。
+当前仅重建固定 revision 的后缀，未宣称覆盖全部 live source metadata。
+
+新增离线工具 `build_source_postgres_tail_snapshot.py` 与
+`apply_source_postgres_tail.py` 分别支持固定版本重建和原子 COPY 差量应用，
+保留基线与旧源。未经完整源边界核验，不设置 `migration_ready=true`。
+原始 SQLite、HF 配置、Lance 与 Voyage embedding 均未因本阶段重建。
 
 ## 已执行的批量路径调整
 

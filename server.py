@@ -3433,7 +3433,6 @@ class Handler(BaseHTTPRequestHandler):
                     native_failure
                     and voyage_hot_path
                     and not source_restore_error
-                    and sidecar_fts_ready
                 ):
                     if native_failure in {"timeout", "unavailable"}:
                         request_native_recovery()
@@ -3442,7 +3441,7 @@ class Handler(BaseHTTPRequestHandler):
                     # thread here only burns CPU after the caller disconnects.
                     # Immediate provider/process failures retain most of the
                     # bounded Voyage window and may still use local BM25.
-                    if native_failure != "timeout":
+                    if native_failure != "timeout" and sidecar_fts_ready:
                         fallback_deadline = min(
                             time.monotonic() + VOYAGE_FALLBACK_TIMEOUT,
                             search_started + VOYAGE_HTTP_TIMEOUT,

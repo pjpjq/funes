@@ -1085,7 +1085,7 @@ def test_remote_failure_keeps_pending_for_recovery(tmp_path):
     s.close()
 
 
-def test_remote_source_reconciliation_acks_present_session_records_only(tmp_path):
+def test_remote_source_reconciliation_keeps_present_records_pending(tmp_path):
     class Client:
         def __init__(self):
             self.calls = []
@@ -1121,16 +1121,16 @@ def test_remote_source_reconciliation_acks_present_session_records_only(tmp_path
 
         result = daemon.reconcile_remote_sources(1)
 
-        assert result["acknowledged"] == 1
+        assert result["acknowledged"] == 0
         assert result["queued"] == 1
         assert result["checked"] == 3
 
         remaining = [r["record_id"] for r in s.pending(limit=10)]
-        assert "s_session" not in remaining
+        assert "s_session" in remaining
         assert "s_memory" in remaining
         assert "s_missing" in remaining
         assert "s_retired" in remaining
-        assert s.pending_count() == 3
+        assert s.pending_count() == 4
     finally:
         s.close()
 

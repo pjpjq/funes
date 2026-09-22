@@ -156,7 +156,7 @@ class SyncDaemon:
         force: bool = False,
         interruptible: bool = False,
     ) -> dict:
-        """Queue only local identities absent from the durable remote source store."""
+        """Queue absent identities without acknowledging pending local revisions."""
         required=("meta_value","record_ids_after","enqueue_records","set_meta")
         if any(not hasattr(self.store,name) for name in required):
             return {"complete":True,"checked":0,"queued":0,"acknowledged":0,"skipped":True}
@@ -183,10 +183,9 @@ class SyncDaemon:
             except Exception as exc:
                 log.warning("remote source inventory unavailable: %s",type(exc).__name__)
                 return {"complete":False,"checked":checked,"queued":queued,"acknowledged":acknowledged,"error":type(exc).__name__}
-            missing_set=set(missing)
-            present=[i for i in identities if i not in missing_set]
-            if present and hasattr(self.store,"ack_session_records"):
-                acknowledged+=self.store.ack_session_records(present)
+            # Presence proves neither the current revision nor its durability.
+            # Only a completed durable ingest may acknowledge pending updates,
+            # including tombstones and metadata changes to session records.
             queued+=self.store.enqueue_records(missing)
             checked+=len(identities)
             batches+=1

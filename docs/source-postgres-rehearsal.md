@@ -240,3 +240,38 @@ identities，并在只读副本发起中途检查。副本确认处于 recovery�
 40 GiB/副本减去 17.087903 GiB 样本外推的名义余量是
 **22.912097 GiB**，不是 2.912097 GiB。实际可用空间还需扣除其他
 数据库、WAL、临时文件等。最终报告以真库全量测量为准。
+
+## 07:18 全量基线主库 canonical hydration 实测
+
+2026-09-23 07:18:59 北京时间的脱敏证据记录：主库实际为
+**3,590,437 行**，schema version 2，使用 runtime role 只读测量。
+沿用冻结 SQLite 前 8,001 行中选出的五类、每类 100 个 identities；
+它验证完整规模表上的固定样本，不代表全表均匀抽样或全量内容检索。
+`get(1)`、`get_many(10)`、`get_many(100)` 共 **15 个 lookup，各 20 次**，
+server/client 各 300 个样本，总耗时 60.718 秒。15 个 lookup 全部完成、
+无失败，所有已记录执行计划均使用 source_identity 唯一 B-tree，
+未见 Seq Scan。
+
+下表 p95 是五类各自 p95 的最小至最大值，**不是合并后的 p95**；
+max 为对应组内观测最大值，单位均为 ms：
+
+| 路径 | server p95 范围 | server max | client p95 范围 | client max |
+|---|---:|---:|---:|---:|
+| get，1 identity | 0.099–0.507 | 5.526 | 61.006–64.712 | 125.917 |
+| get_many，10 identities | 0.201–0.284 | 25.938 | 61.539–65.939 | 124.361 |
+| get_many，100 identities | 1.139–3.003 | 201.217 | 75.568–128.397 | 191.833 |
+
+**server p95 均低于 100 ms，但 client p95 并非全部低于 100 ms**：
+`error_diagnostic` 的 100 条回填为 **128.397 ms（约 128.4 ms）**。
+保留全部峰值，不用 p95 隐去冷页读取可能造成的尖峰；本次未控制缓存，
+不能称为严格 cold-cache 测试，也不能将最大值确定归因于冷缓存。
+server 是 EXPLAIN ANALYZE 的执行时间，不含 planning；client 是另一次
+SELECT 的 execute + 完整 fetch。二者不是同一次执行，不相减推算网络 RTT。
+
+本节仅测 `source_identity` B-tree 的 canonical source 回填，不测
+数字主键 fallback、`search_identifiers` token 搜索、native/Lance 检索或
+HTTP 端到端 recall。`migration_ready=false`；此结果不是切换生产证据。
+输入只含行数和延迟，未含 heap/TOAST/index/database 字节数，不能替代
+前述最终九索引 schema 的容量验收。完整脱敏数值及测量边界见
+`docs/benchmarks/source-postgres-hydration-full-20260923.json`；未收录
+DSN、主机、源 identity、查询原文、payload 或未脱敏计划。

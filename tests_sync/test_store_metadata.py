@@ -594,7 +594,7 @@ def test_pending_query_plan_uses_ready_order_index_without_temp_btree(tmp_path):
         store.close()
 
 
-def test_ack_session_records_only_deletes_appendable_session_kinds(tmp_path):
+def test_ack_session_records_preserves_all_source_kinds_and_checkpoint(tmp_path):
     cfg = Config(tmp_path, tmp_path / ".state", tmp_path / "config.toml")
     store = Store(config=cfg)
     try:
@@ -631,6 +631,7 @@ def test_ack_session_records_only_deletes_appendable_session_kinds(tmp_path):
         ]
         store.upsert_chunks(chunks)
         assert store.pending_count() == 10
+        previous_changes = store.db.total_changes
 
         # Empty list returns 0
         assert store.ack_session_records([]) == 0
@@ -640,27 +641,22 @@ def test_ack_session_records_only_deletes_appendable_session_kinds(tmp_path):
         assert store.ack_session_records(["non_existent_id"]) == 0
         assert store.pending_count() == 10
 
-        # ACK all records: only the 6 active session sources should be pruned
+        # Identity-only ACK cannot confirm any source kind is durably uploaded.
         all_ids = [c.record_id for c in chunks] + ["non_existent_id"]
         deleted = store.ack_session_records(all_ids)
 
-        assert deleted == 6
-        assert store.pending_count() == 4
+        assert deleted == 0
+        assert store.pending_count() == 10
 
         remaining = [r["record_id"] for r in store.pending(limit=10)]
-        assert set(remaining) == {
-            "rec_s_mem",
-            "rec_s_agents",
-            "rec_s_persist",
-            "rec_s_retired",
-        }
+        assert set(remaining) == {c.record_id for c in chunks}
 
         sync_meta = store.meta_value("last_successful_sync")
-        assert sync_meta is not None
-        assert len(sync_meta) > 0
+        assert sync_meta is None
 
-        # Subsequent ACK is idempotent
+        # Repeated compatibility calls remain zero-write no-ops.
         assert store.ack_session_records(all_ids) == 0
-        assert store.pending_count() == 4
+        assert store.pending_count() == 10
+        assert store.db.total_changes == previous_changes
     finally:
         store.close()

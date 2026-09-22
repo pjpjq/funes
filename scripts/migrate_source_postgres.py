@@ -358,7 +358,10 @@ class Migration:
         key = quoted(KEYS[table])
         order = f"convert_to({key},'UTF8')" if table == "translation_cache" else key
         with (connection or self.pg).cursor(name="funes_source_verify", row_factory=tuple_row) as cursor:
-            cursor.itersize = 128
+            # This is a streaming cursor, not fetchall(). Larger blocks avoid
+            # one WAN round trip per 128 rows during prefix/final verification.
+            # 4096 rows remains bounded while reducing those round trips 32x.
+            cursor.itersize = 4096
             cursor.execute(f"SELECT {columns} FROM {quoted(table)} ORDER BY {order}")
             decoded = ((decode_pg_text(value) if isinstance(value, str) else value for value in row)
                        for row in cursor)

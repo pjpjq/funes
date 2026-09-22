@@ -1,11 +1,19 @@
 # PostgreSQL B＋非重复 shadow：同样本容量报告
 
-**2026-09-22，供 review；未修改生产 HF/PG，未全量导入。**
+**2026-09-22 样本 review 快照：当时未修改生产 HF/PG、未全量导入。**
+
+2026-09-23 已在 Northflank 的独立 `funes_source` 数据库开始全量导入
+演练；尚未切换生产。最新演练证据见
+[source-postgres-rehearsal.md](source-postgres-rehearsal.md)，不将下列样本数字
+冒充全量实测容量。
 
 ## 1. 结论与范围
 
 本次正式迁移器的隔离 10,000 行测试，外推 **3,590,437 行 =
 17.087903 GiB/单副本**，比 20 GiB 静态目标低 **2.912097 GiB**。
+当前磁盘配置是 **40 GiB/副本**，因此名义磁盘余量为
+**40 − 17.087903 = 22.912097 GiB**。上面的 2.912097 GiB 仅表示
+距离人为设定的 20 GiB 静态目标的差额，不是实际磁盘余量。
 这是关系文件静态容量估算，不是“20 GiB 磁盘可安全容纳运行峰值”的保证。
 WAL、备份、临时维护空间、未来增长及其他 schema **未计入**。
 没有乘以 3 replicas；三个完整副本的关系文件合计约 51.263709 GiB，
@@ -196,8 +204,12 @@ CREATE UNIQUE INDEX translation_cache_pkey ON translation_cache USING btree (que
   `previous_response_id` 等**内容标识符**仍由 native/Lance 检索，
   不是声称 PG 对 search_identifiers 建了精确内容索引。
 - native 未就绪时不偷偷扫描 359 万行 PG 原文，也不自动重建 PG FTS。
-  现有 `role/since/until` 等 native 不支持的过滤组合在关闭 PG FTS 后
-  返回明确 `503 source_fts_unavailable`；本轮不伪称已补齐过滤能力。
+  PG＋Voyage 且关闭 PG FTS 时，`role/since/until` 使用 native 有界
+  候选扩取、PG canonical identity 批量回填，再按 PG 最新 metadata 过滤。
+  窗口为 `min(4 × limit, FUNES_HTTP_MAX_CANDIDATES, 128)`，因此不是
+  穷尽式过滤检索：匹配项在窗口之外时可能返回空结果。日期按 UTC、
+  边界含等号处理，纯日期 `until` 指当天 00:00，不自动扩展到当天结束；
+  非法日期返回 400。native 或 hydration 失败时明确 503，不扫描原文。
 
 ### 验证记录
 
@@ -206,10 +218,17 @@ PG 实库契约测试覆盖 NULL/空字符串/NUL、原文回填、摘要迁移�
 Space 路由测试中的 native 输出使用 double，仅验证过滤透传、raw 回填、
 鉴权/失败闭合，不把它们当成真实 semantic recall 质量测试。
 
-Alice 隔离 PostgreSQL 16.15 完整 Python 回归：**617 passed、51 subtests passed、
+2026-09-22 样本 review 时，Alice 隔离 PostgreSQL 16.15 完整 Python 回归：**617 passed、51 subtests passed、
 16 skipped，83.00 秒**。覆盖 `service/tests`、`tests_space`、`tests_scripts`、
 `tests_sync`；跳过项为 macOS `lockf` 与 Node/平台限定的 Pi 扩展测试，
 不是 PostgreSQL 集成测试被跳过。
+
+2026-09-23 演练阶段回归：Alice 同一隔离测试库 **658 passed、
+17 skipped、51 subtests passed，81.84 秒**，退出码 0。此轮尚未同步
+新增 identifier benchmark 的脚本和测试；该部分包含在本机的
+benchmark、monitor、PG native routing 专项 **94 passed、1 skipped，
+2.42 秒** 中。两组覆盖有重叠，不相加成一个通过数；没有对 Northflank
+实库运行测试清库 fixture。全部跳过原因和演练边界见演练报告。
 
 ```sh
 FUNES_TEST_POSTGRES_DSN='dbname=funes_pg_test user=root host=/var/run/postgresql' \

@@ -10,8 +10,13 @@ its backups until a separately authorized cutover/rollback window closes.
 
 ## Review status and v2 storage boundary
 
-**September 22, 2026: code and isolated 10k-sample review only. No production
-PostgreSQL/HF cutover or full import has been performed by this change.**
+**September 22, 2026 review snapshot: code and isolated 10k-sample review only;
+no production PostgreSQL/HF cutover or full import had been performed then.**
+
+**September 23, 2026: an explicitly approved full COPY rehearsal is running in
+the dedicated Northflank `funes_source` database. Production is not switched,
+HF/Lance are unchanged, and readiness remains false.** See
+[source-postgres-rehearsal.md](source-postgres-rehearsal.md) for timestamped evidence.
 The same-sample capacity result is **17.0879 GiB per replica**, excluding WAL,
 backups, temporary maintenance space and future growth. See
 [source-postgres-capacity.md](source-postgres-capacity.md) for the complete
@@ -26,7 +31,7 @@ PostgreSQL serves durable source state, exact identity lookup and raw hydration.
 
 The importer also has a version-2 ledger. Runtime rejects v1, incomplete or
 incompatible schemas without DDL, fallback or an automatic rebuild. The commands
-below describe a future explicitly approved migration into a fresh v2 target;
+below describe an explicitly approved migration into a fresh v2 target;
 they are **not** an instruction to alter an existing production schema. Existing
 v1 data must be retained until a separately reviewed conversion/cutover.
 

@@ -11,8 +11,9 @@
 - `migration_ready` 必须保持 false；没有停写和 tail catchup 确认，
   不运行 `--finalize --tail-confirmed`。
 - 不禁用 fsync、同步提交、WAL 或主键/唯一约束来追求吞吐。
-- 用户已明确计算规格是当前免费额度上限，**不得升配或产生新增费用**。
-  下文升配价格只保留为历史诊断依据，不再作为获批执行方案。
+- 用户先要求固定免费规格，随后于本轮明确授权实际尝试一次临时
+  **1 vCPU / 2 GiB /副本**。只改计算 plan，三副本与每副本 40 GiB
+  存储不变；演练完成后需恢复 `nf-compute-20`，不扩大其他执行范围。
 
 源 SHA256：
 
@@ -91,7 +92,7 @@ TOAST 压缩和平台 I/O 也可能共同限制吞吐。
 持有排他锁，未经设计的并行 COPY 会竞争。`maintenance_work_mem`
 主要影响后续建索引，不是当前 COPY 的提速旋钮。只有证明 requested
 checkpoints 在快速增长后，才考虑无重启增加 `max_wal_size`，而且
-它并不能直接消除 `DataFileRead`。本次未改共享 PG 的参数或规格。
+它并不能直接消除 `DataFileRead`。上述诊断阶段未改共享 PG 的参数或规格。
 
 后续只读采样发现：01:38:31 → 01:55:15 的约 16 分 44 秒内，
 `checkpoints_req` 从 **16 增至 25**，`checkpoints_timed` 保持 2627，
@@ -102,7 +103,8 @@ checkpoints 在快速增长后，才考虑无重启增加 `max_wal_size`，而�
 供决策的 API 价格快照：`nf-compute-100-2` 是每副本 1 vCPU / 2 GiB，
 每小时 $0.033；当前每副本每小时 $0.008。三个副本临时升配的计算
 资源价差为 **3 × (0.033 − 0.008) = $0.075/小时**，不包括原有存储、
-网络、税费等。共享 addon 升配可能触发滚动切换和重连；目前未执行。
+网络、税费等。共享 addon 升配可能触发滚动切换和重连；该价格诊断
+阶段尚未执行，后续获批尝试见下一节。
 
 用户随后明确固定免费规格。只读读取官方 `/v1/swagger-json` 与 addon
 状态：公开定义没有 dry-run 参数或额度预校验接口，不能假定付费规格
@@ -110,6 +112,53 @@ PATCH 一定被拒绝。因此没有发送升配 PATCH，也没有声称观察�
 数据库内只读权限核对同时确认当前角色对 `max_wal_size` 没有
 `ALTER SYSTEM` 权限，也没有 `pg_reload_conf()` 执行权限；未改 WAL
 参数。继续沿用已有 COPY 优化，不因试探控制面而中断导入。
+
+## 02:18 获批实际升配尝试
+
+用户随后明确要求“你可以升配试试”，因此只提交一次以下最小请求：
+
+```http
+PATCH /v1/projects/new-api/addons/daili-postgres
+Content-Type: application/json
+
+{"billing":{"deploymentPlan":"nf-compute-100-2"}}
+```
+
+- 2026-09-23 02:18:02 北京时间发起；真实响应为 **HTTP 200**，不是
+  dry-run，也不是额度拒绝。此前没有发送 PATCH，不能混淆两次阶段。
+- 02:18:13 控制面已记入 reconcile；GET 回读 `status=scaling`、
+  `planId=nf-compute-100-2`、`replicas=3`、`storageSize=40960 MiB`、
+  `storageClass=nvme`。请求被接受不等于滚动切换已完成。
+- 变更前最后检查 importer 仍为 PID 111659、active/running；
+  02:16:44 已提交 2,371,038 / 3,590,437 条 memories。
+- 等待控制面恢复 running，并检查 importer 进度；不主动重启导入，
+  不修改 HF、Lance 或源 SQLite。若连接因切换退出，仅按已批准的
+  `--resume --defer-ready` 路径恢复，已提交 checkpoint 不清零。
+- 临时规格实际是否产生新增费用以平台计费为准；上述 API 标价差
+  为三副本合计 $0.075/小时。演练完成后恢复原 plan 的动作尚未执行。
+
+02:22:33 GET 确认 `status=running`、pendingActions 为空，新 plan 与
+三副本/40 GiB 均保持。只读主库探针确认 `pg_is_in_recovery=false`，
+`shared_buffers` 从 108 MiB 增至 **492 MiB**；主库启动时间为
+02:19:25。这证明不只是提交请求被接受，滚动变更已经生效。
+
+切换期间 importer 于 02:19:21 提交到 **2,404,898** 行；02:20:20
+返回 exit 1（未确认 migration readiness）。原 unit 不自动重启。
+最后已提交 checkpoint 必须保留；仅在新主库就绪并确认 marker 后，
+启动同一 `--resume --defer-ready` driver，恢复前仍校验已提交 prefix。
+
+恢复前只读 marker 实测：`phase=copying`，memories 的 `rows` 与
+`last_rowid` 均为 **2,404,898**，`complete=false`；冻结源 SHA256、
+25,935,802,368 字节大小与四表数量匹配原快照，verification 与
+final_verification 均为空。COPY 与 marker 在同一事务提交；中断批次
+不会把已提交断点推到未提交数据之后。
+
+02:24:19 同一 unit 已重新启动，PID **118067**、active/running，日志
+进入 `starting_resume` / `hashing_source`，参数仍为 100k/256 MiB，
+保留 `--resume --defer-ready`。独立 monitor unit 同时 active/running。
+恢复后的 marker 探针触及 importer 排他锁，按 2 秒 lock timeout 返回
+`55P03`；不据此误判 PG 失联或强行解除锁。当前尚无恢复后的新批次
+吞吐样本，不能把 CPU 上限 5 倍或内存 4 倍直接当作实际导入提速倍数。
 
 ## 监控、identifier 和最终容量验收
 

@@ -10,6 +10,13 @@ import pytest
 from scripts import benchmark_postgres_identifier_lookup as benchmark
 
 
+SESSION_SETUP_SQL = (
+    "SET statement_timeout='10s'",
+    "SET lock_timeout='1s'",
+    "SET default_transaction_read_only=on",
+)
+
+
 def index_plan(*, execution_ms=0.75, count=2):
     return [{
         "Plan": {
@@ -108,12 +115,14 @@ def test_batch_limits_are_bounded(limits):
 class FakeConnection:
     """A DB boundary that records SQL and carries deliberately sensitive rows."""
 
-    def __init__(self, *, plan_factory=None, missing=False, seqscan_setting="on", error=None, set_error=None):
+    def __init__(self, *, plan_factory=None, missing=False, seqscan_setting="on", error=None,
+                 set_error=None, set_error_statement=SESSION_SETUP_SQL[-1]):
         self.plan_factory = plan_factory or (lambda index, count: index_plan(execution_ms=index + 1, count=count))
         self.missing = missing
         self.seqscan_setting = seqscan_setting
         self.error = error
         self.set_error = set_error
+        self.set_error_statement = set_error_statement
         self.calls = []
         self.plan_count = 0
         self.preflight_count = 0
@@ -138,8 +147,8 @@ class FakeCursor:
 
     def execute(self, sql, parameters=None):
         self.connection.calls.append((sql, parameters))
-        if sql == "SET default_transaction_read_only=on":
-            if self.connection.set_error:
+        if sql in SESSION_SETUP_SQL:
+            if self.connection.set_error and sql == self.connection.set_error_statement:
                 raise self.connection.set_error
             self.rows = []
         elif sql.startswith("SELECT current_setting("):
@@ -269,27 +278,31 @@ def test_connect_selects_read_write_target_before_setting_read_only(monkeypatch)
     dsn = "postgresql://owner:SECRET@host1,host2/db?target_session_attrs=read-write"
     def connect(actual_dsn, **kwargs):
         assert actual_dsn == dsn
-        assert "default_transaction_read_only" not in kwargs["options"]
+        assert "options" not in kwargs
         assert kwargs["autocommit"] is True
-        assert "statement_timeout=10000" in kwargs["options"]
-        assert "lock_timeout=1000" in kwargs["options"]
+        assert kwargs["connect_timeout"] == 10
+        assert kwargs["prepare_threshold"] is None
         assert connection.calls == []
         return connection
     monkeypatch.setitem(sys.modules, "psycopg", SimpleNamespace(connect=connect))
     assert benchmark._connect_read_only(dsn) is connection
-    assert connection.calls == [("SET default_transaction_read_only=on", None)]
+    assert connection.calls == [(sql, None) for sql in SESSION_SETUP_SQL]
     assert all(cursor.closed for cursor in connection.cursors)
     assert not connection.closed
 
 
-def test_failed_read_only_setup_closes_connection_before_return(monkeypatch):
-    connection = FakeConnection(set_error=RuntimeError("SECRET"))
+@pytest.mark.parametrize("failed_statement", SESSION_SETUP_SQL)
+def test_failed_session_setup_closes_connection_before_return(monkeypatch, failed_statement):
+    connection = FakeConnection(set_error=RuntimeError("SETUP_SECRET"),
+                                set_error_statement=failed_statement)
     monkeypatch.setitem(sys.modules, "psycopg", SimpleNamespace(connect=lambda *args, **kwargs: connection))
-    with pytest.raises(benchmark.BenchmarkError, match="^database_connect_failed$"):
+    with pytest.raises(benchmark.BenchmarkError, match="^database_connect_failed$") as captured:
         benchmark._connect_read_only("postgresql://owner:SECRET@host1,host2/db?target_session_attrs=read-write")
+    assert "SECRET" not in str(captured.value)
     assert connection.closed
     assert all(cursor.closed for cursor in connection.cursors)
-    assert connection.calls == [("SET default_transaction_read_only=on", None)]
+    attempted = SESSION_SETUP_SQL[:SESSION_SETUP_SQL.index(failed_statement) + 1]
+    assert connection.calls == [(sql, None) for sql in attempted]
 
 
 def test_cli_defaults_to_twenty_samples_and_private_output(tmp_path, monkeypatch, capsys):
@@ -315,23 +328,23 @@ def test_cli_defaults_to_twenty_samples_and_private_output(tmp_path, monkeypatch
     kwargs = connect_arguments[0][1]
     assert kwargs["autocommit"] is True
     assert kwargs["prepare_threshold"] is None
-    assert "default_transaction_read_only" not in kwargs["options"]
-    assert connection.calls[0] == ("SET default_transaction_read_only=on", None)
-    assert "statement_timeout=10000" in kwargs["options"]
-    assert "lock_timeout=1000" in kwargs["options"]
+    assert "options" not in kwargs
+    assert connection.calls[:3] == [(sql, None) for sql in SESSION_SETUP_SQL]
     assert kwargs["connect_timeout"] == 10
     assert report_file.stat().st_mode & 0o777 == 0o600
     captured = capsys.readouterr()
     assert secret not in captured.out + captured.err + report_file.read_text()
 
 
-@pytest.mark.parametrize("failure_stage", ["connect", "set", "explain"])
+@pytest.mark.parametrize("failure_stage", ["connect", *SESSION_SETUP_SQL, "explain"])
 def test_cli_failures_overwrite_stale_success_without_exposing_dsn_or_raw(
     tmp_path, monkeypatch, capsys, failure_stage,
 ):
     secret = "postgresql://private:FAILED_DSN_SECRET@host/db"
     error = RuntimeError(secret + " source raw: FAILED_RAW_SECRET")
-    connection = FakeConnection(error=error, set_error=error if failure_stage == "set" else None)
+    connection = FakeConnection(error=error,
+                                set_error=error if failure_stage in SESSION_SETUP_SQL else None,
+                                set_error_statement=failure_stage)
     def connect(*args, **kwargs):
         if failure_stage == "connect":
             raise error
@@ -349,8 +362,13 @@ def test_cli_failures_overwrite_stale_success_without_exposing_dsn_or_raw(
     assert "FAILED_DSN_SECRET" not in combined
     assert "FAILED_RAW_SECRET" not in combined
     assert "Traceback" not in combined
-    if failure_stage in {"set", "explain"}:
+    if failure_stage != "connect":
         assert connection.closed
+        assert all(cursor.closed for cursor in connection.cursors)
+    if failure_stage in SESSION_SETUP_SQL:
+        assert json.loads(report_file.read_text())["error_code"] == "database_connect_failed"
+        attempted = SESSION_SETUP_SQL[:SESSION_SETUP_SQL.index(failure_stage) + 1]
+        assert connection.calls == [(sql, None) for sql in attempted]
 
 
 def test_cli_rejects_dsn_argument_without_echoing_it(capsys):

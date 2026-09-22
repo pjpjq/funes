@@ -407,12 +407,15 @@ def _connect_read_only(dsn: str):
             # Both measured SQL and EXPLAIN remain unprepared, not different
             # prepared/generic-plan lifecycles. Report this SQL-only boundary.
             prepare_threshold=None,
-            options="-c statement_timeout=10000 -c lock_timeout=1000",
         )
         # Let libpq finish multi-host target_session_attrs=read-write selection
         # before making this session read-only; startup read-only rejects it.
+        # Apply session settings with SQL: managed proxies may reject startup
+        # options. Autocommit keeps these SETs outside a transaction.
         cursor = conn.cursor()
         try:
+            cursor.execute("SET statement_timeout='10s'")
+            cursor.execute("SET lock_timeout='1s'")
             cursor.execute("SET default_transaction_read_only=on")
         finally:
             cursor.close()

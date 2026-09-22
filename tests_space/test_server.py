@@ -5080,6 +5080,84 @@ def test_voyage_native_timeout_skips_bm25_and_requests_recovery(monkeypatch):
     assert recovery_calls == [True]
 
 
+@pytest.mark.parametrize(
+    "native_error",
+    (
+        bridge.NativeMcpTimeoutError("native MCP request timed out"),
+        bridge.NativeMcpError("native MCP unavailable"),
+    ),
+)
+def test_voyage_native_timeout_and_unavailable_call_native_recovery_when_fts_not_ready(
+    monkeypatch, native_error
+):
+    """Voyage native timeout or unavailable calls recovery even when sidecar FTS is not ready."""
+    search_calls = []
+    recovery_calls = []
+
+    class Store:
+        def get(self, _identity):
+            return None
+
+        def search(self, *args, **kwargs):
+            search_calls.append((args, kwargs))
+            return [{
+                "source_identity": "session-hit",
+                "source_type": "memory",
+                "raw_text": "raw session text",
+            }]
+
+        def fts_ready(self):
+            return False
+
+    app = SimpleNamespace(
+        translator=SimpleNamespace(
+            rewrite_query=lambda _query: (_ for _ in ()).throw(
+                AssertionError("timeout path must not rewrite query")
+            )
+        ),
+        store=Store(),
+        syncer=SimpleNamespace(restoring=False, restore_failed=False),
+    )
+    monkeypatch.setattr(bridge, "SOURCE_APP", app)
+    monkeypatch.setattr(bridge, "TOKEN", "test-token")
+    monkeypatch.setenv("FUNES_EMBEDDING_PROVIDER", "voyage")
+    monkeypatch.setenv("FUNES_NATIVE_FALLBACK", "false")
+
+    def failing_native(*_args, **_kwargs):
+        raise native_error
+
+    monkeypatch.setattr(bridge, "recall", failing_native)
+    monkeypatch.setattr(
+        bridge,
+        "request_native_recovery",
+        lambda: recovery_calls.append(True),
+    )
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    started = time.monotonic()
+    try:
+        status, body, headers = _post_with_headers(
+            server,
+            "/search",
+            {"query": "failing native query", "limit": 3},
+        )
+        elapsed = time.monotonic() - started
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert status == 503
+    assert elapsed < 0.5
+    assert body["retrieval_degraded"] == "voyage_unavailable"
+    assert body["results"] == []
+    assert body["error"] == "native_mcp_unavailable"
+    assert search_calls == []
+    assert recovery_calls == [True]
+
+
 def test_voyage_blocked_native_timeout_skips_bm25_and_requests_recovery(monkeypatch):
     """A blocked native call timing out via deadline runner skips BM25 and calls recovery."""
     release_native = threading.Event()

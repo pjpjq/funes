@@ -1876,6 +1876,234 @@ class ServiceTests(unittest.TestCase):
         finally:
             store.close()
 
+    def test_fts_ready_transitions(self):
+        store = Store(self.tmp.name)
+        try:
+            # 1. Default store has fts_ready == True (1)
+            self.assertTrue(store.fts_ready())
+            self.assertTrue(store.sync_status()["fts_ready"])
+
+            # 2. begin_bulk_restore sets fts_ready == False (0)
+            store.begin_bulk_restore()
+            self.assertFalse(store.fts_ready())
+            self.assertFalse(store.sync_status()["fts_ready"])
+
+            # 3. finish_bulk_restore with rebuild_fts=False keeps fts_ready == False
+            store.finish_bulk_restore(rebuild_fts=False)
+            self.assertFalse(store.fts_ready())
+            self.assertFalse(store.sync_status()["fts_ready"])
+
+            # 4. reindex sets fts_ready == True
+            store.reindex()
+            self.assertTrue(store.fts_ready())
+            self.assertTrue(store.sync_status()["fts_ready"])
+
+            # 5. begin again -> 0 -> finish with rebuild_fts=True -> 1
+            store.begin_bulk_restore()
+            self.assertFalse(store.fts_ready())
+            store.finish_bulk_restore(rebuild_fts=True)
+            self.assertTrue(store.fts_ready())
+            self.assertTrue(store.sync_status()["fts_ready"])
+        finally:
+            store.close()
+
+    def test_lock_free_count_and_sync_status_while_store_lock_acquired(self):
+        store = Store(self.tmp.name)
+        try:
+            store.ingest([{"source_identity": "doc-1", "raw_text": "hello lock-free"}])
+            with store.lock:
+                # With store.lock held (simulating a long-running write operation),
+                # count(), sync_status(), and fts_ready() must complete without deadlocking
+                # or blocking on self.lock.
+                self.assertEqual(store.count(), 1)
+                status = store.sync_status()
+                self.assertEqual(status["documents"], 1)
+                self.assertTrue(status["fts_ready"])
+                self.assertTrue(store.fts_ready())
+        finally:
+            store.close()
+
+    def test_restore_fts_readiness_on_skip_fts_vs_rebuild(self):
+        from service.server import SnapshotSync
+
+        store = Store(self.tmp.name)
+        try:
+            files = ["funes-snapshot.jsonl.gz.enc"]
+            manifest = {
+                "version": 1,
+                "snapshot": "funes-snapshot.jsonl.gz.enc",
+                "deltas": [],
+                "controls": [],
+            }
+            revision = "sha-rev-checkpoint-fts"
+
+            def mock_restore_file(filename):
+                return 1
+
+            # Test 1: rebuild_fts=False -> completes restore without rebuilding FTS;
+            # checkpoint is removed on completion, and store.fts_ready() is False.
+            syncer_skip = SnapshotSync(store, rebuild_fts=False)
+            syncer_skip.repo = "owner/private"
+            syncer_skip.token = "test-token"
+            checkpoint_path = syncer_skip.restore_checkpoint_path
+            with mock.patch.object(
+                syncer_skip, "_repo_files_metadata", return_value=(files, manifest, revision)
+            ), mock.patch.object(
+                syncer_skip, "_prefetch_restore_files", return_value=None
+            ), mock.patch.object(
+                syncer_skip, "_restore_file", side_effect=mock_restore_file
+            ):
+                result = syncer_skip.restore()
+
+            self.assertEqual(result, 1)
+            self.assertFalse(checkpoint_path.exists())
+            self.assertFalse(store.fts_ready())
+
+            # Test 2: rebuild_fts=True -> rebuilds FTS; checkpoint is removed
+            # on completion, and store.fts_ready() is True.
+            syncer_rebuild = SnapshotSync(store, rebuild_fts=True)
+            syncer_rebuild.repo = "owner/private"
+            syncer_rebuild.token = "test-token"
+            with mock.patch.object(
+                syncer_rebuild, "_repo_files_metadata", return_value=(files, manifest, revision)
+            ), mock.patch.object(
+                syncer_rebuild, "_prefetch_restore_files", return_value=None
+            ), mock.patch.object(
+                syncer_rebuild, "_restore_file", side_effect=mock_restore_file
+            ):
+                result = syncer_rebuild.restore()
+
+            self.assertEqual(result, 1)
+            self.assertFalse(checkpoint_path.exists())
+            self.assertTrue(store.fts_ready())
+        finally:
+            store.close()
+
+    def test_fts_migration_preserves_or_rebuilds_readiness(self):
+        store = Store(self.tmp.name)
+        try:
+            store.ingest([{"source_identity": "doc-1", "raw_text": "hello world"}])
+            self.assertTrue(store.fts_ready())
+
+            # Manually simulate unready state (e.g. restore with rebuild_fts=False)
+            with store.lock, store.conn:
+                store.conn.execute("UPDATE sync_state SET fts_ready=0 WHERE id=1")
+        finally:
+            store.close()
+
+        # Reopen with FUNES_BULK_RESTORE_REBUILD_FTS=false -> preserves fts_ready == False
+        os.environ["FUNES_BULK_RESTORE_REBUILD_FTS"] = "false"
+        try:
+            store_preserved = Store(self.tmp.name)
+            try:
+                self.assertFalse(store_preserved.fts_ready())
+            finally:
+                store_preserved.close()
+        finally:
+            os.environ.pop("FUNES_BULK_RESTORE_REBUILD_FTS", None)
+
+        # Reopen with FUNES_BULK_RESTORE_REBUILD_FTS=true -> rebuilds and sets fts_ready == True
+        os.environ["FUNES_BULK_RESTORE_REBUILD_FTS"] = "true"
+        try:
+            store_rebuilt = Store(self.tmp.name)
+            try:
+                self.assertTrue(store_rebuilt.fts_ready())
+            finally:
+                store_rebuilt.close()
+        finally:
+            os.environ.pop("FUNES_BULK_RESTORE_REBUILD_FTS", None)
+
+    def test_unready_fts_search_behavior(self):
+        from types import SimpleNamespace
+        import server
+
+        # 1. source_fts_ready helper checks
+        self.assertFalse(server.source_fts_ready(None))
+        app_restoring = SimpleNamespace(
+            syncer=SimpleNamespace(restoring=True, restore_failed=False),
+            store=SimpleNamespace(fts_ready=lambda: True),
+        )
+        self.assertFalse(server.source_fts_ready(app_restoring))
+
+        app_failed = SimpleNamespace(
+            syncer=SimpleNamespace(restoring=False, restore_failed=True),
+            store=SimpleNamespace(fts_ready=lambda: True),
+        )
+        self.assertFalse(server.source_fts_ready(app_failed))
+
+        app_unready = SimpleNamespace(
+            syncer=SimpleNamespace(restoring=False, restore_failed=False),
+            store=SimpleNamespace(fts_ready=lambda: False, count=lambda: 1),
+            translator=SimpleNamespace(rewrite_query=lambda q: q),
+        )
+        self.assertFalse(server.source_fts_ready(app_unready))
+
+        app_ready = SimpleNamespace(
+            syncer=SimpleNamespace(restoring=False, restore_failed=False),
+            store=SimpleNamespace(fts_ready=lambda: True),
+        )
+        self.assertTrue(server.source_fts_ready(app_ready))
+
+        # 2. search_source_rankings and search_source_bm25_rankings skip FTS when unready
+        with mock.patch.object(server, "source_app", return_value=app_unready):
+            query, semantic, lexical = server.search_source_rankings(
+                "query", 10, filters={}
+            )
+            self.assertEqual(query, "query")
+            self.assertEqual(semantic, [])
+            self.assertEqual(lexical, [])
+
+            sem_bm25, lex_bm25 = server.search_source_bm25_rankings(
+                "query", 10, filters={}
+            )
+            self.assertEqual(sem_bm25, [])
+            self.assertEqual(lex_bm25, [])
+
+        # 3. HTTP handler returns 503 source_fts_unavailable when sidecar FTS is not ready:
+        # Case A: non-voyage embedding provider
+        with mock.patch.object(server, "source_app", return_value=app_unready),              mock.patch.object(server, "TOKEN", "test-token"),              mock.patch.object(server, "embedding_profile", return_value={"provider": "local"}):
+            server_local = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+            thread = threading.Thread(target=server_local.serve_forever, daemon=True)
+            thread.start()
+            try:
+                conn = HTTPConnection(*server_local.server_address)
+                conn.request(
+                    "POST",
+                    "/search",
+                    json.dumps({"query": "hello"}).encode(),
+                    {"Authorization": "Bearer test-token", "Content-Type": "application/json"},
+                )
+                resp = conn.getresponse()
+                body = json.loads(resp.read().decode())
+                self.assertEqual(resp.status, 503)
+                self.assertEqual(body.get("error"), "source_fts_unavailable")
+            finally:
+                server_local.shutdown()
+                server_local.server_close()
+                thread.join(timeout=1)
+
+        # Case B: voyage provider with unsupported native filter (e.g. "since")
+        with mock.patch.object(server, "source_app", return_value=app_unready),              mock.patch.object(server, "TOKEN", "test-token"),              mock.patch.object(server, "embedding_profile", return_value={"provider": "voyage", "fingerprint": "fp"}):
+            server_voyage = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+            thread = threading.Thread(target=server_voyage.serve_forever, daemon=True)
+            thread.start()
+            try:
+                conn = HTTPConnection(*server_voyage.server_address)
+                conn.request(
+                    "POST",
+                    "/search",
+                    json.dumps({"query": "hello", "since": 12345}).encode(),
+                    {"Authorization": "Bearer test-token", "Content-Type": "application/json"},
+                )
+                resp = conn.getresponse()
+                body = json.loads(resp.read().decode())
+                self.assertEqual(resp.status, 503)
+                self.assertEqual(body.get("error"), "source_fts_unavailable")
+            finally:
+                server_voyage.shutdown()
+                server_voyage.server_close()
+                thread.join(timeout=1)
+
     def test_bulk_restore_skips_embedding_generation_scan_for_explicit_generations(self):
         store = Store(self.tmp.name)
         try:

@@ -25,6 +25,7 @@ import urllib.error
 import urllib.request
 import zlib
 from collections import Counter
+from contextlib import closing
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -393,7 +394,8 @@ class Store:
                     native_held_count INTEGER NOT NULL DEFAULT 0,
                     native_invalid_count INTEGER NOT NULL DEFAULT 0,
                     native_checkpoint_state_version INTEGER NOT NULL DEFAULT 0,
-                    fts_schema_version INTEGER NOT NULL DEFAULT 0
+                    fts_schema_version INTEGER NOT NULL DEFAULT 0,
+                    fts_ready INTEGER NOT NULL DEFAULT 1
                 );
                 INSERT OR IGNORE INTO sync_state(id) VALUES(1);
                 CREATE TABLE IF NOT EXISTS reindex_controls (
@@ -471,6 +473,10 @@ class Store:
                 ("native_invalid_count", "INTEGER NOT NULL DEFAULT 0"),
                 ("native_checkpoint_state_version", "INTEGER NOT NULL DEFAULT 0"),
                 ("fts_schema_version", "INTEGER NOT NULL DEFAULT 0"),
+                # Existing databases already have a complete FTS built by the
+                # pre-readiness code. Only begin_bulk_restore() may invalidate
+                # it, so the migration default must preserve that state.
+                ("fts_ready", "INTEGER NOT NULL DEFAULT 1"),
             ):
                 if name not in sync_columns:
                     self.conn.execute(f"ALTER TABLE sync_state ADD COLUMN {name} {sql_type}")
@@ -491,10 +497,22 @@ class Store:
                 ).fetchone()[0]
                 or 0
             )
-            if (
-                fts_columns != ["raw_text", "retrieval_text", "search_identifiers"]
-                or fts_version < FTS_SCHEMA_VERSION
-            ):
+            fts_ready = bool(
+                self.conn.execute(
+                    "SELECT fts_ready FROM sync_state WHERE id=1"
+                ).fetchone()[0]
+            )
+            rebuild_incomplete_fts = os.getenv(
+                "FUNES_BULK_RESTORE_REBUILD_FTS", "true"
+            ).strip().lower() in {"1", "true", "yes", "on"}
+            expected_fts_columns = ["raw_text", "retrieval_text", "search_identifiers"]
+            fts_shape_mismatch = fts_columns != expected_fts_columns
+            should_rebuild_fts = (
+                fts_shape_mismatch
+                or (fts_ready and fts_version < FTS_SCHEMA_VERSION)
+                or (not fts_ready and rebuild_incomplete_fts)
+            )
+            if fts_shape_mismatch or should_rebuild_fts:
                 # The first sidecar indexed only the derived retrieval shadow.
                 # Rebuild exactly once at startup so existing durable raw rows
                 # become the primary lexical source without client re-upload.
@@ -503,20 +521,22 @@ class Store:
                     """UPDATE memories SET search_identifiers=
                     funes_identifiers(raw_text, retrieval_text)"""
                 )
-                if fts_columns != [
-                    "raw_text", "retrieval_text", "search_identifiers"
-                ]:
+                if fts_shape_mismatch:
                     self.conn.execute("DROP TABLE memories_fts")
                     self.conn.execute(
                         """CREATE VIRTUAL TABLE memories_fts USING fts5(
                         raw_text, retrieval_text, search_identifiers,
                         content='memories', content_rowid='id', tokenize='unicode61')"""
                     )
-                self.conn.execute("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')")
-                self.conn.execute(
-                    "UPDATE sync_state SET fts_schema_version=? WHERE id=1",
-                    (FTS_SCHEMA_VERSION,),
-                )
+                if should_rebuild_fts:
+                    self.conn.execute(
+                        "INSERT INTO memories_fts(memories_fts) VALUES('rebuild')"
+                    )
+                    self.conn.execute(
+                        """UPDATE sync_state SET fts_schema_version=?,fts_ready=1
+                        WHERE id=1""",
+                        (FTS_SCHEMA_VERSION,),
+                    )
             self._create_fts_triggers_locked()
 
             native_state_version = int(
@@ -2313,6 +2333,10 @@ class Store:
     def reindex(self) -> int:
         with self.lock, self.conn:
             self.conn.execute("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')")
+            self.conn.execute(
+                "UPDATE sync_state SET fts_schema_version=?,fts_ready=1 WHERE id=1",
+                (FTS_SCHEMA_VERSION,),
+            )
             return int(self.conn.execute("SELECT count(*) FROM memories").fetchone()[0])
 
     def count(self) -> int:
@@ -2465,15 +2489,30 @@ class Store:
         """Suspend per-row indexes while one logical restore is in flight."""
         with self.lock:
             if self._bulk_restore_depth == 0:
+                previous_fts_ready = bool(
+                    self.conn.execute(
+                        "SELECT fts_ready FROM sync_state WHERE id=1"
+                    ).fetchone()[0]
+                )
                 self._save_and_apply_bulk_pragmas_locked()
                 try:
                     with self.conn:
+                        # FTS triggers are disabled for bulk replay. Mark the
+                        # derived index unavailable before the first restored
+                        # row so a crash or opt-out can never look complete.
+                        self.conn.execute(
+                            "UPDATE sync_state SET fts_ready=0 WHERE id=1"
+                        )
                         self._drop_fts_triggers_locked()
                         self._drop_native_state_triggers_locked()
                         self._drop_secondary_indexes_locked()
                 except Exception:
                     try:
                         with self.conn:
+                            self.conn.execute(
+                                "UPDATE sync_state SET fts_ready=? WHERE id=1",
+                                (int(previous_fts_ready),),
+                            )
                             self._create_secondary_indexes_locked()
                             self._create_fts_triggers_locked()
                             self._create_native_state_triggers_locked()
@@ -2515,11 +2554,9 @@ class Store:
                             self.conn.execute(
                                 "INSERT INTO memories_fts(memories_fts) VALUES('rebuild')"
                             )
-                        else:
-                            # Keep startup schema checks from replaying the same
-                            # multi-million-row rebuild on every container restart.
                             self.conn.execute(
-                                "UPDATE sync_state SET fts_schema_version=? WHERE id=1",
+                                """UPDATE sync_state
+                                SET fts_ready=1,fts_schema_version=? WHERE id=1""",
                                 (FTS_SCHEMA_VERSION,),
                             )
                     finally:
@@ -2532,6 +2569,14 @@ class Store:
                                 self._create_native_state_triggers_locked()
             finally:
                 self._restore_pragmas_locked()
+
+    def fts_ready(self) -> bool:
+        """Whether the sidecar FTS contains every restored source row."""
+        with closing(self._read_connection()) as conn:
+            row = conn.execute(
+                "SELECT fts_ready FROM sync_state WHERE id=1"
+            ).fetchone()
+            return bool(row and row[0])
 
 
 class Translator:

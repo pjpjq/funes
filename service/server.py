@@ -950,7 +950,7 @@ class Store:
                     )
                 )
                 row = self.conn.execute(
-                    """SELECT id, content_hash, source_version, updated_at, retrieval_text,
+                    """SELECT id, content_hash, source_version, updated_at, raw_text, retrieval_text,
                     metadata_json, source_metadata_clock_json,
                     device_id, project, repo, worktree, source_agent,
                     source_type, session_id, message_id, role, timestamp, source_path,
@@ -4408,12 +4408,19 @@ def queue_reindex(app: Any, scope: str) -> dict[str, Any]:
 
 class App:
     def __init__(self, *, rebuild_fts: bool | None = None):
-        # Free Gradio Spaces do not expose /data.  The Hub snapshot remains the
-        # durable source of truth; operators can override this with a writable
-        # mounted volume when one is available.
-        self.store = Store(os.getenv("FUNES_DATA_DIR", "/tmp/funes-data"))
+        # PostgreSQL is an explicit source-store cutover. Never fall back to an
+        # empty SQLite store if the configured database is unavailable/unready.
+        data_dir = os.getenv("FUNES_DATA_DIR", "/tmp/funes-data")
+        if os.getenv("FUNES_POSTGRES_DSN"):
+            from service.postgres import PostgresStore
+            from service.postgres_sync import PostgresSync
+
+            self.store = PostgresStore(data_dir)
+            self.syncer = PostgresSync(self.store, rebuild_fts=rebuild_fts)
+        else:
+            self.store = Store(data_dir)
+            self.syncer = SnapshotSync(self.store, rebuild_fts=rebuild_fts)
         self.translator = Translator(self.store)
-        self.syncer = SnapshotSync(self.store, rebuild_fts=rebuild_fts)
         self.restore_result = 0
         self.restore_done = threading.Event()
         self.reconcile_stop = threading.Event()
@@ -4483,14 +4490,22 @@ class App:
     def _reindex_background(self) -> None:
         self.restore_done.wait()
         while not self.reindex_stop.is_set():
-            result = self.store.apply_pending_reindex_controls(
-                getattr(self, "reindex_batch_size", 500)
-            )
-            if result["applied"]:
-                self.reconcile_wake.set()
-            if result["scanned"] or result["applied"]:
-                continue
-            self.store.compact_reindex_controls()
+            # Restore failure is a closed gate, including the control worker.
+            # PG readiness probes can later reconnect without a Space restart.
+            if not self.syncer.restoring and not self.syncer.restore_failed:
+                try:
+                    result = self.store.apply_pending_reindex_controls(
+                        getattr(self, "reindex_batch_size", 500)
+                    )
+                    if result["applied"]:
+                        self.reconcile_wake.set()
+                    if result["scanned"] or result["applied"]:
+                        continue
+                    self.store.compact_reindex_controls()
+                except Exception:
+                    if getattr(self.syncer, "backend", None) != "postgres":
+                        raise
+                    self.syncer.check_ready()
             self.reindex_wake.wait(self.reconcile_interval)
             self.reindex_wake.clear()
 
@@ -4588,6 +4603,11 @@ def make_handler(app: App):
                 return self._json(200, {"status": "ok", "service": "funes"})
             if route == "/ready":
                 try:
+                    if (
+                        getattr(app.syncer, "backend", None) == "postgres"
+                        and not app.syncer.check_ready()
+                    ):
+                        return self._json(503, {"status": "not_ready", "error": "postgres_unavailable"})
                     if app.syncer.restoring:
                         progress = getattr(app.syncer, "progress", {})
                         return self._json(
@@ -4605,7 +4625,11 @@ def make_handler(app: App):
                         )
                     if app.syncer.restore_failed:
                         return self._json(503, {"status": "not_ready", "error": "restore_failed"})
-                    count = app.store.count()
+                    # PostgreSQL readiness must not COUNT/scan source history.
+                    count = (
+                        None if getattr(app.syncer, "backend", None) == "postgres"
+                        else app.store.count()
+                    )
                     return self._json(
                         200,
                         {
@@ -4616,29 +4640,41 @@ def make_handler(app: App):
                         },
                     )
                 except Exception as exc:
+                    if getattr(app.syncer, "backend", None) == "postgres":
+                        return self._json(503, {"status": "not_ready", "error": "postgres_unavailable"})
                     return self._json(503, {"status": "not_ready", "error": type(exc).__name__})
             if route in PROTECTED and self._authorized():
-                if route == "/sources":
-                    return self._json(200, {"sources": app.store.sources()})
-                if route == "/sync/status":
-                    if app.syncer.restoring:
-                        return self._json(
-                            503,
-                            {
-                                "status": "restoring",
-                                "restore_progress": getattr(
-                                    app.syncer, "progress", {}
-                                ),
-                            },
-                        )
-                    status = app.store.sync_status()
-                    status["restore_progress"] = getattr(app.syncer, "progress", {})
-                    return self._json(200, status)
-                if route == "/get":
-                    params = parse_qs(urlparse(self.path).query)
-                    ident = params.get("source_identity", params.get("id", [""]))[0]
-                    item = app.store.get(ident)
-                    return self._json(200 if item else 404, self._public(item) if item else {"error": "not_found"})
+                try:
+                    if (
+                        getattr(app.syncer, "backend", None) == "postgres"
+                        and not app.syncer.check_ready()
+                    ):
+                        return self._json(503, {"error": "postgres_unavailable", "durable": False})
+                    if route == "/sources":
+                        return self._json(200, {"sources": app.store.sources()})
+                    if route == "/sync/status":
+                        if app.syncer.restoring:
+                            return self._json(
+                                503,
+                                {
+                                    "status": "restoring",
+                                    "restore_progress": getattr(
+                                        app.syncer, "progress", {}
+                                    ),
+                                },
+                            )
+                        status = app.store.sync_status()
+                        status["restore_progress"] = getattr(app.syncer, "progress", {})
+                        return self._json(200, status)
+                    if route == "/get":
+                        params = parse_qs(urlparse(self.path).query)
+                        ident = params.get("source_identity", params.get("id", [""]))[0]
+                        item = app.store.get(ident)
+                        return self._json(200 if item else 404, self._public(item) if item else {"error": "not_found"})
+                except Exception:
+                    if getattr(app.syncer, "backend", None) == "postgres":
+                        return self._json(503, {"error": "postgres_unavailable", "durable": False})
+                    raise
             return self._json(404, {"error": "not_found"})
 
         def do_POST(self) -> None:
@@ -4648,6 +4684,11 @@ def make_handler(app: App):
                 return
             try:
                 body = self._body()
+                if (
+                    getattr(app.syncer, "backend", None) == "postgres"
+                    and not app.syncer.check_ready()
+                ):
+                    return self._json(503, {"error": "postgres_unavailable", "durable": False})
                 if self.path == "/sources/check":
                     if app.syncer.restoring or app.syncer.restore_failed:
                         error = "restore_in_progress" if app.syncer.restoring else "restore_failed"
@@ -4732,6 +4773,8 @@ def make_handler(app: App):
             except (ValueError, json.JSONDecodeError) as exc:
                 return self._json(400, {"error": str(exc)})
             except Exception as exc:
+                if getattr(app.syncer, "backend", None) == "postgres":
+                    return self._json(503, {"error": "postgres_unavailable", "durable": False})
                 return self._json(500, {"error": type(exc).__name__})
 
     return Handler

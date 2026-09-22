@@ -293,11 +293,17 @@ def native_environment(
 
 
 def source_app():
-    """Return the encrypted raw/source store, or None when not configured."""
+    """Return the configured source store, retrying unavailable PostgreSQL."""
     global SOURCE_APP
     if SOURCE_APP is not None:
+        if (
+            getattr(SOURCE_APP.syncer, "backend", None) == "postgres"
+            and SOURCE_APP.syncer.restore_failed
+        ):
+            SOURCE_APP.syncer.check_ready()
         return SOURCE_APP
-    if not os.getenv("FUNES_STORAGE_REPO"):
+    postgres_configured = bool(os.getenv("FUNES_POSTGRES_DSN"))
+    if not postgres_configured and not os.getenv("FUNES_STORAGE_REPO"):
         return None
     with SOURCE_APP_LOCK:
         if SOURCE_APP is None:
@@ -305,24 +311,37 @@ def source_app():
             os.environ.setdefault("FUNES_LAZY_RESTORE", "true")
             os.environ.setdefault("FUNES_REQUIRE_DURABLE_ACK", "true")
             os.environ.setdefault("FUNES_BULK_RESTORE_REBUILD_FTS", "false")
-            SOURCE_APP = SourceApp()
+            try:
+                SOURCE_APP = SourceApp()
+            except Exception:
+                if not postgres_configured:
+                    raise
+                # A missing migration or network outage is not permission to
+                # open an empty local source store. A later request retries.
+                return None
             start_canonical_reconciler(SOURCE_APP)
     return SOURCE_APP
 
 
 def source_readiness_state() -> dict[str, object]:
-    """Snapshot source readiness without initializing or querying the store."""
+    """Snapshot source readiness; PG performs a bounded connectivity check."""
     app = SOURCE_APP
-    configured = app is not None or bool(os.getenv("FUNES_STORAGE_REPO"))
+    postgres_configured = bool(os.getenv("FUNES_POSTGRES_DSN"))
+    configured = app is not None or postgres_configured or bool(os.getenv("FUNES_STORAGE_REPO"))
     if not configured:
         return {"configured": False, "ready": False, "restoring": False}
+    if app is None and postgres_configured:
+        app = source_app()
     if app is None:
         return {
             "configured": True,
             "ready": False,
             "restoring": False,
-            "error": "source_store_unavailable",
+            "error": "postgres_unavailable" if postgres_configured else "source_store_unavailable",
         }
+    if getattr(app.syncer, "backend", None) == "postgres" and not app.syncer.restoring:
+        if app.syncer.check_ready() and app.restore_result < 0:
+            app.restore_result = 0
     restoring = bool(app.syncer.restoring)
     restore_failed = bool(app.syncer.restore_failed)
     state: dict[str, object] = {
@@ -334,7 +353,11 @@ def source_readiness_state() -> dict[str, object]:
     if restoring:
         state["progress"] = getattr(app.syncer, "progress", {})
     if restore_failed:
-        state["error"] = "restore_failed"
+        state["error"] = (
+            "postgres_unavailable"
+            if getattr(app.syncer, "backend", None) == "postgres"
+            else "restore_failed"
+        )
     return state
 
 
@@ -358,7 +381,26 @@ def source_fts_ready(app) -> bool:
 def source_state() -> dict[str, object]:
     app = source_app()
     if app is None:
+        if os.getenv("FUNES_POSTGRES_DSN"):
+            return {"configured": True, "ready": False, "documents": 0,
+                    "error": "postgres_unavailable"}
         return {"configured": False, "ready": False, "documents": 0}
+    try:
+        return _source_state(app)
+    except Exception:
+        if getattr(app.syncer, "backend", None) != "postgres":
+            raise
+        # A disconnect can happen after the readiness precheck. Never expose
+        # the driver error/DSN or turn an incomplete diagnostic into ready.
+        return {"configured": True, "ready": False, "restoring": False,
+                "error": "postgres_unavailable"}
+
+
+def _source_state(app) -> dict[str, object]:
+    if getattr(app.syncer, "backend", None) == "postgres":
+        state = source_readiness_state()
+        if not state["ready"]:
+            return state
     if app.syncer.restoring:
         return {
             "configured": True,
@@ -426,6 +468,9 @@ def prepare_source_documents(app, docs: list[dict]) -> list[dict]:
 def ingest_source_documents(docs: list[dict]) -> tuple[int, dict, list[dict]] | None:
     app = source_app()
     if app is None:
+        if os.getenv("FUNES_POSTGRES_DSN"):
+            return 503, {"ok": False, "durable": False,
+                         "error": "postgres_unavailable"}, []
         return None
     if app.syncer.restoring or app.syncer.restore_failed:
         error = "restore_in_progress" if app.syncer.restoring else "restore_failed"
@@ -2149,12 +2194,28 @@ def materialize_native_results(
         return structured_hits[:limit]
     if not allow_sidecar:
         raise NativeMcpError("native MCP structured hits unavailable")
+    ids = native_result_ids(output)[:limit]
+    store = getattr(app, "store", None)
+    cached_items: dict[str, dict] = {}
+    if store is not None and callable(getattr(store, "get_many", None)):
+        lookup_ids = [canonical_reference_identity(i) or i for i in ids]
+        try:
+            for it in store.get_many(lookup_ids):
+                if isinstance(it, dict):
+                    if it.get("source_identity"):
+                        cached_items[str(it["source_identity"])] = it
+                    if it.get("id") is not None:
+                        cached_items[str(it["id"])] = it
+        except Exception:
+            pass
     results = []
-    for identity in native_result_ids(output)[:limit]:
+    for identity in ids:
         is_canonical_reference = identity.startswith(CANONICAL_REF_PREFIX)
         canonical_identity = canonical_reference_identity(identity)
         lookup_identity = canonical_identity or identity
-        item = app.store.get(lookup_identity) if app is not None else None
+        item = cached_items.get(lookup_identity)
+        if item is None and store is not None:
+            item = store.get(lookup_identity)
         if item is not None:
             public = _public_source_item(item)
             public["retrieval_backend"] = "native_funes"
@@ -3053,6 +3114,10 @@ class Handler(BaseHTTPRequestHandler):
                     result["ok"] = bool(result.get("durable"))
                     self.send_json(200 if result["ok"] else 503, result)
                     return
+                if os.getenv("FUNES_POSTGRES_DSN"):
+                    self.send_json(503, {"ok": False, "durable": False,
+                                         "error": "postgres_unavailable"})
+                    return
                 if not REMOTE:
                     self.send_json(503, {"ok": False, "durable": False, "error": "FUNES_MEMORY is not configured"})
                     return
@@ -3706,6 +3771,11 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(504, {"error": "native_timeout"})
         except (OSError, subprocess.SubprocessError):
             self.send_json(500, {"error": "native_process_error"})
+        except Exception:
+            if not os.getenv("FUNES_POSTGRES_DSN"):
+                raise
+            self.send_json(503, {"ok": False, "durable": False,
+                                 "error": "postgres_unavailable"})
 
 
 def serve(host: str = "0.0.0.0", port: int = PORT) -> None:

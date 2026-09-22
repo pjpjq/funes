@@ -1,3 +1,5 @@
 # Optional: enables private Hugging Face dataset snapshot restore/upload.
 huggingface_hub>=1.16,<2
 cryptography>=46,<47
+# Optional source-store backend; native Lance storage remains on the Hub.
+psycopg[binary]>=3.2,<4

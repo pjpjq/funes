@@ -2015,7 +2015,7 @@ class ServiceTests(unittest.TestCase):
 
     def test_unready_fts_search_behavior(self):
         from types import SimpleNamespace
-        import server
+        import space.server as server
 
         # 1. source_fts_ready helper checks
         self.assertFalse(server.source_fts_ready(None))

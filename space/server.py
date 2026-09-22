@@ -304,7 +304,7 @@ def source_app():
             os.environ.setdefault("FUNES_DATA_DIR", str(HOME / "source-store"))
             os.environ.setdefault("FUNES_LAZY_RESTORE", "true")
             os.environ.setdefault("FUNES_REQUIRE_DURABLE_ACK", "true")
-            SOURCE_APP = SourceApp()
+            SOURCE_APP = SourceApp(rebuild_fts=False)
             start_canonical_reconciler(SOURCE_APP)
     return SOURCE_APP
 

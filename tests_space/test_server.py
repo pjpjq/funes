@@ -711,6 +711,22 @@ def test_remote_without_source_sidecar_is_not_accepted(monkeypatch, tmp_path):
     assert body["error"] == "FUNES_STORAGE_REPO is not configured"
 
 
+def test_space_source_restore_skips_optional_fts_rebuild(monkeypatch, tmp_path):
+    observed = {}
+
+    class FakeSourceApp:
+        def __init__(self, *, rebuild_fts=None):
+            observed["rebuild_fts"] = rebuild_fts
+
+    monkeypatch.setattr(bridge, "SOURCE_APP", None)
+    monkeypatch.setattr(bridge, "SourceApp", FakeSourceApp)
+    monkeypatch.setattr(bridge, "start_canonical_reconciler", lambda _app: None)
+    monkeypatch.setenv("FUNES_STORAGE_REPO", "owner/source")
+
+    assert isinstance(bridge.source_app(), FakeSourceApp)
+    assert observed == {"rebuild_fts": False}
+
+
 def test_sync_status_alias_returns_ready_payload(monkeypatch):
     monkeypatch.setattr(bridge, "TOKEN", "test-token")
     monkeypatch.setattr(bridge, "REMOTE", "owner/memory")

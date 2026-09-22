@@ -304,7 +304,8 @@ def source_app():
             os.environ.setdefault("FUNES_DATA_DIR", str(HOME / "source-store"))
             os.environ.setdefault("FUNES_LAZY_RESTORE", "true")
             os.environ.setdefault("FUNES_REQUIRE_DURABLE_ACK", "true")
-            SOURCE_APP = SourceApp(rebuild_fts=False)
+            os.environ.setdefault("FUNES_BULK_RESTORE_REBUILD_FTS", "false")
+            SOURCE_APP = SourceApp()
             start_canonical_reconciler(SOURCE_APP)
     return SOURCE_APP
 
@@ -335,6 +336,23 @@ def source_readiness_state() -> dict[str, object]:
     if restore_failed:
         state["error"] = "restore_failed"
     return state
+
+
+def source_fts_ready(app) -> bool:
+    """Return sidecar lexical readiness; old test doubles remain compatible."""
+    if app is None:
+        return False
+    syncer = getattr(app, "syncer", None)
+    if syncer is not None and (
+        bool(getattr(syncer, "restoring", False))
+        or bool(getattr(syncer, "restore_failed", False))
+    ):
+        return False
+    store = getattr(app, "store", None)
+    if store is None:
+        return True
+    ready = getattr(store, "fts_ready", None)
+    return bool(ready()) if callable(ready) else True
 
 
 def source_state() -> dict[str, object]:
@@ -793,7 +811,12 @@ def search_source_rankings(
     harness: str | None = None,
 ) -> tuple[str, list[list[dict]], list[list[dict]]]:
     app = source_app()
-    if app is None or app.syncer.restoring or app.syncer.restore_failed:
+    if (
+        app is None
+        or app.syncer.restoring
+        or app.syncer.restore_failed
+        or not source_fts_ready(app)
+    ):
         return query, [], []
     rewritten = app.translator.rewrite_query(query)
     candidate_limit = expanded_candidate_limit(limit)
@@ -828,7 +851,12 @@ def search_source_bm25_rankings(
 ) -> tuple[list[list[dict]], list[list[dict]]]:
     """Run one syntax-safe raw BM25 lookup for a degraded Voyage request."""
     app = source_app()
-    if app is None or app.syncer.restoring or app.syncer.restore_failed:
+    if (
+        app is None
+        or app.syncer.restoring
+        or app.syncer.restore_failed
+        or not source_fts_ready(app)
+    ):
         return [], []
     raw_hits = app.store.search(
         query,
@@ -1261,6 +1289,18 @@ SIDECAR_AUTHORITATIVE_FILTERS = frozenset(
         "source_missing",
         "since",
         "until",
+    )
+)
+# Voyage can apply these exact canonical metadata filters without relying on
+# the local SQLite FTS sidecar. Date/role filters still require a ready sidecar.
+NATIVE_CANONICAL_FILTERS = frozenset(
+    (
+        "source_type",
+        "project",
+        "repo",
+        "device_id",
+        "content_type",
+        "source_missing",
     )
 )
 NATIVE_GET_RE = re.compile(
@@ -3098,10 +3138,61 @@ class Handler(BaseHTTPRequestHandler):
                 harness = str(obj.get("harness", "")).strip() or None
                 profile = embedding_profile()
                 embedding_provider = str(profile["provider"])
-                sidecar_authoritative = bool(
-                    filters.keys() & SIDECAR_AUTHORITATIVE_FILTERS
-                )
+                sidecar_filter_keys = filters.keys() & SIDECAR_AUTHORITATIVE_FILTERS
+                sidecar_fts_ready = source_fts_ready(app)
+                sidecar_authoritative = bool(sidecar_filter_keys and sidecar_fts_ready)
+                unsupported_native_filters = sidecar_filter_keys - NATIVE_CANONICAL_FILTERS
                 source_restore_error = ""
+                if app is not None and (app.syncer.restoring or app.syncer.restore_failed):
+                    source_restore_error = (
+                        "restore_in_progress" if app.syncer.restoring else "restore_failed"
+                    )
+                    if unsupported_native_filters:
+                        self.send_json(
+                            503,
+                            {
+                                "ok": False,
+                                "results": [],
+                                "results_text": "",
+                                "error": source_restore_error,
+                            },
+                        )
+                        return
+                if (
+                    embedding_provider == "voyage"
+                    and not source_restore_error
+                    and not sidecar_fts_ready
+                    and unsupported_native_filters
+                ):
+                    self.send_json(
+                        503,
+                        {
+                            "ok": False,
+                            "results": [],
+                            "results_text": "",
+                            "error": "source_fts_unavailable",
+                            "retrieval_backend": "unavailable",
+                            "embedding_profile": profile,
+                        },
+                    )
+                    return
+                if (
+                    embedding_provider != "voyage"
+                    and not source_restore_error
+                    and not sidecar_fts_ready
+                ):
+                    self.send_json(
+                        503,
+                        {
+                            "ok": False,
+                            "results": [],
+                            "results_text": "",
+                            "error": "source_fts_unavailable",
+                            "retrieval_backend": "unavailable",
+                            "embedding_profile": profile,
+                        },
+                    )
+                    return
                 if app is not None and (app.syncer.restoring or app.syncer.restore_failed):
                     source_restore_error = (
                         "restore_in_progress" if app.syncer.restoring else "restore_failed"
@@ -3310,6 +3401,7 @@ class Handler(BaseHTTPRequestHandler):
                     selective_bm25 = (
                         voyage_hot_path
                         and not source_restore_error
+                        and sidecar_fts_ready
                         and should_augment_with_local_bm25(raw_query, results)
                     )
                     if selective_bm25:
@@ -3337,7 +3429,12 @@ class Handler(BaseHTTPRequestHandler):
                                     [results, *lexical_rankings],
                                     limit,
                                 )
-                if native_failure and voyage_hot_path and not source_restore_error:
+                if (
+                    native_failure
+                    and voyage_hot_path
+                    and not source_restore_error
+                    and sidecar_fts_ready
+                ):
                     if native_failure in {"timeout", "unavailable"}:
                         request_native_recovery()
                     # A native timeout has already consumed the useful client

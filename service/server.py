@@ -25,6 +25,7 @@ import urllib.error
 import urllib.request
 import zlib
 from collections import Counter
+from contextlib import closing
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -286,6 +287,21 @@ MEMORIES_SECONDARY_INDEXES: tuple[tuple[str, str], ...] = (
     ),
 )
 
+MEMORIES_GENERATION_INDEXES: tuple[tuple[str, str], ...] = (
+    (
+        "memories_retrieval_generation_idx",
+        "CREATE INDEX IF NOT EXISTS memories_retrieval_generation_idx ON memories(retrieval_generation)",
+    ),
+    (
+        "memories_native_generation_idx",
+        "CREATE INDEX IF NOT EXISTS memories_native_generation_idx ON memories(native_generation)",
+    ),
+    (
+        "memories_embedding_generation_idx",
+        "CREATE INDEX IF NOT EXISTS memories_embedding_generation_idx ON memories(embedding_generation)",
+    ),
+)
+
 
 class Store:
     def __init__(self, data_dir: str):
@@ -378,7 +394,8 @@ class Store:
                     native_held_count INTEGER NOT NULL DEFAULT 0,
                     native_invalid_count INTEGER NOT NULL DEFAULT 0,
                     native_checkpoint_state_version INTEGER NOT NULL DEFAULT 0,
-                    fts_schema_version INTEGER NOT NULL DEFAULT 0
+                    fts_schema_version INTEGER NOT NULL DEFAULT 0,
+                    fts_ready INTEGER NOT NULL DEFAULT 1
                 );
                 INSERT OR IGNORE INTO sync_state(id) VALUES(1);
                 CREATE TABLE IF NOT EXISTS reindex_controls (
@@ -429,6 +446,7 @@ class Store:
                     self.conn.execute(
                         f"ALTER TABLE memories ADD COLUMN {name} INTEGER NOT NULL DEFAULT 0"
                     )
+            self._create_generation_indexes_locked()
             cache_columns = {row[1] for row in self.conn.execute("PRAGMA table_info(translation_cache)")}
             for name in ("translation_hash", "translation_version", "translation_status"):
                 if name not in cache_columns:
@@ -455,6 +473,10 @@ class Store:
                 ("native_invalid_count", "INTEGER NOT NULL DEFAULT 0"),
                 ("native_checkpoint_state_version", "INTEGER NOT NULL DEFAULT 0"),
                 ("fts_schema_version", "INTEGER NOT NULL DEFAULT 0"),
+                # Existing databases already have a complete FTS built by the
+                # pre-readiness code. Only begin_bulk_restore() may invalidate
+                # it, so the migration default must preserve that state.
+                ("fts_ready", "INTEGER NOT NULL DEFAULT 1"),
             ):
                 if name not in sync_columns:
                     self.conn.execute(f"ALTER TABLE sync_state ADD COLUMN {name} {sql_type}")
@@ -475,10 +497,22 @@ class Store:
                 ).fetchone()[0]
                 or 0
             )
-            if (
-                fts_columns != ["raw_text", "retrieval_text", "search_identifiers"]
-                or fts_version < FTS_SCHEMA_VERSION
-            ):
+            fts_ready = bool(
+                self.conn.execute(
+                    "SELECT fts_ready FROM sync_state WHERE id=1"
+                ).fetchone()[0]
+            )
+            rebuild_incomplete_fts = os.getenv(
+                "FUNES_BULK_RESTORE_REBUILD_FTS", "true"
+            ).strip().lower() in {"1", "true", "yes", "on"}
+            expected_fts_columns = ["raw_text", "retrieval_text", "search_identifiers"]
+            fts_shape_mismatch = fts_columns != expected_fts_columns
+            should_rebuild_fts = (
+                fts_shape_mismatch
+                or (fts_ready and fts_version < FTS_SCHEMA_VERSION)
+                or (not fts_ready and rebuild_incomplete_fts)
+            )
+            if fts_shape_mismatch or should_rebuild_fts:
                 # The first sidecar indexed only the derived retrieval shadow.
                 # Rebuild exactly once at startup so existing durable raw rows
                 # become the primary lexical source without client re-upload.
@@ -487,20 +521,22 @@ class Store:
                     """UPDATE memories SET search_identifiers=
                     funes_identifiers(raw_text, retrieval_text)"""
                 )
-                if fts_columns != [
-                    "raw_text", "retrieval_text", "search_identifiers"
-                ]:
+                if fts_shape_mismatch:
                     self.conn.execute("DROP TABLE memories_fts")
                     self.conn.execute(
                         """CREATE VIRTUAL TABLE memories_fts USING fts5(
                         raw_text, retrieval_text, search_identifiers,
                         content='memories', content_rowid='id', tokenize='unicode61')"""
                     )
-                self.conn.execute("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')")
-                self.conn.execute(
-                    "UPDATE sync_state SET fts_schema_version=? WHERE id=1",
-                    (FTS_SCHEMA_VERSION,),
-                )
+                if should_rebuild_fts:
+                    self.conn.execute(
+                        "INSERT INTO memories_fts(memories_fts) VALUES('rebuild')"
+                    )
+                    self.conn.execute(
+                        """UPDATE sync_state SET fts_schema_version=?,fts_ready=1
+                        WHERE id=1""",
+                        (FTS_SCHEMA_VERSION,),
+                    )
             self._create_fts_triggers_locked()
 
             native_state_version = int(
@@ -563,6 +599,10 @@ class Store:
     def _drop_secondary_indexes_locked(self) -> None:
         for name, _ in MEMORIES_SECONDARY_INDEXES:
             self.conn.execute(f"DROP INDEX IF EXISTS {name}")
+
+    def _create_generation_indexes_locked(self) -> None:
+        for _name, sql in MEMORIES_GENERATION_INDEXES:
+            self.conn.execute(sql)
 
     def _create_secondary_indexes_locked(self) -> None:
         for _name, sql in MEMORIES_SECONDARY_INDEXES:
@@ -866,7 +906,16 @@ class Store:
         created = updated = deduped = 0
         results = []
         with self.lock, self.conn:
-            default_embedding_generation = self._latest_embedding_generation_locked()
+            default_embedding_generation: int | None = None
+
+            def get_default_embedding_generation() -> int:
+                nonlocal default_embedding_generation
+                if default_embedding_generation is None:
+                    default_embedding_generation = (
+                        self._latest_embedding_generation_locked()
+                    )
+                return default_embedding_generation
+
             for doc in docs:
                 raw = str(doc.get("raw_text", doc.get("text", "")))
                 if not raw:
@@ -940,9 +989,12 @@ class Store:
                         else int(row["embedding_generation"] or 0),
                         int(row["embedding_generation"] or 0),
                     )
+                elif embedding_generation_supplied:
+                    pass
                 else:
                     incoming_embedding_generation = max(
-                        incoming_embedding_generation, default_embedding_generation
+                        incoming_embedding_generation,
+                        get_default_embedding_generation(),
                     )
                 values["embedding_generation"] = incoming_embedding_generation
                 if row and row["content_hash"] == content_hash and row["source_version"] == source_version:
@@ -2281,6 +2333,10 @@ class Store:
     def reindex(self) -> int:
         with self.lock, self.conn:
             self.conn.execute("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')")
+            self.conn.execute(
+                "UPDATE sync_state SET fts_schema_version=?,fts_ready=1 WHERE id=1",
+                (FTS_SCHEMA_VERSION,),
+            )
             return int(self.conn.execute("SELECT count(*) FROM memories").fetchone()[0])
 
     def count(self) -> int:
@@ -2355,60 +2411,64 @@ class Store:
         self, documents: Any, batch_size: int = 500, *, apply_controls: bool = True
     ) -> int:
         """Restore a stream without materialising a multi-gigabyte snapshot."""
-        total = 0
-        batch: list[dict[str, Any]] = []
-        for item in documents:
-            if not isinstance(item, dict):
-                continue
-            item = dict(item)
-            record_type = item.pop("_funes_record", "memory")
-            if record_type == "reindex_control":
-                if batch:
+        self.begin_bulk_restore()
+        try:
+            total = 0
+            batch: list[dict[str, Any]] = []
+            for item in documents:
+                if not isinstance(item, dict):
+                    continue
+                item = dict(item)
+                record_type = item.pop("_funes_record", "memory")
+                if record_type == "reindex_control":
+                    if batch:
+                        result = self.ingest(batch)
+                        total += result["created"] + result["updated"]
+                        batch = []
+                    self.record_reindex_control(item)
+                    continue
+                if record_type == "native_optimize_checkpoint":
+                    if batch:
+                        result = self.ingest(batch)
+                        total += result["created"] + result["updated"]
+                        batch = []
+                    self.set_native_optimize_checkpoint(item)
+                    continue
+                if record_type == "native_index_state":
+                    if batch:
+                        result = self.ingest(batch)
+                        total += result["created"] + result["updated"]
+                        batch = []
+                    self.set_native_index_state(item)
+                    continue
+                if record_type == "translation_cache":
+                    query = str(item.get("query", ""))
+                    rewritten = str(item.get("rewritten", ""))
+                    if query and rewritten:
+                        self.translation_put(
+                            query,
+                            rewritten,
+                            status=str(item.get("translation_status") or "ok"),
+                            translation_hash=str(item.get("translation_hash") or ""),
+                            translation_version=str(item.get("translation_version") or PROMPT_VERSION),
+                        )
+                    continue
+                if record_type != "memory":
+                    continue
+                item["metadata"] = item.pop("metadata", item.pop("metadata_json", {}))
+                batch.append(item)
+                if len(batch) >= batch_size:
                     result = self.ingest(batch)
                     total += result["created"] + result["updated"]
                     batch = []
-                self.record_reindex_control(item)
-                continue
-            if record_type == "native_optimize_checkpoint":
-                if batch:
-                    result = self.ingest(batch)
-                    total += result["created"] + result["updated"]
-                    batch = []
-                self.set_native_optimize_checkpoint(item)
-                continue
-            if record_type == "native_index_state":
-                if batch:
-                    result = self.ingest(batch)
-                    total += result["created"] + result["updated"]
-                    batch = []
-                self.set_native_index_state(item)
-                continue
-            if record_type == "translation_cache":
-                query = str(item.get("query", ""))
-                rewritten = str(item.get("rewritten", ""))
-                if query and rewritten:
-                    self.translation_put(
-                        query,
-                        rewritten,
-                        status=str(item.get("translation_status") or "ok"),
-                        translation_hash=str(item.get("translation_hash") or ""),
-                        translation_version=str(item.get("translation_version") or PROMPT_VERSION),
-                    )
-                continue
-            if record_type != "memory":
-                continue
-            item["metadata"] = item.pop("metadata", item.pop("metadata_json", {}))
-            batch.append(item)
-            if len(batch) >= batch_size:
+            if batch:
                 result = self.ingest(batch)
                 total += result["created"] + result["updated"]
-                batch = []
-        if batch:
-            result = self.ingest(batch)
-            total += result["created"] + result["updated"]
-        if apply_controls:
-            self.drain_reindex_controls(batch_size)
-        return total
+            if apply_controls:
+                self.drain_reindex_controls(batch_size)
+            return total
+        finally:
+            self.finish_bulk_restore()
 
     def restore(self, path: Path, *, apply_controls: bool = True) -> int:
         if not path.exists():
@@ -2429,15 +2489,30 @@ class Store:
         """Suspend per-row indexes while one logical restore is in flight."""
         with self.lock:
             if self._bulk_restore_depth == 0:
+                previous_fts_ready = bool(
+                    self.conn.execute(
+                        "SELECT fts_ready FROM sync_state WHERE id=1"
+                    ).fetchone()[0]
+                )
                 self._save_and_apply_bulk_pragmas_locked()
                 try:
                     with self.conn:
+                        # FTS triggers are disabled for bulk replay. Mark the
+                        # derived index unavailable before the first restored
+                        # row so a crash or opt-out can never look complete.
+                        self.conn.execute(
+                            "UPDATE sync_state SET fts_ready=0 WHERE id=1"
+                        )
                         self._drop_fts_triggers_locked()
                         self._drop_native_state_triggers_locked()
                         self._drop_secondary_indexes_locked()
                 except Exception:
                     try:
                         with self.conn:
+                            self.conn.execute(
+                                "UPDATE sync_state SET fts_ready=? WHERE id=1",
+                                (int(previous_fts_ready),),
+                            )
                             self._create_secondary_indexes_locked()
                             self._create_fts_triggers_locked()
                             self._create_native_state_triggers_locked()
@@ -2446,7 +2521,7 @@ class Store:
                     raise
             self._bulk_restore_depth += 1
 
-    def finish_bulk_restore(self) -> None:
+    def finish_bulk_restore(self, *, rebuild_fts: bool | None = None) -> None:
         """Rebuild derived indexes once after the outermost restore."""
         with self.lock:
             if self._bulk_restore_depth <= 0:
@@ -2467,10 +2542,23 @@ class Store:
                                 str(state["native_checkpoint_memory"] or ""),
                             )
                         # FTS5 external-content tables need an explicit rebuild after
-                        # restoring rows from a JSONL snapshot.
-                        self.conn.execute(
-                            "INSERT INTO memories_fts(memories_fts) VALUES('rebuild')"
-                        )
+                        # restoring rows from a JSONL snapshot. A Space can disable
+                        # this optional, very expensive derived-index step while its
+                        # durable Voyage/Lance index is authoritative. The generic
+                        # service keeps the historical default of rebuilding FTS.
+                        if rebuild_fts is None:
+                            rebuild_fts = os.getenv(
+                                "FUNES_BULK_RESTORE_REBUILD_FTS", "true"
+                            ).strip().lower() in {"1", "true", "yes", "on"}
+                        if rebuild_fts:
+                            self.conn.execute(
+                                "INSERT INTO memories_fts(memories_fts) VALUES('rebuild')"
+                            )
+                            self.conn.execute(
+                                """UPDATE sync_state
+                                SET fts_ready=1,fts_schema_version=? WHERE id=1""",
+                                (FTS_SCHEMA_VERSION,),
+                            )
                     finally:
                         try:
                             self._create_secondary_indexes_locked()
@@ -2481,6 +2569,14 @@ class Store:
                                 self._create_native_state_triggers_locked()
             finally:
                 self._restore_pragmas_locked()
+
+    def fts_ready(self) -> bool:
+        """Whether the sidecar FTS contains every restored source row."""
+        with closing(self._read_connection()) as conn:
+            row = conn.execute(
+                "SELECT fts_ready FROM sync_state WHERE id=1"
+            ).fetchone()
+            return bool(row and row[0])
 
 
 class Translator:
@@ -2639,9 +2735,28 @@ class Translator:
         return self.normalize_document(raw)[0]
 
 
+class RestoreFiles(list):
+    """File list returned by restore file enumeration carrying Hub metadata."""
+
+    def __init__(
+        self,
+        files: list[str],
+        manifest: dict[str, Any] | None = None,
+        revision: str | None = None,
+    ):
+        super().__init__(files)
+        self.manifest = manifest
+        self.revision = revision
+
+
 class SnapshotSync:
-    def __init__(self, store: Store):
+    def __init__(self, store: Store, *, rebuild_fts: bool | None = None):
         self.store = store
+        self.rebuild_fts = (
+            self._truth("FUNES_BULK_RESTORE_REBUILD_FTS", True)
+            if rebuild_fts is None
+            else rebuild_fts
+        )
         # Snapshot creation and Hub upload must be one serialized operation.
         # Without this lock, concurrent /sync requests can upload an older
         # snapshot after a newer one and roll the durable dataset backwards.
@@ -2656,6 +2771,12 @@ class SnapshotSync:
         self.manifest_filename = os.getenv(
             "FUNES_RESTORE_MANIFEST_FILE", "funes-restore-manifest-v1.json"
         )
+        checkpoint_filename = os.getenv(
+            "FUNES_RESTORE_CHECKPOINT_FILE", "funes-restore-checkpoint-v1.json"
+        )
+        if not self._safe_repo_filename(checkpoint_filename):
+            raise ValueError("invalid restore checkpoint filename")
+        self.restore_checkpoint_filename = checkpoint_filename
         self.restore_batch = max(50, int(os.getenv("FUNES_RESTORE_BATCH", "500")))
         try:
             restore_download_workers = int(
@@ -2666,11 +2787,21 @@ class SnapshotSync:
         self.restore_download_workers = max(1, min(restore_download_workers, 32))
         self._restore_prefetch_root: Path | None = None
         self._restore_revision: str | None = None
+        self._restore_manifest: dict[str, Any] | None = None
         self.covered_revision: str | None = None
         self.restore_failed = False
         self.restore_error = None
         self.restored = False
         self.restoring = False
+        self._progress_lock = threading.Lock()
+        self._restore_progress: dict[str, Any] = {
+            "phase": "idle",
+            "current": None,
+            "completed": 0,
+            "total": 0,
+            "rows": 0,
+            "bytes": 0,
+        }
         self.storage_key = (
             os.getenv("FUNES_STORAGE_KEY")
             or os.getenv("FUNES_API_TOKEN")
@@ -2687,7 +2818,36 @@ class SnapshotSync:
         self.restore_failed = True
         self.restore_error = type(exc).__name__
         self.store.set_sync(last_error=self.restore_error)
+        self._update_restore_progress(phase="failed", current=None, error=self.restore_error)
         return -1
+
+    def _update_restore_progress(self, **values: Any) -> None:
+        with self._progress_lock:
+            self._restore_progress.update(values)
+
+    @property
+    def progress(self) -> dict[str, Any]:
+        with self._progress_lock:
+            return dict(self._restore_progress)
+
+    @property
+    def restore_checkpoint_path(self) -> Path:
+        if not self._safe_repo_filename(self.restore_checkpoint_filename):
+            raise ValueError("invalid restore checkpoint filename")
+        return self.store.data_dir / self.restore_checkpoint_filename
+
+    @staticmethod
+    def _canonical_json_bytes(data: Any) -> bytes:
+        return json.dumps(
+            data,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+
+    @classmethod
+    def _canonical_digest(cls, data: Any) -> str:
+        return hashlib.sha256(cls._canonical_json_bytes(data)).hexdigest()
 
     def snapshot_path(self) -> Path:
         return self.store.data_dir / self.filename
@@ -3054,6 +3214,111 @@ class SnapshotSync:
                 state = latest
         raise RuntimeError("snapshot compaction changed repeatedly") from last_error
 
+    def _load_restore_checkpoint(
+        self,
+        revision: str | None,
+        manifest: dict[str, Any] | None,
+        files: list[str],
+    ) -> set[str]:
+        return self._load_restore_checkpoint_state(revision, manifest, files)[0]
+
+    def _record_restore_checkpoint(
+        self,
+        revision: str | None,
+        manifest: dict[str, Any] | None,
+        files: list[str],
+        completed: list[str],
+        *,
+        derived_ready: bool = False,
+    ) -> None:
+        target = self.restore_checkpoint_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        manifest_digest = (
+            self._canonical_digest(manifest) if manifest is not None else None
+        )
+        files_digest = self._canonical_digest(list(files))
+        data = {
+            "version": 1,
+            "revision": revision,
+            "manifest_digest": manifest_digest,
+            "files_digest": files_digest,
+            "files": list(files),
+            "completed": list(completed),
+            "derived_ready": bool(derived_ready),
+        }
+        encoded = self._canonical_json_bytes(data)
+        fd, tmp = tempfile.mkstemp(
+            prefix="funes-checkpoint-",
+            dir=str(target.parent),
+        )
+        try:
+            os.chmod(tmp, 0o600)
+            with os.fdopen(fd, "wb") as f:
+                f.write(encoded)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, target)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+
+    def _load_restore_checkpoint_state(
+        self,
+        revision: str | None,
+        manifest: dict[str, Any] | None,
+        files: list[str],
+    ) -> tuple[set[str], bool]:
+        """Return the completed prefix and whether derived indexes are durable.
+
+        Older checkpoint files intentionally default to ``False`` for the
+        derived marker.  That makes a pre-upgrade or crash-interrupted restore
+        rebuild FTS and secondary indexes once instead of risking silent misses.
+        """
+        path = self.restore_checkpoint_path
+        if not path.is_file():
+            return set(), False
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict):
+                return set(), False
+            if raw.get("version") != 1:
+                return set(), False
+            if raw.get("revision") != revision:
+                return set(), False
+            manifest_digest = (
+                self._canonical_digest(manifest) if manifest is not None else None
+            )
+            if raw.get("manifest_digest") != manifest_digest:
+                return set(), False
+            files_list = list(files)
+            if raw.get("files") != files_list:
+                return set(), False
+            if raw.get("files_digest") != self._canonical_digest(files_list):
+                return set(), False
+            completed = raw.get("completed")
+            if (
+                not isinstance(completed, list)
+                or len(completed) > len(files_list)
+                or len(completed) != len(set(completed))
+                or any(not isinstance(f, str) for f in completed)
+                or files_list[: len(completed)] != completed
+            ):
+                return set(), False
+            return set(completed), bool(raw.get("derived_ready", False))
+        except Exception:
+            return set(), False
+
+    def _remove_restore_checkpoint(self) -> None:
+        try:
+            target = self.restore_checkpoint_path
+            if target.exists():
+                target.unlink()
+        except (OSError, ValueError):
+            pass
+
     def _repo_files(self) -> list[str]:
         """List snapshot and delta objects without exposing repository contents."""
         from huggingface_hub import HfApi
@@ -3061,13 +3326,18 @@ class SnapshotSync:
         state = self._remote_restore_state(api)
         self._restore_revision = state["head"]
         manifest = state["manifest"]
+        self._restore_manifest = manifest
         repo_files = state["repo_files"]
         if manifest is not None:
-            return [
-                manifest["snapshot"],
-                *manifest["deltas"],
-                *manifest["controls"],
-            ]
+            return RestoreFiles(
+                [
+                    manifest["snapshot"],
+                    *manifest["deltas"],
+                    *manifest["controls"],
+                ],
+                manifest=manifest,
+                revision=state["head"],
+            )
         files = list(self._source_artifact_names(repo_files))
         snapshots = sorted(name for name in files if name == self.filename + ".enc" or name.startswith(self.prefix))
         deltas = sorted(
@@ -3077,7 +3347,21 @@ class SnapshotSync:
         controls = sorted(name for name in files if name.startswith(self.control_prefix))
         # Controls replay last and carry monotonic per-derived-field generations.
         # This makes immutable hash-named deltas safe regardless of their order.
-        return snapshots + deltas + controls
+        return RestoreFiles(
+            snapshots + deltas + controls,
+            manifest=None,
+            revision=state["head"],
+        )
+
+    def _repo_files_metadata(
+        self,
+    ) -> tuple[list[str], dict[str, Any] | None, str | None]:
+        files = self._repo_files()
+        return (
+            list(files),
+            getattr(files, "manifest", self._restore_manifest),
+            getattr(files, "revision", self._restore_revision),
+        )
 
     def _restore_file(self, filename: str) -> int:
         encrypted = None
@@ -3102,6 +3386,13 @@ class SnapshotSync:
                 local_dir=str(self.store.data_dir / "remote"),
             )
             encrypted = Path(downloaded)
+        try:
+            file_bytes = encrypted.stat().st_size if encrypted.is_file() else 0
+        except OSError:
+            file_bytes = 0
+        if file_bytes:
+            with self._progress_lock:
+                self._restore_progress["bytes"] += file_bytes
         if not filename.endswith(".enc"):
             if not self._truth("FUNES_ALLOW_PLAINTEXT_SOURCE_RESTORE"):
                 raise RuntimeError("plaintext source snapshot restore is disabled")
@@ -3146,55 +3437,164 @@ class SnapshotSync:
                     yield json.loads(line)
 
     def restore(self) -> int:
-        if self.repo and self.token:
-            try:
-                self._restore_revision = None
-                self.covered_revision = None
-                restored_revision = None
-                self.store.begin_bulk_restore()
+        with self.upload_lock:
+            if self.repo and self.token:
                 try:
-                    files = self._repo_files()
-                    restored_revision = self._restore_revision
-                    if not files:
-                        # Backwards-compatible single-file snapshot lookup.
-                        files = [self.filename + ".enc"]
-                    restored = 0
-                    self._restore_prefetch_root = self._prefetch_restore_files(files)
+                    self._restore_revision = None
+                    self._restore_manifest = None
+                    self.covered_revision = None
+                    restored_revision = None
+                    self._update_restore_progress(
+                        phase="listing",
+                        current=None,
+                        completed=0,
+                        total=0,
+                        rows=0,
+                        bytes=0,
+                    )
+                    bulk_active = False
+                    restore_completed = False
                     try:
-                        for filename in files:
-                            restored += self._restore_file(filename)
+                        files, manifest, restored_revision = self._repo_files_metadata()
+                        self._restore_revision = restored_revision
+                        self._restore_manifest = manifest
+                        if not files:
+                            # Backwards-compatible single-file snapshot lookup.
+                            files = [self.filename + ".enc"]
+                        completed_files, derived_ready = self._load_restore_checkpoint_state(
+                            restored_revision, manifest, list(files)
+                        )
+                        completed_order = [f for f in files if f in completed_files]
+                        restored = 0
+                        remaining_files = [f for f in files if f not in completed_files]
+                        self._update_restore_progress(
+                            phase="prefetching" if remaining_files else "indexing",
+                            current=None,
+                            completed=len(completed_order),
+                            total=len(files),
+                        )
+                        # A fully completed checkpoint is safe to skip only when
+                        # the previous run recorded the derived-index commit.
+                        # Older checkpoints and crash-interrupted restores rebuild.
+                        if remaining_files or not derived_ready:
+                            self.store.begin_bulk_restore()
+                            bulk_active = True
+                        self._restore_prefetch_root = self._prefetch_restore_files(
+                            remaining_files
+                        )
+                        try:
+                            for filename in files:
+                                if filename in completed_files:
+                                    continue
+                                self._update_restore_progress(
+                                    phase="restoring", current=filename
+                                )
+                                restored += self._restore_file(filename)
+                                completed_order.append(filename)
+                                self._record_restore_checkpoint(
+                                    restored_revision,
+                                    manifest,
+                                    list(files),
+                                    completed_order,
+                                )
+                                self._update_restore_progress(
+                                    completed=len(completed_order),
+                                    rows=restored,
+                                    current=None,
+                                )
+                        finally:
+                            self._restore_prefetch_root = None
+                        # A complete Hub restore can replay an old generation-zero
+                        # revision into an id below a partially persisted row cursor.
+                        # Rewind only here; ordinary local restarts keep their cursor.
+                        self._update_restore_progress(
+                            phase="indexing", current="reindex_controls"
+                        )
+                        self.store.compact_reindex_controls(replay=True)
+                        self.store.drain_reindex_controls(self.restore_batch)
+                        restore_completed = True
                     finally:
-                        self._restore_prefetch_root = None
-                    # A complete Hub restore can replay an old generation-zero
-                    # revision into an id below a partially persisted row cursor.
-                    # Rewind only here; ordinary local restarts keep their cursor.
-                    self.store.compact_reindex_controls(replay=True)
-                    self.store.drain_reindex_controls(self.restore_batch)
-                finally:
-                    self.store.finish_bulk_restore()
-                self.covered_revision = restored_revision
-                self._restore_revision = None
-                self.restored = True
-                return restored
-            except Exception as exc:  # optional recovery must never stop serving
-                self._restore_revision = None
-                status = getattr(getattr(exc, "response", None), "status_code", None)
-                if status == 404 and self._truth("FUNES_ALLOW_EMPTY_REMOTE"):
+                        if bulk_active:
+                            self._update_restore_progress(
+                                phase="indexing", current="memories_fts"
+                            )
+                            self.store.finish_bulk_restore(
+                                rebuild_fts=self.rebuild_fts
+                            )
+                            self._record_restore_checkpoint(
+                                restored_revision,
+                                manifest,
+                                list(files),
+                                completed_order,
+                                derived_ready=True,
+                            )
+                        if restore_completed:
+                            self._remove_restore_checkpoint()
+                    self.covered_revision = restored_revision
+                    self._restore_revision = None
+                    self._restore_manifest = None
+                    self.restore_failed = False
+                    self.restore_error = None
+                    self.store.set_sync(last_error=None)
                     self.restored = True
-                    return 0
+                    self._update_restore_progress(
+                        phase="completed",
+                        current=None,
+                        completed=len(files),
+                        total=len(files),
+                        rows=restored,
+                    )
+                    return restored
+                except Exception as exc:  # optional recovery must never stop serving
+                    self._restore_revision = None
+                    self._restore_manifest = None
+                    status = getattr(getattr(exc, "response", None), "status_code", None)
+                    if status == 404 and self._truth("FUNES_ALLOW_EMPTY_REMOTE"):
+                        self.restore_failed = False
+                        self.restore_error = None
+                        self.store.set_sync(last_error=None)
+                        self.restored = True
+                        return 0
+                    return self._fail_restore(exc)
+            local = self.snapshot_path()
+            if not local.exists():
+                self.restore_failed = False
+                self.restore_error = None
+                self.store.set_sync(last_error=None)
+                self.restored = True
+                self._update_restore_progress(
+                    phase="completed", current=None, completed=0, total=0, rows=0, bytes=0
+                )
+                return 0
+            try:
+                local_bytes = local.stat().st_size if local.is_file() else 0
+                self._update_restore_progress(
+                    phase="restoring",
+                    current=local.name,
+                    completed=0,
+                    total=1,
+                    rows=0,
+                    bytes=local_bytes,
+                )
+                restored = self.store.restore(local, apply_controls=False)
+                self._update_restore_progress(phase="indexing", current="reindex_controls")
+                self.store.compact_reindex_controls()
+                self.store.drain_reindex_controls(self.restore_batch)
+                self.restore_failed = False
+                self.restore_error = None
+                self.store.set_sync(last_error=None)
+                self.restored = True
+                self._update_restore_progress(
+                    phase="completed",
+                    current=None,
+                    completed=1,
+                    total=1,
+                    rows=restored,
+                    bytes=local_bytes,
+                )
+                return restored
+            except Exception as exc:
                 return self._fail_restore(exc)
-        local = self.snapshot_path()
-        if not local.exists():
-            self.restored = True
-            return 0
-        try:
-            restored = self.store.restore(local, apply_controls=False)
-            self.store.compact_reindex_controls()
-            self.store.drain_reindex_controls(self.restore_batch)
-            self.restored = True
-            return restored
-        except Exception as exc:
-            return self._fail_restore(exc)
 
     def _secret_gate(self, path: Path) -> tuple[bool, str]:
         """Run the same TruffleHog CLI contract used by native `funes push`.
@@ -4007,13 +4407,13 @@ def queue_reindex(app: Any, scope: str) -> dict[str, Any]:
 
 
 class App:
-    def __init__(self):
+    def __init__(self, *, rebuild_fts: bool | None = None):
         # Free Gradio Spaces do not expose /data.  The Hub snapshot remains the
         # durable source of truth; operators can override this with a writable
         # mounted volume when one is available.
         self.store = Store(os.getenv("FUNES_DATA_DIR", "/tmp/funes-data"))
         self.translator = Translator(self.store)
-        self.syncer = SnapshotSync(self.store)
+        self.syncer = SnapshotSync(self.store, rebuild_fts=rebuild_fts)
         self.restore_result = 0
         self.restore_done = threading.Event()
         self.reconcile_stop = threading.Event()
@@ -4189,18 +4589,51 @@ def make_handler(app: App):
             if route == "/ready":
                 try:
                     if app.syncer.restoring:
-                        return self._json(503, {"status": "restoring"})
+                        progress = getattr(app.syncer, "progress", {})
+                        return self._json(
+                            503,
+                            {
+                                "status": "restoring",
+                                "phase": progress.get("phase", "restoring"),
+                                "current": progress.get("current"),
+                                "completed": progress.get("completed", 0),
+                                "total": progress.get("total", 0),
+                                "rows": progress.get("rows", 0),
+                                "bytes": progress.get("bytes", 0),
+                                "progress": progress,
+                            },
+                        )
                     if app.syncer.restore_failed:
                         return self._json(503, {"status": "not_ready", "error": "restore_failed"})
                     count = app.store.count()
-                    return self._json(200, {"status": "ready", "documents": count, "restored": app.restore_result})
+                    return self._json(
+                        200,
+                        {
+                            "status": "ready",
+                            "documents": count,
+                            "restored": app.restore_result,
+                            "progress": getattr(app.syncer, "progress", {}),
+                        },
+                    )
                 except Exception as exc:
                     return self._json(503, {"status": "not_ready", "error": type(exc).__name__})
             if route in PROTECTED and self._authorized():
                 if route == "/sources":
                     return self._json(200, {"sources": app.store.sources()})
                 if route == "/sync/status":
-                    return self._json(200, app.store.sync_status())
+                    if app.syncer.restoring:
+                        return self._json(
+                            503,
+                            {
+                                "status": "restoring",
+                                "restore_progress": getattr(
+                                    app.syncer, "progress", {}
+                                ),
+                            },
+                        )
+                    status = app.store.sync_status()
+                    status["restore_progress"] = getattr(app.syncer, "progress", {})
+                    return self._json(200, status)
                 if route == "/get":
                     params = parse_qs(urlparse(self.path).query)
                     ident = params.get("source_identity", params.get("id", [""]))[0]
@@ -4279,9 +4712,22 @@ def make_handler(app: App):
                     result = queue_reindex(app, str(body.get("scope", "")))
                     return self._json(202 if result.get("durable") else 503, result)
                 if self.path == "/sync":
+                    if app.syncer.restoring or app.syncer.restore_failed:
+                        error = "restore_in_progress" if app.syncer.restoring else "restore_failed"
+                        return self._json(503, {"error": error, "durable": False})
                     result = app.syncer.upload()
                     return self._json(200 if result.get("durable") else 503, result)
                 if self.path == "/sync/status":
+                    if app.syncer.restoring:
+                        return self._json(
+                            503,
+                            {
+                                "status": "restoring",
+                                "restore_progress": getattr(
+                                    app.syncer, "progress", {}
+                                ),
+                            },
+                        )
                     return self._json(200, app.store.sync_status())
             except (ValueError, json.JSONDecodeError) as exc:
                 return self._json(400, {"error": str(exc)})

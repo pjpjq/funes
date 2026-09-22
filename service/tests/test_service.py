@@ -12,16 +12,16 @@ from http.client import HTTPConnection
 from pathlib import Path
 from http.server import ThreadingHTTPServer
 
-from service.server import QUERY_PROMPT_VERSION, QUERY_RETRIEVAL_PROMPT, RETRIEVAL_PROMPT, App, Store, Translator, ingest_documents, make_handler, persist_translation_documents, prepare_ingest_documents
+from service.server import FTS_SCHEMA_VERSION, QUERY_PROMPT_VERSION, QUERY_RETRIEVAL_PROMPT, RETRIEVAL_PROMPT, App, Store, Translator, ingest_documents, make_handler, persist_translation_documents, prepare_ingest_documents
 
 
 class ServiceTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.old = {k: os.environ.get(k) for k in ("FUNES_DATA_DIR", "FUNES_AUTH_TOKEN", "FUNES_API_TOKEN", "FUNES_STORAGE_KEY", "FUNES_STORAGE_REPO", "FUNES_SNAPSHOT_FILE", "FUNES_RESTORE_MANIFEST_FILE", "HF_TOKEN", "FUNES_REQUIRE_DURABLE_ACK", "FUNES_ALLOW_EMPTY_REMOTE", "FUNES_MAX_BODY_BYTES", "FUNES_RETRIEVAL_LANGUAGE_MODE", "TRANSLATION_BASE_URL", "TRANSLATION_API_KEY", "TRANSLATION_MODEL", "TRANSLATION_MAX_PER_INGEST", "TRANSLATION_QUERY_MAX_TOKENS", "TRANSLATION_RECONCILE_INTERVAL", "RETURN_RETRIEVAL_TEXT")}
+        self.old = {k: os.environ.get(k) for k in ("FUNES_DATA_DIR", "FUNES_AUTH_TOKEN", "FUNES_API_TOKEN", "FUNES_STORAGE_KEY", "FUNES_STORAGE_REPO", "FUNES_SNAPSHOT_FILE", "FUNES_RESTORE_MANIFEST_FILE", "HF_TOKEN", "FUNES_REQUIRE_DURABLE_ACK", "FUNES_ALLOW_EMPTY_REMOTE", "FUNES_MAX_BODY_BYTES", "FUNES_RETRIEVAL_LANGUAGE_MODE", "FUNES_BULK_RESTORE_REBUILD_FTS", "TRANSLATION_BASE_URL", "TRANSLATION_API_KEY", "TRANSLATION_MODEL", "TRANSLATION_MAX_PER_INGEST", "TRANSLATION_QUERY_MAX_TOKENS", "TRANSLATION_RECONCILE_INTERVAL", "RETURN_RETRIEVAL_TEXT")}
         os.environ["FUNES_DATA_DIR"] = self.tmp.name
         os.environ["FUNES_AUTH_TOKEN"] = "test-token"
-        for k in ("FUNES_API_TOKEN", "FUNES_STORAGE_KEY", "FUNES_STORAGE_REPO", "FUNES_SNAPSHOT_FILE", "FUNES_RESTORE_MANIFEST_FILE", "HF_TOKEN", "FUNES_REQUIRE_DURABLE_ACK", "FUNES_ALLOW_EMPTY_REMOTE", "FUNES_MAX_BODY_BYTES", "FUNES_RETRIEVAL_LANGUAGE_MODE", "TRANSLATION_BASE_URL", "TRANSLATION_API_KEY", "TRANSLATION_MODEL", "TRANSLATION_MAX_PER_INGEST", "TRANSLATION_QUERY_MAX_TOKENS", "TRANSLATION_RECONCILE_INTERVAL", "RETURN_RETRIEVAL_TEXT"):
+        for k in ("FUNES_API_TOKEN", "FUNES_STORAGE_KEY", "FUNES_STORAGE_REPO", "FUNES_SNAPSHOT_FILE", "FUNES_RESTORE_MANIFEST_FILE", "HF_TOKEN", "FUNES_REQUIRE_DURABLE_ACK", "FUNES_ALLOW_EMPTY_REMOTE", "FUNES_MAX_BODY_BYTES", "FUNES_RETRIEVAL_LANGUAGE_MODE", "FUNES_BULK_RESTORE_REBUILD_FTS", "TRANSLATION_BASE_URL", "TRANSLATION_API_KEY", "TRANSLATION_MODEL", "TRANSLATION_MAX_PER_INGEST", "TRANSLATION_QUERY_MAX_TOKENS", "TRANSLATION_RECONCILE_INTERVAL", "RETURN_RETRIEVAL_TEXT"):
             os.environ.pop(k, None)
 
     def tearDown(self):
@@ -1787,6 +1787,575 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(store.conn.execute("PRAGMA mmap_size").fetchone()[0], 0)
         store.close()
 
+    def test_bulk_restore_can_skip_derived_fts_rebuild(self):
+        store = Store(self.tmp.name)
+        try:
+            with mock.patch.dict(
+                os.environ, {"FUNES_BULK_RESTORE_REBUILD_FTS": "false"}
+            ):
+                store.begin_bulk_restore()
+                store.ingest(
+                    [
+                        {
+                            "source_identity": "restored-without-fts",
+                            "raw_text": "restored sentinel phrase",
+                        }
+                    ]
+                )
+                store.finish_bulk_restore()
+
+            # The expensive derived rebuild was skipped, but its schema marker,
+            # secondary indexes, triggers, and normal pragmas were restored.
+            self.assertEqual(
+                store.conn.execute(
+                    "SELECT fts_schema_version FROM sync_state WHERE id=1"
+                ).fetchone()[0],
+                FTS_SCHEMA_VERSION,
+            )
+            self.assertEqual(
+                store.conn.execute(
+                    "SELECT count(*) FROM memories_fts "
+                    "WHERE memories_fts MATCH 'sentinel'"
+                ).fetchone()[0],
+                0,
+            )
+            self.assertIsNotNone(
+                store.conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='index' "
+                    "AND name='memories_source_agent_role_idx'"
+                ).fetchone()
+            )
+            self.assertIsNotNone(
+                store.conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='trigger' "
+                    "AND name='memories_ai'"
+                ).fetchone()
+            )
+            self.assertEqual(store.conn.execute("PRAGMA synchronous").fetchone()[0], 2)
+
+            store.ingest(
+                [
+                    {
+                        "source_identity": "post-restore-trigger",
+                        "raw_text": "postrestore trigger phrase",
+                    }
+                ]
+            )
+            self.assertEqual(
+                store.conn.execute(
+                    "SELECT count(*) FROM memories_fts "
+                    "WHERE memories_fts MATCH 'postrestore'"
+                ).fetchone()[0],
+                1,
+            )
+        finally:
+            store.close()
+
+    def test_bulk_restore_rebuilds_fts_by_default(self):
+        store = Store(self.tmp.name)
+        try:
+            with mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("FUNES_BULK_RESTORE_REBUILD_FTS", None)
+                store.begin_bulk_restore()
+                store.ingest(
+                    [
+                        {
+                            "source_identity": "restored-with-default-fts",
+                            "raw_text": "default rebuild phrase",
+                        }
+                    ]
+                )
+                store.finish_bulk_restore()
+            self.assertEqual(
+                store.conn.execute(
+                    "SELECT count(*) FROM memories_fts "
+                    "WHERE memories_fts MATCH 'default'"
+                ).fetchone()[0],
+                1,
+            )
+        finally:
+            store.close()
+
+    def test_fts_ready_transitions(self):
+        store = Store(self.tmp.name)
+        try:
+            # 1. Default store has fts_ready == True (1)
+            self.assertTrue(store.fts_ready())
+            self.assertTrue(store.sync_status()["fts_ready"])
+
+            # 2. begin_bulk_restore sets fts_ready == False (0)
+            store.begin_bulk_restore()
+            self.assertFalse(store.fts_ready())
+            self.assertFalse(store.sync_status()["fts_ready"])
+
+            # 3. finish_bulk_restore with rebuild_fts=False keeps fts_ready == False
+            store.finish_bulk_restore(rebuild_fts=False)
+            self.assertFalse(store.fts_ready())
+            self.assertFalse(store.sync_status()["fts_ready"])
+
+            # 4. reindex sets fts_ready == True
+            store.reindex()
+            self.assertTrue(store.fts_ready())
+            self.assertTrue(store.sync_status()["fts_ready"])
+
+            # 5. begin again -> 0 -> finish with rebuild_fts=True -> 1
+            store.begin_bulk_restore()
+            self.assertFalse(store.fts_ready())
+            store.finish_bulk_restore(rebuild_fts=True)
+            self.assertTrue(store.fts_ready())
+            self.assertTrue(store.sync_status()["fts_ready"])
+        finally:
+            store.close()
+
+    def test_lock_free_count_and_sync_status_while_store_lock_acquired(self):
+        store = Store(self.tmp.name)
+        try:
+            store.ingest([{"source_identity": "doc-1", "raw_text": "hello lock-free"}])
+            with store.lock:
+                # With store.lock held (simulating a long-running write operation),
+                # count(), sync_status(), and fts_ready() must complete without deadlocking
+                # or blocking on self.lock.
+                self.assertEqual(store.count(), 1)
+                status = store.sync_status()
+                self.assertEqual(status["documents"], 1)
+                self.assertTrue(status["fts_ready"])
+                self.assertTrue(store.fts_ready())
+        finally:
+            store.close()
+
+    def test_restore_fts_readiness_on_skip_fts_vs_rebuild(self):
+        from service.server import SnapshotSync
+
+        store = Store(self.tmp.name)
+        try:
+            files = ["funes-snapshot.jsonl.gz.enc"]
+            manifest = {
+                "version": 1,
+                "snapshot": "funes-snapshot.jsonl.gz.enc",
+                "deltas": [],
+                "controls": [],
+            }
+            revision = "sha-rev-checkpoint-fts"
+
+            def mock_restore_file(filename):
+                return 1
+
+            # Test 1: rebuild_fts=False -> completes restore without rebuilding FTS;
+            # checkpoint is removed on completion, and store.fts_ready() is False.
+            syncer_skip = SnapshotSync(store, rebuild_fts=False)
+            syncer_skip.repo = "owner/private"
+            syncer_skip.token = "test-token"
+            checkpoint_path = syncer_skip.restore_checkpoint_path
+            with mock.patch.object(
+                syncer_skip, "_repo_files_metadata", return_value=(files, manifest, revision)
+            ), mock.patch.object(
+                syncer_skip, "_prefetch_restore_files", return_value=None
+            ), mock.patch.object(
+                syncer_skip, "_restore_file", side_effect=mock_restore_file
+            ):
+                result = syncer_skip.restore()
+
+            self.assertEqual(result, 1)
+            self.assertFalse(checkpoint_path.exists())
+            self.assertFalse(store.fts_ready())
+
+            # Test 2: rebuild_fts=True -> rebuilds FTS; checkpoint is removed
+            # on completion, and store.fts_ready() is True.
+            syncer_rebuild = SnapshotSync(store, rebuild_fts=True)
+            syncer_rebuild.repo = "owner/private"
+            syncer_rebuild.token = "test-token"
+            with mock.patch.object(
+                syncer_rebuild, "_repo_files_metadata", return_value=(files, manifest, revision)
+            ), mock.patch.object(
+                syncer_rebuild, "_prefetch_restore_files", return_value=None
+            ), mock.patch.object(
+                syncer_rebuild, "_restore_file", side_effect=mock_restore_file
+            ):
+                result = syncer_rebuild.restore()
+
+            self.assertEqual(result, 1)
+            self.assertFalse(checkpoint_path.exists())
+            self.assertTrue(store.fts_ready())
+        finally:
+            store.close()
+
+    def test_fts_migration_preserves_or_rebuilds_readiness(self):
+        store = Store(self.tmp.name)
+        try:
+            store.ingest([{"source_identity": "doc-1", "raw_text": "hello world"}])
+            self.assertTrue(store.fts_ready())
+
+            # Manually simulate unready state (e.g. restore with rebuild_fts=False)
+            with store.lock, store.conn:
+                store.conn.execute("UPDATE sync_state SET fts_ready=0 WHERE id=1")
+        finally:
+            store.close()
+
+        # Reopen with FUNES_BULK_RESTORE_REBUILD_FTS=false -> preserves fts_ready == False
+        os.environ["FUNES_BULK_RESTORE_REBUILD_FTS"] = "false"
+        try:
+            store_preserved = Store(self.tmp.name)
+            try:
+                self.assertFalse(store_preserved.fts_ready())
+            finally:
+                store_preserved.close()
+        finally:
+            os.environ.pop("FUNES_BULK_RESTORE_REBUILD_FTS", None)
+
+        # Reopen with FUNES_BULK_RESTORE_REBUILD_FTS=true -> rebuilds and sets fts_ready == True
+        os.environ["FUNES_BULK_RESTORE_REBUILD_FTS"] = "true"
+        try:
+            store_rebuilt = Store(self.tmp.name)
+            try:
+                self.assertTrue(store_rebuilt.fts_ready())
+            finally:
+                store_rebuilt.close()
+        finally:
+            os.environ.pop("FUNES_BULK_RESTORE_REBUILD_FTS", None)
+
+    def test_unready_fts_search_behavior(self):
+        from types import SimpleNamespace
+        import server
+
+        # 1. source_fts_ready helper checks
+        self.assertFalse(server.source_fts_ready(None))
+        app_restoring = SimpleNamespace(
+            syncer=SimpleNamespace(restoring=True, restore_failed=False),
+            store=SimpleNamespace(fts_ready=lambda: True),
+        )
+        self.assertFalse(server.source_fts_ready(app_restoring))
+
+        app_failed = SimpleNamespace(
+            syncer=SimpleNamespace(restoring=False, restore_failed=True),
+            store=SimpleNamespace(fts_ready=lambda: True),
+        )
+        self.assertFalse(server.source_fts_ready(app_failed))
+
+        app_unready = SimpleNamespace(
+            syncer=SimpleNamespace(restoring=False, restore_failed=False),
+            store=SimpleNamespace(fts_ready=lambda: False, count=lambda: 1),
+            translator=SimpleNamespace(rewrite_query=lambda q: q),
+        )
+        self.assertFalse(server.source_fts_ready(app_unready))
+
+        app_ready = SimpleNamespace(
+            syncer=SimpleNamespace(restoring=False, restore_failed=False),
+            store=SimpleNamespace(fts_ready=lambda: True),
+        )
+        self.assertTrue(server.source_fts_ready(app_ready))
+
+        # 2. search_source_rankings and search_source_bm25_rankings skip FTS when unready
+        with mock.patch.object(server, "source_app", return_value=app_unready):
+            query, semantic, lexical = server.search_source_rankings(
+                "query", 10, filters={}
+            )
+            self.assertEqual(query, "query")
+            self.assertEqual(semantic, [])
+            self.assertEqual(lexical, [])
+
+            sem_bm25, lex_bm25 = server.search_source_bm25_rankings(
+                "query", 10, filters={}
+            )
+            self.assertEqual(sem_bm25, [])
+            self.assertEqual(lex_bm25, [])
+
+        # 3. HTTP handler returns 503 source_fts_unavailable when sidecar FTS is not ready:
+        # Case A: non-voyage embedding provider
+        with mock.patch.object(server, "source_app", return_value=app_unready),              mock.patch.object(server, "TOKEN", "test-token"),              mock.patch.object(server, "embedding_profile", return_value={"provider": "local"}):
+            server_local = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+            thread = threading.Thread(target=server_local.serve_forever, daemon=True)
+            thread.start()
+            try:
+                conn = HTTPConnection(*server_local.server_address)
+                conn.request(
+                    "POST",
+                    "/search",
+                    json.dumps({"query": "hello"}).encode(),
+                    {"Authorization": "Bearer test-token", "Content-Type": "application/json"},
+                )
+                resp = conn.getresponse()
+                body = json.loads(resp.read().decode())
+                self.assertEqual(resp.status, 503)
+                self.assertEqual(body.get("error"), "source_fts_unavailable")
+            finally:
+                server_local.shutdown()
+                server_local.server_close()
+                thread.join(timeout=1)
+
+        # Case B: voyage provider with unsupported native filter (e.g. "since")
+        with mock.patch.object(server, "source_app", return_value=app_unready),              mock.patch.object(server, "TOKEN", "test-token"),              mock.patch.object(server, "embedding_profile", return_value={"provider": "voyage", "fingerprint": "fp"}):
+            server_voyage = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+            thread = threading.Thread(target=server_voyage.serve_forever, daemon=True)
+            thread.start()
+            try:
+                conn = HTTPConnection(*server_voyage.server_address)
+                conn.request(
+                    "POST",
+                    "/search",
+                    json.dumps({"query": "hello", "since": 12345}).encode(),
+                    {"Authorization": "Bearer test-token", "Content-Type": "application/json"},
+                )
+                resp = conn.getresponse()
+                body = json.loads(resp.read().decode())
+                self.assertEqual(resp.status, 503)
+                self.assertEqual(body.get("error"), "source_fts_unavailable")
+            finally:
+                server_voyage.shutdown()
+                server_voyage.server_close()
+                thread.join(timeout=1)
+
+    def test_bulk_restore_skips_embedding_generation_scan_for_explicit_generations(self):
+        store = Store(self.tmp.name)
+        try:
+            # 1. Bulk restore with explicit embedding_generation across multiple batches:
+            # Table scan (_latest_embedding_generation_locked) must be skipped entirely (0 calls).
+            docs = [
+                {
+                    "source_identity": f"doc-explicit-{i}",
+                    "raw_text": f"explicit generation {i}",
+                    "embedding_generation": 2,
+                }
+                for i in range(10)
+            ]
+            with mock.patch.object(
+                store,
+                "_latest_embedding_generation_locked",
+                wraps=store._latest_embedding_generation_locked,
+            ) as spy_gen:
+                total = store.restore_documents(docs, batch_size=3)
+                self.assertEqual(total, 10)
+                self.assertEqual(spy_gen.call_count, 0)
+
+            # All rows have their explicit generation preserved
+            rows = store.conn.execute(
+                "SELECT embedding_generation FROM memories WHERE source_identity LIKE 'doc-explicit-%'"
+            ).fetchall()
+            self.assertEqual(len(rows), 10)
+            self.assertTrue(all(r[0] == 2 for r in rows))
+
+            # Bulk restore lifecycle restored secondary indexes and depth
+            self.assertEqual(store._bulk_restore_depth, 0)
+            index_names = {
+                r["name"]
+                for r in store.conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='memories'"
+                )
+            }
+            self.assertIn("memories_source_agent_role_idx", index_names)
+
+            # 2. Bulk restore of legacy docs (missing embedding_generation) evaluates lazily
+            # once per batch, not once per document.
+            legacy_docs = [
+                {
+                    "source_identity": f"doc-legacy-{i}",
+                    "raw_text": f"legacy document {i}",
+                }
+                for i in range(6)
+            ]
+            with mock.patch.object(
+                store,
+                "_latest_embedding_generation_locked",
+                wraps=store._latest_embedding_generation_locked,
+            ) as spy_gen:
+                total = store.restore_documents(legacy_docs, batch_size=2)
+                self.assertEqual(total, 6)
+                self.assertEqual(spy_gen.call_count, 3)
+
+            legacy_rows = store.conn.execute(
+                "SELECT embedding_generation FROM memories WHERE source_identity LIKE 'doc-legacy-%'"
+            ).fetchall()
+            self.assertEqual(len(legacy_rows), 6)
+            self.assertTrue(all(r[0] == 2 for r in legacy_rows))
+
+            # 3. Normal ingest lazy evaluation and dedupe / update / CAS semantics
+            # Ingesting empty list does not call generation lookup
+            with mock.patch.object(
+                store,
+                "_latest_embedding_generation_locked",
+                wraps=store._latest_embedding_generation_locked,
+            ) as spy_gen:
+                store.ingest([])
+                self.assertEqual(spy_gen.call_count, 0)
+
+            # Ingesting existing row (dedupe / update) does not call generation lookup
+            with mock.patch.object(
+                store,
+                "_latest_embedding_generation_locked",
+                wraps=store._latest_embedding_generation_locked,
+            ) as spy_gen:
+                res = store.ingest([
+                    {
+                        "source_identity": "doc-explicit-0",
+                        "raw_text": "explicit generation 0",
+                    }
+                ])
+                self.assertEqual(res["deduped"], 1)
+                self.assertEqual(spy_gen.call_count, 0)
+
+            # Updating existing row preserves higher existing generation
+            store.ingest([
+                {
+                    "source_identity": "doc-explicit-0",
+                    "raw_text": "updated text",
+                    "embedding_generation": 1,
+                }
+            ])
+            val = store.conn.execute(
+                "SELECT embedding_generation FROM memories WHERE source_identity='doc-explicit-0'"
+            ).fetchone()[0]
+            self.assertEqual(val, 2)
+
+            # Updating existing row advances to higher incoming generation
+            store.ingest([
+                {
+                    "source_identity": "doc-explicit-0",
+                    "raw_text": "advanced text",
+                    "embedding_generation": 5,
+                }
+            ])
+            val = store.conn.execute(
+                "SELECT embedding_generation FROM memories WHERE source_identity='doc-explicit-0'"
+            ).fetchone()[0]
+            self.assertEqual(val, 5)
+
+            # Normal ingest of batch of new legacy rows fetches default generation lazily ONCE per batch
+            with mock.patch.object(
+                store,
+                "_latest_embedding_generation_locked",
+                wraps=store._latest_embedding_generation_locked,
+            ) as spy_gen:
+                store.ingest([
+                    {
+                        "source_identity": f"doc-normal-legacy-{i}",
+                        "raw_text": f"new normal legacy row {i}",
+                    }
+                    for i in range(5)
+                ])
+                self.assertEqual(spy_gen.call_count, 1)
+
+            val = store.conn.execute(
+                "SELECT embedding_generation FROM memories WHERE source_identity='doc-normal-legacy-0'"
+            ).fetchone()[0]
+            self.assertEqual(val, 5)
+
+            # Normal ingest of new row with explicit embedding_generation:
+            # Does NOT call _latest_embedding_generation_locked (0 calls).
+            with mock.patch.object(
+                store,
+                "_latest_embedding_generation_locked",
+                wraps=store._latest_embedding_generation_locked,
+            ) as spy_gen:
+                store.ingest([
+                    {
+                        "source_identity": "doc-normal-explicit",
+                        "raw_text": "new normal explicit row",
+                        "embedding_generation": 7,
+                    }
+                ])
+                self.assertEqual(spy_gen.call_count, 0)
+
+            val = store.conn.execute(
+                "SELECT embedding_generation FROM memories WHERE source_identity='doc-normal-explicit'"
+            ).fetchone()[0]
+            self.assertEqual(val, 7)
+        finally:
+            store.close()
+
+    def test_generation_indexes_and_covering_query_plans(self):
+        store = Store(self.tmp.name)
+        try:
+            # 1. Generation indexes exist initially
+            index_names = {
+                row["name"]
+                for row in store.conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='memories'"
+                )
+            }
+            self.assertIn("memories_retrieval_generation_idx", index_names)
+            self.assertIn("memories_native_generation_idx", index_names)
+            self.assertIn("memories_embedding_generation_idx", index_names)
+
+            # 2. Query plans use covering indexes for max() generation queries
+            plans_reindex = [
+                row[3]
+                for row in store.conn.execute(
+                    """EXPLAIN QUERY PLAN SELECT max(value) FROM (
+                    SELECT COALESCE(max(generation), 0) AS value FROM reindex_controls
+                    UNION ALL SELECT COALESCE(max(retrieval_generation), 0) FROM memories
+                    UNION ALL SELECT COALESCE(max(native_generation), 0) FROM memories
+                    UNION ALL SELECT COALESCE(max(embedding_generation), 0) FROM memories
+                    )"""
+                ).fetchall()
+            ]
+            self.assertTrue(any("COVERING INDEX memories_retrieval_generation_idx" in p for p in plans_reindex))
+            self.assertTrue(any("COVERING INDEX memories_native_generation_idx" in p for p in plans_reindex))
+            self.assertTrue(any("COVERING INDEX memories_embedding_generation_idx" in p for p in plans_reindex))
+
+            plans_embedding = [
+                row[3]
+                for row in store.conn.execute(
+                    """EXPLAIN QUERY PLAN SELECT max(value) FROM (
+                    SELECT COALESCE(max(generation), 0) AS value
+                    FROM reindex_controls WHERE scope='all'
+                    UNION ALL
+                    SELECT COALESCE(max(embedding_generation), 0) FROM memories
+                    )"""
+                ).fetchall()
+            ]
+            self.assertTrue(any("COVERING INDEX memories_embedding_generation_idx" in p for p in plans_embedding))
+
+            plans_single = [
+                row[3]
+                for row in store.conn.execute(
+                    "EXPLAIN QUERY PLAN SELECT COALESCE(max(embedding_generation), 0) FROM memories"
+                ).fetchall()
+            ]
+            self.assertTrue(any("COVERING INDEX memories_embedding_generation_idx" in p for p in plans_single))
+
+            # 3. Generation indexes are NOT dropped by begin_bulk_restore()
+            store.begin_bulk_restore()
+            bulk_index_names = {
+                row["name"]
+                for row in store.conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='memories'"
+                )
+            }
+            self.assertIn("memories_retrieval_generation_idx", bulk_index_names)
+            self.assertIn("memories_native_generation_idx", bulk_index_names)
+            self.assertIn("memories_embedding_generation_idx", bulk_index_names)
+            # Secondary indexes are dropped as expected
+            self.assertNotIn("memories_source_agent_role_idx", bulk_index_names)
+
+            # Query plan inside bulk restore still uses covering index
+            plans_bulk = [
+                row[3]
+                for row in store.conn.execute(
+                    "EXPLAIN QUERY PLAN SELECT COALESCE(max(embedding_generation), 0) FROM memories"
+                ).fetchall()
+            ]
+            self.assertTrue(any("COVERING INDEX memories_embedding_generation_idx" in p for p in plans_bulk))
+
+            store.finish_bulk_restore()
+
+            # 4. prepare_ingest_documents supplies embedding_generation so Store.ingest skips lookup
+            app = App()
+            try:
+                prepared = prepare_ingest_documents(app, [{"raw_text": "hello from prepared pipeline"}])
+                self.assertTrue(all("embedding_generation" in doc for doc in prepared))
+
+                with mock.patch.object(
+                    app.store,
+                    "_latest_embedding_generation_locked",
+                    wraps=app.store._latest_embedding_generation_locked,
+                ) as spy_gen:
+                    res = app.store.ingest(prepared)
+                    self.assertEqual(res["created"], 1)
+                    self.assertEqual(spy_gen.call_count, 0)
+            finally:
+                app.close()
+        finally:
+            store.close()
+
     def test_bulk_restore_exception_in_restore_recovers_indexes_and_pragmas(self):
         store = Store(self.tmp.name)
         store.ingest([{"source_identity": "doc-err", "raw_text": "failure test"}])
@@ -2227,6 +2796,7 @@ class ServiceTests(unittest.TestCase):
         connection = sqlite3.connect(Path(self.tmp.name) / "funes.sqlite3")
         with connection:
             connection.execute("DROP TRIGGER memories_native_au")
+            connection.execute("DROP INDEX IF EXISTS memories_embedding_generation_idx")
             connection.execute("ALTER TABLE memories DROP COLUMN embedding_generation")
         connection.close()
 
@@ -2237,6 +2807,12 @@ class ServiceTests(unittest.TestCase):
             }
             self.assertIn("embedding_generation", columns)
             self.assertEqual(migrated.get("legacy")["embedding_generation"], 0)
+            index_names = {
+                row["name"] for row in migrated.conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='memories'"
+                )
+            }
+            self.assertIn("memories_embedding_generation_idx", index_names)
         finally:
             migrated.close()
 
@@ -4373,6 +4949,739 @@ class ServiceTests(unittest.TestCase):
                     target,
                 ],
             )
+        store.close()
+
+    def test_restore_checkpoint_filename_security(self):
+        from service.server import SnapshotSync
+
+        store = Store(self.tmp.name)
+        for bad in (
+            "../checkpoint.json",
+            "/tmp/bad.json",
+            "sub/cp.json",
+            "..",
+        ):
+            with mock.patch.dict(os.environ, {"FUNES_RESTORE_CHECKPOINT_FILE": bad}):
+                with self.assertRaises(ValueError):
+                    SnapshotSync(store)
+        self.assertFalse(SnapshotSync._safe_repo_filename("cp\x00.json"))
+
+        syncer = SnapshotSync(store)
+        syncer.restore_checkpoint_filename = "../escape.json"
+        with self.assertRaises(ValueError):
+            _ = syncer.restore_checkpoint_path
+        store.close()
+
+    def test_restore_checkpoint_lifecycle_and_resume_skip(self):
+        from service.server import SnapshotSync
+
+        store = Store(self.tmp.name)
+        syncer = SnapshotSync(store)
+        syncer.repo = "owner/private"
+        syncer.token = "test-token"
+        files = [
+            "funes-snapshot.jsonl.gz.enc",
+            "funes-delta-1.jsonl.gz.enc",
+            "funes-delta-2.jsonl.gz.enc",
+        ]
+        manifest = {
+            "version": 1,
+            "snapshot": "funes-snapshot.jsonl.gz.enc",
+            "deltas": ["funes-delta-1.jsonl.gz.enc", "funes-delta-2.jsonl.gz.enc"],
+            "controls": [],
+        }
+        revision = "sha-rev-1"
+        restored_files = []
+
+        def mock_restore_file(filename):
+            restored_files.append(filename)
+            return 1
+
+        checkpoint_path = syncer.restore_checkpoint_path
+        syncer._record_restore_checkpoint(
+            revision,
+            manifest,
+            files,
+            ["funes-snapshot.jsonl.gz.enc", "funes-delta-1.jsonl.gz.enc"],
+        )
+        self.assertTrue(checkpoint_path.is_file())
+
+        with mock.patch.object(
+            syncer, "_repo_files_metadata", return_value=(files, manifest, revision)
+        ), mock.patch.object(
+            syncer, "_prefetch_restore_files", return_value=None
+        ), mock.patch.object(
+            syncer, "_restore_file", side_effect=mock_restore_file
+        ):
+            result = syncer.restore()
+
+        self.assertEqual(result, 1)
+        self.assertEqual(restored_files, ["funes-delta-2.jsonl.gz.enc"])
+        self.assertFalse(checkpoint_path.exists())
+        self.assertFalse(syncer.restore_failed)
+        self.assertIsNone(syncer.restore_error)
+        store.close()
+
+    def test_restore_checkpoint_retained_on_failure_and_resumed(self):
+        from service.server import SnapshotSync
+
+        store = Store(self.tmp.name)
+        syncer = SnapshotSync(store)
+        syncer.repo = "owner/private"
+        syncer.token = "test-token"
+        files = [
+            "funes-snapshot.jsonl.gz.enc",
+            "funes-delta-fail.jsonl.gz.enc",
+            "funes-delta-last.jsonl.gz.enc",
+        ]
+        revision = "sha-fail-1"
+        restored_calls = []
+
+        def mock_restore_fail(filename):
+            restored_calls.append(filename)
+            if filename == "funes-delta-fail.jsonl.gz.enc":
+                raise RuntimeError("simulated download failure")
+            return 10
+
+        with mock.patch.object(
+            syncer, "_repo_files_metadata", return_value=(files, None, revision)
+        ), mock.patch.object(
+            syncer, "_prefetch_restore_files", return_value=None
+        ), mock.patch.object(
+            syncer, "_restore_file", side_effect=mock_restore_fail
+        ):
+            res1 = syncer.restore()
+
+        self.assertEqual(res1, -1)
+        self.assertTrue(syncer.restore_failed)
+        self.assertEqual(syncer.restore_error, "RuntimeError")
+        self.assertEqual(
+            restored_calls,
+            ["funes-snapshot.jsonl.gz.enc", "funes-delta-fail.jsonl.gz.enc"],
+        )
+
+        checkpoint_path = syncer.restore_checkpoint_path
+        self.assertTrue(checkpoint_path.is_file())
+        saved_checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+        self.assertEqual(saved_checkpoint["completed"], ["funes-snapshot.jsonl.gz.enc"])
+
+        restored_calls.clear()
+
+        def mock_restore_success(filename):
+            restored_calls.append(filename)
+            return 5
+
+        with mock.patch.object(
+            syncer, "_repo_files_metadata", return_value=(files, None, revision)
+        ), mock.patch.object(
+            syncer, "_prefetch_restore_files", return_value=None
+        ), mock.patch.object(
+            syncer, "_restore_file", side_effect=mock_restore_success
+        ):
+            res2 = syncer.restore()
+
+        self.assertEqual(res2, 10)
+        self.assertEqual(
+            restored_calls,
+            ["funes-delta-fail.jsonl.gz.enc", "funes-delta-last.jsonl.gz.enc"],
+        )
+        self.assertFalse(checkpoint_path.exists())
+        self.assertFalse(syncer.restore_failed)
+        self.assertIsNone(syncer.restore_error)
+        store.close()
+
+    def test_restore_checkpoint_strict_completed_prefix_validation(self):
+        from service.server import SnapshotSync
+
+        store = Store(self.tmp.name)
+        syncer = SnapshotSync(store)
+        files = ["snap.enc", "delta-1.enc", "delta-2.enc"]
+        revision = "rev-strict"
+        manifest = None
+        checkpoint_path = syncer.restore_checkpoint_path
+
+        def write_cp(completed):
+            syncer._record_restore_checkpoint(revision, manifest, files, completed)
+
+        # Exact prefix match: valid
+        write_cp(["snap.enc", "delta-1.enc"])
+        self.assertEqual(
+            syncer._load_restore_checkpoint(revision, manifest, files),
+            {"snap.enc", "delta-1.enc"},
+        )
+
+        # Gap in sequence (not a prefix)
+        write_cp(["snap.enc", "delta-2.enc"])
+        self.assertEqual(
+            syncer._load_restore_checkpoint(revision, manifest, files), set()
+        )
+
+        # Out of order
+        write_cp(["delta-1.enc", "snap.enc"])
+        self.assertEqual(
+            syncer._load_restore_checkpoint(revision, manifest, files), set()
+        )
+
+        # Missing first item
+        write_cp(["delta-1.enc"])
+        self.assertEqual(
+            syncer._load_restore_checkpoint(revision, manifest, files), set()
+        )
+
+        # Duplicate entries
+        data = {
+            "version": 1,
+            "revision": revision,
+            "manifest_digest": None,
+            "files_digest": syncer._canonical_digest(files),
+            "files": files,
+            "completed": ["snap.enc", "snap.enc"],
+        }
+        checkpoint_path.write_text(json.dumps(data), encoding="utf-8")
+        self.assertEqual(
+            syncer._load_restore_checkpoint(revision, manifest, files), set()
+        )
+
+        # Non-string entries
+        data["completed"] = ["snap.enc", 123]
+        checkpoint_path.write_text(json.dumps(data), encoding="utf-8")
+        self.assertEqual(
+            syncer._load_restore_checkpoint(revision, manifest, files), set()
+        )
+
+        # Completed longer than files
+        data["completed"] = ["snap.enc", "delta-1.enc", "delta-2.enc", "extra.enc"]
+        checkpoint_path.write_text(json.dumps(data), encoding="utf-8")
+        self.assertEqual(
+            syncer._load_restore_checkpoint(revision, manifest, files), set()
+        )
+        store.close()
+
+    def test_restore_checkpoint_metadata_invalidation(self):
+        from service.server import SnapshotSync
+
+        store = Store(self.tmp.name)
+        syncer = SnapshotSync(store)
+        files = ["snap.enc", "delta-1.enc"]
+        manifest = {
+            "version": 1,
+            "snapshot": "snap.enc",
+            "deltas": ["delta-1.enc"],
+            "controls": [],
+        }
+        revision = "rev-1"
+
+        syncer._record_restore_checkpoint(revision, manifest, files, ["snap.enc"])
+
+        # Matches initially
+        self.assertEqual(
+            syncer._load_restore_checkpoint(revision, manifest, files),
+            {"snap.enc"},
+        )
+
+        # Changed revision
+        self.assertEqual(
+            syncer._load_restore_checkpoint("rev-2", manifest, files),
+            set(),
+        )
+
+        # Changed manifest content
+        other_manifest = dict(manifest, deltas=["delta-2.enc"])
+        self.assertEqual(
+            syncer._load_restore_checkpoint(revision, other_manifest, files),
+            set(),
+        )
+
+        # None manifest vs dict manifest
+        self.assertEqual(
+            syncer._load_restore_checkpoint(revision, None, files),
+            set(),
+        )
+
+        # Changed files list
+        other_files = ["snap.enc", "delta-2.enc"]
+        self.assertEqual(
+            syncer._load_restore_checkpoint(revision, manifest, other_files),
+            set(),
+        )
+        store.close()
+
+    def test_restore_checkpoint_corrupted_json_or_invalid_schema(self):
+        from service.server import SnapshotSync
+
+        store = Store(self.tmp.name)
+        syncer = SnapshotSync(store)
+        checkpoint_path = syncer.restore_checkpoint_path
+        files = ["snap.enc"]
+        revision = "rev-1"
+
+        # Not a file
+        self.assertEqual(syncer._load_restore_checkpoint(revision, None, files), set())
+
+        # Corrupted JSON syntax
+        checkpoint_path.write_text("{malformed json: true", encoding="utf-8")
+        self.assertEqual(syncer._load_restore_checkpoint(revision, None, files), set())
+
+        # Non-dict JSON (e.g. list, string, number)
+        checkpoint_path.write_text("[1, 2, 3]", encoding="utf-8")
+        self.assertEqual(syncer._load_restore_checkpoint(revision, None, files), set())
+        checkpoint_path.write_text('"checkpoint"', encoding="utf-8")
+        self.assertEqual(syncer._load_restore_checkpoint(revision, None, files), set())
+
+        # Version mismatch
+        checkpoint_path.write_text(
+            json.dumps({"version": 2, "revision": revision}), encoding="utf-8"
+        )
+        self.assertEqual(syncer._load_restore_checkpoint(revision, None, files), set())
+
+        # Missing digests
+        checkpoint_path.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "revision": revision,
+                    "files": files,
+                    "completed": files,
+                }
+            ),
+            encoding="utf-8",
+        )
+        self.assertEqual(syncer._load_restore_checkpoint(revision, None, files), set())
+        store.close()
+
+    def test_restore_checkpoint_nested_delta(self):
+        from service.server import SnapshotSync
+
+        store = Store(self.tmp.name)
+        syncer = SnapshotSync(store)
+        syncer.repo = "owner/private"
+        syncer.token = "test-token"
+        nested_files = [
+            "funes-snapshot.jsonl.gz.enc",
+            "deltas/4a/funes-delta-4a1b2c3d.jsonl.gz.enc",
+            "deltas/8f/funes-delta-8f9e0a1b.jsonl.gz.enc",
+        ]
+        manifest = {
+            "version": 1,
+            "snapshot": nested_files[0],
+            "deltas": nested_files[1:],
+            "controls": [],
+        }
+        revision = "rev-nested"
+        restored_files = []
+
+        def mock_restore_file(filename):
+            restored_files.append(filename)
+            return 1
+
+        # Record checkpoint with first two (snapshot + 1st nested delta)
+        syncer._record_restore_checkpoint(
+            revision,
+            manifest,
+            nested_files,
+            nested_files[:2],
+        )
+        self.assertEqual(
+            syncer._load_restore_checkpoint(revision, manifest, nested_files),
+            set(nested_files[:2]),
+        )
+
+        with mock.patch.object(
+            syncer,
+            "_repo_files_metadata",
+            return_value=(nested_files, manifest, revision),
+        ), mock.patch.object(
+            syncer, "_prefetch_restore_files", return_value=None
+        ), mock.patch.object(
+            syncer, "_restore_file", side_effect=mock_restore_file
+        ):
+            result = syncer.restore()
+
+        self.assertEqual(result, 1)
+        self.assertEqual(restored_files, [nested_files[2]])
+        self.assertFalse(syncer.restore_checkpoint_path.exists())
+        store.close()
+
+    def test_sync_endpoint_rejects_during_restoring_and_restore_failed(self):
+        app = mock.Mock()
+        app.store = Store(self.tmp.name)
+        app.syncer = mock.Mock()
+        app.syncer.restoring = True
+        app.syncer.restore_failed = False
+        app.syncer.upload = mock.Mock(return_value={"uploaded": True, "durable": True})
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(app))
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            # While restoring: 503 restore_in_progress
+            status, body = self._request(server, "POST", "/sync", {})
+            self.assertEqual(status, 503)
+            self.assertEqual(body, {"error": "restore_in_progress", "durable": False})
+            self.assertEqual(app.syncer.upload.call_count, 0)
+
+            # When restore_failed: 503 restore_failed
+            app.syncer.restoring = False
+            app.syncer.restore_failed = True
+            status, body = self._request(server, "POST", "/sync", {})
+            self.assertEqual(status, 503)
+            self.assertEqual(body, {"error": "restore_failed", "durable": False})
+            self.assertEqual(app.syncer.upload.call_count, 0)
+
+            # When healthy: 200 upload called
+            app.syncer.restore_failed = False
+            status, body = self._request(server, "POST", "/sync", {})
+            self.assertEqual(status, 200)
+            self.assertEqual(body, {"uploaded": True, "durable": True})
+            self.assertEqual(app.syncer.upload.call_count, 1)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+            app.store.close()
+
+    def test_restore_holds_upload_lock_against_concurrent_upload(self):
+        import time
+        from service.server import SnapshotSync
+
+        store = Store(self.tmp.name)
+        syncer = SnapshotSync(store)
+        syncer.repo = "owner/private"
+        syncer.token = "test-token"
+
+        files = ["snap.enc", "delta-1.enc"]
+        restore_started = threading.Event()
+        proceed_restore = threading.Event()
+        upload_attempted = threading.Event()
+        upload_finished = threading.Event()
+
+        def slow_restore_file(filename):
+            restore_started.set()
+            upload_attempted.wait(timeout=2)
+            proceed_restore.wait(timeout=2)
+            return 1
+
+        api = mock.Mock()
+        api.repo_info.return_value = mock.Mock(sha="rev-lock")
+        api.list_repo_tree.return_value = []
+
+        with mock.patch.object(
+            syncer, "_repo_files_metadata", return_value=(files, None, "rev-lock")
+        ), mock.patch.object(
+            syncer, "_prefetch_restore_files", return_value=None
+        ), mock.patch.object(
+            syncer, "_restore_file", side_effect=slow_restore_file
+        ), mock.patch.object(
+            syncer, "_encryption_key", return_value=b"0" * 32
+        ), mock.patch(
+            "huggingface_hub.HfApi", return_value=api
+        ):
+            restore_thread = threading.Thread(target=syncer.restore)
+            restore_thread.start()
+
+            restore_started.wait(timeout=2)
+
+            lock_acquired_by_main = syncer.upload_lock.acquire(blocking=False)
+            self.assertFalse(
+                lock_acquired_by_main,
+                "Main thread should not acquire upload_lock while restore holds it",
+            )
+
+            def run_upload():
+                upload_attempted.set()
+                syncer.upload()
+                upload_finished.set()
+
+            upload_thread = threading.Thread(target=run_upload)
+            upload_thread.start()
+
+            upload_attempted.wait(timeout=2)
+            time.sleep(0.05)
+            self.assertFalse(
+                upload_finished.is_set(),
+                "Upload should be blocked while restore holds upload_lock",
+            )
+
+            proceed_restore.set()
+            restore_thread.join(timeout=2)
+            upload_thread.join(timeout=2)
+
+            self.assertTrue(
+                upload_finished.is_set(),
+                "Upload should finish after restore releases upload_lock",
+            )
+            self.assertFalse(syncer.restore_failed)
+        store.close()
+
+    def test_restore_progress_phases_and_counters(self):
+        from service.server import SnapshotSync
+
+        store = Store(self.tmp.name)
+        syncer = SnapshotSync(store)
+        syncer.repo = "owner/private"
+        syncer.token = "test-token"
+
+        # 1. Initial idle state
+        initial = syncer.progress
+        self.assertEqual(initial["phase"], "idle")
+        self.assertIsNone(initial["current"])
+        self.assertEqual(initial["completed"], 0)
+        self.assertEqual(initial["total"], 0)
+        self.assertEqual(initial["rows"], 0)
+        self.assertEqual(initial["bytes"], 0)
+
+        files = [
+            "funes-snapshot.jsonl.gz.enc",
+            "funes-delta-1.jsonl.gz.enc",
+        ]
+        manifest = {
+            "version": 1,
+            "snapshot": "funes-snapshot.jsonl.gz.enc",
+            "deltas": ["funes-delta-1.jsonl.gz.enc"],
+            "controls": [],
+        }
+        revision = "rev-progress-check"
+
+        history = []
+        original_update = syncer._update_restore_progress
+
+        def track_update(**kwargs):
+            original_update(**kwargs)
+            history.append(dict(syncer.progress))
+
+        def mock_restore_file(filename):
+            with syncer._progress_lock:
+                syncer._restore_progress["bytes"] += 512
+            return 3
+
+        syncer._update_restore_progress = track_update
+
+        with mock.patch.object(
+            syncer, "_repo_files_metadata", return_value=(files, manifest, revision)
+        ), mock.patch.object(
+            syncer, "_prefetch_restore_files", return_value=None
+        ), mock.patch.object(
+            syncer, "_restore_file", side_effect=mock_restore_file
+        ):
+            result = syncer.restore()
+
+        self.assertEqual(result, 6)
+        self.assertFalse(syncer.restore_failed)
+        self.assertTrue(syncer.restored)
+
+        # Verify phase progression and counters in recorded history
+        phases = [h["phase"] for h in history]
+        self.assertIn("listing", phases)
+        self.assertIn("prefetching", phases)
+        self.assertIn("restoring", phases)
+        self.assertIn("indexing", phases)
+        self.assertIn("completed", phases)
+
+        # Verify restoring phase records file names and increments
+        restoring_snapshots = [h for h in history if h["phase"] == "restoring"]
+        current_files = [h["current"] for h in restoring_snapshots if h["current"] is not None]
+        self.assertEqual(current_files, files)
+
+        # Final progress counters
+        final_progress = syncer.progress
+        self.assertEqual(final_progress["phase"], "completed")
+        self.assertIsNone(final_progress["current"])
+        self.assertEqual(final_progress["completed"], 2)
+        self.assertEqual(final_progress["total"], 2)
+        self.assertEqual(final_progress["rows"], 6)
+        self.assertEqual(final_progress["bytes"], 1024)
+
+        # Test failure transition
+        syncer_fail = SnapshotSync(store)
+        syncer_fail.repo = "owner/private"
+        syncer_fail.token = "test-token"
+
+        def mock_restore_raise(filename):
+            raise RuntimeError("simulated download failure")
+
+        with mock.patch.object(
+            syncer_fail, "_repo_files_metadata", return_value=(files, manifest, revision)
+        ), mock.patch.object(
+            syncer_fail, "_prefetch_restore_files", return_value=None
+        ), mock.patch.object(
+            syncer_fail, "_restore_file", side_effect=mock_restore_raise
+        ):
+            fail_res = syncer_fail.restore()
+
+        self.assertEqual(fail_res, -1)
+        self.assertTrue(syncer_fail.restore_failed)
+        fail_progress = syncer_fail.progress
+        self.assertEqual(fail_progress["phase"], "failed")
+        self.assertIsNone(fail_progress["current"])
+        self.assertEqual(fail_progress.get("error"), "RuntimeError")
+
+        store.close()
+
+    def test_restore_progress_endpoints(self):
+        app = mock.Mock()
+        app.store = Store(self.tmp.name)
+        app.syncer = mock.Mock()
+        app.syncer.restoring = True
+        app.syncer.restore_failed = False
+        app.syncer.progress = {
+            "phase": "restoring",
+            "current": "funes-delta-1.jsonl.gz.enc",
+            "completed": 1,
+            "total": 3,
+            "rows": 42,
+            "bytes": 2048,
+        }
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(app))
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            # During restore: /ready returns 503 with progress breakdown
+            status, body = self._request(server, "GET", "/ready")
+            self.assertEqual(status, 503)
+            self.assertEqual(body["status"], "restoring")
+            self.assertEqual(body["phase"], "restoring")
+            self.assertEqual(body["current"], "funes-delta-1.jsonl.gz.enc")
+            self.assertEqual(body["completed"], 1)
+            self.assertEqual(body["total"], 3)
+            self.assertEqual(body["rows"], 42)
+            self.assertEqual(body["bytes"], 2048)
+            self.assertEqual(body["progress"], app.syncer.progress)
+
+            # When restoring: /sync/status returns 503 with restore_progress
+            status, body = self._request(server, "GET", "/sync/status")
+            self.assertEqual(status, 503)
+            self.assertEqual(body.get("status"), "restoring")
+            self.assertEqual(body.get("restore_progress"), app.syncer.progress)
+
+            # POST must use the same non-blocking restore short-circuit.
+            status, body = self._request(server, "POST", "/sync/status", {})
+            self.assertEqual(status, 503)
+            self.assertEqual(body.get("status"), "restoring")
+            self.assertEqual(body.get("restore_progress"), app.syncer.progress)
+
+            # Once ready: /ready returns 200 with progress info
+            app.syncer.restoring = False
+            app.restore_result = 42
+            status, body = self._request(server, "GET", "/ready")
+            self.assertEqual(status, 200)
+            self.assertEqual(body["status"], "ready")
+            self.assertEqual(body["restored"], 42)
+            self.assertEqual(body["progress"], app.syncer.progress)
+
+            # Once ready: /sync/status returns 200 with restore_progress
+            status, body = self._request(server, "GET", "/sync/status")
+            self.assertEqual(status, 200)
+            self.assertEqual(body.get("restore_progress"), app.syncer.progress)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+            app.store.close()
+
+    def test_restore_checkpoint_resume_without_remaining_skips_bulk_rebuild(self):
+        from service.server import SnapshotSync
+
+        store = Store(self.tmp.name)
+        syncer = SnapshotSync(store)
+        syncer.repo = "owner/private"
+        syncer.token = "test-token"
+        files = [
+            "funes-snapshot.jsonl.gz.enc",
+            "funes-delta-1.jsonl.gz.enc",
+            "funes-delta-2.jsonl.gz.enc",
+        ]
+        manifest = {
+            "version": 1,
+            "snapshot": "funes-snapshot.jsonl.gz.enc",
+            "deltas": ["funes-delta-1.jsonl.gz.enc", "funes-delta-2.jsonl.gz.enc"],
+            "controls": [],
+        }
+        revision = "sha-resume-skip-1"
+
+        # Case 1: Checkpoint covers all manifest files AND derived_ready=True
+        # Must skip begin_bulk_restore and finish_bulk_restore
+        syncer._record_restore_checkpoint(
+            revision,
+            manifest,
+            files,
+            files,
+            derived_ready=True,
+        )
+        self.assertTrue(syncer.restore_checkpoint_path.is_file())
+
+        with mock.patch.object(
+            syncer, "_repo_files_metadata", return_value=(files, manifest, revision)
+        ), mock.patch.object(
+            syncer, "_prefetch_restore_files", return_value=None
+        ), mock.patch.object(
+            syncer, "_restore_file"
+        ) as mock_restore_file, mock.patch.object(
+            store, "begin_bulk_restore"
+        ) as mock_begin_bulk, mock.patch.object(
+            store, "finish_bulk_restore"
+        ) as mock_finish_bulk, mock.patch.object(
+            store, "compact_reindex_controls"
+        ) as mock_compact, mock.patch.object(
+            store, "drain_reindex_controls"
+        ) as mock_drain:
+            result = syncer.restore()
+
+        self.assertEqual(result, 0)
+        mock_restore_file.assert_not_called()
+        mock_begin_bulk.assert_not_called()
+        mock_finish_bulk.assert_not_called()
+        mock_compact.assert_called_once_with(replay=True)
+        mock_drain.assert_called_once_with(syncer.restore_batch)
+        self.assertFalse(syncer.restore_checkpoint_path.exists())
+        self.assertFalse(syncer.restore_failed)
+        self.assertTrue(syncer.restored)
+        self.assertEqual(syncer.covered_revision, revision)
+        self.assertEqual(syncer.progress["phase"], "completed")
+        self.assertEqual(syncer.progress["completed"], len(files))
+        self.assertEqual(syncer.progress["total"], len(files))
+
+        # Case 2: Checkpoint covers all files BUT derived_ready=False
+        # Must execute bulk rebuild (begin/finish_bulk_restore + controls drain) to ensure durability
+        syncer2 = SnapshotSync(store)
+        syncer2.repo = "owner/private"
+        syncer2.token = "test-token"
+        syncer2._record_restore_checkpoint(
+            revision,
+            manifest,
+            files,
+            files,
+            derived_ready=False,
+        )
+        self.assertTrue(syncer2.restore_checkpoint_path.is_file())
+
+        with mock.patch.object(
+            syncer2, "_repo_files_metadata", return_value=(files, manifest, revision)
+        ), mock.patch.object(
+            syncer2, "_prefetch_restore_files", return_value=None
+        ), mock.patch.object(
+            syncer2, "_restore_file"
+        ) as mock_restore_file2, mock.patch.object(
+            store, "begin_bulk_restore"
+        ) as mock_begin_bulk2, mock.patch.object(
+            store, "finish_bulk_restore"
+        ) as mock_finish_bulk2, mock.patch.object(
+            store, "compact_reindex_controls"
+        ) as mock_compact2, mock.patch.object(
+            store, "drain_reindex_controls"
+        ) as mock_drain2:
+            result2 = syncer2.restore()
+
+        self.assertEqual(result2, 0)
+        mock_restore_file2.assert_not_called()
+        mock_begin_bulk2.assert_called_once()
+        mock_finish_bulk2.assert_called_once()
+        mock_compact2.assert_called_once_with(replay=True)
+        mock_drain2.assert_called_once_with(syncer2.restore_batch)
+        self.assertFalse(syncer2.restore_checkpoint_path.exists())
+        self.assertFalse(syncer2.restore_failed)
+        self.assertTrue(syncer2.restored)
+
         store.close()
 
 if __name__ == "__main__":

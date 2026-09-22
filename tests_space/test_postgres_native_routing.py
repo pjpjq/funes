@@ -287,45 +287,270 @@ def test_supported_canonical_filters_passed_to_native_tuning_without_false_503(m
     assert kwargs["harness"] == "codex"
 
 
-@pytest.mark.parametrize("unsupported_filter", [
-    {"role": "user"},
-    {"since": "2026-09-01T00:00:00Z"},
-    {"until": "2026-09-22T00:00:00Z"},
-])
-def test_unsupported_filters_fail_fast_503_when_pg_fts_disabled(monkeypatch, unsupported_filter):
-    """Unsupported sidecar filters (role, since, until) return 503 source_fts_unavailable."""
+@pytest.fixture
+def pg_filtered_search(monkeypatch):
+    """Exercise the real HTTP route without native/network/database side effects."""
     store = MemoryStoreDouble()
-    syncer = mock.Mock(restoring=False, restore_failed=False)
-    app = mock.Mock(store=store, syncer=syncer)
+    app = mock.Mock(store=store, syncer=mock.Mock(restoring=False, restore_failed=False))
+    state = {"output": "", "recall_calls": []}
 
-    recall_called = False
+    def fake_recall(query, **kwargs):
+        state["recall_calls"].append((query, kwargs))
+        return state["output"]
 
-    def fake_recall(*_args, **_kwargs):
-        nonlocal recall_called
-        recall_called = True
-        return ""
+    def unexpected_scan(*_args, **_kwargs):
+        pytest.fail("filtered PostgreSQL native route must not scan sources or use native get")
 
     monkeypatch.setattr(bridge, "SOURCE_APP", app)
     monkeypatch.setattr(bridge, "TOKEN", "test-token")
     monkeypatch.setenv("FUNES_EMBEDDING_PROVIDER", "voyage")
     monkeypatch.setenv("FUNES_POSTGRES_DSN", "postgresql://user:pass@localhost:5432/funes")
+    monkeypatch.setattr(bridge, "HTTP_MAX_CANDIDATES", 12)
     monkeypatch.setattr(bridge, "recall", fake_recall)
-
+    monkeypatch.setattr(bridge, "get", unexpected_scan)
+    monkeypatch.setattr(bridge, "search_source_rankings", unexpected_scan)
+    monkeypatch.setattr(bridge, "search_source_bm25_rankings", unexpected_scan)
     server = ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread = threading.Thread(target=lambda: server.serve_forever(poll_interval=0.01), daemon=True)
     thread.start()
     try:
-        payload = {"query": "test query", "limit": 3, **unsupported_filter}
-        status, body = _post(server, "/search", payload)
+        yield server, store, state, app
     finally:
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)
+        assert not thread.is_alive()
 
+
+def _native_fixture_results(store, state, records):
+    store.records = {item["source_identity"]: item for item in records}
+    state["output"] = "NATIVE_ONLY_UNFILTERED_EXCERPT\n" + "".join(
+        f"  → get {canonical_reference(item['source_identity'])}\n" for item in records
+    )
+
+
+@pytest.mark.parametrize("filters,rejected_metadata", [
+    ({"role": "user"}, {"role": "assistant"}),
+    ({"since": "2026-09-22T00:00:00Z"}, {"timestamp": "2026-09-21T23:59:59Z"}),
+    ({"until": "2026-09-22T00:00:00Z"}, {"timestamp": "2026-09-22T00:00:01Z"}),
+])
+def test_pg_native_post_filters_use_hydrated_metadata(pg_filtered_search, filters, rejected_metadata):
+    server, store, state, _app = pg_filtered_search
+    records = [
+        {"source_identity": "rejected", "raw_text": "REJECTED_RAW", **rejected_metadata},
+        {"source_identity": "accepted", "raw_text": "ORIGINAL_RAW",
+         "role": "user", "timestamp": "2026-09-22T00:00:00Z", "retrieval_text": "DERIVED_SHADOW"},
+        {"source_identity": "missing-metadata", "raw_text": "MISSING_METADATA_RAW"},
+    ]
+    _native_fixture_results(store, state, records)
+    status, body = _post(server, "/search", {"query": "test query", "limit": 1, **filters})
+    assert status == 200
+    assert body["ok"] is True
+    assert [item["source_identity"] for item in body["results"]] == ["accepted"]
+    assert body["results_text"] == "ORIGINAL_RAW"
+    assert "DERIVED_SHADOW" not in json.dumps(body)
+    assert "REJECTED_RAW" not in json.dumps(body)
+    assert "NATIVE_ONLY_UNFILTERED_EXCERPT" not in json.dumps(body)
+    assert store.get_many_calls == [["rejected", "accepted", "missing-metadata"]]
+    assert store.get_calls == []
+    assert len(state["recall_calls"]) == 1
+    tuning = state["recall_calls"][0][1]
+    assert tuning["k"] == tuning["candidates"] == 4
+    assert not (filters.keys() & tuning.keys())
+
+
+def test_pg_native_combined_filters_keep_native_pushdown_and_source_order(pg_filtered_search):
+    server, store, state, _app = pg_filtered_search
+    base = {"role": "user", "timestamp": "2026-09-22T00:00:00Z", "project": "funes",
+            "source_agent": "codex", "source_type": "doc", "repo": "funes-repo",
+            "device_id": "dev-001", "content_type": "text/plain", "source_missing": False}
+    _native_fixture_results(store, state, [
+        {**base, "source_identity": "wrong-role", "role": "assistant", "raw_text": "WRONG_ROLE"},
+        {**base, "source_identity": "stale-native-project", "project": "other", "raw_text": "STALE_PROJECT"},
+        {**base, "source_identity": "first", "raw_text": "FIRST_RAW"},
+        {**base, "source_identity": "second", "raw_text": "SECOND_RAW"},
+        {**base, "source_identity": "third", "raw_text": "THIRD_RAW"},
+    ])
+    filters = {key: value for key, value in base.items() if key != "timestamp"}
+    filters.update(since="2026-09-21", until="2026-09-23")
+    status, body = _post(server, "/search", {
+        "query": "test query", "limit": 2, "facets": filters, "harness": "codex",
+    })
+    assert status == 200
+    assert [item["source_identity"] for item in body["results"]] == ["first", "second"]
+    assert body["results_text"] == "FIRST_RAW\n\nSECOND_RAW"
+    tuning = state["recall_calls"][0][1]
+    assert tuning["k"] == tuning["candidates"] == 8
+    assert tuning["harness"] == "codex"
+    for key in filters.keys() - {"role", "since", "until"}:
+        assert tuning[key] == filters[key]
+    assert not ({"role", "since", "until"} & tuning.keys())
+
+
+@pytest.mark.parametrize("operator_cap,limit,expected", [(12, 1, 4), (3, 50, 3), (12, 50, 12), (1000000, 50, 128)])
+def test_pg_native_post_filter_candidate_cap_is_hard(pg_filtered_search, monkeypatch, operator_cap, limit, expected):
+    server, store, state, _app = pg_filtered_search
+    monkeypatch.setattr(bridge, "HTTP_MAX_CANDIDATES", operator_cap)
+    _native_fixture_results(store, state, [
+        {"source_identity": f"candidate-{index}", "role": "assistant", "raw_text": "EXCLUDED"}
+        for index in range(expected)
+    ] + [{"source_identity": "beyond-cap", "role": "user", "raw_text": "OUTSIDE_WINDOW"}])
+    status, body = _post(server, "/search", {
+        "query": "test query", "limit": limit, "role": "user", "candidates": 10000000,
+    })
+    assert status == 200
+    assert body["results"] == []
+    assert body["results_text"] == ""
+    assert state["recall_calls"][0][1]["k"] == expected
+    assert state["recall_calls"][0][1]["candidates"] == expected
+    assert len(store.get_many_calls) == 1
+    assert len(store.get_many_calls[0]) == expected
+    assert "beyond-cap" not in store.get_many_calls[0]
+    assert store.get_calls == []
+
+
+@pytest.mark.parametrize("timestamp,accepted", [
+    ("2026-09-22T00:00:00Z", True),
+    ("2026-09-22T08:00:00+08:00", True),
+    ("2026-09-22", True),
+    ("2026-09-21T23:59:59.999999Z", False),
+    ("2026-09-22T00:00:00.000001Z", False),
+    (None, False),
+    ("not-a-timestamp", False),
+])
+def test_pg_native_post_filter_date_bounds_are_inclusive_utc(pg_filtered_search, timestamp, accepted):
+    server, store, state, _app = pg_filtered_search
+    _native_fixture_results(store, state, [
+        {"source_identity": "boundary", "raw_text": "BOUNDARY_RAW", "timestamp": timestamp},
+    ])
+    status, body = _post(server, "/search", {
+        "query": "test query", "since": "2026-09-22", "until": "2026-09-22T00:00:00Z",
+    })
+    assert status == 200
+    assert bool(body["results"]) is accepted
+    assert body["results_text"] == ("BOUNDARY_RAW" if accepted else "")
+
+
+@pytest.mark.parametrize("filters", [
+    {"role": []}, {"role": ""}, {"role": 1}, {"since": 12345}, {"until": {}},
+    {"since": ""}, {"since": "2026-02-30"}, {"until": "not-a-date"},
+    {"since": "2026-09-23", "until": "2026-09-22"},
+])
+def test_pg_native_post_filter_invalid_parameters_fail_before_retrieval(pg_filtered_search, filters):
+    server, store, state, _app = pg_filtered_search
+    status, body = _post(server, "/search", {"query": "test query", **filters})
+    assert status == 400
+    assert body["error"]
+    assert state["recall_calls"] == []
+    assert store.get_many_calls == []
+
+
+def test_pg_native_post_filters_empty_native_result(pg_filtered_search):
+    server, store, state, _app = pg_filtered_search
+    status, body = _post(server, "/search", {"query": "test query", "role": "user"})
+    assert status == 200
+    assert body["results"] == []
+    assert body["results_text"] == ""
+    assert len(state["recall_calls"]) == 1
+    assert store.get_many_calls == []
+
+
+def test_pg_native_post_filters_missing_source_never_uses_native_text(pg_filtered_search):
+    server, store, state, _app = pg_filtered_search
+    state["output"] = f"NATIVE_RAW_MUST_NOT_LEAK\n  → get {canonical_reference('missing')}\n  → get native-session\n"
+    status, body = _post(server, "/search", {"query": "test query", "role": "user"})
+    assert status == 200
+    assert body["results"] == []
+    assert body["results_text"] == ""
+    assert store.get_many_calls == [["missing", "native-session"]]
+    assert store.get_calls == []
+
+
+def test_pg_native_post_filter_batch_failure_is_fail_closed(pg_filtered_search):
+    server, store, state, _app = pg_filtered_search
+    _native_fixture_results(store, state, [
+        {"source_identity": "present", "role": "user", "raw_text": "MUST_NOT_FALL_BACK"},
+    ])
+    store.fail_get_many = True
+    status, body = _post(server, "/search", {"query": "test query", "role": "user"})
     assert status == 503
-    assert body["ok"] is False
+    assert body["error"] == "postgres_unavailable"
+    assert "MUST_NOT_FALL_BACK" not in json.dumps(body)
+    assert "secret_pass" not in json.dumps(body)
+    assert store.get_calls == []
+
+
+def test_pg_native_post_filter_dependency_value_error_is_not_a_validation_error(pg_filtered_search, monkeypatch):
+    server, store, state, _app = pg_filtered_search
+    _native_fixture_results(store, state, [
+        {"source_identity": "present", "role": "user", "raw_text": "MUST_NOT_FALL_BACK"},
+    ])
+
+    def broken_decode(_identities):
+        raise ValueError("postgresql://secret_user:secret_password@private_db metadata decoding failed")
+
+    monkeypatch.setattr(store, "get_many", broken_decode)
+    status, body = _post(server, "/search", {"query": "test query", "role": "user"})
+    assert status == 503
+    assert body["error"] == "postgres_unavailable"
+    assert "secret_password" not in json.dumps(body)
+    assert store.get_calls == []
+
+
+def test_pg_native_post_filters_unavailable_store_fails_before_retrieval(pg_filtered_search, monkeypatch):
+    server, store, state, _app = pg_filtered_search
+    monkeypatch.setattr(bridge, "source_app", lambda: None)
+    status, body = _post(server, "/search", {"query": "test query", "role": "user"})
+    assert status == 503
+    assert body["error"] == "postgres_unavailable"
+    assert body["results"] == []
+    assert body["results_text"] == ""
+    assert state["recall_calls"] == []
+    assert store.get_many_calls == []
+
+
+@pytest.mark.parametrize("failure,status,code", [
+    (bridge.NativeMcpBusyError, 429, "native_mcp_busy"),
+    (bridge.NativeMcpTimeoutError, 503, "native_mcp_unavailable"),
+    (bridge.NativeMcpError, 503, "native_mcp_unavailable"),
+])
+def test_pg_native_post_filters_native_failure_never_uses_source_scan(pg_filtered_search, monkeypatch, failure, status, code):
+    server, store, state, _app = pg_filtered_search
+
+    def broken_native(*_args, **_kwargs):
+        raise failure("private native diagnostic")
+
+    monkeypatch.setattr(bridge, "recall", broken_native)
+    monkeypatch.setattr(bridge, "request_native_recovery", lambda: None)
+    response_status, body = _post(server, "/search", {"query": "test query", "role": "user"})
+    assert response_status == status
+    assert body["error"] == code
+    assert body["results"] == []
+    assert body["results_text"] == ""
+    assert "private native diagnostic" not in json.dumps(body)
+    assert store.get_many_calls == []
+
+
+@pytest.mark.parametrize("state_name", ["restoring", "restore_failed"])
+def test_pg_native_post_filters_restore_is_fail_closed(pg_filtered_search, state_name):
+    server, store, state, app = pg_filtered_search
+    setattr(app.syncer, state_name, True)
+    status, body = _post(server, "/search", {"query": "test query", "role": "user"})
+    assert status == 503
+    assert body["results"] == []
+    assert body["results_text"] == ""
+    assert state["recall_calls"] == []
+    assert store.get_many_calls == []
+
+
+def test_non_postgres_sidecar_filters_keep_existing_unready_behavior(pg_filtered_search, monkeypatch):
+    server, store, state, _app = pg_filtered_search
+    monkeypatch.delenv("FUNES_POSTGRES_DSN")
+    status, body = _post(server, "/search", {"query": "test query", "role": "user"})
+    assert status == 503
     assert body["error"] == "source_fts_unavailable"
-    assert not recall_called
+    assert state["recall_calls"] == []
+    assert store.get_many_calls == []
 
 
 def test_postgres_disconnect_during_search_sanitized_503(monkeypatch):

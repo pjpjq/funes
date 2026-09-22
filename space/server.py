@@ -24,6 +24,7 @@ import urllib.error
 import urllib.request
 import zlib
 from collections.abc import Mapping, Sequence
+from datetime import datetime, timezone
 from typing import Any
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -132,6 +133,10 @@ try:
     HTTP_MAX_CANDIDATES = max(1, int(os.getenv("FUNES_HTTP_MAX_CANDIDATES", "12")))
 except ValueError:
     HTTP_MAX_CANDIDATES = 12
+# Source-only facets are post-filtered over one bounded native result window.
+# The existing operator cap may lower this window but never raise the hard cap.
+PG_POST_FILTER_MAX_CANDIDATES = 128
+PG_POST_FILTER_OVERFETCH = 4
 try:
     HTTP_NATIVE_TIMEOUT = min(50.0, max(0.1, float(os.getenv("FUNES_HTTP_NATIVE_TIMEOUT", "12"))))
 except ValueError:
@@ -1337,7 +1342,8 @@ SIDECAR_AUTHORITATIVE_FILTERS = frozenset(
     )
 )
 # Voyage can apply these exact canonical metadata filters without relying on
-# the local SQLite FTS sidecar. Date/role filters still require a ready sidecar.
+# the local SQLite FTS sidecar. PostgreSQL can post-filter role/date facets only
+# after a bounded native window has been hydrated from canonical source rows.
 NATIVE_CANONICAL_FILTERS = frozenset(
     (
         "source_type",
@@ -1348,6 +1354,7 @@ NATIVE_CANONICAL_FILTERS = frozenset(
         "source_missing",
     )
 )
+NATIVE_SOURCE_POST_FILTERS = frozenset(("role", "since", "until"))
 NATIVE_GET_RE = re.compile(
     r"(?m)^\s*→\s*get\s+(.+?)(?=\s+--(?:from|to|memory)\b|$)"
 )
@@ -2180,6 +2187,57 @@ def structured_native_hits(result: object, limit: int) -> list[dict]:
     ]
 
 
+def _source_filter_timestamp(value: object) -> datetime:
+    """Parse ISO dates/times; a date or naive datetime denotes UTC midnight/time."""
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("expected an ISO 8601 date or datetime")
+    timestamp = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=timezone.utc)
+    return timestamp.astimezone(timezone.utc)
+
+
+def _native_source_filter_bounds(filters: dict[str, object]) -> dict[str, datetime]:
+    """Validate only the PG post-filter route, without changing SQLite semantics."""
+    for name in ("source_agent", "source_type", "project", "repo", "device_id", "role", "content_type"):
+        if name in filters and (not isinstance(filters[name], str) or not filters[name].strip()):
+            raise ValueError(f"{name} must be a non-empty string")
+    if "source_missing" in filters and not isinstance(filters["source_missing"], bool):
+        raise ValueError("source_missing must be a boolean")
+    bounds = {}
+    for name in ("since", "until"):
+        if name in filters:
+            try:
+                bounds[name] = _source_filter_timestamp(filters[name])
+            except (ValueError, OverflowError) as exc:
+                raise ValueError(f"{name} must be an ISO 8601 date or datetime") from exc
+    if "since" in bounds and "until" in bounds and bounds["since"] > bounds["until"]:
+        raise ValueError("since must be on or before until")
+    return bounds
+
+
+def _matches_native_source_filters(
+    item: dict, filters: dict[str, object], bounds: dict[str, datetime]
+) -> bool:
+    """Use current source metadata, never native snippets or retrieval shadows."""
+    for name in ("source_agent", "source_type", "project", "repo", "device_id", "role", "content_type"):
+        if name in filters and item.get(name) != filters[name]:
+            return False
+    if "source_missing" in filters and item.get("source_missing") != filters["source_missing"]:
+        return False
+    if bounds:
+        try:
+            timestamp = _source_filter_timestamp(item.get("timestamp"))
+        except (ValueError, OverflowError):
+            # Missing/malformed source metadata cannot prove a date constraint.
+            return False
+        if "since" in bounds and timestamp < bounds["since"]:
+            return False
+        if "until" in bounds and timestamp > bounds["until"]:
+            return False
+    return True
+
+
 def materialize_native_results(
     output: str,
     app,
@@ -2188,6 +2246,7 @@ def materialize_native_results(
     deadline: float | None = None,
     structured_hits: list[dict] | None = None,
     allow_sidecar: bool = True,
+    require_source_batch: bool = False,
 ) -> list[dict]:
     """Resolve native rank coordinates to raw sidecar documents or sessions."""
     if structured_hits is not None:
@@ -2196,24 +2255,36 @@ def materialize_native_results(
         raise NativeMcpError("native MCP structured hits unavailable")
     ids = native_result_ids(output)[:limit]
     store = getattr(app, "store", None)
+    if require_source_batch and not callable(getattr(store, "get_many", None)):
+        raise RuntimeError("source batch hydration unavailable")
     cached_items: dict[str, dict] = {}
-    if store is not None and callable(getattr(store, "get_many", None)):
+    if ids and store is not None and callable(getattr(store, "get_many", None)):
         lookup_ids = [canonical_reference_identity(i) or i for i in ids]
         try:
             for it in store.get_many(lookup_ids):
                 if isinstance(it, dict):
                     if it.get("source_identity"):
                         cached_items[str(it["source_identity"])] = it
-                    if it.get("id") is not None:
+                    if not require_source_batch and it.get("id") is not None:
                         cached_items[str(it["id"])] = it
-        except Exception:
-            pass
+        except Exception as exc:
+            if require_source_batch:
+                # No repeated point reads or native text fallback on PG failure.
+                # Normalize dependency ValueError too: only request validation
+                # may return a 400 with a human-readable error.
+                raise RuntimeError("source batch hydration failed") from exc
     results = []
     for identity in ids:
         is_canonical_reference = identity.startswith(CANONICAL_REF_PREFIX)
         canonical_identity = canonical_reference_identity(identity)
         lookup_identity = canonical_identity or identity
         item = cached_items.get(lookup_identity)
+        if require_source_batch and (
+            item is None or not isinstance(item.get("raw_text"), str)
+        ):
+            # Only identities backed by current PG raw/metadata are filterable.
+            # Missing rows are not an excuse to expose native retrieval_text.
+            continue
         if item is None and store is not None:
             item = store.get(lookup_identity)
         if item is not None:
@@ -2842,6 +2913,7 @@ def _http_native_results(
     deadline: float,
     *,
     native_only: bool = False,
+    require_source_batch: bool = False,
 ) -> list[dict]:
     """Recall and materialize raw text within one hard HTTP deadline."""
 
@@ -2862,7 +2934,10 @@ def _http_native_results(
             )
         output = recall(query, k=limit, timeout=remaining, **tuning)
         return (
-            materialize_native_results(output, app, limit, deadline=deadline)
+            materialize_native_results(
+                output, app, limit, deadline=deadline,
+                require_source_batch=require_source_batch,
+            )
             if output
             else []
         )
@@ -3223,11 +3298,31 @@ class Handler(BaseHTTPRequestHandler):
                             },
                         )
                         return
+                pg_native_post_filter = bool(
+                    os.getenv("FUNES_POSTGRES_DSN")
+                    and embedding_provider == "voyage"
+                    and not source_restore_error
+                    and not sidecar_fts_ready
+                    and unsupported_native_filters
+                    and unsupported_native_filters <= NATIVE_SOURCE_POST_FILTERS
+                )
+                post_filter_bounds = (
+                    _native_source_filter_bounds(filters) if pg_native_post_filter else {}
+                )
+                if pg_native_post_filter and not callable(
+                    getattr(getattr(app, "store", None), "get_many", None)
+                ):
+                    self.send_json(
+                        503,
+                        {"ok": False, "results": [], "results_text": "", "error": "postgres_unavailable"},
+                    )
+                    return
                 if (
                     embedding_provider == "voyage"
                     and not source_restore_error
                     and not sidecar_fts_ready
                     and unsupported_native_filters
+                    and not pg_native_post_filter
                 ):
                     self.send_json(
                         503,
@@ -3398,16 +3493,28 @@ class Handler(BaseHTTPRequestHandler):
                     # raise the cap with FUNES_HTTP_MAX_CANDIDATES.
                     requested_candidates = int(tuning.get("candidates", max(2, limit * 2)))
                     tuning["candidates"] = min(HTTP_MAX_CANDIDATES, requested_candidates)
+                    native_limit = limit
+                    if pg_native_post_filter:
+                        # One ANN/BM25 window only: no pagination, retries, source
+                        # scan, or promise of exhaustive filtered recall. Even
+                        # a huge operator/request value cannot lift the hard cap.
+                        native_limit = min(
+                            HTTP_MAX_CANDIDATES,
+                            PG_POST_FILTER_MAX_CANDIDATES,
+                            limit * PG_POST_FILTER_OVERFETCH,
+                        )
+                        tuning["candidates"] = native_limit
                     tuning.setdefault("neighbors", 0)
                     tuning.setdefault("half_life", 0)
                     if native_allowed and voyage_hot_path:
                         results = _http_native_results(
                             query,
                             app,
-                            limit,
+                            native_limit,
                             tuning,
                             native_deadline,
                             native_only=bool(source_restore_error),
+                            require_source_batch=pg_native_post_filter,
                         )
                     else:
                         out = (
@@ -3568,6 +3675,11 @@ class Handler(BaseHTTPRequestHandler):
                         if results
                         else sidecar_results
                     )
+                if pg_native_post_filter:
+                    results = [
+                        item for item in results
+                        if _matches_native_source_filters(item, filters, post_filter_bounds)
+                    ][:limit]
                 results_text = "\n\n".join(
                     str(item.get("raw_text", ""))
                     for item in results

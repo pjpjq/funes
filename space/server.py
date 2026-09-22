@@ -2272,6 +2272,18 @@ def materialize_native_results(
                 # No repeated point reads or native text fallback on PG failure.
                 # Normalize dependency ValueError too: only request validation
                 # may return a 400 with a human-readable error.
+                syncer = getattr(app, "syncer", None)
+                check_ready = getattr(syncer, "check_ready", None)
+                if (
+                    getattr(syncer, "backend", None) == "postgres"
+                    and callable(check_ready)
+                ):
+                    try:
+                        # Repair the primary connection for the next request;
+                        # this request stays fail-closed and is never replayed.
+                        check_ready()
+                    except Exception:
+                        pass
                 raise RuntimeError("source batch hydration failed") from exc
     results = []
     for identity in ids:

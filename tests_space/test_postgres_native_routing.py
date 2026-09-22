@@ -480,6 +480,36 @@ def test_pg_native_post_filter_batch_failure_is_fail_closed(pg_filtered_search):
     assert store.get_calls == []
 
 
+def test_pg_native_post_filter_batch_failure_recovers_for_next_request(pg_filtered_search):
+    server, store, state, app = pg_filtered_search
+    _native_fixture_results(store, state, [
+        {"source_identity": "present", "role": "user", "raw_text": "RECOVERED_RAW"},
+    ])
+    store.fail_get_many = True
+    app.syncer.backend = "postgres"
+
+    def check_ready():
+        store.fail_get_many = False
+        return True
+
+    app.syncer.check_ready.side_effect = check_ready
+
+    first_status, first_body = _post(
+        server, "/search", {"query": "test query", "role": "user"}
+    )
+    second_status, second_body = _post(
+        server, "/search", {"query": "test query", "role": "user"}
+    )
+
+    assert first_status == 503
+    assert first_body["error"] == "postgres_unavailable"
+    assert second_status == 200
+    assert second_body["results_text"] == "RECOVERED_RAW"
+    assert store.get_many_calls == [["present"], ["present"]]
+    assert store.get_calls == []
+    app.syncer.check_ready.assert_called_once_with()
+
+
 def test_pg_native_post_filter_dependency_value_error_is_not_a_validation_error(pg_filtered_search, monkeypatch):
     server, store, state, _app = pg_filtered_search
     _native_fixture_results(store, state, [

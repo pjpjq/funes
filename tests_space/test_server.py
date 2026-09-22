@@ -711,6 +711,36 @@ def test_remote_without_source_sidecar_is_not_accepted(monkeypatch, tmp_path):
     assert body["error"] == "FUNES_STORAGE_REPO is not configured"
 
 
+def test_space_source_restore_skips_optional_fts_rebuild(monkeypatch, tmp_path):
+    observed = {}
+    previous_rebuild_fts = os.environ.pop("FUNES_BULK_RESTORE_REBUILD_FTS", None)
+
+    class FakeSourceApp:
+        def __init__(self):
+            observed["rebuild_fts"] = os.environ.get(
+                "FUNES_BULK_RESTORE_REBUILD_FTS"
+            )
+
+    monkeypatch.setattr(bridge, "SOURCE_APP", None)
+    monkeypatch.setattr(bridge, "SourceApp", FakeSourceApp)
+    monkeypatch.setattr(bridge, "start_canonical_reconciler", lambda _app: None)
+    monkeypatch.setenv("FUNES_STORAGE_REPO", "owner/source")
+    monkeypatch.setenv("FUNES_DATA_DIR", str(tmp_path / "source-store"))
+    monkeypatch.setenv("FUNES_LAZY_RESTORE", "true")
+    monkeypatch.setenv("FUNES_REQUIRE_DURABLE_ACK", "true")
+    try:
+        assert isinstance(bridge.source_app(), FakeSourceApp)
+        assert observed == {"rebuild_fts": "false"}
+    finally:
+        # source_app() mutates os.environ directly via setdefault(), outside
+        # monkeypatch's bookkeeping. Restore the exact pre-test state so the
+        # default does not leak into later Store migrations.
+        if previous_rebuild_fts is None:
+            os.environ.pop("FUNES_BULK_RESTORE_REBUILD_FTS", None)
+        else:
+            os.environ["FUNES_BULK_RESTORE_REBUILD_FTS"] = previous_rebuild_fts
+
+
 def test_sync_status_alias_returns_ready_payload(monkeypatch):
     monkeypatch.setattr(bridge, "TOKEN", "test-token")
     monkeypatch.setattr(bridge, "REMOTE", "owner/memory")

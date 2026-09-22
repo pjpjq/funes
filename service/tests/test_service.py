@@ -12,16 +12,16 @@ from http.client import HTTPConnection
 from pathlib import Path
 from http.server import ThreadingHTTPServer
 
-from service.server import QUERY_PROMPT_VERSION, QUERY_RETRIEVAL_PROMPT, RETRIEVAL_PROMPT, App, Store, Translator, ingest_documents, make_handler, persist_translation_documents, prepare_ingest_documents
+from service.server import FTS_SCHEMA_VERSION, QUERY_PROMPT_VERSION, QUERY_RETRIEVAL_PROMPT, RETRIEVAL_PROMPT, App, Store, Translator, ingest_documents, make_handler, persist_translation_documents, prepare_ingest_documents
 
 
 class ServiceTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.old = {k: os.environ.get(k) for k in ("FUNES_DATA_DIR", "FUNES_AUTH_TOKEN", "FUNES_API_TOKEN", "FUNES_STORAGE_KEY", "FUNES_STORAGE_REPO", "FUNES_SNAPSHOT_FILE", "FUNES_RESTORE_MANIFEST_FILE", "HF_TOKEN", "FUNES_REQUIRE_DURABLE_ACK", "FUNES_ALLOW_EMPTY_REMOTE", "FUNES_MAX_BODY_BYTES", "FUNES_RETRIEVAL_LANGUAGE_MODE", "TRANSLATION_BASE_URL", "TRANSLATION_API_KEY", "TRANSLATION_MODEL", "TRANSLATION_MAX_PER_INGEST", "TRANSLATION_QUERY_MAX_TOKENS", "TRANSLATION_RECONCILE_INTERVAL", "RETURN_RETRIEVAL_TEXT")}
+        self.old = {k: os.environ.get(k) for k in ("FUNES_DATA_DIR", "FUNES_AUTH_TOKEN", "FUNES_API_TOKEN", "FUNES_STORAGE_KEY", "FUNES_STORAGE_REPO", "FUNES_SNAPSHOT_FILE", "FUNES_RESTORE_MANIFEST_FILE", "HF_TOKEN", "FUNES_REQUIRE_DURABLE_ACK", "FUNES_ALLOW_EMPTY_REMOTE", "FUNES_MAX_BODY_BYTES", "FUNES_RETRIEVAL_LANGUAGE_MODE", "FUNES_BULK_RESTORE_REBUILD_FTS", "TRANSLATION_BASE_URL", "TRANSLATION_API_KEY", "TRANSLATION_MODEL", "TRANSLATION_MAX_PER_INGEST", "TRANSLATION_QUERY_MAX_TOKENS", "TRANSLATION_RECONCILE_INTERVAL", "RETURN_RETRIEVAL_TEXT")}
         os.environ["FUNES_DATA_DIR"] = self.tmp.name
         os.environ["FUNES_AUTH_TOKEN"] = "test-token"
-        for k in ("FUNES_API_TOKEN", "FUNES_STORAGE_KEY", "FUNES_STORAGE_REPO", "FUNES_SNAPSHOT_FILE", "FUNES_RESTORE_MANIFEST_FILE", "HF_TOKEN", "FUNES_REQUIRE_DURABLE_ACK", "FUNES_ALLOW_EMPTY_REMOTE", "FUNES_MAX_BODY_BYTES", "FUNES_RETRIEVAL_LANGUAGE_MODE", "TRANSLATION_BASE_URL", "TRANSLATION_API_KEY", "TRANSLATION_MODEL", "TRANSLATION_MAX_PER_INGEST", "TRANSLATION_QUERY_MAX_TOKENS", "TRANSLATION_RECONCILE_INTERVAL", "RETURN_RETRIEVAL_TEXT"):
+        for k in ("FUNES_API_TOKEN", "FUNES_STORAGE_KEY", "FUNES_STORAGE_REPO", "FUNES_SNAPSHOT_FILE", "FUNES_RESTORE_MANIFEST_FILE", "HF_TOKEN", "FUNES_REQUIRE_DURABLE_ACK", "FUNES_ALLOW_EMPTY_REMOTE", "FUNES_MAX_BODY_BYTES", "FUNES_RETRIEVAL_LANGUAGE_MODE", "FUNES_BULK_RESTORE_REBUILD_FTS", "TRANSLATION_BASE_URL", "TRANSLATION_API_KEY", "TRANSLATION_MODEL", "TRANSLATION_MAX_PER_INGEST", "TRANSLATION_QUERY_MAX_TOKENS", "TRANSLATION_RECONCILE_INTERVAL", "RETURN_RETRIEVAL_TEXT"):
             os.environ.pop(k, None)
 
     def tearDown(self):
@@ -1786,6 +1786,95 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(store.conn.execute("PRAGMA cache_size").fetchone()[0], -2000)
         self.assertEqual(store.conn.execute("PRAGMA mmap_size").fetchone()[0], 0)
         store.close()
+
+    def test_bulk_restore_can_skip_derived_fts_rebuild(self):
+        store = Store(self.tmp.name)
+        try:
+            with mock.patch.dict(
+                os.environ, {"FUNES_BULK_RESTORE_REBUILD_FTS": "false"}
+            ):
+                store.begin_bulk_restore()
+                store.ingest(
+                    [
+                        {
+                            "source_identity": "restored-without-fts",
+                            "raw_text": "restored sentinel phrase",
+                        }
+                    ]
+                )
+                store.finish_bulk_restore()
+
+            # The expensive derived rebuild was skipped, but its schema marker,
+            # secondary indexes, triggers, and normal pragmas were restored.
+            self.assertEqual(
+                store.conn.execute(
+                    "SELECT fts_schema_version FROM sync_state WHERE id=1"
+                ).fetchone()[0],
+                FTS_SCHEMA_VERSION,
+            )
+            self.assertEqual(
+                store.conn.execute(
+                    "SELECT count(*) FROM memories_fts "
+                    "WHERE memories_fts MATCH 'sentinel'"
+                ).fetchone()[0],
+                0,
+            )
+            self.assertIsNotNone(
+                store.conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='index' "
+                    "AND name='memories_source_agent_role_idx'"
+                ).fetchone()
+            )
+            self.assertIsNotNone(
+                store.conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='trigger' "
+                    "AND name='memories_ai'"
+                ).fetchone()
+            )
+            self.assertEqual(store.conn.execute("PRAGMA synchronous").fetchone()[0], 2)
+
+            store.ingest(
+                [
+                    {
+                        "source_identity": "post-restore-trigger",
+                        "raw_text": "postrestore trigger phrase",
+                    }
+                ]
+            )
+            self.assertEqual(
+                store.conn.execute(
+                    "SELECT count(*) FROM memories_fts "
+                    "WHERE memories_fts MATCH 'postrestore'"
+                ).fetchone()[0],
+                1,
+            )
+        finally:
+            store.close()
+
+    def test_bulk_restore_rebuilds_fts_by_default(self):
+        store = Store(self.tmp.name)
+        try:
+            with mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("FUNES_BULK_RESTORE_REBUILD_FTS", None)
+                store.begin_bulk_restore()
+                store.ingest(
+                    [
+                        {
+                            "source_identity": "restored-with-default-fts",
+                            "raw_text": "default rebuild phrase",
+                        }
+                    ]
+                )
+                store.finish_bulk_restore()
+            self.assertEqual(
+                store.conn.execute(
+                    "SELECT count(*) FROM memories_fts "
+                    "WHERE memories_fts MATCH 'default'"
+                ).fetchone()[0],
+                1,
+            )
+        finally:
+            store.close()
 
     def test_bulk_restore_skips_embedding_generation_scan_for_explicit_generations(self):
         store = Store(self.tmp.name)

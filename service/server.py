@@ -2482,7 +2482,7 @@ class Store:
                     raise
             self._bulk_restore_depth += 1
 
-    def finish_bulk_restore(self) -> None:
+    def finish_bulk_restore(self, *, rebuild_fts: bool | None = None) -> None:
         """Rebuild derived indexes once after the outermost restore."""
         with self.lock:
             if self._bulk_restore_depth <= 0:
@@ -2503,10 +2503,25 @@ class Store:
                                 str(state["native_checkpoint_memory"] or ""),
                             )
                         # FTS5 external-content tables need an explicit rebuild after
-                        # restoring rows from a JSONL snapshot.
-                        self.conn.execute(
-                            "INSERT INTO memories_fts(memories_fts) VALUES('rebuild')"
-                        )
+                        # restoring rows from a JSONL snapshot. A Space can disable
+                        # this optional, very expensive derived-index step while its
+                        # durable Voyage/Lance index is authoritative. The generic
+                        # service keeps the historical default of rebuilding FTS.
+                        if rebuild_fts is None:
+                            rebuild_fts = os.getenv(
+                                "FUNES_BULK_RESTORE_REBUILD_FTS", "true"
+                            ).strip().lower() in {"1", "true", "yes", "on"}
+                        if rebuild_fts:
+                            self.conn.execute(
+                                "INSERT INTO memories_fts(memories_fts) VALUES('rebuild')"
+                            )
+                        else:
+                            # Keep startup schema checks from replaying the same
+                            # multi-million-row rebuild on every container restart.
+                            self.conn.execute(
+                                "UPDATE sync_state SET fts_schema_version=? WHERE id=1",
+                                (FTS_SCHEMA_VERSION,),
+                            )
                     finally:
                         try:
                             self._create_secondary_indexes_locked()
@@ -2690,8 +2705,13 @@ class RestoreFiles(list):
 
 
 class SnapshotSync:
-    def __init__(self, store: Store):
+    def __init__(self, store: Store, *, rebuild_fts: bool | None = None):
         self.store = store
+        self.rebuild_fts = (
+            self._truth("FUNES_BULK_RESTORE_REBUILD_FTS", True)
+            if rebuild_fts is None
+            else rebuild_fts
+        )
         # Snapshot creation and Hub upload must be one serialized operation.
         # Without this lock, concurrent /sync requests can upload an older
         # snapshot after a newer one and roll the durable dataset backwards.
@@ -3453,7 +3473,9 @@ class SnapshotSync:
                             self._update_restore_progress(
                                 phase="indexing", current="memories_fts"
                             )
-                            self.store.finish_bulk_restore()
+                            self.store.finish_bulk_restore(
+                                rebuild_fts=self.rebuild_fts
+                            )
                             self._record_restore_checkpoint(
                                 restored_revision,
                                 manifest,
@@ -4340,13 +4362,13 @@ def queue_reindex(app: Any, scope: str) -> dict[str, Any]:
 
 
 class App:
-    def __init__(self):
+    def __init__(self, *, rebuild_fts: bool | None = None):
         # Free Gradio Spaces do not expose /data.  The Hub snapshot remains the
         # durable source of truth; operators can override this with a writable
         # mounted volume when one is available.
         self.store = Store(os.getenv("FUNES_DATA_DIR", "/tmp/funes-data"))
         self.translator = Translator(self.store)
-        self.syncer = SnapshotSync(self.store)
+        self.syncer = SnapshotSync(self.store, rebuild_fts=rebuild_fts)
         self.restore_result = 0
         self.restore_done = threading.Event()
         self.reconcile_stop = threading.Event()

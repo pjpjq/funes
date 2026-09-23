@@ -2661,7 +2661,7 @@ def test_pending_translation_raw_is_sent_to_native(monkeypatch, tmp_path):
     assert captured["raw_text"] == "等待翻译"
 
 
-def test_canonical_scan_waits_for_raw_durability_lock(monkeypatch, tmp_path):
+def test_canonical_scan_revalidates_after_raw_durability_race(monkeypatch, tmp_path):
     app = _source_app(tmp_path)
     item = _canonical_source(app.store, "durability-race")
     scanned = threading.Event()
@@ -2679,13 +2679,13 @@ def test_canonical_scan_waits_for_raw_durability_lock(monkeypatch, tmp_path):
         lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("undurable row must not index")),
     )
     result = {}
-    bridge.WRITE_LOCK.acquire()
+    bridge.NATIVE_WRITE_LOCK.acquire()
     thread = threading.Thread(
         target=lambda: result.setdefault("value", bridge.reconcile_canonical_index(app))
     )
     thread.start()
     try:
-        assert not scanned.wait(0.05)
+        assert scanned.wait(1)
         app.store.update_native_index(
             [{
                 "source_identity": item["source_identity"],
@@ -2698,7 +2698,7 @@ def test_canonical_scan_waits_for_raw_durability_lock(monkeypatch, tmp_path):
             }]
         )
     finally:
-        bridge.WRITE_LOCK.release()
+        bridge.NATIVE_WRITE_LOCK.release()
         thread.join(timeout=1)
         app.store.close()
     assert scanned.is_set()
@@ -2865,7 +2865,7 @@ def test_profile_change_rebuilds_durable_session_without_client_reupload(monkeyp
     assert rebuilt["native_index_profile"] == bridge.embedding_profile()["fingerprint"]
 
 
-def test_canonical_phase_reports_write_lock_wait_without_row_data(monkeypatch):
+def test_canonical_scan_does_not_wait_for_write_lock(monkeypatch):
     class Store:
         @staticmethod
         def canonical_index_candidates(*_args):
@@ -2884,18 +2884,13 @@ def test_canonical_phase_reports_write_lock_wait_without_row_data(monkeypatch):
     thread = threading.Thread(target=bridge.reconcile_canonical_index, args=(app,))
     thread.start()
     try:
-        deadline = time.monotonic() + 1
-        while (
-            bridge.canonical_reconcile_state(app)["phase"] != "waiting_write_lock"
-            and time.monotonic() < deadline
-        ):
-            time.sleep(0.005)
+        thread.join(timeout=1)
+        assert not thread.is_alive()
         status = bridge.canonical_reconcile_state(app)
-        assert status["phase"] == "waiting_write_lock"
+        assert status["phase"] != "waiting_write_lock"
         assert "owner/memory" not in json.dumps(status)
     finally:
         bridge.WRITE_LOCK.release()
-        thread.join(timeout=1)
     assert not thread.is_alive()
 
 
@@ -2951,6 +2946,21 @@ def test_canonical_index_intervals_preserve_legacy_override(environ, expected):
 @pytest.mark.parametrize(
     ("environ", "expected"),
     [
+        ({}, 64),
+        ({"FUNES_CANONICAL_INDEX_BATCH": "32"}, 32),
+        ({"FUNES_CANONICAL_INDEX_BATCH": "128"}, 128),
+        ({"FUNES_CANONICAL_INDEX_BATCH": "0"}, 1),
+        ({"FUNES_CANONICAL_INDEX_BATCH": "-5"}, 1),
+        ({"FUNES_CANONICAL_INDEX_BATCH": "invalid"}, 64),
+    ],
+)
+def test_canonical_index_batch_parsing(environ, expected):
+    assert bridge._canonical_index_batch(environ) == expected
+
+
+@pytest.mark.parametrize(
+    ("environ", "expected"),
+    [
         ({}, (8, 6000)),
         ({"FUNES_CANONICAL_INDEX_REQUEST_ROWS": "4"}, (4, 6000)),
         ({"FUNES_CANONICAL_INDEX_MAX_CHARS": "12000"}, (8, 12000)),
@@ -2960,6 +2970,13 @@ def test_canonical_index_intervals_preserve_legacy_override(environ, expected):
                 "FUNES_CANONICAL_INDEX_MAX_CHARS": "20000",
             },
             (16, 20000),
+        ),
+        (
+            {
+                "FUNES_CANONICAL_INDEX_REQUEST_ROWS": "64",
+                "FUNES_CANONICAL_INDEX_MAX_CHARS": "48000",
+            },
+            (64, 48000),
         ),
         (
             {
@@ -2986,6 +3003,7 @@ def test_canonical_index_request_limits_parsing(environ, expected):
     [
         ({}, 20.0),
         ({"FUNES_CANONICAL_INDEX_MIN_REQUEST_INTERVAL": "10"}, 10.0),
+        ({"FUNES_CANONICAL_INDEX_MIN_REQUEST_INTERVAL": "3"}, 3.0),
         ({"FUNES_CANONICAL_INDEX_MIN_REQUEST_INTERVAL": "0.5"}, 0.5),
         ({"FUNES_CANONICAL_INDEX_MIN_REQUEST_INTERVAL": "-5"}, 0.0),
         ({"FUNES_CANONICAL_INDEX_MIN_REQUEST_INTERVAL": "invalid"}, 20.0),

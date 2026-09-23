@@ -4688,7 +4688,7 @@ def make_handler(app: App):
                 try:
                     if (
                         getattr(app.syncer, "backend", None) == "postgres"
-                        and not app.syncer.check_ready()
+                        and not app.syncer.probe_ready()
                     ):
                         return self._json(503, {"error": "postgres_unavailable", "durable": False})
                     if route == "/sources":
@@ -4727,7 +4727,11 @@ def make_handler(app: App):
                 body = self._body()
                 if (
                     getattr(app.syncer, "backend", None) == "postgres"
-                    and not app.syncer.check_ready()
+                    and not (
+                        app.syncer.probe_ready()
+                        if self.path in {"/sources/check", "/search", "/recall"}
+                        else app.syncer.check_ready()
+                    )
                 ):
                     return self._json(503, {"error": "postgres_unavailable", "durable": False})
                 if self.path == "/sources/check":

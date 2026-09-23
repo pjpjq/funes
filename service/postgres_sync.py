@@ -24,20 +24,26 @@ class PostgresSync:
         self.restored = False
         self.restore_failed = False
         self.restore_error: str | None = None
+        self._progress_lock = threading.Lock()
         self._progress = {"phase": "idle", "current": None, "completed": 0,
                           "total": 0, "rows": 0, "bytes": 0}
 
     @property
     def progress(self) -> dict[str, Any]:
-        with self.upload_lock:
+        # Status endpoints must never wait behind an upload/restore batch.
+        with self._progress_lock:
             return dict(self._progress)
+
+    def _set_progress(self, **values: Any) -> None:
+        with self._progress_lock:
+            self._progress.update(values)
 
     def _unavailable(self) -> None:
         # No exception text, DSN, SQL parameter, or source payload is public.
         # Do not write sync_state here: the database is precisely what failed.
         self.restore_failed = True
         self.restore_error = "postgres_unavailable"
-        self._progress.update(phase="failed", error=self.restore_error)
+        self._set_progress(phase="failed", error=self.restore_error)
 
     def check_ready(self) -> bool:
         """Reconnect/check the migrated database, without enumerating sources."""
@@ -56,8 +62,9 @@ class PostgresSync:
             self.restore_failed = False
             self.restore_error = None
             self.restored = True
-            self._progress.update(phase="complete")
-            self._progress.pop("error", None)
+            self._set_progress(phase="complete")
+            with self._progress_lock:
+                self._progress.pop("error", None)
             return True
 
     def probe_ready(self) -> bool:
@@ -84,7 +91,7 @@ class PostgresSync:
         """Validate the existing source database; there are no rows to replay."""
         with self.upload_lock:
             self.restoring = True
-            self._progress.update(phase="connecting")
+            self._set_progress(phase="connecting")
             try:
                 return 0 if self.check_ready() else -1
             finally:

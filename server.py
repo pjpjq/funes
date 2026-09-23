@@ -437,6 +437,23 @@ def _source_state(app) -> dict[str, object]:
     active_profile = embedding_profile()
     build_profile = index_embedding_profile()
     build_memory = index_memory()
+    if hasattr(app.store, "status_snapshot"):
+        snapshot = app.store.status_snapshot(
+            build_profile,
+            build_memory,
+            index_layout_version=CANONICAL_INDEX_LAYOUT_VERSION,
+        )
+        return {
+            "configured": True,
+            "ready": True,
+            "documents": snapshot.get("documents", 0),
+            "restored": getattr(app, "restore_result", 0),
+            "sync": snapshot.get("sync", {}),
+            "active_index": {"memory": REMOTE, "profile": active_profile},
+            "build_index": {"memory": build_memory, "profile": build_profile},
+            "canonical_index": snapshot.get("canonical_index", {}),
+            "canonical_reconciler": canonical_reconcile_state(app),
+        }
     checkpoint = app.store.native_index_checkpoint(build_profile, build_memory)
     checkpoint["failures"] = app.store.native_index_failure_counts()
     optimize = app.store.native_optimize_checkpoint()
@@ -3106,6 +3123,41 @@ def sync_status_payload() -> tuple[int, dict[str, object]]:
             "source_store": source_readiness,
             "embedding_profile": embedding_profile(),
         }
+    app = SOURCE_APP if SOURCE_APP is not None else source_app()
+    is_postgres = (
+        bool(os.getenv("FUNES_POSTGRES_DSN"))
+        or getattr(getattr(app, "syncer", None), "backend", None) == "postgres"
+        or hasattr(getattr(app, "store", None), "status_snapshot")
+    )
+    if is_postgres:
+        warm = warm_state()
+        sources = source_state()
+        source_ok = not sources.get("configured") or bool(sources.get("ready"))
+        warm_ok = warm.get("state") == "ready"
+        ok = source_ok and warm_ok
+        error = ""
+        if not source_ok:
+            error = str(sources.get("error") or "source_store_unavailable")
+        elif not warm_ok:
+            error = (
+                "native_memory_warming"
+                if warm.get("state") == "warming"
+                else "native_mcp_unavailable"
+            )
+        return (
+            200 if ok else 503,
+            {
+                "ok": ok,
+                "remote": REMOTE,
+                "status": "",
+                "diagnostic": "not_run",
+                "native_status": "deferred",
+                "error": error,
+                "native_warm": warm,
+                "source_store": sources,
+                "embedding_profile": embedding_profile(),
+            },
+        )
     try:
         code, out, err = run("status", REMOTE, timeout=30)
     except subprocess.TimeoutExpired:

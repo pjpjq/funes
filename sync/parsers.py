@@ -521,27 +521,80 @@ def _chunk(source: Source, *, ordinal: int, session: str, message: str, role: st
     )
 
 
+_SESSION_PREFIX_MAX_BYTES = 256 * 1024
+_SESSION_PREFIX_MAX_LINES = 256
+_LINE_SCAN_BLOCK_BYTES = 64 * 1024
+
+
+def _last_complete_line_offset(handle, end: int) -> int:
+    """Find the byte after the final newline without retaining the prefix."""
+    if end <= 0:
+        return 0
+    handle.seek(end - 1)
+    if handle.read(1) == b"\n":
+        return end
+    position = end - 1
+    while position > 0:
+        block_start = max(0, position - _LINE_SCAN_BLOCK_BYTES)
+        handle.seek(block_start)
+        block = handle.read(position - block_start)
+        newline = block.rfind(b"\n")
+        if newline >= 0:
+            return block_start + newline + 1
+        position = block_start
+    return 0
+
+
+def complete_line_offset(path: Path, size: int | None = None) -> int:
+    """Return the durable cursor after the last newline at ``size``."""
+    with path.open("rb") as handle:
+        if size is None:
+            handle.seek(0, 2)
+            size = handle.tell()
+        return _last_complete_line_offset(handle, max(0, int(size)))
+
+
 def _read_lines(path: Path, start: int = 0) -> list[str]:
-    data = path.read_bytes()
-    if start:
-        tail = data[start:]
-        # A cursor can land in the middle of a UTF-8/JSONL record.  Drop that
-        # partial line; the next reconciliation will see it again if needed.
-        if not data[:start].endswith(b"\n"):
-            cut = tail.find(b"\n")
-            tail = tail[cut + 1:] if cut >= 0 else b""
-        data = tail
+    with path.open("rb") as handle:
+        handle.seek(0, 2)
+        complete_end = _last_complete_line_offset(handle, handle.tell())
+        if complete_end <= 0 or start >= complete_end:
+            return []
+        data_start = 0
+        if start > 0:
+            # One byte of look-behind distinguishes a line boundary without
+            # materializing the entire prefix. If the cursor crossed a record,
+            # discard only that partial record before reading the appended tail.
+            handle.seek(start - 1)
+            if handle.read(1) != b"\n":
+                handle.readline(complete_end - handle.tell())
+            data_start = handle.tell()
+        if data_start >= complete_end:
+            return []
+        handle.seek(data_start)
+        data = handle.read(complete_end - data_start)
     return data.decode("utf-8", errors="replace").splitlines()
+
+
+def _read_session_prefix(path: Path) -> list[str]:
+    """Read a bounded header window for append-session identity recovery."""
+    with path.open("rb") as handle:
+        data = handle.read(_SESSION_PREFIX_MAX_BYTES)
+    lines = data.decode("utf-8", errors="replace").splitlines()
+    if data and not data.endswith(b"\n"):
+        lines = lines[:-1]
+    return lines[:_SESSION_PREFIX_MAX_LINES]
 
 
 def _parse_codex_native(source: Source, start: int = 0) -> list[Chunk]:
     # Read the small prefix for session_meta even during an append-only pass.
     path = Path(source.path)
-    all_lines = _read_lines(path, 0 if not start else 0)
-    session = _session_fallback(all_lines, source)
+    lines = _read_lines(path, start)
+    header_lines = _read_session_prefix(path)
+    session = _session_fallback(header_lines, source)
     parent = ""
     worktree = ""
-    for line in all_lines[:256]:
+    for line in header_lines:
         try:
             obj = json.loads(line)
         except Exception:
@@ -552,7 +605,6 @@ def _parse_codex_native(source: Source, start: int = 0) -> list[Chunk]:
             parent = str(payload.get("parent_thread_id") or "")
             worktree = str(payload.get("cwd") or "")
             break
-    lines = _read_lines(path, start) if start else all_lines
     # `start` is a byte cursor only; identities never depend on that cursor.
     out: list[Chunk] = []
     for ordinal, line in enumerate(lines):
@@ -600,9 +652,9 @@ def _parse_codex_native(source: Source, start: int = 0) -> list[Chunk]:
 def _parse_claude_native(source: Source, start: int = 0) -> list[Chunk]:
     out: list[Chunk] = []
     path = Path(source.path)
-    all_lines = _read_lines(path, 0)
-    session = _session_fallback(all_lines, source)
-    lines = _read_lines(path, start) if start else all_lines
+    lines = _read_lines(path, start)
+    header_lines = _read_session_prefix(path)
+    session = _session_fallback(header_lines, source)
     for ordinal, line in enumerate(lines):
         try:
             obj = json.loads(line)
@@ -634,10 +686,11 @@ def _parse_pi_native(source: Source, start: int = 0) -> list[Chunk]:
     path = Path(source.path)
     # Append scans must retain the session envelope from the beginning of the
     # file; otherwise the fallback stem becomes a new identity for every tail.
-    prefix = _read_lines(path, 0)
-    session = _session_fallback(prefix, source)
+    lines = _read_lines(path, start)
+    header_lines = _read_session_prefix(path)
+    session = _session_fallback(header_lines, source)
     worktree = ""
-    for line in prefix[:256]:
+    for line in header_lines:
         try:
             obj = json.loads(line)
         except Exception:
@@ -646,15 +699,14 @@ def _parse_pi_native(source: Source, start: int = 0) -> list[Chunk]:
             session = str(obj.get("id") or obj.get("sessionId") or session)
             worktree = str(obj.get("cwd") or "")
             break
-    lines = _read_lines(path, start) if start else prefix
     for ordinal, line in enumerate(lines):
         try:
             obj = json.loads(line)
         except Exception:
             continue
         if obj.get("type") == "session":
-            session = str(obj.get("id") or obj.get("sessionId") or session)
-            worktree = str(obj.get("cwd") or "")
+            # Session identity/worktree come only from the shared bounded
+            # prefix so full and append scans cannot diverge on a late header.
             continue
         if obj.get("type") != "message":
             continue
@@ -682,30 +734,39 @@ def _parse_memory_native(source: Source) -> list[Chunk]:
         return []
     # Keep headings/paragraphs together and cap individual requests so a large
     # memory file never becomes one unbounded translation call.
-    pieces = [p.strip() for p in re.split(r"\n(?=\s*#{1,6}\s)", raw) if p.strip()]
-    if not pieces:
-        pieces = [raw]
+    sections = [p.strip() for p in re.split(r"\n(?=\s*#{1,6}\s)", raw) if p.strip()]
+    if not sections:
+        sections = [raw]
     out = []
-    for i, piece in enumerate(pieces):
-        if len(piece) > 6000:
-            pieces[i:i + 1] = [piece[j:j + 6000] for j in range(0, len(piece), 6000)]
     repo_identity, relative_path = _memory_identity_context(source)
     source_content_type = source.source_type if source.source_type in {"agents_md", "project_instruction"} else "memory"
-    for i, piece in enumerate(pieces):
+    ordinal = 0
+    section_occurrences: dict[str, int] = {}
+    for body in sections:
         # Memory identity is semantic rather than path/index based so copies of
         # the same repository memory converge across devices and mount points.
-        lines = piece.splitlines()
-        heading = lines[0].strip() if lines else ""
+        lines = body.splitlines()
+        heading = lines[0].strip() if lines and re.match(r"\s*#{1,6}\s", lines[0]) else ""
         # A heading is the durable section key: content may be edited in place,
         # while an absolute checkout path and byte/line position can change.
         section = heading or "__preamble__"
-        semantic_id = f"memory:{source.kind}:{repo_identity}:{relative_path}:{section}"
-        c = _chunk(source, ordinal=i, session="", message=semantic_id, role="system",
-                   text=piece, raw=piece, content_type=source_content_type,
-                   metadata={"source_file": str(source.path)}, record_type=source_content_type,
-                   fallback_key=heading)
-        if c:
-            out.append(c)
+        occurrence = section_occurrences.get(section, 0)
+        section_occurrences[section] = occurrence + 1
+        section_key = section if occurrence == 0 else f"{section}:occurrence:{occurrence}"
+        pieces = [body[i:i + 6000] for i in range(0, len(body), 6000)]
+        for part_index, piece in enumerate(pieces):
+            part = section_key if part_index == 0 else f"{section_key}:part:{part_index}"
+            semantic_id = f"memory:{source.kind}:{repo_identity}:{relative_path}:{part}"
+            metadata: dict[str, Any] = {"source_file": str(source.path)}
+            if len(pieces) > 1:
+                metadata.update({"chunk_index": part_index, "chunk_count": len(pieces)})
+            c = _chunk(source, ordinal=ordinal, session="", message=semantic_id, role="system",
+                       text=piece, raw=piece, content_type=source_content_type,
+                       metadata=metadata, record_type=source_content_type,
+                       fallback_key=heading)
+            if c:
+                out.append(c)
+            ordinal += 1
     return out
 
 
@@ -735,11 +796,11 @@ def _split_large(chunks: list[Chunk], max_chars: int = 6000) -> list[Chunk]:
 
 
 def _parse_jsonl_path(source: Source, start: int = 0) -> list[Chunk]:
-    """Parse a generic JSONL tail with a session anchor from the full file."""
+    """Parse a generic JSONL tail with a bounded prefix session anchor."""
     path = Path(source.path)
-    all_lines = _read_lines(path, 0)
-    session = _session_fallback(all_lines, source)
-    lines = _read_lines(path, start) if start else all_lines
+    lines = _read_lines(path, start)
+    header_lines = _read_session_prefix(path)
+    session = _session_fallback(header_lines, source)
     return _parse_jsonl(source, lines, start, session)
 
 

@@ -304,6 +304,7 @@ def test_zero_record_migration_does_not_replay_converged_sources_forever(
         s.set_cursor(source.source_key,stat.st_size,stat.st_ino,stat.st_size)
     (c.state_dir/'initial-backfill.complete').write_text('legacy',encoding='utf-8')
     (c.state_dir/'source-schema-v2.complete').write_text('legacy',encoding='utf-8')
+    (c.state_dir/'zero-record-repair-v1.complete').write_text('legacy',encoding='utf-8')
     daemon=SyncDaemon(c,s,type("Client",(),{})())
 
     daemon.scan_once()
@@ -363,6 +364,194 @@ def test_fresh_install_without_initial_backfill_seeds_eof(tmp_path, monkeypatch)
     assert s.cursor(source.source_key)["offset"] == p.stat().st_size
     assert (c.state_dir/'initial-backfill.complete').exists()
     assert (c.state_dir/'source-schema-v2.complete').exists()
+    s.close()
+
+
+def test_appendable_cursor_waits_at_last_complete_newline(tmp_path, monkeypatch):
+    from sync.discovery import Source
+
+    c = cfg(tmp_path)
+    p = tmp_path / "rollout.jsonl"
+    header = json.dumps(
+        {"type": "session_meta", "payload": {"id": "cursor-session"}}
+    ) + "\n"
+    first = json.dumps(
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "id": "first",
+                "role": "user",
+                "content": "first complete turn",
+            },
+        }
+    ) + "\n"
+    partial = json.dumps(
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "id": "second",
+                "role": "assistant",
+                "content": "等待换行",
+            },
+        },
+        ensure_ascii=False,
+    )
+    p.write_text(header + first + partial, encoding="utf-8")
+    source = Source("codex:~/sessions/cursor.jsonl", "codex", p, c.device_id)
+    monkeypatch.setattr("sync.daemon.discover_sources", lambda _config: [source])
+    s = Store(config=c)
+    daemon = SyncDaemon(c, s, type("Client", (), {})())
+
+    assert daemon.scan_once() == 1
+
+    cursor = s.cursor(source.source_key)
+    complete_offset = len((header + first).encode("utf-8"))
+    assert cursor["offset"] == complete_offset
+    assert cursor["size"] == p.stat().st_size
+
+    with p.open("a", encoding="utf-8") as handle:
+        handle.write("\n")
+
+    assert daemon.scan_once() == 1
+    assert s.stats()["records"] == 2
+    s.close()
+
+
+def test_no_backfill_seed_preserves_unterminated_append(tmp_path, monkeypatch):
+    from sync.discovery import Source
+
+    c = cfg(tmp_path)
+    c.initial_backfill = False
+    p = tmp_path / "seed-rollout.jsonl"
+    header = json.dumps(
+        {"type": "session_meta", "payload": {"id": "seed-session"}}
+    ) + "\n"
+    historical = json.dumps(
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "id": "historical",
+                "role": "user",
+                "content": "must remain skipped",
+            },
+        }
+    ) + "\n"
+    partial = json.dumps(
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "id": "after-install",
+                "role": "user",
+                "content": "安装时尚未换行",
+            },
+        },
+        ensure_ascii=False,
+    )
+    p.write_text(header + historical + partial, encoding="utf-8")
+    source = Source("codex:~/sessions/seed.jsonl", "codex", p, c.device_id)
+    monkeypatch.setattr("sync.daemon.discover_sources", lambda _config: [source])
+    starts = []
+    real_parse = parse_file
+
+    def tracked_parse(item, start=0):
+        starts.append(start)
+        return real_parse(item, start)
+
+    monkeypatch.setattr("sync.daemon.parse_file", tracked_parse)
+    s = Store(config=c)
+    daemon = SyncDaemon(c, s, type("Client", (), {})())
+
+    assert daemon.scan_once() == 0
+
+    cursor = s.cursor(source.source_key)
+    complete_offset = len((header + historical).encode("utf-8"))
+    assert cursor["offset"] == complete_offset
+    assert cursor["size"] == p.stat().st_size
+
+    with p.open("a", encoding="utf-8") as handle:
+        handle.write("\n")
+
+    assert daemon.scan_once() == 1
+    assert starts == [complete_offset]
+    assert s.stats()["records"] == 1
+    s.close()
+
+
+def test_legacy_mid_line_cursor_forces_full_reconcile(tmp_path, monkeypatch):
+    from sync.discovery import Source
+
+    c = cfg(tmp_path)
+    p = tmp_path / "legacy-rollout.jsonl"
+    header = json.dumps(
+        {"type": "session_meta", "payload": {"id": "legacy-session"}}
+    ) + "\n"
+    stale_line = json.dumps(
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "id": "legacy-fragment",
+                "role": "assistant",
+                "content": "stale fragment",
+            },
+        }
+    ) + "\n"
+    p.write_text(header + stale_line, encoding="utf-8")
+    source = Source("codex:~/sessions/legacy.jsonl", "codex", p, c.device_id)
+    stale = parse_file(source)[0]
+    current_line = json.dumps(
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "id": "current",
+                "role": "assistant",
+                "content": "completed after upgrade",
+            },
+        }
+    )
+    p.write_text(header + current_line, encoding="utf-8")
+    before_append = p.stat()
+    legacy_offset = len(header.encode("utf-8")) + len(current_line.encode("utf-8")) // 2
+    monkeypatch.setattr("sync.daemon.discover_sources", lambda _config: [source])
+    starts = []
+    real_parse = parse_file
+
+    def tracked_parse(item, start=0):
+        starts.append(start)
+        return real_parse(item, start)
+
+    monkeypatch.setattr("sync.daemon.parse_file", tracked_parse)
+    s = Store(config=c)
+    s.register_source(source, before_append)
+    s.upsert_chunks([stale])
+    s.set_cursor(
+        source.source_key,
+        legacy_offset,
+        before_append.st_ino,
+        before_append.st_size,
+    )
+    for marker in (
+        "initial-backfill.complete",
+        "source-schema-v2.complete",
+        "zero-record-repair-v1.complete",
+    ):
+        (c.state_dir / marker).write_text("legacy", encoding="utf-8")
+    daemon = SyncDaemon(c, s, type("Client", (), {})())
+
+    with p.open("a", encoding="utf-8") as handle:
+        handle.write("\n")
+
+    assert daemon.scan_once() == 1
+    assert starts == [0]
+    assert s.get(stale.record_id)["source_missing"] is True
+    cursor = s.cursor(source.source_key)
+    assert cursor["offset"] == p.stat().st_size
+    assert cursor["size"] == p.stat().st_size
     s.close()
 
 
@@ -453,22 +642,22 @@ def test_remote_source_reconciliation_resumes_and_only_queues_missing(tmp_path):
 
     first=daemon.reconcile_remote_sources(1)
 
-    assert first == {"complete":False,"checked":4,"queued":2}
+    assert first == {"complete":False,"checked":4,"queued":2,"acknowledged":0}
     assert client.calls == [["a","b","c","d"]]
     assert s.meta_value(daemon._remote_source_cursor_key) == "d"
     assert s.pending_count() == 2
     assert not daemon._remote_source_marker.exists()
 
     resumed=SyncDaemon(c,s,client).reconcile_remote_sources(1)
-    assert resumed == {"complete":False,"checked":0,"queued":0}
+    assert resumed == {"complete":False,"checked":0,"queued":0,"acknowledged":0}
     s.ack(["b","d"])
     completed=SyncDaemon(c,s,client).reconcile_remote_sources(1)
-    assert completed == {"complete":True,"checked":0,"queued":0}
+    assert completed == {"complete":True,"checked":0,"queued":0,"acknowledged":0}
     assert daemon._remote_source_marker.exists()
     assert s.meta_value(daemon._remote_source_cursor_key) == ""
 
     forced=SyncDaemon(c,s,client).reconcile_remote_sources(1,force=True)
-    assert forced == {"complete":False,"checked":4,"queued":2}
+    assert forced == {"complete":False,"checked":4,"queued":2,"acknowledged":0}
 
     other=cfg(tmp_path)
     other.remote_url="https://other-memory.example"
@@ -519,6 +708,7 @@ def test_remote_source_reconciliation_stops_between_batches(tmp_path):
         "complete":False,
         "checked":1,
         "queued":0,
+        "acknowledged":0,
         "interrupted":True,
     }
     assert client.calls == 1
@@ -685,6 +875,67 @@ def test_successful_ingest_is_not_followed_by_full_snapshot(tmp_path):
     assert client.snapshot_calls == 0
 
 
+def test_continuous_daemon_flushes_before_remote_inventory(tmp_path):
+    events = []
+
+    class StoreWithBacklog:
+        db = None
+
+        def __init__(self):
+            self.pending_rows = 1
+
+        def pending(self, _limit):
+            if not self.pending_rows:
+                return []
+            return [{"record_id": "one", "payload": '{"raw_text":"one"}', "attempts": 0}]
+
+        def ack(self, _record_ids):
+            events.append("flush")
+            self.pending_rows = 0
+
+        def pending_count(self):
+            return self.pending_rows
+
+        def fail(self, *_args):
+            raise AssertionError("the fake upload should succeed")
+
+    class Client:
+        def ingest(self, records):
+            assert len(records) == 1
+            return {"accepted": 1}
+
+    class Wake:
+        def is_set(self):
+            return False
+
+        def wait(self, _timeout):
+            daemon.running = False
+
+        def clear(self):
+            return None
+
+        def set(self):
+            return None
+
+    c = cfg(tmp_path)
+    c.auto_discover = False
+    daemon = SyncDaemon(c, StoreWithBacklog(), Client())
+    daemon._wake = Wake()
+    daemon.scan_once = lambda: events.append("scan") or 0
+    daemon.reconcile_remote_sources = lambda *_args, **_kwargs: events.append("reconcile") or {
+        "complete": True,
+        "checked": 0,
+        "queued": 0,
+        "acknowledged": 0,
+    }
+    daemon._start_watcher = lambda: None
+    daemon._stop_watcher = lambda: None
+
+    daemon.run()
+
+    assert events[:3] == ["scan", "flush", "reconcile"]
+
+
 def test_flush_batch_respects_serialized_byte_limit(tmp_path):
     payloads = [
         json.dumps({"raw_text": "a" * 20}),
@@ -832,3 +1083,126 @@ def test_remote_failure_keeps_pending_for_recovery(tmp_path):
     assert daemon.flush_once() == 0
     assert s.pending_count() == 1
     s.close()
+
+
+def test_remote_source_reconciliation_keeps_present_records_pending(tmp_path):
+    class Client:
+        def __init__(self):
+            self.calls = []
+
+        def missing_source_identities(self, identities):
+            self.calls.append(list(identities))
+            return [i for i in identities if i == "s_missing"]
+
+    c = cfg(tmp_path)
+    s = Store(config=c)
+    try:
+        from sync.discovery import Source
+        from sync.parsers import Chunk
+        s.register_source(Source("src_sess", "codex", tmp_path / "sess.jsonl", "dev"))
+        s.register_source(Source("src_mem", "codex_memory", tmp_path / "mem.md", "dev"))
+        s.register_source(Source("src_ret", "pi", tmp_path / "ret.jsonl", "dev"))
+        s.db.execute("UPDATE sources SET retired=1 WHERE source_key='src_ret'")
+        s.db.commit()
+
+        s.upsert_chunks([
+            Chunk("s_session", "src_sess", "codex", "sess.jsonl", "sess", 0, "user", "text", "text"),
+            Chunk("s_missing", "src_sess", "codex", "sess.jsonl", "sess", 1, "user", "text2", "text2"),
+            Chunk("s_memory", "src_mem", "codex_memory", "mem.md", "mem", 0, "user", "text3", "text3"),
+            Chunk("s_retired", "src_ret", "pi", "ret.jsonl", "ret", 0, "user", "text4", "text4"),
+        ])
+        assert s.pending_count() == 4
+        # Ack s_missing to simulate a record previously evicted or not yet in queue
+        s.ack(["s_missing"])
+        assert s.pending_count() == 3
+
+        client = Client()
+        daemon = SyncDaemon(c, s, client)
+
+        result = daemon.reconcile_remote_sources(1)
+
+        assert result["acknowledged"] == 0
+        assert result["queued"] == 1
+        assert result["checked"] == 3
+
+        remaining = [r["record_id"] for r in s.pending(limit=10)]
+        assert "s_session" in remaining
+        assert "s_memory" in remaining
+        assert "s_missing" in remaining
+        assert "s_retired" in remaining
+        assert s.pending_count() == 4
+    finally:
+        s.close()
+
+
+def test_continuous_daemon_adaptive_wait_under_backlog_vs_idle(tmp_path):
+    class FakeStore:
+        def __init__(self, initial_pending: int):
+            self._pending = initial_pending
+
+        def pending(self, limit):
+            count = min(self._pending, limit)
+            return [{"record_id": f"r{i}", "payload": '{"raw_text":"a"}', "attempts": 0} for i in range(count)]
+
+        def ack(self, record_ids):
+            self._pending = max(0, self._pending - min(len(record_ids), 2))
+
+        def pending_count(self):
+            return self._pending
+
+        def fail(self, *_args):
+            pass
+
+    class FakeClient:
+        def ingest(self, records):
+            return {"accepted": len(records)}
+
+    class FakeWake:
+        def __init__(self):
+            self.waits = []
+
+        def is_set(self):
+            return False
+
+        def wait(self, timeout):
+            self.waits.append(timeout)
+            daemon.running = False
+
+        def clear(self):
+            pass
+
+        def set(self):
+            pass
+
+    c = cfg(tmp_path)
+    c.auto_discover = False
+    c.interval = 300
+
+    # 1. Backlog scenario: pending_count > 0 after burst -> short wait (1s)
+    backlog_store = FakeStore(initial_pending=50)
+    wake1 = FakeWake()
+    daemon = SyncDaemon(c, backlog_store, FakeClient())
+    daemon._wake = wake1
+    daemon.scan_once = lambda: 0
+    daemon._start_watcher = lambda: None
+    daemon._stop_watcher = lambda: None
+    daemon._remote_source_marker.parent.mkdir(parents=True, exist_ok=True)
+    daemon._remote_source_marker.write_text("1", encoding="utf-8")
+
+    daemon.run()
+    assert wake1.waits == [1]
+    assert backlog_store.pending_count() > 0
+
+    # 2. Idle scenario: pending_count == 0 -> normal idle wait (config.interval: 300s)
+    idle_store = FakeStore(initial_pending=0)
+    wake2 = FakeWake()
+    daemon = SyncDaemon(c, idle_store, FakeClient())
+    daemon._wake = wake2
+    daemon.scan_once = lambda: 0
+    daemon._start_watcher = lambda: None
+    daemon._stop_watcher = lambda: None
+    daemon._remote_source_marker.parent.mkdir(parents=True, exist_ok=True)
+    daemon._remote_source_marker.write_text("1", encoding="utf-8")
+
+    daemon.run()
+    assert wake2.waits == [300]

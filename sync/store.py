@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .config import Config
+from .config import Config, _restrict_owned_permissions
 from .discovery import Source
 from .parsers import Chunk
 
@@ -16,24 +17,72 @@ class Store:
     def __init__(self, path: Path|str|None=None, config: Config|None=None):
         self.config=config or Config.load(); self.config.ensure()
         self.path=Path(path or self.config.state_dir/"sync.db"); self.path.parent.mkdir(parents=True,exist_ok=True)
+        self._prepare_database_file()
+        self._restrict_sqlite_files()
         self.db=sqlite3.connect(self.path, timeout=30, check_same_thread=False)
         self.db.row_factory=sqlite3.Row; self.db.execute("PRAGMA journal_mode=WAL"); self._schema()
+        self._restrict_sqlite_files()
+    def _prepare_database_file(self):
+        """Create a new POSIX database privately before SQLite opens it."""
+        if os.name == "nt":
+            return
+        try:
+            descriptor=os.open(self.path, os.O_CREAT|os.O_EXCL|os.O_RDWR, 0o600)
+        except FileExistsError:
+            return
+        except OSError:
+            return
+        os.close(descriptor)
+    def _restrict_sqlite_files(self):
+        for path in (self.path, Path(f"{self.path}-wal"), Path(f"{self.path}-shm")):
+            _restrict_owned_permissions(path, 0o600)
     def _schema(self):
         self.db.executescript('''
-        CREATE TABLE IF NOT EXISTS sources(source_key TEXT PRIMARY KEY,kind TEXT NOT NULL,path TEXT NOT NULL,device_id TEXT,project TEXT,active INTEGER DEFAULT 1,size INTEGER,mtime REAL,inode INTEGER,updated_at REAL);
+        CREATE TABLE IF NOT EXISTS sources(source_key TEXT PRIMARY KEY,kind TEXT NOT NULL,path TEXT NOT NULL,device_id TEXT,project TEXT,active INTEGER DEFAULT 1,retired INTEGER NOT NULL DEFAULT 0,size INTEGER,mtime REAL,inode INTEGER,updated_at REAL);
         CREATE TABLE IF NOT EXISTS records(record_id TEXT PRIMARY KEY,source_key TEXT NOT NULL,content_hash TEXT NOT NULL,version INTEGER DEFAULT 1,payload TEXT NOT NULL,updated_at REAL);
         CREATE INDEX IF NOT EXISTS records_source ON records(source_key);
         CREATE TABLE IF NOT EXISTS queue(record_id TEXT PRIMARY KEY,attempts INTEGER DEFAULT 0,next_at REAL DEFAULT 0,last_error TEXT,queued_at REAL);
         CREATE INDEX IF NOT EXISTS queue_failed ON queue(last_error) WHERE last_error IS NOT NULL;
         CREATE INDEX IF NOT EXISTS queue_schedule ON queue(next_at,queued_at);
+        CREATE INDEX IF NOT EXISTS queue_ready_order ON queue(queued_at,next_at);
         CREATE TABLE IF NOT EXISTS cursors(source_key TEXT PRIMARY KEY,offset INTEGER DEFAULT 0,inode INTEGER,size INTEGER,updated_at REAL);
         CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL,updated_at REAL NOT NULL);
         CREATE INDEX IF NOT EXISTS sources_active_kind ON sources(active,kind);
-        '''); self.db.commit()
+        ''')
+        source_columns={row[1] for row in self.db.execute("PRAGMA table_info(sources)")}
+        if "retired" not in source_columns:
+            self.db.execute(
+                "ALTER TABLE sources ADD COLUMN retired INTEGER NOT NULL DEFAULT 0"
+            )
+        self.db.commit()
+        retirement_migration="legacy_automation_retirement_v1"
+        if not self.db.execute(
+            "SELECT 1 FROM meta WHERE key=?",(retirement_migration,)
+        ).fetchone():
+            now=time.time()
+            with self.db:
+                self.db.execute('''
+                    UPDATE sources SET retired=1,active=0,updated_at=?
+                    WHERE kind='codex_memory'
+                      AND replace(lower(path),char(92),'/') LIKE '%/.codex/automations/%'
+                      AND lower(path) NOT LIKE '%.md'
+                      AND lower(path) NOT LIKE '%.toml'
+                ''',(now,))
+                self.db.execute('''
+                    DELETE FROM queue WHERE record_id IN (
+                        SELECT r.record_id FROM records r
+                        JOIN sources s ON s.source_key=r.source_key
+                        WHERE s.retired=1
+                    )
+                ''')
+                self.db.execute(
+                    "INSERT INTO meta(key,value,updated_at) VALUES(?,?,?)",
+                    (retirement_migration,"completed",now),
+                )
     def close(self): self.db.close()
     def register_source(self,s:Source,stat=None):
         now=time.time(); st=stat
-        self.db.execute("INSERT INTO sources(source_key,kind,path,device_id,project,active,size,mtime,inode,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(source_key) DO UPDATE SET kind=excluded.kind,path=excluded.path,device_id=excluded.device_id,project=excluded.project,active=1,size=excluded.size,mtime=excluded.mtime,inode=excluded.inode,updated_at=excluded.updated_at",(s.source_key,s.kind,str(s.path),s.device_id,s.project,1,st.st_size if st else None,st.st_mtime if st else None,st.st_ino if st else None,now)); self.db.commit()
+        self.db.execute("INSERT INTO sources(source_key,kind,path,device_id,project,active,retired,size,mtime,inode,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(source_key) DO UPDATE SET kind=excluded.kind,path=excluded.path,device_id=excluded.device_id,project=excluded.project,active=1,retired=0,size=excluded.size,mtime=excluded.mtime,inode=excluded.inode,updated_at=excluded.updated_at",(s.source_key,s.kind,str(s.path),s.device_id,s.project,1,0,st.st_size if st else None,st.st_mtime if st else None,st.st_ino if st else None,now)); self.db.commit()
     def mark_missing(self, present:set[str]):
         # Keep records and source rows; only mark source inactive.
         self.db.execute("UPDATE sources SET active=0,updated_at=? WHERE source_key NOT IN (%s)" % (','.join('?'*len(present)) if present else "''"), (time.time(),*present) if present else (time.time(),)); self.db.commit()
@@ -98,7 +147,10 @@ class Store:
         return int(self.db.execute("SELECT count(*) FROM queue").fetchone()[0])
     def record_ids_after(self, after: str = "", limit: int = 5000) -> list[str]:
         rows=self.db.execute(
-            "SELECT record_id FROM records WHERE record_id>? ORDER BY record_id LIMIT ?",
+            """SELECT r.record_id FROM records r
+            LEFT JOIN sources s ON s.source_key=r.source_key
+            WHERE r.record_id>? AND COALESCE(s.retired,0)=0
+            ORDER BY r.record_id LIMIT ?""",
             (after,max(1,int(limit))),
         ).fetchall()
         return [str(row[0]) for row in rows]
@@ -109,7 +161,11 @@ class Store:
         now=time.time()
         with self.db:
             self.db.executemany(
-                "INSERT OR IGNORE INTO queue(record_id,attempts,next_at,last_error,queued_at) SELECT record_id,0,0,NULL,? FROM records WHERE record_id=?",
+                """INSERT OR IGNORE INTO queue(
+                record_id,attempts,next_at,last_error,queued_at)
+                SELECT r.record_id,0,0,NULL,? FROM records r
+                LEFT JOIN sources s ON s.source_key=r.source_key
+                WHERE r.record_id=? AND COALESCE(s.retired,0)=0""",
                 ((now,record_id) for record_id in dict.fromkeys(record_ids)),
             )
         return self.db.total_changes-before
@@ -121,6 +177,14 @@ class Store:
                 if cursor.rowcount > 0:
                     stamp=datetime.fromtimestamp(now, timezone.utc).isoformat()
                     self.db.execute("INSERT INTO meta(key,value,updated_at) VALUES('last_successful_sync',?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",(stamp,now))
+    def ack_session_records(self, record_ids: list[str]) -> int:
+        """Compatibility no-op for legacy identity-only reconciliation callers.
+
+        Presence cannot prove that the pending revision is durably stored.
+        Leave the queue and sync checkpoint untouched; only a completed durable
+        ingest may call ``ack`` to acknowledge pending updates.
+        """
+        return 0
     def fail(self,record_id,error,delay=30):
         self.db.execute("UPDATE queue SET attempts=attempts+1,next_at=?,last_error=? WHERE record_id=?",(time.time()+delay,error[:1000],record_id)); self.db.commit()
     @staticmethod

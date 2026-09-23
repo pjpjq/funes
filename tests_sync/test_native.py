@@ -7,6 +7,47 @@ from sync.parsers import parse_file
 from sync.store import Store
 
 
+class _CountingBinaryReader:
+    def __init__(self, handle, reads):
+        self.handle = handle
+        self.reads = reads
+
+    def __enter__(self):
+        self.handle.__enter__()
+        return self
+
+    def __exit__(self, *args):
+        return self.handle.__exit__(*args)
+
+    def __getattr__(self, name):
+        return getattr(self.handle, name)
+
+    def read(self, size=-1):
+        value = self.handle.read(size)
+        self.reads.append(len(value))
+        return value
+
+    def readline(self, size=-1):
+        value = self.handle.readline(size)
+        self.reads.append(len(value))
+        return value
+
+
+def _track_binary_reads(monkeypatch, target):
+    reads = []
+    original_open = Path.open
+
+    def tracked_open(path, *args, **kwargs):
+        handle = original_open(path, *args, **kwargs)
+        mode = args[0] if args else kwargs.get("mode", "r")
+        if path == target and "b" in mode:
+            return _CountingBinaryReader(handle, reads)
+        return handle
+
+    monkeypatch.setattr(Path, "open", tracked_open)
+    return reads
+
+
 def test_codex_call_and_result_have_distinct_stable_ids(tmp_path):
     path = tmp_path / "rollout.jsonl"
     rows = [
@@ -23,6 +64,195 @@ def test_codex_call_and_result_have_distinct_stable_ids(tmp_path):
     assert chunks[1].record_id != chunks[2].record_id
     assert {c.content_type for c in chunks} == {"user_message", "tool_call", "tool_result"}
     assert all(c.as_dict()["source_agent"] == "codex" for c in chunks)
+
+
+def test_codex_append_reads_only_bounded_prefix_and_tail(monkeypatch, tmp_path):
+    path = tmp_path / "large-rollout.jsonl"
+    header = json.dumps(
+        {
+            "type": "session_meta",
+            "payload": {
+                "id": "bounded-session",
+                "parent_thread_id": "parent-session",
+                "cwd": "/repo",
+            },
+        }
+    ) + "\n"
+    padding = json.dumps({"type": "ignored"}) + "\n"
+    path.write_text(header + padding * (2 * 1024 * 1024 // len(padding)), encoding="utf-8")
+    offset = path.stat().st_size
+    appended = json.dumps(
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "id": "new-message",
+                "role": "assistant",
+                "content": "new tail",
+            },
+        }
+    ) + "\n"
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(appended)
+    source = Source("codex:~/sessions/large-rollout.jsonl", "codex", path, "dev-a")
+    reads = _track_binary_reads(monkeypatch, path)
+
+    chunks = parse_file(source, offset)
+
+    assert len(chunks) == 1
+    assert chunks[0].session_id == "bounded-session"
+    assert chunks[0].parent_session_id == "parent-session"
+    assert chunks[0].worktree == "/repo"
+    assert sum(reads) <= 256 * 1024 + len(appended.encode()) + 2
+
+
+def test_codex_full_and_append_share_bounded_session_prefix(tmp_path):
+    path = tmp_path / "late-header-rollout.jsonl"
+    padding = json.dumps({"type": "ignored", "padding": "x" * 1024}) + "\n"
+    prefix = padding * 300
+    assert len(prefix.encode("utf-8")) > 256 * 1024
+    assert prefix.count("\n") > 256
+    late_header = json.dumps(
+        {"type": "session_meta", "payload": {"id": "late-session"}}
+    ) + "\n"
+    first = json.dumps(
+        {
+            "type": "response_item",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": "first",
+            },
+        }
+    ) + "\n"
+    path.write_text(prefix + late_header + first, encoding="utf-8")
+    offset = path.stat().st_size
+    second = json.dumps(
+        {
+            "type": "response_item",
+            "timestamp": "2026-01-01T00:00:01Z",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": "second",
+            },
+        }
+    ) + "\n"
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(second)
+    source = Source("codex:~/sessions/late-header.jsonl", "codex", path, "dev-a")
+
+    appended = parse_file(source, offset)
+    full = parse_file(source)
+
+    assert len(appended) == 1
+    assert appended[0].session_id == full[-1].session_id
+    assert appended[0].record_id == full[-1].record_id
+
+
+def test_codex_ignores_unterminated_eof_record_until_newline(tmp_path):
+    path = tmp_path / "unterminated-rollout.jsonl"
+    header = json.dumps(
+        {"type": "session_meta", "payload": {"id": "partial-session"}}
+    ) + "\n"
+    complete = json.dumps(
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "id": "complete",
+                "role": "user",
+                "content": "complete record",
+            },
+        }
+    ) + "\n"
+    partial = json.dumps(
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "id": "partial",
+                "role": "assistant",
+                "content": "等待换行",
+            },
+        },
+        ensure_ascii=False,
+    )
+    path.write_text(header + complete + partial, encoding="utf-8")
+    source = Source("codex:~/sessions/unterminated.jsonl", "codex", path, "dev-a")
+
+    before_newline = parse_file(source)
+
+    assert [chunk.message_id for chunk in before_newline] == ["complete"]
+
+    offset = len((header + complete).encode("utf-8"))
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write("\n")
+
+    after_newline = parse_file(source, offset)
+
+    assert [chunk.message_id for chunk in after_newline] == ["partial"]
+
+
+def test_codex_append_discards_record_crossed_by_cursor(tmp_path):
+    path = tmp_path / "partial-rollout.jsonl"
+    header = json.dumps(
+        {"type": "session_meta", "payload": {"id": "partial-session"}}
+    ) + "\n"
+    crossed = json.dumps(
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "id": "crossed",
+                "role": "user",
+                "content": "跨过中文字符的记录",
+            },
+        },
+        ensure_ascii=False,
+    ) + "\n"
+    complete = json.dumps(
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "id": "complete",
+                "role": "assistant",
+                "content": "complete record",
+            },
+        }
+    ) + "\n"
+    encoded = (header + crossed + complete).encode("utf-8")
+    path.write_bytes(encoded)
+    source = Source("codex:~/sessions/partial-rollout.jsonl", "codex", path, "dev-a")
+    offset = encoded.index("中".encode("utf-8")) + 1
+
+    chunks = parse_file(source, offset)
+
+    assert [chunk.message_id for chunk in chunks] == ["complete"]
+    assert chunks[0].session_id == "partial-session"
+
+
+def test_codex_native_empty_append_fallback_matches_full_rescan(tmp_path):
+    path = tmp_path / "generic-codex.jsonl"
+    header = json.dumps(
+        {"type": "session_meta", "payload": {"id": "generic-session"}}
+    ) + "\n"
+    first = json.dumps({"type": "event", "id": "event-1", "text": "first"}) + "\n"
+    path.write_text(header + first, encoding="utf-8")
+    offset = path.stat().st_size
+    second = json.dumps({"type": "event", "id": "event-2", "text": "second"}) + "\n"
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(second)
+    source = Source("codex:~/sessions/generic-codex.jsonl", "codex", path, "dev-a")
+
+    appended = parse_file(source, offset)
+    full = parse_file(source)
+
+    assert len(appended) == 1
+    assert appended[0].session_id == "generic-session"
+    assert appended[0].record_id == full[-1].record_id
 
 
 def test_same_session_converges_across_devices(tmp_path):
@@ -68,6 +298,78 @@ def test_pi_append_keeps_native_session_identity(tmp_path):
     assert first[0].session_id == "pi-real-session"
     assert appended[0].session_id == "pi-real-session"
     assert first[0].record_id != appended[0].record_id
+
+
+def test_pi_append_reads_only_bounded_prefix_and_keeps_full_identity(
+    monkeypatch, tmp_path
+):
+    path = tmp_path / "large-pi-session.jsonl"
+    header = json.dumps(
+        {"type": "session", "id": "pi-bounded-session", "cwd": "/repo"}
+    ) + "\n"
+    padding = json.dumps({"type": "ignored"}) + "\n"
+    late_header = json.dumps(
+        {"type": "session", "id": "outside-bounded-prefix", "cwd": "/wrong"}
+    ) + "\n"
+    path.write_text(
+        header + padding * (2 * 1024 * 1024 // len(padding)) + late_header,
+        encoding="utf-8",
+    )
+    offset = path.stat().st_size
+    appended = json.dumps(
+        {
+            "type": "message",
+            "timestamp": "2026-01-01T00:00:01Z",
+            "message": {"role": "assistant", "content": "pi tail"},
+        }
+    ) + "\n"
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(appended)
+    source = Source("pi:~/sessions/large.jsonl", "pi", path, "dev-a")
+    reads = _track_binary_reads(monkeypatch, path)
+
+    appended_chunks = parse_file(source, offset)
+    append_read_bytes = sum(reads)
+    full = parse_file(source)
+
+    assert len(appended_chunks) == 1
+    assert appended_chunks[0].session_id == "pi-bounded-session"
+    assert appended_chunks[0].record_id == full[-1].record_id
+    assert append_read_bytes <= 256 * 1024 + len(appended.encode("utf-8")) + 2
+
+
+def test_claude_append_reads_only_bounded_prefix_and_keeps_full_identity(
+    monkeypatch, tmp_path
+):
+    path = tmp_path / "large-claude-session.jsonl"
+    header = json.dumps(
+        {"type": "session", "id": "claude-bounded-session"}
+    ) + "\n"
+    padding = json.dumps({"type": "ignored"}) + "\n"
+    path.write_text(
+        header + padding * (2 * 1024 * 1024 // len(padding)), encoding="utf-8"
+    )
+    offset = path.stat().st_size
+    appended = json.dumps(
+        {
+            "type": "assistant",
+            "timestamp": "2026-01-01T00:00:01Z",
+            "message": {"role": "assistant", "content": "claude tail"},
+        }
+    ) + "\n"
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(appended)
+    source = Source("claude:~/projects/large.jsonl", "claude", path, "dev-a")
+    reads = _track_binary_reads(monkeypatch, path)
+
+    appended_chunks = parse_file(source, offset)
+    append_read_bytes = sum(reads)
+    full = parse_file(source)
+
+    assert len(appended_chunks) == 1
+    assert appended_chunks[0].session_id == "claude-bounded-session"
+    assert appended_chunks[0].record_id == full[-1].record_id
+    assert append_read_bytes <= 256 * 1024 + len(appended.encode("utf-8")) + 2
 
 
 def test_codex_fallback_append_matches_full_rescan_without_native_id(tmp_path):
@@ -164,6 +466,74 @@ def test_memory_update_is_one_record_and_queue_is_idempotent(tmp_path):
     assert store.stats()["records"] == 1
     assert store.stats()["pending"] == 1
     store.close()
+
+
+def test_unheaded_persistent_memory_update_keeps_identity_and_increments_version(tmp_path):
+    path = tmp_path / "memory.md"
+    path.write_text("plain memory before edit\n", encoding="utf-8")
+    source = Source("memory:persistent", "persistent", path, "dev")
+    cfg = Config(tmp_path, tmp_path / "state", tmp_path / "config.toml")
+    store = Store(config=cfg)
+    try:
+        before = parse_file(source)
+        assert len(before) == 1
+        assert before[0].message_id.endswith(":__preamble__")
+        assert store.upsert_chunks(before) == 1
+
+        path.write_text("plain memory after edit\n", encoding="utf-8")
+        after = parse_file(source)
+        assert len(after) == 1
+        assert after[0].record_id == before[0].record_id
+        assert store.upsert_chunks(after) == 1
+
+        row = store.db.execute(
+            "SELECT version FROM records WHERE record_id=?", (after[0].record_id,)
+        ).fetchone()
+        assert row["version"] == 2
+        assert store.stats()["records"] == 1
+    finally:
+        store.close()
+
+
+def test_large_unheaded_persistent_memory_parts_are_unique_and_stable(tmp_path):
+    path = tmp_path / "memory.md"
+    path.write_text("a" * 6100, encoding="utf-8")
+    source = Source("memory:persistent", "persistent", path, "dev")
+
+    before = parse_file(source)
+    assert len(before) == 2
+    assert len({chunk.record_id for chunk in before}) == 2
+    assert all(len(chunk.raw_text) <= 6000 for chunk in before)
+
+    path.write_text("b" + "a" * 6099, encoding="utf-8")
+    after = parse_file(source)
+    assert [chunk.record_id for chunk in after] == [chunk.record_id for chunk in before]
+
+
+def test_repeated_memory_headings_are_unique_and_stable_across_updates(tmp_path):
+    path = tmp_path / "memory.md"
+    path.write_text("# decision\nfirst\n# decision\nsecond\n", encoding="utf-8")
+    source = Source("memory:persistent", "persistent", path, "dev")
+    cfg = Config(tmp_path, tmp_path / "state", tmp_path / "config.toml")
+    store = Store(config=cfg)
+    try:
+        before = parse_file(source)
+        assert len(before) == 2
+        assert len({chunk.record_id for chunk in before}) == 2
+        assert before[0].message_id.endswith(":# decision")
+        assert before[1].message_id.endswith(":# decision:occurrence:1")
+        assert store.upsert_chunks(before) == 2
+
+        path.write_text("# decision\nupdated first\n# decision\nupdated second\n", encoding="utf-8")
+        after = parse_file(source)
+        assert [chunk.record_id for chunk in after] == [chunk.record_id for chunk in before]
+        assert store.upsert_chunks(after) == 2
+
+        versions = store.db.execute("SELECT version FROM records ORDER BY record_id").fetchall()
+        assert [row["version"] for row in versions] == [2, 2]
+        assert store.stats()["records"] == 2
+    finally:
+        store.close()
 
 
 def test_discovery_excludes_auth_and_finds_archived(tmp_path):

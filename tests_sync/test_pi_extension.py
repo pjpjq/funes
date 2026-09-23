@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -20,6 +21,7 @@ def run_harness(
     source: str,
     body: str,
     extra_env: dict[str, str] | None = None,
+    timeout: int = 15,
 ) -> subprocess.CompletedProcess[str]:
     config = tmp_path / "config.toml"
     config.write_text(source, encoding="utf-8")
@@ -44,7 +46,7 @@ def run_harness(
         check=False,
         capture_output=True,
         text=True,
-        timeout=10,
+        timeout=timeout,
     )
 
 
@@ -61,6 +63,88 @@ def test_pi_reads_current_and_legacy_remote_config(tmp_path, source, expected):
     result = run_harness(tmp_path, source, "console.log(configuredRemoteUrl());\n")
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == expected
+
+
+@pytest.mark.skipif(
+    NODE is None or sys.platform != "linux", reason="Linux secret-file fallback is required"
+)
+def test_pi_reads_tokens_from_private_env_file(tmp_path):
+    requests = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            requests.append(dict(self.headers.items()))
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"ok":true,"results":[]}')
+
+        def log_message(self, format, *args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        env_file = tmp_path / "funes.env"
+        env_file.write_text(
+            "FUNES_API_TOKEN=from-private-file\nFUNES_HF_TOKEN=hf-from-private-file\n",
+            encoding="utf-8",
+        )
+        env_file.chmod(0o600)
+        body = (
+            "const tools = {};\n"
+            "const pi = {registerTool(tool) { tools[tool.name] = tool; }, on() {}};\n"
+            "extension(pi);\n"
+            "await tools.funes_recall.execute('test', {query: 'history'});\n"
+        )
+        result = run_harness(
+            tmp_path,
+            f'[remote]\nurl = "http://127.0.0.1:{server.server_port}"\n',
+            body,
+            {
+                "FUNES_API_TOKEN": "",
+                "FUNES_HF_TOKEN": "",
+                "HF_TOKEN": "",
+                "FUNES_ENV_FILE": str(env_file),
+            },
+        )
+        assert result.returncode == 0, result.stderr
+        assert len(requests) == 1
+        assert requests[0]["Authorization"] == "Bearer hf-from-private-file"
+        assert requests[0]["X-Funes-Authorization"] == "Bearer from-private-file"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+@pytest.mark.skipif(
+    NODE is None or sys.platform != "linux", reason="Linux secret-file fallback is required"
+)
+def test_pi_rejects_public_env_file(tmp_path):
+    env_file = tmp_path / "funes.env"
+    env_file.write_text("FUNES_API_TOKEN=public-token\n", encoding="utf-8")
+    env_file.chmod(0o644)
+    body = (
+        "const tools = {};\n"
+        "const pi = {registerTool(tool) { tools[tool.name] = tool; }, on() {}};\n"
+        "extension(pi);\n"
+        "const result = await tools.funes_recall.execute('test', {query: 'history'});\n"
+        "console.log(result.content[0].text);\n"
+    )
+    result = run_harness(
+        tmp_path,
+        '[remote]\nurl = "http://127.0.0.1:1"\n',
+        body,
+        {
+            "FUNES_API_TOKEN": "",
+            "FUNES_HF_TOKEN": "",
+            "HF_TOKEN": "",
+            "FUNES_ENV_FILE": str(env_file),
+        },
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "null"
 
 
 @pytest.mark.skipif(NODE is None, reason="node is unavailable")
@@ -131,6 +215,59 @@ def test_pi_does_not_follow_or_retry_redirect(tmp_path):
 
 
 @pytest.mark.skipif(NODE is None, reason="node is unavailable")
+def test_pi_before_agent_start_allows_slow_search_within_automatic_budget(tmp_path):
+    requests = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            requests.append(self.path)
+            time.sleep(6.1)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(
+                b'{"ok":true,"results":[{"raw_text":"remembered decision"}]}'
+            )
+
+        def log_message(self, format, *args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server.daemon_threads = True
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        body = (
+            "let beforeAgentStart;\n"
+            "const pi = {registerTool() {}, on(name, handler) { "
+            "if (name === 'before_agent_start') beforeAgentStart = handler; }};\n"
+            "extension(pi);\n"
+            "const result = await beforeAgentStart({"
+            "prompt: 'What did we decide previously about the remote memory?', "
+            "systemPrompt: 'base'});\n"
+            "console.log(JSON.stringify(result ?? null));\n"
+        )
+        started = time.monotonic()
+        result = run_harness(
+            tmp_path,
+            f'[remote]\nurl = "http://127.0.0.1:{server.server_port}"\n',
+            body,
+            {"FUNES_REMOTE_AUTO_RECALL_TIMEOUT_MS": "8000"},
+        )
+        elapsed = time.monotonic() - started
+
+        assert result.returncode == 0, result.stderr
+        assert json.loads(result.stdout) == {
+            "systemPrompt": "base\n\n## Funes unified memory\n1. remembered decision"
+        }
+        assert requests == ["/search"]
+        assert 5.8 < elapsed < 8.0
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+@pytest.mark.skipif(NODE is None, reason="node is unavailable")
 @pytest.mark.parametrize("failure", ("hang", "503"))
 def test_pi_before_agent_start_fails_open_with_automatic_budget(tmp_path, failure):
     requests = []
@@ -189,7 +326,242 @@ def test_pi_before_agent_start_fails_open_with_automatic_budget(tmp_path, failur
         assert result.returncode == 0, result.stderr
         assert result.stdout.strip() == "null"
         assert requests == ["/search"]
-        assert elapsed < 5
+        assert elapsed < (10.5 if failure == "hang" else 5)
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+@pytest.mark.skipif(NODE is None, reason="node is unavailable")
+def test_pi_funes_recall_uses_short_503_backoff_and_recovers(tmp_path):
+    requests = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            requests.append((self.path, time.monotonic()))
+            if len(requests) == 1:
+                self.send_response(503)
+                self.end_headers()
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(
+                b'{"ok":true,"results":[{"raw_text":"recovered decision"}]}'
+            )
+
+        def log_message(self, format, *args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server.daemon_threads = True
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        body = (
+            "const tools = {};\n"
+            "const pi = {registerTool(tool) { tools[tool.name] = tool; }, on() {}};\n"
+            "extension(pi);\n"
+            "const result = await tools.funes_recall.execute('test', {query: 'decision'});\n"
+            "console.log(result.content[0].text);\n"
+        )
+        started = time.monotonic()
+        result = run_harness(
+            tmp_path,
+            f'[remote]\nurl = "http://127.0.0.1:{server.server_port}"\n',
+            body,
+        )
+        elapsed = time.monotonic() - started
+        assert result.returncode == 0, result.stderr
+        parsed = json.loads(result.stdout)
+        assert parsed["ok"] is True
+        assert parsed["results"][0]["raw_text"] == "recovered decision"
+        assert len(requests) == 2
+        delay = requests[1][1] - requests[0][1]
+        assert 0.4 <= delay < 1.5, f"expected ~0.5s backoff, got {delay}"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+@pytest.mark.skipif(NODE is None, reason="node is unavailable")
+def test_pi_funes_recall_ignores_long_remote_env_and_defaults_to_two_attempts(tmp_path):
+    requests = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            requests.append((self.path, time.monotonic()))
+            self.send_response(503)
+            self.end_headers()
+
+        def log_message(self, format, *args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server.daemon_threads = True
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        body = (
+            "const tools = {};\n"
+            "const pi = {registerTool(tool) { tools[tool.name] = tool; }, on() {}};\n"
+            "extension(pi);\n"
+            "const result = await tools.funes_recall.execute('test', {query: 'decision'});\n"
+            "console.log(result.content[0].text);\n"
+        )
+        started = time.monotonic()
+        result = run_harness(
+            tmp_path,
+            f'[remote]\nurl = "http://127.0.0.1:{server.server_port}"\n',
+            body,
+            {
+                "FUNES_REMOTE_TIMEOUT": "180",
+                "FUNES_REMOTE_ATTEMPTS": "5",
+                "FUNES_REMOTE_ATTEMPT_TIMEOUT": "50",
+            },
+        )
+        elapsed = time.monotonic() - started
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "null"
+        assert len(requests) == 2
+        assert elapsed < 4.0
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+@pytest.mark.skipif(NODE is None, reason="node is unavailable")
+def test_pi_funes_recall_reads_dedicated_recall_attempts_env(tmp_path):
+    requests = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            requests.append((self.path, time.monotonic()))
+            self.send_response(503)
+            self.end_headers()
+
+        def log_message(self, format, *args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server.daemon_threads = True
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        body = (
+            "const tools = {};\n"
+            "const pi = {registerTool(tool) { tools[tool.name] = tool; }, on() {}};\n"
+            "extension(pi);\n"
+            "const result = await tools.funes_recall.execute('test', {query: 'decision'});\n"
+            "console.log(result.content[0].text);\n"
+        )
+        result = run_harness(
+            tmp_path,
+            f'[remote]\nurl = "http://127.0.0.1:{server.server_port}"\n',
+            body,
+            {
+                "FUNES_REMOTE_RECALL_ATTEMPTS": "3",
+            },
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "null"
+        assert len(requests) == 3
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+@pytest.mark.skipif(NODE is None, reason="node is unavailable")
+def test_pi_funes_get_keeps_standard_backoff_and_remote_budget(tmp_path):
+    requests = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            requests.append((self.path, time.monotonic()))
+            if len(requests) == 1:
+                self.send_response(503)
+                self.end_headers()
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"ok":true,"record":"found"}')
+
+        def log_message(self, format, *args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server.daemon_threads = True
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        body = (
+            "const tools = {};\n"
+            "const pi = {registerTool(tool) { tools[tool.name] = tool; }, on() {}};\n"
+            "extension(pi);\n"
+            "const result = await tools.funes_get.execute('test', {record_id: 'rec-1'});\n"
+            "console.log(result.content[0].text);\n"
+        )
+        result = run_harness(
+            tmp_path,
+            f'[remote]\nurl = "http://127.0.0.1:{server.server_port}"\n',
+            body,
+        )
+        assert result.returncode == 0, result.stderr
+        parsed = json.loads(result.stdout)
+        assert parsed["ok"] is True
+        assert len(requests) == 2
+        assert requests[0][0] == "/get"
+        delay = requests[1][1] - requests[0][1]
+        assert delay >= 1.8, f"expected standard backoff >= 1.8s, got {delay}"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+@pytest.mark.skipif(NODE is None, reason="node is unavailable")
+def test_pi_funes_recall_allows_slow_search_matching_large_index_latency(tmp_path):
+    requests = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            requests.append(self.path)
+            time.sleep(6.1)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(
+                b'{"ok":true,"results":[{"raw_text":"large index raw text"}]}'
+            )
+
+        def log_message(self, format, *args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server.daemon_threads = True
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        body = (
+            "const tools = {};\n"
+            "const pi = {registerTool(tool) { tools[tool.name] = tool; }, on() {}};\n"
+            "extension(pi);\n"
+            "const result = await tools.funes_recall.execute('test', {query: 'bm25'});\n"
+            "console.log(result.content[0].text);\n"
+        )
+        started = time.monotonic()
+        result = run_harness(
+            tmp_path,
+            f'[remote]\nurl = "http://127.0.0.1:{server.server_port}"\n',
+            body,
+            {"FUNES_REMOTE_AUTO_RECALL_TIMEOUT_MS": "8000"},
+        )
+        elapsed = time.monotonic() - started
+        assert result.returncode == 0, result.stderr
+        parsed = json.loads(result.stdout)
+        assert parsed["ok"] is True
+        assert parsed["results"][0]["raw_text"] == "large index raw text"
+        assert len(requests) == 1
+        assert 5.8 < elapsed < 8.0
     finally:
         server.shutdown()
         server.server_close()

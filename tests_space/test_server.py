@@ -1,6 +1,10 @@
 import gzip
 import hashlib
 import json
+import os
+import socket
+import subprocess
+import sys
 import threading
 import time
 from collections import deque
@@ -120,6 +124,103 @@ def test_query_text_is_deterministic_and_never_calls_provider(monkeypatch):
     assert bridge.query_text("中文 CPA 问题") == "CPA"
 
 
+def test_selective_bm25_trigger_accepts_repeated_groups_two_two_one():
+    raw_query = "CPA 第二轮为什么丢上下文？"
+    results = [
+        {
+            "source_identity": "a-1",
+            "session_id": "session-a",
+            "raw_text": "Northflank 调用 previous_response_id 后继续执行。",
+        },
+        {
+            "source_identity": "a-2",
+            "session_id": "session-a",
+            "raw_text": "同一 session 的普通记录。",
+        },
+        {
+            "source_identity": "b-1",
+            "session_id": "session-b",
+            "raw_text": "previous_response_id 与下一轮上下文有关。",
+        },
+        {
+            "source_identity": "b-2",
+            "session_id": "session-b",
+            "raw_text": "另一个重复 session 的普通记录。",
+        },
+        {
+            "source_identity": "c-1",
+            "session_id": "session-c",
+            "raw_text": "单独的 session。",
+        },
+    ]
+
+    assert bridge.should_augment_with_local_bm25(raw_query, results) is True
+
+
+@pytest.mark.parametrize(
+    ("query", "results"),
+    (
+        (
+            "why was context lost?",
+            [
+                {"session_id": "same", "raw_text": "retry_state"},
+                {"session_id": "same", "raw_text": "retry_state"},
+                {"session_id": "same", "raw_text": "retry_state"},
+            ],
+        ),
+        (
+            "please investigate the context loss 的",
+            [
+                {"session_id": "same", "raw_text": "retry_state"},
+                {"session_id": "same", "raw_text": "retry_state"},
+                {"session_id": "same", "raw_text": "retry_state"},
+            ],
+        ),
+        (
+            "为什么丢上下文？",
+            [
+                {"session_id": "one", "raw_text": "retry_state"},
+                {"session_id": "two", "raw_text": "retry_state"},
+                {"session_id": "three", "raw_text": "retry_state"},
+            ],
+        ),
+        (
+            "为什么丢上下文？",
+            [
+                {"session_id": "same", "raw_text": "retry_state"},
+                {"session_id": "same", "raw_text": "no identifier here"},
+                {"session_id": "same", "raw_text": "another note"},
+            ],
+        ),
+        (
+            "retry_state 为什么丢上下文？",
+            [
+                {"session_id": "same", "raw_text": "retry_state"},
+                {"session_id": "same", "raw_text": "retry_state"},
+                {"session_id": "same", "raw_text": "retry_state"},
+            ],
+        ),
+    ),
+)
+def test_selective_bm25_trigger_keeps_ordinary_requests_one_pass(query, results):
+    assert bridge.should_augment_with_local_bm25(query, results) is False
+
+
+def test_selective_bm25_trigger_rejects_secret_and_unstructured_terms():
+    unsafe = "ghp_" + "x" * 36
+    rows = [
+        {
+            "session_id": "same",
+            "raw_text": (
+                f"Northflank access_token {unsafe}"
+            ),
+        }
+        for _ in range(3)
+    ]
+
+    assert bridge.should_augment_with_local_bm25("这个问题为什么失败？", rows) is False
+
+
 def test_native_mcp_worker_reuses_child_and_passes_hf_environment(monkeypatch, tmp_path):
     processes = []
 
@@ -146,6 +247,43 @@ def test_native_mcp_worker_reuses_child_and_passes_hf_environment(monkeypatch, t
     assert methods[2:] == ["tools/call", "tools/call"]
     assert processes[0].messages[2]["params"]["name"] == "recall"
     assert processes[0].messages[3]["params"]["name"] == "get"
+
+
+def test_native_mcp_worker_can_return_structured_recall_result(monkeypatch, tmp_path):
+    def responder(message, stdout):
+        if message.get("method") == "initialize":
+            _mcp_responder(message, stdout)
+            return
+        if message.get("method") == "tools/call":
+            stdout.push(
+                {
+                    "jsonrpc": "2.0",
+                    "id": message["id"],
+                    "result": {
+                        "content": [{"type": "text", "text": "agent rendering"}],
+                        "structuredContent": {
+                            "hits": [{"raw_text": "raw", "session_id": "s1"}]
+                        },
+                    },
+                }
+            )
+
+    monkeypatch.setattr(
+        bridge.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: _FakeProcess(responder),
+    )
+    worker = bridge.NativeMcpWorker(
+        "fake-funes", "owner/memory", tmp_path, timeout=1, handshake_timeout=1
+    )
+    try:
+        result = worker.recall_result("query", k=1)
+    finally:
+        worker.close()
+
+    assert result["structuredContent"]["hits"] == [
+        {"raw_text": "raw", "session_id": "s1"}
+    ]
 
 
 def test_native_mcp_worker_rejects_tool_error_text(monkeypatch, tmp_path):
@@ -573,6 +711,36 @@ def test_remote_without_source_sidecar_is_not_accepted(monkeypatch, tmp_path):
     assert body["error"] == "FUNES_STORAGE_REPO is not configured"
 
 
+def test_space_source_restore_skips_optional_fts_rebuild(monkeypatch, tmp_path):
+    observed = {}
+    previous_rebuild_fts = os.environ.pop("FUNES_BULK_RESTORE_REBUILD_FTS", None)
+
+    class FakeSourceApp:
+        def __init__(self):
+            observed["rebuild_fts"] = os.environ.get(
+                "FUNES_BULK_RESTORE_REBUILD_FTS"
+            )
+
+    monkeypatch.setattr(bridge, "SOURCE_APP", None)
+    monkeypatch.setattr(bridge, "SourceApp", FakeSourceApp)
+    monkeypatch.setattr(bridge, "start_canonical_reconciler", lambda _app: None)
+    monkeypatch.setenv("FUNES_STORAGE_REPO", "owner/source")
+    monkeypatch.setenv("FUNES_DATA_DIR", str(tmp_path / "source-store"))
+    monkeypatch.setenv("FUNES_LAZY_RESTORE", "true")
+    monkeypatch.setenv("FUNES_REQUIRE_DURABLE_ACK", "true")
+    try:
+        assert isinstance(bridge.source_app(), FakeSourceApp)
+        assert observed == {"rebuild_fts": "false"}
+    finally:
+        # source_app() mutates os.environ directly via setdefault(), outside
+        # monkeypatch's bookkeeping. Restore the exact pre-test state so the
+        # default does not leak into later Store migrations.
+        if previous_rebuild_fts is None:
+            os.environ.pop("FUNES_BULK_RESTORE_REBUILD_FTS", None)
+        else:
+            os.environ["FUNES_BULK_RESTORE_REBUILD_FTS"] = previous_rebuild_fts
+
+
 def test_sync_status_alias_returns_ready_payload(monkeypatch):
     monkeypatch.setattr(bridge, "TOKEN", "test-token")
     monkeypatch.setattr(bridge, "REMOTE", "owner/memory")
@@ -604,6 +772,463 @@ def test_sync_status_alias_returns_ready_payload(monkeypatch):
     assert body["ok"] is True
     assert body["remote"] == "owner/memory"
     assert "chunks: 12" in body["status"]
+
+
+def test_get_ready_is_constant_time_and_never_touches_storage(monkeypatch):
+    class Store:
+        def __getattribute__(self, name):
+            raise AssertionError(f"GET /ready must not access store.{name}")
+
+    app = SimpleNamespace(
+        store=Store(),
+        syncer=SimpleNamespace(restoring=False, restore_failed=False),
+        restore_result=12,
+    )
+    monkeypatch.setattr(bridge, "TOKEN", "test-token")
+    monkeypatch.setattr(bridge, "REMOTE", "owner/memory")
+    monkeypatch.setenv("FUNES_STORAGE_REPO", "owner/source")
+    monkeypatch.setattr(bridge, "SOURCE_APP", app)
+    monkeypatch.setattr(
+        bridge,
+        "source_state",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("GET /ready must not build full source status")
+        ),
+    )
+    monkeypatch.setattr(
+        bridge,
+        "source_app",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("GET /ready must not initialize the source app")
+        ),
+    )
+    monkeypatch.setattr(bridge, "warm_state", lambda: {"state": "ready"})
+    monkeypatch.setattr(
+        bridge,
+        "run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("GET /ready must not run native status")
+        ),
+    )
+    server = ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        conn = HTTPConnection(*server.server_address)
+        conn.request("GET", "/ready", headers={"Authorization": "Bearer test-token"})
+        response = conn.getresponse()
+        body = json.loads(response.read())
+        conn.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert response.status == 200
+    assert body["ok"] is True
+    assert body["remote"] == "owner/memory"
+    assert body["source_store"] == {
+        "configured": True,
+        "ready": True,
+        "restoring": False,
+        "restored": 12,
+    }
+    assert body["native_warm"]["state"] == "ready"
+    assert body["status"] == ""
+
+
+def test_ready_retries_failed_warm_without_sidecar_then_recovers(monkeypatch):
+    refreshes = []
+    queued_warms = []
+    monkeypatch.setattr(bridge, "TOKEN", "test-token")
+    monkeypatch.setattr(bridge, "REMOTE", "owner/memory")
+    monkeypatch.delenv("FUNES_STORAGE_REPO", raising=False)
+    monkeypatch.setattr(bridge, "SOURCE_APP", None)
+    monkeypatch.setattr(
+        bridge,
+        "_WARM_STATE",
+        {
+            "state": "not_started",
+            "started_at": None,
+            "finished_at": None,
+            "refresh_pending": False,
+        },
+    )
+    monkeypatch.setattr(
+        bridge,
+        "source_state",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("GET /ready must not build full source status")
+        ),
+    )
+    monkeypatch.setattr(
+        bridge,
+        "run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("GET /ready must stay lightweight")
+        ),
+    )
+
+    def first_refresh_fails():
+        refreshes.append("failed")
+        raise bridge.NativeMcpError("provider unavailable")
+
+    monkeypatch.setattr(bridge, "_refresh_native_worker", first_refresh_fails)
+    bridge._warm_native_memory()
+    assert bridge.warm_state()["state"] == "error"
+
+    def refreshed_worker_is_ready():
+        refreshes.append("ready")
+
+    monkeypatch.setattr(bridge, "_refresh_native_worker", refreshed_worker_is_ready)
+
+    class QueuedThread:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def start(self):
+            queued_warms.append(self)
+
+    # Do not patch the global Thread while a ThreadingHTTPServer is alive.
+    # The queued worker makes the retry/warming transition deterministic.
+    with monkeypatch.context() as context:
+        context.setattr(bridge.threading, "Thread", QueuedThread)
+        code, payload = bridge.ready_payload()
+        assert code == 503
+        assert payload["native_warm"]["state"] == "warming"
+        assert len(queued_warms) == 1
+        repeat_code, repeat = bridge.ready_payload()
+        assert repeat_code == 503
+        assert repeat["native_warm"]["state"] == "warming"
+        assert len(queued_warms) == 1
+        queued_warms[0].kwargs["target"](**queued_warms[0].kwargs["kwargs"])
+
+    assert refreshes == ["failed", "ready"]
+    assert bridge.warm_state()["state"] == "ready"
+    server = ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        conn = HTTPConnection(*server.server_address)
+        conn.request("GET", "/ready", headers={"Authorization": "Bearer test-token"})
+        response = conn.getresponse()
+        body = json.loads(response.read())
+        conn.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert response.status == 200
+    assert body["ok"] is True
+
+
+def test_get_ready_returns_immediate_503_during_source_restore(monkeypatch):
+    class Store:
+        def __getattribute__(self, name):
+            raise AssertionError(f"GET /ready must not access store.{name}")
+
+    app = SimpleNamespace(
+        store=Store(),
+        syncer=SimpleNamespace(restoring=True, restore_failed=False),
+        restore_result=0,
+    )
+    monkeypatch.setattr(bridge, "TOKEN", "test-token")
+    monkeypatch.setattr(bridge, "REMOTE", "owner/memory")
+    monkeypatch.setenv("FUNES_STORAGE_REPO", "owner/source")
+    monkeypatch.setattr(bridge, "SOURCE_APP", app)
+    monkeypatch.setattr(
+        bridge,
+        "source_state",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("GET /ready must not build full source status")
+        ),
+    )
+    monkeypatch.setattr(bridge, "warm_state", lambda: {"state": "ready"})
+    monkeypatch.setattr(
+        bridge,
+        "run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("GET /ready must not run native status")
+        ),
+    )
+    server = ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    started = time.monotonic()
+    try:
+        conn = HTTPConnection(*server.server_address)
+        conn.request("GET", "/ready", headers={"Authorization": "Bearer test-token"})
+        response = conn.getresponse()
+        body = json.loads(response.read())
+        conn.close()
+        elapsed = time.monotonic() - started
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert elapsed < 0.25
+    assert response.status == 503
+    assert body["error"] == "restore_in_progress"
+    assert body["source_store"]["restoring"] is True
+
+
+@pytest.mark.parametrize(
+    ("restoring", "restore_failed", "source_error"),
+    (
+        (True, False, "restore_in_progress"),
+        (False, True, "restore_failed"),
+    ),
+)
+def test_search_ready_stays_200_while_source_is_unavailable(
+    monkeypatch, restoring, restore_failed, source_error
+):
+    class Store:
+        def __getattribute__(self, name):
+            raise AssertionError(f"readiness must not access store.{name}")
+
+    app = SimpleNamespace(
+        store=Store(),
+        syncer=SimpleNamespace(restoring=restoring, restore_failed=restore_failed),
+        restore_result=0,
+    )
+    monkeypatch.setattr(bridge, "TOKEN", "test-token")
+    monkeypatch.setattr(bridge, "REMOTE", "owner/memory")
+    monkeypatch.setenv("FUNES_STORAGE_REPO", "owner/source")
+    monkeypatch.setattr(bridge, "SOURCE_APP", app)
+    monkeypatch.setattr(bridge, "warm_state", lambda: {"state": "ready"})
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        responses = {}
+        for path in ("/ready/search", "/ready/ingest", "/ready"):
+            conn = HTTPConnection(*server.server_address)
+            conn.request("GET", path, headers={"Authorization": "Bearer test-token"})
+            response = conn.getresponse()
+            responses[path] = response.status, json.loads(response.read())
+            conn.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert responses["/ready/search"][0] == 200
+    assert responses["/ready/search"][1]["ok"] is True
+    assert responses["/ready/ingest"][0] == 503
+    assert responses["/ready/ingest"][1]["error"] == source_error
+    assert responses["/ready"][0] == 503
+    assert responses["/ready"][1]["error"] == source_error
+
+
+def test_search_ready_stays_200_during_active_worker_replacement(monkeypatch):
+    process = SimpleNamespace(poll=lambda: None)
+    monkeypatch.setattr(bridge, "REMOTE", "owner/memory")
+    monkeypatch.delenv("FUNES_STORAGE_REPO", raising=False)
+    monkeypatch.setattr(bridge, "SOURCE_APP", None)
+    monkeypatch.setattr(bridge, "MCP_WORKER", SimpleNamespace(process=process))
+    monkeypatch.setattr(bridge, "_MCP_WORKER_CONFIG", bridge._native_worker_config())
+    monkeypatch.setattr(bridge, "warm_state", lambda: {"state": "warming"})
+
+    search_code, search = bridge.search_ready_payload()
+    ingest_code, ingest = bridge.ready_payload()
+
+    assert search_code == 200
+    assert search["ok"] is True
+    assert search["error"] == ""
+    assert search["native_warm"]["state"] == "warming"
+    assert ingest_code == 503
+    assert ingest["error"] == "native_warm_warming"
+
+    monkeypatch.setattr(bridge, "_MCP_WORKER_CONFIG", ("stale",))
+    assert bridge.search_ready_payload()[0] == 503
+    monkeypatch.setattr(bridge, "_MCP_WORKER_CONFIG", bridge._native_worker_config())
+    process.poll = lambda: 1
+    assert bridge.search_ready_payload()[0] == 503
+
+
+def test_search_ready_stays_503_during_initial_warm_without_active_worker(monkeypatch):
+    monkeypatch.setattr(bridge, "REMOTE", "owner/memory")
+    monkeypatch.delenv("FUNES_STORAGE_REPO", raising=False)
+    monkeypatch.setattr(bridge, "SOURCE_APP", None)
+    monkeypatch.setattr(bridge, "MCP_WORKER", None)
+    monkeypatch.setattr(bridge, "warm_state", lambda: {"state": "warming"})
+
+    code, payload = bridge.search_ready_payload()
+
+    assert code == 503
+    assert payload["ok"] is False
+    assert payload["error"] == "native_warm_warming"
+
+
+def test_search_ready_requires_source_for_legacy_local_provider(monkeypatch):
+    app = SimpleNamespace(
+        syncer=SimpleNamespace(restoring=True, restore_failed=False),
+        restore_result=0,
+    )
+    monkeypatch.setattr(bridge, "REMOTE", "owner/memory")
+    monkeypatch.setattr(bridge, "SOURCE_APP", app)
+    monkeypatch.setenv("FUNES_STORAGE_REPO", "owner/source")
+    monkeypatch.setenv("FUNES_EMBEDDING_PROVIDER", "local")
+    monkeypatch.setattr(bridge, "warm_state", lambda: {"state": "ready"})
+
+    code, payload = bridge.search_ready_payload()
+
+    assert code == 503
+    assert payload["ok"] is False
+    assert payload["error"] == "restore_in_progress"
+
+
+@pytest.mark.parametrize(
+    ("path", "payload", "extra_headers"),
+    (
+        ("/sync", {}, {}),
+        ("/reindex", {"scope": "all"}, {}),
+        (
+            "/ingest",
+            {"documents": [{"raw_text": "must not be retained"}]},
+            {"Prefer": "respond-async"},
+        ),
+    ),
+)
+@pytest.mark.parametrize(
+    ("restoring", "restore_failed", "source_error"),
+    (
+        (True, False, "restore_in_progress"),
+        (False, True, "restore_failed"),
+    ),
+)
+def test_writes_fail_fast_while_source_is_restoring(
+    monkeypatch,
+    path,
+    payload,
+    extra_headers,
+    restoring,
+    restore_failed,
+    source_error,
+):
+    class Store:
+        def __getattribute__(self, name):
+            raise AssertionError(f"restore-gated write must not access store.{name}")
+
+    app = SimpleNamespace(
+        store=Store(),
+        syncer=SimpleNamespace(restoring=restoring, restore_failed=restore_failed),
+        restore_result=0,
+    )
+    monkeypatch.setattr(bridge, "TOKEN", "test-token")
+    monkeypatch.setattr(bridge, "REMOTE", "owner/memory")
+    monkeypatch.setattr(bridge, "SOURCE_APP", app)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    started = time.monotonic()
+    try:
+        conn = HTTPConnection(*server.server_address)
+        headers = {
+            "Authorization": "Bearer test-token",
+            "Content-Type": "application/json",
+            **extra_headers,
+        }
+        conn.request("POST", path, json.dumps(payload).encode(), headers)
+        response = conn.getresponse()
+        body = json.loads(response.read())
+        conn.close()
+        elapsed = time.monotonic() - started
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert elapsed < 0.25
+    assert response.status == 503
+    assert body["error"] == source_error
+    assert body["durable"] is False
+
+
+def test_sync_status_native_timeout_keeps_sanitized_reconciler_state(monkeypatch):
+    monkeypatch.setattr(bridge, "REMOTE", "owner/private")
+    monkeypatch.setattr(
+        bridge,
+        "run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            bridge.subprocess.TimeoutExpired(
+                ["/private/path", "exception-only-private"],
+                30,
+                output="PRIVATE RAW SESSION",
+                stderr="SECRET PROVIDER PAYLOAD",
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        bridge,
+        "source_state",
+        lambda: {
+            "configured": True,
+            "ready": True,
+            "documents": 17,
+            "canonical_reconciler": {
+                "thread_alive": True,
+                "phase": "native_ingest",
+            },
+        },
+    )
+    monkeypatch.setattr(bridge, "warm_state", lambda: {"state": "ready"})
+
+    code, payload = bridge.sync_status_payload()
+
+    assert code == 503
+    assert payload["ok"] is False
+    assert payload["status"] == ""
+    assert payload["error"] == "native_status_timeout"
+    assert payload["source_store"]["canonical_reconciler"] == {
+        "thread_alive": True,
+        "phase": "native_ingest",
+    }
+    rendered = json.dumps(payload)
+    assert "exception-only-private" not in rendered
+    assert "/private/path" not in rendered
+    assert "PRIVATE RAW SESSION" not in rendered
+    assert "SECRET PROVIDER PAYLOAD" not in rendered
+
+
+def test_get_sync_status_still_runs_full_native_status(monkeypatch):
+    calls = []
+    monkeypatch.setattr(bridge, "TOKEN", "test-token")
+    monkeypatch.setattr(bridge, "REMOTE", "owner/memory")
+    monkeypatch.setattr(
+        bridge,
+        "source_state",
+        lambda: {"configured": True, "ready": True, "documents": 0},
+    )
+    monkeypatch.setattr(bridge, "warm_state", lambda: {"state": "ready"})
+
+    def fake_run(*args, **kwargs):
+        calls.append((args, kwargs))
+        return 0, "chunks: 12\n", ""
+
+    monkeypatch.setattr(bridge, "run", fake_run)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        conn = HTTPConnection(*server.server_address)
+        conn.request(
+            "GET", "/sync/status", headers={"Authorization": "Bearer test-token"}
+        )
+        response = conn.getresponse()
+        body = json.loads(response.read())
+        conn.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert response.status == 200
+    assert calls == [(("status", "owner/memory"), {"timeout": 30})]
+    assert body["status"] == "chunks: 12\n"
 
 
 def test_sync_checkpoint_acknowledges_existing_durable_push(monkeypatch):
@@ -730,6 +1355,11 @@ def _source_app(tmp_path, durable=True):
 
 
 def _post(server, path, payload, token="test-token"):
+    status, body, _headers = _post_with_headers(server, path, payload, token)
+    return status, body
+
+
+def _post_with_headers(server, path, payload, token="test-token"):
     conn = HTTPConnection(*server.server_address)
     conn.request(
         "POST",
@@ -739,8 +1369,122 @@ def _post(server, path, payload, token="test-token"):
     )
     response = conn.getresponse()
     body = json.loads(response.read())
+    headers = dict(response.getheaders())
     conn.close()
-    return response.status, body
+    return response.status, body, headers
+
+
+def test_server_script_entry_can_filter_warm_memory(tmp_path):
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+
+    env = os.environ.copy()
+    for name in ("FUNES_STORAGE_REPO", "FUNES_INDEX_MEMORY"):
+        env.pop(name, None)
+    env.update(
+        {
+            "FUNES_API_TOKEN": "test-token",
+            "FUNES_BIN": "/usr/bin/false",
+            "FUNES_HOME": str(tmp_path),
+            "FUNES_MEMORY": "owner/canonical-memory",
+            "PYTHONPATH": str(Path(bridge.__file__).parents[1]),
+            "PORT": str(port),
+        }
+    )
+    process = subprocess.Popen(
+        [sys.executable, str(Path(bridge.__file__))],
+        cwd=Path(bridge.__file__).parents[1],
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    server = SimpleNamespace(server_address=("127.0.0.1", port))
+    deadline = time.monotonic() + 60
+    try:
+        while True:
+            if process.poll() is not None:
+                pytest.fail(f"server exited early: {(process.stderr.read() or '')[-1000:]}")
+            try:
+                status, body = _post(
+                    server, "/warm", {"memory": "owner/legacy-memory"}
+                )
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    pytest.fail("server did not accept warm requests within 60 seconds")
+                time.sleep(0.05)
+        assert status == 200
+        assert body["skipped"] is True
+        assert body["reason"] == "memory_mismatch"
+    finally:
+        process.terminate()
+        try:
+            process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=3)
+
+
+def test_warm_skips_mismatched_memory_without_breaking_existing_callers(monkeypatch):
+    calls = []
+    monkeypatch.setattr(bridge, "TOKEN", "test-token")
+    monkeypatch.setattr(bridge, "REMOTE", "owner/canonical-memory")
+    monkeypatch.setattr(bridge, "warm_state", lambda: {"state": "ready"})
+    monkeypatch.setattr(
+        bridge,
+        "request_warm",
+        lambda **kwargs: calls.append(kwargs) or {"state": "warming"},
+    )
+    server = ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        status, mismatch = _post(
+            server, "/warm", {"memory": "owner/legacy-memory"}
+        )
+        uri_status, uri_matching = _post(
+            server,
+            "/warm",
+            {"memory": "hf://datasets/owner/canonical-memory"},
+        )
+        matching_status, matching = _post(
+            server, "/warm", {"memory": "owner/canonical-memory"}
+        )
+        monkeypatch.setattr(
+            bridge, "REMOTE", "hf://datasets/owner/canonical-memory"
+        )
+        shorthand_status, shorthand_matching = _post(
+            server, "/warm", {"memory": "owner/canonical-memory"}
+        )
+        legacy_status, legacy = _post(server, "/warm", {})
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert status == 200
+    assert mismatch == {
+        "ok": True,
+        "skipped": True,
+        "reason": "memory_mismatch",
+        "native_warm": {"state": "ready"},
+    }
+    assert matching_status == 202
+    assert matching["native_warm"]["state"] == "warming"
+    assert uri_status == 202
+    assert uri_matching["native_warm"]["state"] == "warming"
+    assert shorthand_status == 202
+    assert shorthand_matching["native_warm"]["state"] == "warming"
+    assert legacy_status == 202
+    assert legacy["native_warm"]["state"] == "warming"
+    assert calls == [
+        {"force": True},
+        {"force": True},
+        {"force": True},
+        {"force": True},
+    ]
 
 
 def test_sources_check_requires_auth_and_returns_no_raw_payload(monkeypatch, tmp_path):
@@ -1307,9 +2051,10 @@ def test_source_sidecar_updates_in_place_and_returns_only_raw_text(monkeypatch, 
         search_status, found = _post(
             server,
             "/search",
-            {"query": "english retrieval needle", "source_type": "memory", "limit": 3},
+            {"query": "新的中文正文", "source_type": "memory", "limit": 3},
         )
         get_status, item = _post(server, "/get", {"id": "memory-section"})
+        stored = app.store.get("memory-section")
         count = app.store.count()
     finally:
         server.shutdown()
@@ -1324,7 +2069,10 @@ def test_source_sidecar_updates_in_place_and_returns_only_raw_text(monkeypatch, 
     assert app.syncer.uploads[-1][0]["raw_text"] == "新的中文正文"
     assert found["results"][0]["raw_text"] == "新的中文正文"
     assert "retrieval_text" not in found["results"][0]
+    assert "_source_metadata_clocks" in stored
+    assert "_source_metadata_clocks" not in found["results"][0]
     assert item["result"]["raw_text"] == "新的中文正文"
+    assert "_source_metadata_clocks" not in item["result"]
     assert count == 1
 
 
@@ -1516,6 +2264,67 @@ def test_canonical_source_version_has_unambiguous_field_boundaries():
     assert bridge.canonical_source_version(
         {**base, "native_generation": 1}
     ) != bridge.canonical_source_version({**base, "native_generation": 2})
+    assert bridge.canonical_source_version(
+        {**base, "embedding_generation": 1}
+    ) != bridge.canonical_source_version({**base, "embedding_generation": 2})
+
+
+def test_canonical_source_version_generation_zero_preserves_legacy_hash():
+    item = {
+        "source_version": "raw-v1",
+        "content_hash": "hash",
+        "translation_hash": "translation-hash",
+        "translation_version": "translation-version",
+        "retrieval_text": "english retrieval",
+        "source_missing": False,
+        "native_generation": 3,
+        "embedding_generation": 0,
+    }
+    assert bridge.canonical_source_version(
+        item, {"fingerprint": "fixed-profile"}
+    ) == "a16edaffcadde01adc63c9e51e346fc10dc3bbe77c6276582e268f6370421ea5"
+    assert bridge.canonical_source_version(
+        {**item, "embedding_generation": 7}, {"fingerprint": "fixed-profile"}
+    ) == (
+        "~funes-eg-v1:00000000000000000007:"
+        "a16edaffcadde01adc63c9e51e346fc10dc3bbe77c6276582e268f6370421ea5"
+    )
+
+
+def test_canonical_source_version_keeps_epoch_prefix_across_shadow_changes():
+    base = {
+        "source_version": "raw-v1",
+        "content_hash": "hash",
+        "embedding_generation": 7,
+    }
+    left = bridge.canonical_source_version(
+        {**base, "retrieval_text": "first"}, {"fingerprint": "fixed-profile"}
+    )
+    right = bridge.canonical_source_version(
+        {**base, "retrieval_text": "second"}, {"fingerprint": "fixed-profile"}
+    )
+    assert left != right
+    assert left.startswith("~funes-eg-v1:00000000000000000007:")
+    assert right.startswith("~funes-eg-v1:00000000000000000007:")
+
+
+def test_canonical_document_carries_embedding_generation():
+    item = {
+        "source_identity": "memory-section",
+        "source_version": "raw-v1",
+        "raw_text": "raw",
+        "retrieval_text": "retrieval",
+        "content_hash": "hash",
+        "updated_at": "2026-09-15T00:00:00Z",
+        "embedding_generation": 7,
+    }
+    assert bridge.canonical_document(item)["embedding_generation"] == 7
+
+
+def test_opaque_source_id_matches_native_domain_separated_contract():
+    assert bridge._opaque_source_id("identity-with-secret-marker") == (
+        "sha256:1cfefd9638aac282a2a112dc1cfa62a18376b837315a9b67f6687f697168af9c"
+    )
 
 
 def test_embedding_profile_matches_native_contract(monkeypatch):
@@ -1562,6 +2371,7 @@ def test_native_environment_uses_safe_production_defaults(monkeypatch, tmp_path)
     assert env["FUNES_EMBEDDING_SCHEMA_VERSION"] == "2"
     assert env["FUNES_RERANK_PROVIDER"] == "none"
     assert env["FUNES_NATIVE_FALLBACK"] == "false"
+    assert env["FUNES_MCP_PIN_MEMORY"] == "true"
     assert env["FUNES_RETRIEVAL_LANGUAGE_MODE"] == "raw"
 
 
@@ -1614,17 +2424,115 @@ def test_run_uses_explicit_build_profile_without_mutating_active_profile(
     build = bridge._embedding_profile("voyage", "voyage-4-lite", 1024, 2)
     captured = {}
 
-    def fake_subprocess_run(argv, **kwargs):
+    class FakeProcess:
+        pid = 123
+        returncode = 0
+
+        @staticmethod
+        def communicate(**kwargs):
+            captured["timeout"] = kwargs["timeout"]
+            return "ok", ""
+
+    def fake_popen(argv, **kwargs):
         captured["argv"] = argv
         captured["env"] = kwargs["env"]
-        return SimpleNamespace(returncode=0, stdout="ok", stderr="")
+        captured["start_new_session"] = kwargs["start_new_session"]
+        return FakeProcess()
 
     monkeypatch.setattr(bridge, "HOME", tmp_path)
-    monkeypatch.setattr(bridge.subprocess, "run", fake_subprocess_run)
+    monkeypatch.setattr(bridge.subprocess, "Popen", fake_popen)
     assert bridge.run("status", "owner/build", profile=build) == (0, "ok", "")
     assert captured["argv"] == [bridge.FUNES_BIN, "status", "owner/build"]
     assert captured["env"]["FUNES_EMBEDDING_PROVIDER"] == "voyage"
+    assert captured["timeout"] == 180
+    assert captured["start_new_session"] is (bridge.os.name == "posix")
     assert bridge.embedding_profile()["provider"] == "local"
+
+
+def test_run_timeout_reaps_process_group_and_discards_sensitive_output(
+    monkeypatch, tmp_path
+):
+    captured = {"calls": 0}
+
+    class TimedOutProcess:
+        pid = 456
+        returncode = None
+
+        def communicate(self, **kwargs):
+            captured["calls"] += 1
+            if captured["calls"] == 1:
+                raise bridge.subprocess.TimeoutExpired(
+                    ["PRIVATE PATH", "owner/private"],
+                    kwargs["timeout"],
+                    output="PRIVATE RAW SESSION",
+                    stderr="SECRET PROVIDER PAYLOAD",
+                )
+            assert kwargs == {}
+            self.returncode = -9
+            return "PRIVATE RAW SESSION", "SECRET PROVIDER PAYLOAD"
+
+        def kill(self):
+            captured["killed"] = True
+
+    monkeypatch.setattr(bridge, "HOME", tmp_path)
+    monkeypatch.setattr(bridge.subprocess, "Popen", lambda *_args, **_kwargs: TimedOutProcess())
+    monkeypatch.setattr(
+        bridge.os,
+        "killpg",
+        lambda pid, sig: captured.update(killpg=(pid, sig)),
+    )
+
+    with pytest.raises(bridge.subprocess.TimeoutExpired) as raised:
+        bridge.run("status", "owner/private", timeout=0.01)
+
+    assert captured["calls"] == 2
+    if bridge.os.name == "posix":
+        assert captured["killpg"] == (456, bridge.signal.SIGKILL)
+    else:
+        assert captured["killed"] is True
+    rendered = str(raised.value)
+    assert "owner/private" not in rendered
+    assert "PRIVATE RAW SESSION" not in rendered
+    assert "SECRET PROVIDER PAYLOAD" not in rendered
+
+
+@pytest.mark.skipif(bridge.os.name != "posix", reason="POSIX process groups required")
+def test_run_timeout_reaps_real_descendant_and_cleans_private_tmpdir(
+    monkeypatch, tmp_path
+):
+    pid_path = tmp_path / "descendant.pid"
+    marker = "PRIVATE RAW SESSION MARKER"
+    code = (
+        "import os,subprocess,sys,time;"
+        "child=subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)']);"
+        f"open({str(pid_path)!r},'w').write(str(child.pid));"
+        f"open(os.path.join(os.environ['TMPDIR'],'raw.txt'),'w').write({marker!r});"
+        "time.sleep(60)"
+    )
+    monkeypatch.setattr(bridge, "FUNES_BIN", bridge.sys.executable)
+    monkeypatch.setattr(bridge.tempfile, "tempdir", str(tmp_path))
+
+    with pytest.raises(bridge.subprocess.TimeoutExpired) as raised:
+        bridge.run("-c", code, timeout=0.25)
+
+    descendant = int(pid_path.read_text())
+    state = ""
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline:
+        probe = bridge.subprocess.run(
+            ["/bin/ps", "-o", "stat=", "-p", str(descendant)],
+            capture_output=True,
+            text=True,
+        )
+        state = probe.stdout.strip()
+        if not state or state.startswith("Z"):
+            break
+        time.sleep(0.025)
+    assert not state or state.startswith("Z")
+    assert list(tmp_path.glob("funes-native-*")) == []
+    rendered = str(raised.value)
+    assert marker not in rendered
+    assert str(pid_path) not in rendered
 
 
 def test_blue_green_reconcile_writes_only_build_target_and_does_not_warm_active(
@@ -1848,9 +2756,77 @@ def test_canonical_jsonl_sends_raw_and_profile_checkpoint_is_durable(monkeypatch
     )
     assert durable_records[-1]["_funes_record"] == "native_index_state"
     assert "raw_text" not in durable_records[-1]
-    # A canonical batch commit must not cold-refresh the active worker.  The
-    # refresh is deferred until the derived index is optimized.
-    assert warm == []
+    assert warm == [{"force": True}]
+
+
+def test_canonical_commit_refresh_uses_app_scoped_cooldown(monkeypatch, tmp_path):
+    app = _source_app(tmp_path)
+    for identity in ("first", "second", "third"):
+        _canonical_source(app.store, identity)
+    clock = [100.0]
+    warm = []
+    monkeypatch.setattr(bridge, "REMOTE", "owner/memory")
+    monkeypatch.setattr(bridge, "INDEX_REMOTE", "")
+    monkeypatch.setattr(bridge, "CANONICAL_INDEX_BATCH", 1)
+    monkeypatch.setattr(bridge, "CANONICAL_REFRESH_COOLDOWN", 300.0)
+    monkeypatch.setattr(bridge.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(bridge, "request_warm", lambda **kwargs: warm.append(kwargs))
+    monkeypatch.setattr(
+        bridge,
+        "run",
+        lambda *_args, **_kwargs: (
+            0,
+            "ingested sources=1 chunks=1 unchanged=0 stale=0 held=0 commit=revision\n",
+            "",
+        ),
+    )
+    try:
+        assert bridge.reconcile_canonical_index(app)["indexed"] == 1
+        clock[0] = 101.0
+        assert bridge.reconcile_canonical_index(app)["indexed"] == 1
+        assert warm == [{"force": True}]
+
+        clock[0] = 401.0
+        assert bridge.reconcile_canonical_index(app)["indexed"] == 1
+        assert warm == [{"force": True}, {"force": True}]
+    finally:
+        app.store.close()
+
+
+def test_canonical_final_backlog_flushes_dirty_refresh_once(monkeypatch, tmp_path):
+    app = _source_app(tmp_path)
+    for identity in ("first", "second"):
+        _canonical_source(app.store, identity)
+    warm = []
+    monkeypatch.setattr(bridge, "REMOTE", "owner/memory")
+    monkeypatch.setattr(bridge, "INDEX_REMOTE", "")
+    monkeypatch.setattr(bridge, "CANONICAL_INDEX_BATCH", 1)
+    monkeypatch.setattr(bridge, "CANONICAL_REFRESH_COOLDOWN", 300.0)
+    monkeypatch.setattr(bridge.time, "monotonic", lambda: 100.0)
+    monkeypatch.setattr(bridge, "request_warm", lambda **kwargs: warm.append(kwargs))
+    # A failed optimize must not strand the final committed revision behind the
+    # cooldown; the trailing dirty flush is independent of optimize success.
+    monkeypatch.setattr(bridge, "optimize_native_index", lambda *_args: False)
+    monkeypatch.setattr(
+        bridge,
+        "run",
+        lambda *_args, **_kwargs: (
+            0,
+            "ingested sources=1 chunks=1 unchanged=0 stale=0 held=0 commit=revision\n",
+            "",
+        ),
+    )
+    try:
+        assert bridge.reconcile_canonical_index(app)["indexed"] == 1
+        assert bridge.reconcile_canonical_index(app)["indexed"] == 1
+        assert warm == [{"force": True}]
+
+        assert bridge.reconcile_canonical_index(app)["attempted"] == 0
+        assert warm == [{"force": True}, {"force": True}]
+        assert bridge.reconcile_canonical_index(app)["attempted"] == 0
+        assert warm == [{"force": True}, {"force": True}]
+    finally:
+        app.store.close()
 
 
 def test_profile_change_rebuilds_durable_session_without_client_reupload(monkeypatch, tmp_path):
@@ -1889,6 +2865,457 @@ def test_profile_change_rebuilds_durable_session_without_client_reupload(monkeyp
     assert rebuilt["native_index_profile"] == bridge.embedding_profile()["fingerprint"]
 
 
+def test_canonical_phase_reports_write_lock_wait_without_row_data(monkeypatch):
+    class Store:
+        @staticmethod
+        def canonical_index_candidates(*_args):
+            return []
+
+    app = SimpleNamespace(
+        store=Store(),
+        syncer=SimpleNamespace(restoring=False, restore_failed=False),
+    )
+    bridge._initialize_canonical_reconcile_state(app)
+    monkeypatch.setattr(bridge, "REMOTE", "owner/memory")
+    monkeypatch.setattr(bridge, "INDEX_REMOTE", "")
+    monkeypatch.setattr(bridge, "optimize_canonical_index", lambda *_args: False)
+
+    bridge.WRITE_LOCK.acquire()
+    thread = threading.Thread(target=bridge.reconcile_canonical_index, args=(app,))
+    thread.start()
+    try:
+        deadline = time.monotonic() + 1
+        while (
+            bridge.canonical_reconcile_state(app)["phase"] != "waiting_write_lock"
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.005)
+        status = bridge.canonical_reconcile_state(app)
+        assert status["phase"] == "waiting_write_lock"
+        assert "owner/memory" not in json.dumps(status)
+    finally:
+        bridge.WRITE_LOCK.release()
+        thread.join(timeout=1)
+    assert not thread.is_alive()
+
+
+def test_source_state_reports_reconciler_while_restore_is_running(monkeypatch):
+    app = SimpleNamespace(
+        syncer=SimpleNamespace(restoring=True, restore_failed=False),
+        store=SimpleNamespace(count=lambda: 17),
+        restore_result=0,
+    )
+    bridge._initialize_canonical_reconcile_state(app)
+    monkeypatch.setattr(bridge, "SOURCE_APP", app)
+
+    status = bridge.source_state()
+
+    assert status["ready"] is False
+    assert status["restoring"] is True
+    assert status["documents"] == 17
+    assert status["canonical_reconciler"]["phase"] == "waiting_restore"
+
+
+class _RecordingCanonicalStop:
+    def __init__(self, stop_after=1):
+        self.stop_after = stop_after
+        self.waits = []
+
+    def is_set(self):
+        return False
+
+    def wait(self, timeout):
+        self.waits.append(timeout)
+        return len(self.waits) >= self.stop_after
+
+
+@pytest.mark.parametrize(
+    ("environ", "expected"),
+    [
+        ({}, (1.0, 30.0)),
+        ({"FUNES_CANONICAL_INDEX_INTERVAL": "86400"}, (86400.0, 86400.0)),
+        (
+            {
+                "FUNES_CANONICAL_INDEX_INTERVAL": "86400",
+                "FUNES_CANONICAL_INDEX_ACTIVE_INTERVAL": "1",
+                "FUNES_CANONICAL_INDEX_IDLE_INTERVAL": "300",
+            },
+            (1.0, 300.0),
+        ),
+    ],
+)
+def test_canonical_index_intervals_preserve_legacy_override(environ, expected):
+    assert bridge._canonical_index_intervals(environ) == expected
+
+
+@pytest.mark.parametrize(
+    ("environ", "expected"),
+    [
+        ({}, (8, 6000)),
+        ({"FUNES_CANONICAL_INDEX_REQUEST_ROWS": "4"}, (4, 6000)),
+        ({"FUNES_CANONICAL_INDEX_MAX_CHARS": "12000"}, (8, 12000)),
+        (
+            {
+                "FUNES_CANONICAL_INDEX_REQUEST_ROWS": "16",
+                "FUNES_CANONICAL_INDEX_MAX_CHARS": "20000",
+            },
+            (16, 20000),
+        ),
+        (
+            {
+                "FUNES_CANONICAL_INDEX_REQUEST_ROWS": "0",
+                "FUNES_CANONICAL_INDEX_MAX_CHARS": "-10",
+            },
+            (1, 1),
+        ),
+        (
+            {
+                "FUNES_CANONICAL_INDEX_REQUEST_ROWS": "invalid",
+                "FUNES_CANONICAL_INDEX_MAX_CHARS": "bad",
+            },
+            (8, 6000),
+        ),
+    ],
+)
+def test_canonical_index_request_limits_parsing(environ, expected):
+    assert bridge._canonical_index_request_limits(environ) == expected
+
+
+@pytest.mark.parametrize(
+    ("environ", "expected"),
+    [
+        ({}, 20.0),
+        ({"FUNES_CANONICAL_INDEX_MIN_REQUEST_INTERVAL": "10"}, 10.0),
+        ({"FUNES_CANONICAL_INDEX_MIN_REQUEST_INTERVAL": "0.5"}, 0.5),
+        ({"FUNES_CANONICAL_INDEX_MIN_REQUEST_INTERVAL": "-5"}, 0.0),
+        ({"FUNES_CANONICAL_INDEX_MIN_REQUEST_INTERVAL": "invalid"}, 20.0),
+    ],
+)
+def test_canonical_index_min_request_interval_parsing(environ, expected):
+    assert bridge._canonical_index_min_request_interval(environ) == expected
+
+
+def test_select_bounded_canonical_records_bounds_by_rows():
+    records = [
+        ({"source_identity": f"doc-{i}", "raw_text": f"text-{i}"}, {})
+        for i in range(12)
+    ]
+    selected = bridge.select_bounded_canonical_records(records, max_rows=5, max_chars=10000)
+    assert len(selected) == 5
+    assert [r[0]["source_identity"] for r in selected] == [f"doc-{i}" for i in range(5)]
+
+    selected_default = bridge.select_bounded_canonical_records(records)
+    assert len(selected_default) == 8
+    assert [r[0]["source_identity"] for r in selected_default] == [f"doc-{i}" for i in range(8)]
+
+
+def test_select_bounded_canonical_records_bounds_by_chars():
+    records = [
+        ({"source_identity": "doc-0", "raw_text": "a" * 2000}, {}),
+        ({"source_identity": "doc-1", "raw_text": "b" * 2500}, {}),
+        ({"source_identity": "doc-2", "raw_text": "c" * 2000}, {}),
+        ({"source_identity": "doc-3", "raw_text": "d" * 500}, {}),
+    ]
+    selected = bridge.select_bounded_canonical_records(records, max_rows=8, max_chars=5000)
+    assert len(selected) == 2
+    assert [r[0]["source_identity"] for r in selected] == ["doc-0", "doc-1"]
+
+
+def test_select_bounded_canonical_records_oversize_first_alone_no_starvation():
+    oversize = ({"source_identity": "oversize", "raw_text": "x" * 15000}, {})
+    small1 = ({"source_identity": "small-1", "raw_text": "y" * 100}, {})
+    small2 = ({"source_identity": "small-2", "raw_text": "z" * 100}, {})
+
+    selected = bridge.select_bounded_canonical_records([oversize, small1, small2], max_chars=6000)
+    assert len(selected) == 1
+    assert selected[0][0]["source_identity"] == "oversize"
+
+    selected_single = bridge.select_bounded_canonical_records([oversize], max_chars=6000)
+    assert len(selected_single) == 1
+    assert selected_single[0][0]["source_identity"] == "oversize"
+
+    selected_after = bridge.select_bounded_canonical_records([small1, oversize, small2], max_chars=6000)
+    assert len(selected_after) == 1
+    assert selected_after[0][0]["source_identity"] == "small-1"
+
+
+def test_select_bounded_canonical_records_empty_and_dict_inputs():
+    assert bridge.select_bounded_canonical_records([]) == []
+
+    records = [{"source_identity": f"doc-{i}", "raw_text": "test"} for i in range(5)]
+    selected = bridge.select_bounded_canonical_records(records, max_rows=2)
+    assert len(selected) == 2
+    assert [r["source_identity"] for r in selected] == ["doc-0", "doc-1"]
+
+
+def test_canonical_reconcile_state_exposes_safe_values():
+    app = SimpleNamespace()
+    bridge._initialize_canonical_reconcile_state(app)
+    status = bridge.canonical_reconcile_state(app)
+
+    assert status["batch_size"] == bridge.CANONICAL_INDEX_BATCH
+    assert status["request_rows"] == bridge.CANONICAL_INDEX_REQUEST_ROWS
+    assert status["max_chars"] == bridge.CANONICAL_INDEX_MAX_CHARS
+    assert status["min_request_interval_seconds"] == bridge.CANONICAL_INDEX_MIN_REQUEST_INTERVAL
+    assert status["timeout_seconds"] == bridge.CANONICAL_INDEX_TIMEOUT
+
+    dumped = json.dumps(status)
+    assert "raw_text" not in dumped
+    assert "token" not in dumped.lower()
+
+
+def test_canonical_background_enforces_min_request_interval_after_progress(monkeypatch):
+    stop = _RecordingCanonicalStop(stop_after=2)
+    app = SimpleNamespace(
+        restore_done=threading.Event(),
+        canonical_index_stop=stop,
+    )
+    app.restore_done.set()
+    monkeypatch.setattr(bridge, "CANONICAL_INDEX_ACTIVE_INTERVAL", 1.0)
+    monkeypatch.setattr(bridge, "CANONICAL_INDEX_MIN_REQUEST_INTERVAL", 20.0)
+    monkeypatch.setattr(bridge, "CANONICAL_INDEX_INTERVAL", 30.0)
+    bridge._initialize_canonical_reconcile_state(app)
+
+    results = iter([
+        {"attempted": 2, "indexed": 2, "held": 0, "durable": True},
+        {"attempted": 1, "indexed": 1, "held": 0, "durable": True},
+    ])
+    monkeypatch.setattr(bridge, "reconcile_canonical_index", lambda _app: next(results))
+
+    bridge._canonical_reconcile_background(app)
+
+    status = bridge.canonical_reconcile_state(app)
+    assert stop.waits == [20.0, 20.0]
+    assert status["wait_seconds"] == 20.0
+    assert status["min_request_interval_seconds"] == 20.0
+
+    stop2 = _RecordingCanonicalStop(stop_after=1)
+    app2 = SimpleNamespace(restore_done=threading.Event(), canonical_index_stop=stop2)
+    app2.restore_done.set()
+    monkeypatch.setattr(bridge, "CANONICAL_INDEX_ACTIVE_INTERVAL", 25.0)
+    bridge._initialize_canonical_reconcile_state(app2)
+    monkeypatch.setattr(
+        bridge, "reconcile_canonical_index",
+        lambda _app: {"attempted": 1, "indexed": 1, "held": 0, "durable": True}
+    )
+    bridge._canonical_reconcile_background(app2)
+    assert stop2.waits == [25.0]
+
+
+def test_reconcile_canonical_index_bounds_by_rows_and_persists_per_subprocess(monkeypatch, tmp_path):
+    app = _source_app(tmp_path)
+    for i in range(14):
+        _canonical_source(app.store, f"row-{i:02d}", raw=f"content {i}")
+
+    monkeypatch.setattr(bridge, "REMOTE", "owner/memory")
+    monkeypatch.setattr(bridge, "CANONICAL_INDEX_BATCH", 32)
+    monkeypatch.setattr(bridge, "CANONICAL_INDEX_REQUEST_ROWS", 5)
+    monkeypatch.setattr(bridge, "CANONICAL_INDEX_MAX_CHARS", 10000)
+
+    ingested_batches = []
+
+    def fake_run(*args, **_kwargs):
+        path = Path(args[1])
+        batch = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+        ingested_batches.append([doc["source_identity"] for doc in batch])
+        return 0, f"ingested sources={len(batch)} chunks={len(batch)} unchanged=0 stale=0 held=0 commit=rev\n", ""
+
+    monkeypatch.setattr(bridge, "run", fake_run)
+    monkeypatch.setattr(bridge, "request_warm", lambda **_kwargs: None)
+
+    try:
+        res1 = bridge.reconcile_canonical_index(app)
+        assert res1["attempted"] == 5
+        assert res1["indexed"] == 5
+        assert len(ingested_batches[0]) == 5
+
+        res2 = bridge.reconcile_canonical_index(app)
+        assert res2["attempted"] == 5
+        assert res2["indexed"] == 5
+        assert len(ingested_batches[1]) == 5
+
+        res3 = bridge.reconcile_canonical_index(app)
+        assert res3["attempted"] == 4
+        assert res3["indexed"] == 4
+        assert len(ingested_batches[2]) == 4
+
+        res4 = bridge.reconcile_canonical_index(app)
+        assert res4["attempted"] == 0
+    finally:
+        app.store.close()
+
+
+def test_reconcile_canonical_index_bounds_by_chars_and_admits_oversize_first(monkeypatch, tmp_path):
+    app = _source_app(tmp_path)
+    _canonical_source(app.store, "oversize-first", raw="超长中文内容" * 1500)
+    _canonical_source(app.store, "normal-1", raw="普通内容1")
+    _canonical_source(app.store, "normal-2", raw="普通内容2")
+
+    monkeypatch.setattr(bridge, "REMOTE", "owner/memory")
+    monkeypatch.setattr(bridge, "CANONICAL_INDEX_REQUEST_ROWS", 8)
+    monkeypatch.setattr(bridge, "CANONICAL_INDEX_MAX_CHARS", 6000)
+
+    ingested_batches = []
+
+    def fake_run(*args, **_kwargs):
+        path = Path(args[1])
+        batch = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+        ingested_batches.append([doc["source_identity"] for doc in batch])
+        return 0, f"ingested sources={len(batch)} chunks={len(batch)} unchanged=0 stale=0 held=0 commit=rev\n", ""
+
+    monkeypatch.setattr(bridge, "run", fake_run)
+    monkeypatch.setattr(bridge, "request_warm", lambda **_kwargs: None)
+
+    try:
+        res1 = bridge.reconcile_canonical_index(app)
+        assert res1["attempted"] == 1
+        assert res1["indexed"] == 1
+        assert ingested_batches[0] == ["oversize-first"]
+
+        res2 = bridge.reconcile_canonical_index(app)
+        assert res2["attempted"] == 2
+        assert res2["indexed"] == 2
+        assert ingested_batches[1] == ["normal-1", "normal-2"]
+
+        res3 = bridge.reconcile_canonical_index(app)
+        assert res3["attempted"] == 0
+    finally:
+        app.store.close()
+
+
+def test_canonical_background_uses_active_wait_for_consecutive_work(monkeypatch):
+    stop = _RecordingCanonicalStop(stop_after=2)
+    app = SimpleNamespace(
+        restore_done=threading.Event(),
+        canonical_index_stop=stop,
+    )
+    app.restore_done.set()
+    monkeypatch.setattr(bridge, "CANONICAL_INDEX_ACTIVE_INTERVAL", 0.25)
+    monkeypatch.setattr(bridge, "CANONICAL_INDEX_INTERVAL", 9.0)
+    monkeypatch.setattr(bridge, "CANONICAL_INDEX_MIN_REQUEST_INTERVAL", 0.25)
+    bridge._initialize_canonical_reconcile_state(app)
+    results = iter(
+        [
+            {"attempted": 2, "indexed": 2, "held": 0, "durable": True},
+            {"attempted": 1, "indexed": 1, "held": 0, "durable": True},
+        ]
+    )
+    monkeypatch.setattr(bridge, "reconcile_canonical_index", lambda _app: next(results))
+
+    bridge._canonical_reconcile_background(app)
+
+    status = bridge.canonical_reconcile_state(app)
+    assert stop.waits == [0.25, 0.25]
+    assert status["wait_seconds"] == 0.25
+    assert status["active_interval_seconds"] == 0.25
+    assert status["idle_interval_seconds"] == 9.0
+    assert status["interval_seconds"] == 9.0
+    assert status["consecutive_failures"] == 0
+
+
+def test_canonical_background_uses_idle_wait_when_no_work(monkeypatch):
+    stop = _RecordingCanonicalStop()
+    app = SimpleNamespace(
+        restore_done=threading.Event(),
+        canonical_index_stop=stop,
+    )
+    app.restore_done.set()
+    monkeypatch.setattr(bridge, "CANONICAL_INDEX_ACTIVE_INTERVAL", 0.25)
+    monkeypatch.setattr(bridge, "CANONICAL_INDEX_INTERVAL", 9.0)
+    bridge._initialize_canonical_reconcile_state(app)
+    monkeypatch.setattr(
+        bridge,
+        "reconcile_canonical_index",
+        lambda _app: {"attempted": 0, "indexed": 0, "held": 0, "durable": True},
+    )
+
+    bridge._canonical_reconcile_background(app)
+
+    status = bridge.canonical_reconcile_state(app)
+    assert stop.waits == [9.0]
+    assert status["wait_seconds"] == 9.0
+    assert status["last_error"] is None
+
+
+def test_canonical_background_uses_idle_wait_when_attempt_makes_no_progress(
+    monkeypatch,
+):
+    stop = _RecordingCanonicalStop()
+    app = SimpleNamespace(
+        restore_done=threading.Event(),
+        canonical_index_stop=stop,
+    )
+    app.restore_done.set()
+    monkeypatch.setattr(bridge, "CANONICAL_INDEX_ACTIVE_INTERVAL", 0.25)
+    monkeypatch.setattr(bridge, "CANONICAL_INDEX_INTERVAL", 9.0)
+    bridge._initialize_canonical_reconcile_state(app)
+    monkeypatch.setattr(
+        bridge,
+        "reconcile_canonical_index",
+        lambda _app: {"attempted": 2, "indexed": 0, "held": 0, "durable": True},
+    )
+
+    bridge._canonical_reconcile_background(app)
+
+    status = bridge.canonical_reconcile_state(app)
+    assert stop.waits == [9.0]
+    assert status["wait_seconds"] == 9.0
+    assert status["consecutive_failures"] == 0
+
+
+def test_canonical_background_marks_non_durable_result_as_failure(monkeypatch):
+    app = SimpleNamespace(
+        restore_done=threading.Event(),
+        canonical_index_stop=threading.Event(),
+    )
+    app.restore_done.set()
+    bridge._initialize_canonical_reconcile_state(app)
+
+    def not_durable(_app):
+        app.canonical_index_stop.set()
+        return {"attempted": 2, "indexed": 0, "held": 0, "durable": False}
+
+    monkeypatch.setattr(bridge, "reconcile_canonical_index", not_durable)
+    bridge._canonical_reconcile_background(app)
+
+    status = bridge.canonical_reconcile_state(app)
+    assert status["last_error"] == "status_not_durable"
+    assert status["consecutive_failures"] == 1
+    assert status["last_result"]["durable"] is False
+
+
+def test_canonical_background_reports_only_allowlisted_error(monkeypatch):
+    stop = _RecordingCanonicalStop()
+    app = SimpleNamespace(
+        restore_done=threading.Event(),
+        canonical_index_stop=stop,
+    )
+    app.restore_done.set()
+    monkeypatch.setattr(bridge, "CANONICAL_INDEX_ACTIVE_INTERVAL", 0.25)
+    monkeypatch.setattr(bridge, "CANONICAL_INDEX_INTERVAL", 9.0)
+    bridge._initialize_canonical_reconcile_state(app)
+
+    def explode(_app):
+        raise RuntimeError("PRIVATE RAW SESSION provider payload")
+
+    monkeypatch.setattr(bridge, "reconcile_canonical_index", explode)
+    bridge._canonical_reconcile_background(app)
+
+    status = bridge.canonical_reconcile_state(app)
+    assert status["active"] is False
+    assert status["phase"] == "sleeping"
+    assert status["last_error"] == "unexpected"
+    assert status["consecutive_failures"] == 1
+    assert status["last_result"] is None
+    assert status["last_duration_ms"] >= 0
+    assert status["batch_size"] == bridge.CANONICAL_INDEX_BATCH
+    assert status["timeout_seconds"] == bridge.CANONICAL_INDEX_TIMEOUT
+    assert stop.waits == [9.0]
+    assert status["wait_seconds"] == 9.0
+    assert "PRIVATE RAW SESSION" not in json.dumps(status)
+    assert "provider payload" not in json.dumps(status)
+
+
 def test_canonical_catchup_optimizes_once_and_restores_checkpoint(monkeypatch, tmp_path):
     monkeypatch.setattr(bridge, "REMOTE", "owner/memory")
     monkeypatch.setattr(bridge, "INDEX_REMOTE", "")
@@ -1908,6 +3335,17 @@ def test_canonical_catchup_optimizes_once_and_restores_checkpoint(monkeypatch, t
             )
         ]
     )
+    # Simulate an optimized marker written before source_agent_idx became a
+    # required native index. It must trigger exactly one structural upgrade.
+    legacy_marker = bridge.native_optimize_marker(
+        profile,
+        "optimized",
+        {},
+        store.native_index_checkpoint(profile, memory)["index_fingerprint"],
+        memory=memory,
+    )
+    legacy_marker.pop("index_layout_version")
+    assert store.set_native_optimize_checkpoint(legacy_marker)
     app = SimpleNamespace(store=store, syncer=_SourceSyncer(), restore_result=0)
     optimize_calls = []
     warm_calls = []
@@ -1961,6 +3399,7 @@ def test_canonical_catchup_optimizes_once_and_restores_checkpoint(monkeypatch, t
     assert {key: checkpoint[key] for key in profile} == profile
     assert checkpoint["status"] == "optimized"
     assert checkpoint["memory"] == memory
+    assert checkpoint["index_layout_version"] == bridge.CANONICAL_INDEX_LAYOUT_VERSION
     assert restored_checkpoint == checkpoint
     assert {key: status["canonical_index"][key] for key in profile} == profile
     assert status["canonical_index"]["optimize"]["status"] == "optimized"
@@ -2033,7 +3472,7 @@ def test_invalid_canonical_row_isolated_without_blocking_clean_rows(
     assert pending == []
 
 
-def test_canonical_held_batch_is_bisected_and_source_revision_retries(monkeypatch, tmp_path):
+def test_canonical_held_batch_uses_opaque_fast_path_and_source_revision_retries(monkeypatch, tmp_path):
     app = _source_app(tmp_path)
     _canonical_source(app.store, "clean-doc")
     _canonical_source(app.store, "dirty-doc")
@@ -2049,7 +3488,14 @@ def test_canonical_held_batch_is_bisected_and_source_revision_retries(monkeypatc
         held = int("dirty-doc" in identities)
         sources = len(identities) - held
         commit = " commit=commit1" if sources else ""
-        return 0, f"ingested sources={sources} chunks={sources} unchanged=0 stale=0 held={held}{commit}\n", ""
+        held_source_ids = (
+            [bridge._opaque_source_id("dirty-doc")] if held else []
+        )
+        return 0, (
+            f"ingested sources={sources} chunks={sources} unchanged=0 "
+            f"stale=0 held={held}{commit} "
+            f"held_source_ids={json.dumps(held_source_ids)}\n"
+        ), ""
 
     monkeypatch.setattr(bridge, "run", held_run)
     try:
@@ -2088,14 +3534,134 @@ def test_canonical_held_batch_is_bisected_and_source_revision_retries(monkeypatc
         revised = app.store.get("dirty-doc")
     finally:
         app.store.close()
-    assert calls == [["clean-doc", "dirty-doc"], ["clean-doc"], ["dirty-doc"]]
+    assert calls == [["clean-doc", "dirty-doc"]]
     assert first == {"attempted": 2, "indexed": 1, "held": 1, "durable": True}
     assert clean["native_index_status"] == "indexed"
     assert dirty["native_index_status"] == "held_secret"
     assert second["attempted"] == 0
     assert third["indexed"] == 1
     assert revised["native_index_status"] == "indexed"
-    assert warm == []
+    assert len(warm) == 1
+
+
+@pytest.mark.parametrize(
+    "reported_ids",
+    [
+        None,
+        "[not-json]",
+        json.dumps(["sha256:" + "f" * 64]),
+        "[]",
+    ],
+    ids=["legacy", "malformed", "unknown", "count-mismatch"],
+)
+def test_canonical_held_fast_path_rejects_untrusted_identity_reports(
+    monkeypatch, tmp_path, reported_ids
+):
+    app = _source_app(tmp_path)
+    _canonical_source(app.store, "clean-doc")
+    _canonical_source(app.store, "dirty-doc")
+    calls = []
+    monkeypatch.setattr(bridge, "REMOTE", "owner/memory")
+    monkeypatch.setattr(bridge, "request_warm", lambda **_kwargs: None)
+
+    def held_run(*args, **_kwargs):
+        identities = [
+            json.loads(line)["source_identity"]
+            for line in Path(args[1]).read_text().splitlines()
+        ]
+        calls.append(identities)
+        if len(identities) == 2:
+            extension = (
+                "" if reported_ids is None else f" held_source_ids={reported_ids}"
+            )
+            return 0, (
+                "ingested sources=1 chunks=1 unchanged=0 stale=0 held=1 "
+                f"commit=initial{extension}\n"
+            ), ""
+        if identities == ["dirty-doc"]:
+            held_source_ids = json.dumps(
+                [bridge._opaque_source_id("dirty-doc")]
+            )
+            return 0, (
+                "ingested sources=0 chunks=0 unchanged=0 stale=0 held=1 "
+                f"held_source_ids={held_source_ids}\n"
+            ), ""
+        return 0, (
+            "ingested sources=0 chunks=0 unchanged=1 stale=0 held=0 "
+            "held_source_ids=[]\n"
+        ), ""
+
+    monkeypatch.setattr(bridge, "run", held_run)
+    try:
+        result = bridge.reconcile_canonical_index(app)
+        clean = app.store.get("clean-doc")
+        dirty = app.store.get("dirty-doc")
+    finally:
+        app.store.close()
+
+    assert calls == [
+        ["clean-doc", "dirty-doc"],
+        ["clean-doc"],
+        ["dirty-doc"],
+    ]
+    assert result == {"attempted": 2, "indexed": 1, "held": 1, "durable": True}
+    assert clean["native_index_status"] == "indexed"
+    assert dirty["native_index_status"] == "held_secret"
+
+
+def test_canonical_mixed_stale_and_held_report_still_bisects(
+    monkeypatch, tmp_path
+):
+    app = _source_app(tmp_path)
+    _canonical_source(app.store, "stale-doc")
+    _canonical_source(app.store, "dirty-doc")
+    calls = []
+    monkeypatch.setattr(bridge, "REMOTE", "owner/memory")
+    monkeypatch.setattr(bridge, "request_warm", lambda **_kwargs: None)
+
+    def mixed_run(*args, **_kwargs):
+        identities = [
+            json.loads(line)["source_identity"]
+            for line in Path(args[1]).read_text().splitlines()
+        ]
+        calls.append(identities)
+        if len(identities) == 2:
+            held_source_ids = json.dumps(
+                [bridge._opaque_source_id("dirty-doc")]
+            )
+            return 0, (
+                "ingested sources=0 chunks=0 unchanged=0 stale=1 held=1 "
+                f"held_source_ids={held_source_ids}\n"
+            ), ""
+        if identities == ["dirty-doc"]:
+            held_source_ids = json.dumps(
+                [bridge._opaque_source_id("dirty-doc")]
+            )
+            return 0, (
+                "ingested sources=0 chunks=0 unchanged=0 stale=0 held=1 "
+                f"held_source_ids={held_source_ids}\n"
+            ), ""
+        return 0, (
+            "ingested sources=0 chunks=0 unchanged=0 stale=1 held=0\n"
+        ), ""
+
+    monkeypatch.setattr(bridge, "run", mixed_run)
+    try:
+        result = bridge.reconcile_canonical_index(app)
+        stale = app.store.get("stale-doc")
+        dirty = app.store.get("dirty-doc")
+    finally:
+        app.store.close()
+
+    assert calls == [
+        ["stale-doc", "dirty-doc"],
+        ["stale-doc"],
+        ["dirty-doc"],
+    ]
+    assert result == {"attempted": 2, "indexed": 0, "held": 1, "durable": True}
+    assert stale["native_index_status"] == "retry"
+    assert stale["native_index_error"] == "native_stale"
+    assert dirty["native_index_status"] == "held_secret"
 
 
 def test_canonical_failure_persists_retry_and_next_pass_succeeds(monkeypatch, tmp_path):
@@ -2173,7 +3739,9 @@ def test_restart_restores_pending_canonical_and_indexes_it(monkeypatch, tmp_path
     assert item["native_index_status"] == "indexed"
 
 
-def test_native_rank_maps_canonical_to_raw_and_forwards_facets(monkeypatch, tmp_path):
+def test_voyage_native_rank_maps_canonical_to_raw_with_indexed_filter(
+    monkeypatch, tmp_path
+):
     app = _source_app(tmp_path)
     provider_calls = []
 
@@ -2189,12 +3757,16 @@ def test_native_rank_maps_canonical_to_raw_and_forwards_facets(monkeypatch, tmp_
         retrieval="CANONICAL ENGLISH SHADOW",
         source_missing=False,
     )
+    app.store.search = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        AssertionError("successful Voyage recall must not run sidecar FTS")
+    )
     calls = []
 
     class FakeWorker:
         def recall(self, query, **kwargs):
             calls.append((query, kwargs))
-            return "CANONICAL ENGLISH SHADOW\n  → get canonical id --from 0 --to 0"
+            reference = bridge.canonical_reference("canonical id")
+            return f"CANONICAL ENGLISH SHADOW\n  → get {reference} --from 0 --to 0"
 
         def get(self, *_args, **_kwargs):
             raise AssertionError("canonical hit must resolve from sidecar")
@@ -2217,15 +3789,7 @@ def test_native_rank_maps_canonical_to_raw_and_forwards_facets(monkeypatch, tmp_
             {
                 "query": "english retrieval",
                 "limit": 3,
-                "facets": {
-                    "source_agent": "codex",
-                    "source_type": "memory",
-                    "project": "demo",
-                    "repo": "owner/repo",
-                    "device_id": "device-1",
-                    "content_type": "summary",
-                    "source_missing": False,
-                },
+                "facets": {"source_agent": "codex"},
             },
         )
     finally:
@@ -2234,15 +3798,228 @@ def test_native_rank_maps_canonical_to_raw_and_forwards_facets(monkeypatch, tmp_
         thread.join(timeout=2)
         app.store.close()
     assert status == 200
+    # This is the wire representation returned by native recall, not a raw
+    # sidecar identity that happens to resolve in the test fixture.
+    assert bridge.canonical_reference("canonical id") == "funes-doc:Y2Fub25pY2FsIGlk"
     assert body["results"][0]["raw_text"] == "原始 sidecar 正文"
     assert "retrieval_text" not in body["results"][0]
     assert "CANONICAL ENGLISH SHADOW" not in body["results_text"]
-    assert provider_calls == ["english retrieval"]
+    assert provider_calls == []
     assert calls[0][0] == "english retrieval"
     assert body["retrieval_query"] == "english retrieval"
     assert calls[0][1]["source_agent"] == "codex"
-    assert calls[0][1]["source_type"] == "memory"
-    assert calls[0][1]["source_missing"] is False
+
+
+@pytest.mark.parametrize(
+    ("restoring", "restore_failed", "degraded"),
+    (
+        (True, False, "source_restore_in_progress"),
+        (False, True, "source_restore_failed"),
+    ),
+)
+def test_voyage_native_search_uses_structured_hits_while_source_is_unavailable(
+    monkeypatch, restoring, restore_failed, degraded
+):
+    class Store:
+        def __getattribute__(self, name):
+            raise AssertionError(f"degraded native search must not access store.{name}")
+
+    calls = []
+
+    class FakeWorker:
+        process = SimpleNamespace(poll=lambda: None)
+
+        def recall_result(self, query, **kwargs):
+            calls.append((query, kwargs))
+            return {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "agent text must never be parsed or returned",
+                    }
+                ],
+                "structuredContent": {
+                    "hits": [
+                        {
+                            "raw_text": "原始 native 正文",
+                            "session_id": "session-1",
+                            "seq": 7,
+                            "timestamp": "2026-09-14T00:00:00Z",
+                            "block_type": "response",
+                            "harness": "codex",
+                            "score": 0.91,
+                            "neighbors": [
+                                {
+                                    "raw_text": "相邻原文",
+                                    "seq": 6,
+                                    "role": "user",
+                                    "block_type": "prompt",
+                                    "retrieval_text": "NEIGHBOR SHADOW",
+                                }
+                            ],
+                            "retrieval_text": "DERIVED SECRET SHADOW",
+                            "secret": "must-not-leak",
+                        }
+                    ]
+                },
+            }
+
+    app = SimpleNamespace(
+        store=Store(),
+        syncer=SimpleNamespace(
+            restoring=restoring,
+            restore_failed=restore_failed,
+        ),
+        restore_result=0,
+    )
+    monkeypatch.setattr(bridge, "SOURCE_APP", app)
+    monkeypatch.setattr(bridge, "MCP_WORKER", FakeWorker())
+    monkeypatch.setattr(bridge, "TOKEN", "test-token")
+    monkeypatch.setattr(bridge, "REMOTE", "owner/memory")
+    monkeypatch.setenv("FUNES_EMBEDDING_PROVIDER", "voyage")
+    monkeypatch.setattr(bridge, "_MCP_WORKER_CONFIG", bridge._native_worker_config())
+    monkeypatch.setattr(bridge, "warm_state", lambda: {"state": "warming"})
+    monkeypatch.setattr(
+        bridge,
+        "search_source_bm25_rankings",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("restore degradation must disable all sidecar BM25")
+        ),
+    )
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        status, body = _post(
+            server,
+            "/search",
+            {"query": "cold restore query", "limit": 3, "source_agent": "codex"},
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert status == 200
+    assert calls and calls[0][0] == "cold restore query"
+    assert body["retrieval_degraded"] == degraded
+    assert body["retrieval_backend"] == "voyage_lance_bm25_rrf"
+    assert body["results_text"] == "原始 native 正文"
+    assert body["results"] == [
+        {
+            "raw_text": "原始 native 正文",
+            "session_id": "session-1",
+            "seq": 7,
+            "timestamp": "2026-09-14T00:00:00Z",
+            "block_type": "response",
+            "harness": "codex",
+            "score": 0.91,
+            "neighbors": [
+                {
+                    "raw_text": "相邻原文",
+                    "seq": 6,
+                    "role": "user",
+                    "block_type": "prompt",
+                }
+            ],
+            "retrieval_backend": "native_funes",
+        }
+    ]
+    assert "agent text" not in json.dumps(body, ensure_ascii=False)
+    assert "DERIVED SECRET SHADOW" not in json.dumps(body, ensure_ascii=False)
+    assert "NEIGHBOR SHADOW" not in json.dumps(body, ensure_ascii=False)
+    assert "must-not-leak" not in json.dumps(body, ensure_ascii=False)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    (
+        {"query": "query", "role": "user"},
+        {"query": "query", "since": "2026-09-01"},
+        {"query": "query", "until": "2026-09-14"},
+    ),
+)
+def test_source_only_search_filters_fail_fast_during_restore(monkeypatch, payload):
+    class Store:
+        def __getattribute__(self, name):
+            raise AssertionError(f"restore gate must not access store.{name}")
+
+    class FakeWorker:
+        def recall_result(self, *_args, **_kwargs):
+            raise AssertionError("source-only filters must not call native")
+
+    app = SimpleNamespace(
+        store=Store(),
+        syncer=SimpleNamespace(restoring=True, restore_failed=False),
+        restore_result=0,
+    )
+    monkeypatch.setattr(bridge, "SOURCE_APP", app)
+    monkeypatch.setattr(bridge, "MCP_WORKER", FakeWorker())
+    monkeypatch.setattr(bridge, "TOKEN", "test-token")
+    monkeypatch.setattr(bridge, "REMOTE", "owner/memory")
+    monkeypatch.setenv("FUNES_EMBEDDING_PROVIDER", "voyage")
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    started = time.monotonic()
+    try:
+        status, body = _post(server, "/search", payload)
+        elapsed = time.monotonic() - started
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert elapsed < 0.25
+    assert status == 503
+    assert body["error"] == "restore_in_progress"
+
+
+def test_native_unavailable_during_restore_fails_without_sidecar_fallback(monkeypatch):
+    class Store:
+        def __getattribute__(self, name):
+            raise AssertionError(f"native failure must not access store.{name}")
+
+    class FakeWorker:
+        def recall_result(self, *_args, **_kwargs):
+            raise bridge.NativeMcpError("native unavailable")
+
+    app = SimpleNamespace(
+        store=Store(),
+        syncer=SimpleNamespace(restoring=True, restore_failed=False),
+        restore_result=0,
+    )
+    monkeypatch.setattr(bridge, "SOURCE_APP", app)
+    monkeypatch.setattr(bridge, "MCP_WORKER", FakeWorker())
+    monkeypatch.setattr(bridge, "TOKEN", "test-token")
+    monkeypatch.setattr(bridge, "REMOTE", "owner/memory")
+    monkeypatch.setattr(bridge, "warm_state", lambda: {"state": "ready"})
+    monkeypatch.setenv("FUNES_EMBEDDING_PROVIDER", "voyage")
+    monkeypatch.setattr(
+        bridge,
+        "search_source_bm25_rankings",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("native failure during restore must not fall back")
+        ),
+    )
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    started = time.monotonic()
+    try:
+        status, body = _post(server, "/search", {"query": "query"})
+        elapsed = time.monotonic() - started
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert elapsed < 0.25
+    assert status == 503
+    assert body["error"] == "native_mcp_unavailable"
 
 
 def test_sidecar_search_rrf_queries_raw_and_rewrite_with_filters(monkeypatch):
@@ -2295,7 +4072,7 @@ def test_sidecar_search_partitions_native_sessions_and_filters_harness(monkeypat
             assert allow_broad_scan is False
             if query == "raw query":
                 return [
-                    {"source_identity": "memory", "source_type": "memory", "raw_text": "memory raw", "retrieval_text": "shadow"},
+                    {"source_identity": "memory", "source_type": "memory", "source_agent": "codex", "raw_text": "memory raw", "retrieval_text": "shadow"},
                     {"source_identity": "codex", "source_type": "session", "source_agent": "codex", "raw_text": "codex raw", "retrieval_text": "shadow"},
                     {"source_identity": "claude", "source_type": "claude_session", "source_agent": "claude", "raw_text": "claude raw", "retrieval_text": "shadow"},
                     {"source_identity": "claude-code", "source_type": "session", "source_agent": "claude_code", "raw_text": "claude code raw", "retrieval_text": "shadow"},
@@ -2327,9 +4104,13 @@ def test_sidecar_search_partitions_native_sessions_and_filters_harness(monkeypat
         for item in ranking
     )
 
-    _, _, claude_fallback = bridge.search_source_rankings(
+    _, claude_primary, claude_fallback = bridge.search_source_rankings(
         "raw query", 5, {}, harness="claude_code"
     )
+    assert [item["source_identity"] for item in claude_primary[0]] == [
+        "claude",
+        "claude-code",
+    ]
     assert [item["source_identity"] for item in claude_fallback[0]] == [
         "claude",
         "claude-code",
@@ -2338,6 +4119,114 @@ def test_sidecar_search_partitions_native_sessions_and_filters_harness(monkeypat
         "raw query", 5, {}, harness="unknown"
     )
     assert unknown_fallback == []
+
+
+def test_voyage_bm25_fallback_is_one_raw_fts_and_strips_retrieval_text(monkeypatch):
+    calls = []
+    hit = {
+        "source_identity": "raw-hit",
+        "source_type": "memory",
+        "raw_text": "raw source of truth",
+        "retrieval_text": "derived shadow",
+    }
+
+    class Store:
+        def search(self, query, limit, filters, *, allow_broad_scan):
+            calls.append((query, limit, filters, allow_broad_scan))
+            return [hit]
+
+    app = SimpleNamespace(
+        translator=SimpleNamespace(
+            rewrite_query=lambda _query: (_ for _ in ()).throw(
+                AssertionError("fast Voyage fallback must not call the provider")
+            )
+        ),
+        store=Store(),
+        syncer=SimpleNamespace(restoring=False, restore_failed=False),
+    )
+    monkeypatch.setattr(bridge, "SOURCE_APP", app)
+
+    primary, fallback = bridge.search_source_bm25_rankings(
+        "previous_response_id", 3, {"repo": "owner/repo"}
+    )
+
+    assert calls == [("previous_response_id", 9, {"repo": "owner/repo"}, False)]
+    assert primary == [[{key: value for key, value in hit.items() if key != "retrieval_text"}]]
+    assert fallback == []
+
+
+def test_deadline_runner_is_single_flight_when_dependency_ignores_timeout():
+    release = threading.Event()
+    finished = threading.Event()
+    calls = []
+    thread_name = "test-funes-single-flight"
+
+    def blocked():
+        calls.append(True)
+        try:
+            release.wait(40)
+        finally:
+            finished.set()
+
+    try:
+        for _ in range(6):
+            with pytest.raises((RuntimeError, TimeoutError)):
+                bridge._run_before_deadline(
+                    blocked,
+                    time.monotonic() + 0.02,
+                    thread_name=thread_name,
+                )
+        assert calls == [True]
+        assert sum(
+            thread.name == thread_name for thread in threading.enumerate()
+        ) == 1
+    finally:
+        release.set()
+        finished.wait(1)
+
+
+def test_deadline_runner_rejects_foreign_invocation_without_sharing_result():
+    release = threading.Event()
+    started = threading.Event()
+    first_done = threading.Event()
+    first_result = []
+    calls = []
+    thread_name = "test-funes-single-flight-foreign-result"
+
+    def first():
+        calls.append("A")
+        started.set()
+        release.wait(1)
+        return "sentinel A"
+
+    def call_first():
+        try:
+            first_result.append(
+                bridge._run_before_deadline(
+                    first, time.monotonic() + 1, thread_name=thread_name
+                )
+            )
+        finally:
+            first_done.set()
+
+    caller = threading.Thread(target=call_first, daemon=True)
+    caller.start()
+    try:
+        assert started.wait(1)
+        with pytest.raises(bridge._DeadlineRunBusyError):
+            bridge._run_before_deadline(
+                lambda: calls.append("B") or "sentinel B",
+                time.monotonic() + 1,
+                thread_name=thread_name,
+            )
+        assert calls == ["A"]
+        assert sum(thread.name == thread_name for thread in threading.enumerate()) == 1
+    finally:
+        release.set()
+        assert first_done.wait(1)
+        caller.join(timeout=1)
+
+    assert first_result == ["sentinel A"]
 
 
 @pytest.mark.parametrize(
@@ -2370,34 +4259,170 @@ def test_explicit_sidecar_filters_keep_sessions_primary(monkeypatch, filters):
     assert fallback == []
 
 
-def test_http_rrf_promotes_dual_hit_and_keeps_sidecar_raw(monkeypatch, tmp_path):
+@pytest.mark.parametrize(
+    "filters",
+    (
+        {"role": "user"},
+        {"since": "2026-09-01"},
+        {"until": "2026-09-02"},
+        {"source_type": "memory"},
+        {"project": "funes"},
+        {"repo": "pjpjq/funes"},
+        {"device_id": "dev-test"},
+        {"content_type": "memory"},
+        {"source_missing": False},
+    ),
+)
+def test_http_voyage_unindexed_filters_remain_sidecar_authoritative(
+    monkeypatch, filters
+):
+    calls = []
+    hit = {
+        "source_identity": "filtered",
+        "source_type": "memory",
+        "raw_text": "filtered raw",
+        "retrieval_text": "derived shadow",
+    }
+
+    class Store:
+        def search(self, query, limit, *, filters, allow_broad_scan):
+            calls.append((query, limit, filters, allow_broad_scan))
+            return [hit]
+
+    app = SimpleNamespace(
+        translator=SimpleNamespace(rewrite_query=lambda query: query),
+        store=Store(),
+        syncer=SimpleNamespace(restoring=False, restore_failed=False),
+    )
+    monkeypatch.setattr(bridge, "SOURCE_APP", app)
+    monkeypatch.setattr(bridge, "TOKEN", "test-token")
+    monkeypatch.setattr(
+        bridge,
+        "recall",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("unindexed filters must not enter native recall")
+        ),
+    )
+    server = ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        status, body = _post(
+            server,
+            "/search",
+            {"query": "raw query", "limit": 3, **filters},
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert status == 200
+    assert calls == [("raw query", 9, filters, False)]
+    assert body["retrieval_backend"] == "bm25"
+    assert body["results"] == [
+        {key: value for key, value in hit.items() if key != "retrieval_text"}
+    ]
+    assert body["results_text"] == "filtered raw"
+    assert "retrieval_degraded" not in body
+
+
+def test_http_voyage_role_filter_never_waits_for_query_translator(monkeypatch):
+    release_translator = threading.Event()
+    translator_finished = threading.Event()
+    translator_calls = []
+    hit = {"source_identity": "role-hit", "raw_text": "role filtered raw"}
+
+    def blocked_rewrite(query):
+        translator_calls.append(query)
+        try:
+            release_translator.wait(40)
+            return query
+        finally:
+            translator_finished.set()
+
+    app = SimpleNamespace(
+        translator=SimpleNamespace(rewrite_query=blocked_rewrite),
+        store=SimpleNamespace(search=lambda *_args, **_kwargs: [hit]),
+        syncer=SimpleNamespace(restoring=False, restore_failed=False),
+    )
+    monkeypatch.setattr(bridge, "SOURCE_APP", app)
+    monkeypatch.setattr(bridge, "TOKEN", "test-token")
+    server = ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    watchdog = threading.Timer(5.2, release_translator.set)
+    watchdog.daemon = True
+    watchdog.start()
+    started = time.monotonic()
+    try:
+        status, body = _post(
+            server,
+            "/search",
+            {"query": "raw query", "limit": 3, "role": "user"},
+        )
+        elapsed = time.monotonic() - started
+    finally:
+        release_translator.set()
+        watchdog.cancel()
+        translator_finished.wait(1)
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert bridge.VOYAGE_HTTP_TIMEOUT <= 7.5
+    assert elapsed < 5
+    assert translator_calls == []
+    assert status == 200
+    assert body["results"] == [hit]
+
+
+def test_voyage_role_filter_applies_harness_to_sidecar_sessions(monkeypatch):
+    hits = [
+        {
+            "source_identity": "codex-session",
+            "source_type": "session",
+            "source_agent": "codex",
+            "role": "user",
+            "raw_text": "codex raw",
+        },
+        {
+            "source_identity": "claude-session",
+            "source_type": "session",
+            "source_agent": "claude",
+            "role": "user",
+            "raw_text": "claude raw",
+        },
+    ]
+    app = SimpleNamespace(
+        store=SimpleNamespace(search=lambda *_args, **_kwargs: hits),
+        syncer=SimpleNamespace(restoring=False, restore_failed=False),
+    )
+    monkeypatch.setattr(bridge, "SOURCE_APP", app)
+
+    primary, fallback = bridge.search_source_bm25_rankings(
+        "raw query", 3, {"role": "user"}, harness="codex"
+    )
+
+    assert [item["source_identity"] for item in primary[0]] == ["codex-session"]
+    assert fallback == []
+
+
+def test_http_voyage_uses_native_rrf_order_and_keeps_sidecar_raw(monkeypatch, tmp_path):
     app = _source_app(tmp_path)
     for identity, raw in (
         ("both", "dual raw"),
         ("native-only", "native raw"),
     ):
         _canonical_source(app.store, identity, raw=raw, retrieval="ENGLISH SHADOW")
-    source_rankings = [
-        [
-            {"source_identity": "sidecar-only", "raw_text": "raw BM25"},
-            {"source_identity": "both", "raw_text": "triple raw"},
-            {"source_identity": "session-fallback", "raw_text": "fallback raw"},
-        ],
-        [
-            {"source_identity": "provider-only", "raw_text": "provider raw"},
-            {"source_identity": "both", "raw_text": "triple raw"},
-        ],
-    ]
     native_queries = []
     monkeypatch.setattr(bridge, "SOURCE_APP", app)
     monkeypatch.setattr(bridge, "TOKEN", "test-token")
     monkeypatch.setattr(
         bridge,
         "search_source_rankings",
-        lambda query, limit, filters, harness: (
-            "provider query",
-            source_rankings,
-            [[{"source_identity": "session-fallback", "raw_text": "fallback raw"}]],
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("successful Voyage recall must not run sidecar FTS")
         ),
     )
     def native_recall(query, **_kwargs):
@@ -2426,20 +4451,294 @@ def test_http_rrf_promotes_dual_hit_and_keeps_sidecar_raw(monkeypatch, tmp_path)
     assert body["retrieval_backend"] == "voyage_lance_bm25_rrf"
     assert body["embedding_profile"]["provider"] == "voyage"
     assert [item["source_identity"] for item in body["results"]] == [
-        "both",
-        "sidecar-only",
-        "provider-only",
         "native-only",
-        "session-fallback",
+        "both",
     ]
-    assert body["results_text"] == (
-        "triple raw\n\nraw BM25\n\nprovider raw\n\nnative raw\n\nfallback raw"
-    )
+    assert body["results_text"] == "native raw\n\ndual raw"
     assert "ENGLISH SHADOW" not in json.dumps(body["results"], ensure_ascii=False)
-    assert "fallback raw" in body["results_text"]
 
 
-def test_http_rrf_preserves_exact_session_rank_before_native(monkeypatch):
+def test_http_selective_bm25_fuses_full_raw_union_with_filters(monkeypatch):
+    raw_query = "CPA 第二轮为什么丢上下文？"
+    first_results = [
+        {
+            "source_identity": "dominant-1",
+            "session_id": "session-a",
+            "raw_text": "Northflank previous_response_id 第一条原文",
+        },
+        {
+            "source_identity": "dominant-2",
+            "session_id": "session-a",
+            "raw_text": "previous_response_id 第二条原文",
+        },
+        {
+            "source_identity": "dominant-3",
+            "session_id": "session-a",
+            "raw_text": "previous_response_id 第三条原文",
+        },
+    ]
+    recovered = {
+        "source_identity": "recovered-history",
+        "session_id": "session-c",
+        "raw_text": "历史原文：CPA Northflank previous_response_id",
+    }
+    recall_calls = []
+    bm25_calls = []
+
+    class Store:
+        def search(self, query, limit, *, filters, allow_broad_scan):
+            assert query == raw_query
+            assert limit == 9
+            assert filters == {"source_agent": "codex"}
+            assert allow_broad_scan is False
+            return [
+                {**item, "source_type": "session", "source_agent": "codex", "retrieval_text": "DERIVED"}
+                for item in [*first_results, recovered]
+            ]
+
+    app = SimpleNamespace(
+        store=Store(),
+        syncer=SimpleNamespace(restoring=False, restore_failed=False),
+    )
+    real_bm25 = bridge.search_source_bm25_rankings
+
+    def tracked_bm25(query, limit, filters, harness):
+        bm25_calls.append((query, limit, filters, harness))
+        return real_bm25(query, limit, filters, harness)
+
+    monkeypatch.setattr(bridge, "SOURCE_APP", app)
+    monkeypatch.setattr(bridge, "TOKEN", "test-token")
+    monkeypatch.setenv("FUNES_EMBEDDING_PROVIDER", "voyage")
+    monkeypatch.setattr(
+        bridge,
+        "recall",
+        lambda query, **_kwargs: recall_calls.append(query) or "first pass",
+    )
+    monkeypatch.setattr(
+        bridge,
+        "materialize_native_results",
+        lambda *_args, **_kwargs: first_results,
+    )
+    monkeypatch.setattr(bridge, "search_source_bm25_rankings", tracked_bm25)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        status, body = _post(
+            server,
+            "/search",
+            {
+                "query": raw_query,
+                "limit": 3,
+                "source_agent": "codex",
+                "harness": "codex",
+            },
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert status == 200
+    assert recall_calls == [raw_query]
+    assert bm25_calls == [
+        (raw_query, 3, {"source_agent": "codex"}, "codex")
+    ]
+    assert body["query"] == raw_query
+    assert body["retrieval_query"] == raw_query
+    recovered_result = next(
+        item
+        for item in body["results"]
+        if item["source_identity"] == recovered["source_identity"]
+    )
+    assert recovered_result["raw_text"] == recovered["raw_text"]
+    assert body["results_text"].split("\n\n") == [
+        item["raw_text"] for item in body["results"]
+    ]
+    assert "DERIVED" not in json.dumps(body, ensure_ascii=False)
+    assert not any(
+        word in key.lower()
+        for key in body
+        for word in ("feedback", "identifier", "expanded")
+    )
+    assert sum(
+        item.get("session_id") == "session-a" for item in body["results"][:3]
+    ) <= 2
+
+
+def test_http_selective_bm25_non_trigger_never_opens_sqlite(monkeypatch):
+    first_results = [
+        {
+            "source_identity": f"dominant-{index}",
+            "session_id": "session-a",
+            "raw_text": f"retry_state raw {index}",
+        }
+        for index in range(3)
+    ]
+    recall_calls = []
+    app = SimpleNamespace(
+        store=SimpleNamespace(),
+        syncer=SimpleNamespace(restoring=False, restore_failed=False),
+    )
+    monkeypatch.setattr(bridge, "SOURCE_APP", app)
+    monkeypatch.setattr(bridge, "TOKEN", "test-token")
+    monkeypatch.setenv("FUNES_EMBEDDING_PROVIDER", "voyage")
+    monkeypatch.setattr(
+        bridge,
+        "recall",
+        lambda query, **_kwargs: recall_calls.append(query) or "first pass",
+    )
+    monkeypatch.setattr(
+        bridge,
+        "materialize_native_results",
+        lambda *_args, **_kwargs: first_results,
+    )
+    monkeypatch.setattr(
+        bridge,
+        "search_source_bm25_rankings",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("ordinary requests must not open SQLite")
+        ),
+    )
+    server = ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        status, body = _post(
+            server, "/search", {"query": "why was context lost?", "limit": 3}
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert status == 200
+    assert recall_calls == ["why was context lost?"]
+    assert body["results"] == first_results
+
+
+def test_http_selective_bm25_timeout_returns_first_pass_within_shared_deadline(
+    monkeypatch,
+):
+    raw_query = "为什么第二轮丢上下文？"
+    first_results = [
+        {
+            "source_identity": f"dominant-{index}",
+            "session_id": "session-a",
+            "raw_text": f"retry_state 原始记录 {index}",
+        }
+        for index in range(3)
+    ]
+    release = threading.Event()
+    finished = threading.Event()
+    recall_calls = []
+    bm25_calls = []
+
+    def native_recall(query, **_kwargs):
+        recall_calls.append(query)
+        return "first pass"
+
+    def blocked_bm25(query, limit, filters, harness):
+        bm25_calls.append((query, limit, filters, harness))
+        try:
+            release.wait(40)
+            return [], []
+        finally:
+            finished.set()
+
+    app = SimpleNamespace(
+        store=SimpleNamespace(),
+        syncer=SimpleNamespace(restoring=False, restore_failed=False),
+    )
+    monkeypatch.setattr(bridge, "SOURCE_APP", app)
+    monkeypatch.setattr(bridge, "TOKEN", "test-token")
+    monkeypatch.setenv("FUNES_EMBEDDING_PROVIDER", "voyage")
+    monkeypatch.setattr(bridge, "VOYAGE_HTTP_TIMEOUT", 0.12)
+    monkeypatch.setattr(bridge, "VOYAGE_NATIVE_TIMEOUT", 0.08)
+    monkeypatch.setattr(bridge, "recall", native_recall)
+    monkeypatch.setattr(
+        bridge,
+        "materialize_native_results",
+        lambda output, *_args, **_kwargs: first_results if output == "first pass" else [],
+    )
+    monkeypatch.setattr(bridge, "search_source_bm25_rankings", blocked_bm25)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    started = time.monotonic()
+    try:
+        status, body = _post(server, "/search", {"query": raw_query, "limit": 3})
+        elapsed = time.monotonic() - started
+    finally:
+        release.set()
+        finished.wait(1)
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert elapsed < 1
+    assert status == 200
+    assert recall_calls == [raw_query]
+    assert bm25_calls == [(raw_query, 3, {}, None)]
+    assert body["results"] == first_results
+    assert body["retrieval_query"] == raw_query
+    assert "retrieval_degraded" not in body
+
+
+def test_http_selective_bm25_failure_keeps_first_pass_and_hides_error(monkeypatch):
+    raw_query = "为什么第二轮丢上下文？"
+    first_results = [
+        {
+            "source_identity": f"dominant-{index}",
+            "session_id": "session-a",
+            "raw_text": f"retry_state 原始记录 {index}",
+        }
+        for index in range(3)
+    ]
+    recall_calls = []
+
+    app = SimpleNamespace(
+        store=SimpleNamespace(),
+        syncer=SimpleNamespace(restoring=False, restore_failed=False),
+    )
+    monkeypatch.setattr(bridge, "SOURCE_APP", app)
+    monkeypatch.setattr(bridge, "TOKEN", "test-token")
+    monkeypatch.setenv("FUNES_EMBEDDING_PROVIDER", "voyage")
+    monkeypatch.setattr(
+        bridge,
+        "recall",
+        lambda query, **_kwargs: recall_calls.append(query) or "first pass",
+    )
+    monkeypatch.setattr(
+        bridge,
+        "materialize_native_results",
+        lambda *_args, **_kwargs: first_results,
+    )
+    monkeypatch.setattr(
+        bridge,
+        "search_source_bm25_rankings",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("sidecar-secret-detail")
+        ),
+    )
+    server = ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        status, body = _post(server, "/search", {"query": raw_query, "limit": 3})
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    encoded = json.dumps(body, ensure_ascii=False)
+    assert status == 200
+    assert recall_calls == [raw_query]
+    assert body["results"] == first_results
+    assert "sidecar-secret-detail" not in encoded
+
+
+def test_http_native_bm25_keeps_exact_identifier_without_sidecar_fts(monkeypatch):
     exact = {
         "source_identity": "exact-session",
         "source_type": "session",
@@ -2447,35 +4746,32 @@ def test_http_rrf_preserves_exact_session_rank_before_native(monkeypatch):
         "raw_text": "exact identifier",
         "retrieval_text": "shadow",
     }
-    related = {
-        "source_identity": "related-memory",
-        "source_type": "memory",
-        "raw_text": "related result",
-        "retrieval_text": "shadow",
-    }
-    rewritten_related = {
-        "source_identity": "rewritten-related",
-        "source_type": "memory",
-        "raw_text": "rewritten related",
-        "retrieval_text": "shadow",
-    }
+    native_queries = []
     app = SimpleNamespace(
-        translator=SimpleNamespace(rewrite_query=lambda _query: "rewritten identifier"),
+        translator=SimpleNamespace(
+            rewrite_query=lambda _query: (_ for _ in ()).throw(
+                AssertionError("successful Voyage recall must not rewrite the query")
+            )
+        ),
         store=SimpleNamespace(
-            search=lambda query, *_args, **_kwargs: (
-                [exact, related] if query == "identifier" else [rewritten_related]
+            search=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("native BM25 owns exact identifiers")
             )
         ),
         syncer=SimpleNamespace(restoring=False, restore_failed=False),
     )
     monkeypatch.setattr(bridge, "SOURCE_APP", app)
     monkeypatch.setattr(bridge, "TOKEN", "test-token")
-    monkeypatch.setattr(bridge, "recall", lambda *_args, **_kwargs: "native")
+    monkeypatch.setattr(
+        bridge,
+        "recall",
+        lambda query, **_kwargs: native_queries.append(query) or "native exact hit",
+    )
     monkeypatch.setattr(
         bridge,
         "materialize_native_results",
         lambda *_args, **_kwargs: [
-            {"source_identity": "native-related", "raw_text": "native related"}
+            {key: value for key, value in exact.items() if key != "retrieval_text"}
         ],
     )
     server = ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
@@ -2489,6 +4785,7 @@ def test_http_rrf_preserves_exact_session_rank_before_native(monkeypatch):
         thread.join(timeout=2)
 
     assert status == 200
+    assert native_queries == ["identifier"]
     assert body["results"] == [
         {
             "source_identity": "exact-session",
@@ -2573,6 +4870,7 @@ def test_http_weak_cjk_sidecar_uses_short_native_budget(
     monkeypatch.setattr(bridge, "SOURCE_APP", app)
     monkeypatch.setattr(bridge, "TOKEN", "test-token")
     monkeypatch.setattr(bridge, "LANGUAGE_MODE", "auto")
+    monkeypatch.setenv("FUNES_EMBEDDING_PROVIDER", "local")
     monkeypatch.setattr(bridge, "CJK_NATIVE_TIMEOUT", 5.0)
     monkeypatch.setattr(
         bridge,
@@ -2616,7 +4914,7 @@ def test_http_weak_cjk_sidecar_uses_short_native_budget(
     ("native_error", "degraded"),
     (
         (bridge.NativeMcpError("timed out"), "voyage_unavailable"),
-        (bridge.NativeMcpBusyError("busy"), "native_mcp_busy"),
+        (bridge.NativeMcpBusyError("busy"), "voyage_unavailable"),
     ),
 )
 def test_http_native_failure_returns_raw_sidecar_results(
@@ -2632,12 +4930,8 @@ def test_http_native_failure_returns_raw_sidecar_results(
     monkeypatch.setattr(bridge, "TOKEN", "test-token")
     monkeypatch.setattr(
         bridge,
-        "search_source_rankings",
-        lambda query, limit, filters, harness: (
-            "provider query",
-            source_rankings,
-            source_rankings,
-        ),
+        "search_source_bm25_rankings",
+        lambda query, limit, filters, harness: (source_rankings, source_rankings),
     )
     monkeypatch.setattr(
         bridge,
@@ -2662,6 +4956,361 @@ def test_http_native_failure_returns_raw_sidecar_results(
     assert body["results"] == source_rankings[0]
 
 
+def test_voyage_native_recall_succeeds_within_new_budget(monkeypatch):
+    """(a) A native recall completing inside the new ~6s budget succeeds."""
+    native_calls = []
+    hit = {
+        "source_identity": "voyage-hit-1",
+        "source_type": "memory",
+        "raw_text": "native recall successful content",
+    }
+    app = SimpleNamespace(
+        store=SimpleNamespace(
+            search=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("successful Voyage recall must not run sidecar FTS")
+            ),
+        ),
+        syncer=SimpleNamespace(restoring=False, restore_failed=False),
+    )
+    monkeypatch.setattr(bridge, "SOURCE_APP", app)
+    monkeypatch.setattr(bridge, "TOKEN", "test-token")
+    monkeypatch.setenv("FUNES_EMBEDDING_PROVIDER", "voyage")
+
+    def slow_ok_native(query, **kwargs):
+        native_calls.append((query, kwargs))
+        # Complete inside the ~6s budget (> 4.0s former cap).
+        time.sleep(4.2)
+        reference = bridge.canonical_reference("voyage-hit-1")
+        return f"native raw snippet\n  → get {reference} --from 0 --to 0"
+
+    monkeypatch.setattr(bridge, "recall", slow_ok_native)
+    monkeypatch.setattr(
+        bridge,
+        "materialize_native_results",
+        lambda *_args, **_kwargs: [hit],
+    )
+    server = ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    started = time.monotonic()
+    try:
+        status, body = _post(
+            server,
+            "/search",
+            {"query": "delayed query", "limit": 3},
+        )
+        elapsed = time.monotonic() - started
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert status == 200
+    assert 4.0 < elapsed < 6.8
+    assert len(native_calls) == 1
+    assert 5.0 < native_calls[0][1]["timeout"] <= bridge.VOYAGE_NATIVE_TIMEOUT
+    assert body["retrieval_backend"] == "voyage_lance_bm25_rrf"
+    assert "retrieval_degraded" not in body
+    assert body["results"] == [hit]
+
+
+def test_voyage_native_timeout_skips_bm25_and_requests_recovery(monkeypatch):
+    """(b) A NativeMcpTimeoutError skips SQLite BM25 fallback and calls asynchronous recovery."""
+    search_calls = []
+    recovery_calls = []
+
+    class Store:
+        def get(self, _identity):
+            return None
+
+        def search(self, *args, **kwargs):
+            search_calls.append((args, kwargs))
+            return [{
+                "source_identity": "session-hit",
+                "source_type": "memory",
+                "raw_text": "raw session text",
+            }]
+
+    app = SimpleNamespace(
+        translator=SimpleNamespace(
+            rewrite_query=lambda _query: (_ for _ in ()).throw(
+                AssertionError("timeout path must not rewrite query")
+            )
+        ),
+        store=Store(),
+        syncer=SimpleNamespace(restoring=False, restore_failed=False),
+    )
+    monkeypatch.setattr(bridge, "SOURCE_APP", app)
+    monkeypatch.setattr(bridge, "TOKEN", "test-token")
+    monkeypatch.setenv("FUNES_EMBEDDING_PROVIDER", "voyage")
+    monkeypatch.setenv("FUNES_NATIVE_FALLBACK", "false")
+
+    def timed_out_native(*_args, **_kwargs):
+        raise bridge.NativeMcpTimeoutError("native MCP request timed out")
+
+    monkeypatch.setattr(bridge, "recall", timed_out_native)
+    monkeypatch.setattr(
+        bridge,
+        "request_native_recovery",
+        lambda: recovery_calls.append(True),
+    )
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    started = time.monotonic()
+    try:
+        status, body, headers = _post_with_headers(
+            server,
+            "/search",
+            {"query": "timed out query", "limit": 3},
+        )
+        elapsed = time.monotonic() - started
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert status == 503
+    assert elapsed < 0.5
+    assert body["retrieval_degraded"] == "voyage_unavailable"
+    assert body["results"] == []
+    assert body["error"] == "native_mcp_unavailable"
+    assert search_calls == []
+    assert recovery_calls == [True]
+
+
+@pytest.mark.parametrize(
+    "native_error",
+    (
+        bridge.NativeMcpTimeoutError("native MCP request timed out"),
+        bridge.NativeMcpError("native MCP unavailable"),
+    ),
+)
+def test_voyage_native_timeout_and_unavailable_call_native_recovery_when_fts_not_ready(
+    monkeypatch, native_error
+):
+    """Voyage native timeout or unavailable calls recovery even when sidecar FTS is not ready."""
+    search_calls = []
+    recovery_calls = []
+
+    class Store:
+        def get(self, _identity):
+            return None
+
+        def search(self, *args, **kwargs):
+            search_calls.append((args, kwargs))
+            return [{
+                "source_identity": "session-hit",
+                "source_type": "memory",
+                "raw_text": "raw session text",
+            }]
+
+        def fts_ready(self):
+            return False
+
+    app = SimpleNamespace(
+        translator=SimpleNamespace(
+            rewrite_query=lambda _query: (_ for _ in ()).throw(
+                AssertionError("timeout path must not rewrite query")
+            )
+        ),
+        store=Store(),
+        syncer=SimpleNamespace(restoring=False, restore_failed=False),
+    )
+    monkeypatch.setattr(bridge, "SOURCE_APP", app)
+    monkeypatch.setattr(bridge, "TOKEN", "test-token")
+    monkeypatch.setenv("FUNES_EMBEDDING_PROVIDER", "voyage")
+    monkeypatch.setenv("FUNES_NATIVE_FALLBACK", "false")
+
+    def failing_native(*_args, **_kwargs):
+        raise native_error
+
+    monkeypatch.setattr(bridge, "recall", failing_native)
+    monkeypatch.setattr(
+        bridge,
+        "request_native_recovery",
+        lambda: recovery_calls.append(True),
+    )
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    started = time.monotonic()
+    try:
+        status, body, headers = _post_with_headers(
+            server,
+            "/search",
+            {"query": "failing native query", "limit": 3},
+        )
+        elapsed = time.monotonic() - started
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert status == 503
+    assert elapsed < 0.5
+    assert body["retrieval_degraded"] == "voyage_unavailable"
+    assert body["results"] == []
+    assert body["error"] == "native_mcp_unavailable"
+    assert search_calls == []
+    assert recovery_calls == [True]
+
+
+def test_voyage_blocked_native_timeout_skips_bm25_and_requests_recovery(monkeypatch):
+    """A blocked native call timing out via deadline runner skips BM25 and calls recovery."""
+    release_native = threading.Event()
+    native_finished = threading.Event()
+    search_calls = []
+    recovery_calls = []
+
+    class Store:
+        def get(self, _identity):
+            return None
+
+        def search(self, query, limit, filters, *, allow_broad_scan):
+            search_calls.append((query, limit, filters, allow_broad_scan))
+            return [{"source_identity": "bm25-hit", "raw_text": "bm25 raw"}]
+
+    app = SimpleNamespace(
+        translator=SimpleNamespace(
+            rewrite_query=lambda _query: (_ for _ in ()).throw(
+                AssertionError("timeout path must not rewrite query")
+            )
+        ),
+        store=Store(),
+        syncer=SimpleNamespace(restoring=False, restore_failed=False),
+    )
+    monkeypatch.setattr(bridge, "SOURCE_APP", app)
+    monkeypatch.setattr(bridge, "TOKEN", "test-token")
+    monkeypatch.setenv("FUNES_EMBEDDING_PROVIDER", "voyage")
+    monkeypatch.setenv("FUNES_NATIVE_FALLBACK", "false")
+    monkeypatch.setattr(bridge, "VOYAGE_NATIVE_TIMEOUT", 0.08)
+    monkeypatch.setattr(bridge, "VOYAGE_HTTP_TIMEOUT", 0.15)
+
+    def blocked_native(*_args, **_kwargs):
+        try:
+            release_native.wait(10)
+            return ""
+        finally:
+            native_finished.set()
+
+    monkeypatch.setattr(bridge, "recall", blocked_native)
+    monkeypatch.setattr(
+        bridge,
+        "request_native_recovery",
+        lambda: recovery_calls.append(True),
+    )
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    started = time.monotonic()
+    try:
+        status, body, headers = _post_with_headers(
+            server, "/search", {"query": "blocked query", "limit": 3}
+        )
+        elapsed = time.monotonic() - started
+    finally:
+        release_native.set()
+        native_finished.wait(1)
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert status == 503
+    assert elapsed < 0.5
+    assert body["retrieval_degraded"] == "voyage_unavailable"
+    assert body["results"] == []
+    assert body["error"] == "native_mcp_unavailable"
+    assert search_calls == []
+    assert recovery_calls == [True]
+
+
+def test_request_native_recovery_triggers_warm_only_for_native_mcp_worker(monkeypatch):
+    warm_calls = []
+    monkeypatch.setattr(bridge, "request_warm", lambda *, force: warm_calls.append(force))
+
+    monkeypatch.setattr(bridge, "MCP_WORKER", None)
+    bridge.request_native_recovery()
+    assert warm_calls == []
+
+    class DummyNativeWorker(bridge.NativeMcpWorker):
+        def __init__(self):
+            pass
+
+    monkeypatch.setattr(bridge, "MCP_WORKER", DummyNativeWorker())
+    bridge.request_native_recovery()
+    assert warm_calls == [True]
+
+
+def test_concurrent_voyage_native_request_returns_busy_without_foreign_result(
+    monkeypatch,
+):
+    release_native = threading.Event()
+    native_started = threading.Event()
+    first_complete = threading.Event()
+    native_queries = []
+    first_response = []
+
+    class Store:
+        def search(self, *_args, **_kwargs):
+            # The busy request may use bounded raw BM25 before returning 429.
+            return []
+
+    app = SimpleNamespace(
+        store=Store(),
+        syncer=SimpleNamespace(restoring=False, restore_failed=False),
+    )
+    monkeypatch.setattr(bridge, "SOURCE_APP", app)
+    monkeypatch.setattr(bridge, "TOKEN", "test-token")
+    monkeypatch.setenv("FUNES_EMBEDDING_PROVIDER", "voyage")
+
+    def blocked_native(query, **_kwargs):
+        native_queries.append(query)
+        native_started.set()
+        release_native.wait(2)
+        return ""
+
+    monkeypatch.setattr(bridge, "recall", blocked_native)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+
+    def first_request():
+        try:
+            first_response.append(_post(server, "/search", {"query": "first"}))
+        finally:
+            first_complete.set()
+
+    request_thread = threading.Thread(target=first_request, daemon=True)
+    request_thread.start()
+    try:
+        assert native_started.wait(1)
+        status, body, headers = _post_with_headers(
+            server, "/search", {"query": "second"}
+        )
+        assert status == 429
+        assert headers["Retry-After"] == "3"
+        assert body["error"] == "native_mcp_busy"
+        assert native_queries == ["first"]
+        assert sum(
+            thread.name == "funes-http-native-recall"
+            for thread in threading.enumerate()
+        ) == 1
+    finally:
+        release_native.set()
+        assert first_complete.wait(1)
+        request_thread.join(timeout=1)
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=2)
+
+    assert first_response[0][0] == 200
+    assert first_response[0][1]["query"] == "first"
+
+
 @pytest.mark.parametrize("has_sidecar", (False, True))
 def test_voyage_failure_skips_slow_legacy_fallback(monkeypatch, has_sidecar):
     source_rankings = (
@@ -2681,8 +5330,8 @@ def test_voyage_failure_skips_slow_legacy_fallback(monkeypatch, has_sidecar):
     monkeypatch.setenv("FUNES_NATIVE_FALLBACK", "false")
     monkeypatch.setattr(
         bridge,
-        "search_source_rankings",
-        lambda *_args, **_kwargs: ("raw query", source_rankings, []),
+        "search_source_bm25_rankings",
+        lambda *_args, **_kwargs: (source_rankings, []),
     )
 
     def unavailable_voyage(*_args, **kwargs):
@@ -2709,7 +5358,7 @@ def test_voyage_failure_skips_slow_legacy_fallback(monkeypatch, has_sidecar):
         thread.join(timeout=2)
     assert elapsed < 5
     assert native_timeouts and 0 < native_timeouts[0] <= bridge.VOYAGE_NATIVE_TIMEOUT
-    assert native_timeouts[0] < 5
+    assert 5.0 <= native_timeouts[0] <= bridge.VOYAGE_NATIVE_TIMEOUT
     assert legacy_calls == []
     if has_sidecar:
         assert status == 200
@@ -2725,19 +5374,18 @@ def test_voyage_failure_skips_slow_legacy_fallback(monkeypatch, has_sidecar):
         assert body["embedding_profile"]["provider"] == "voyage"
 
 
-def test_http_native_empty_uses_session_sidecar_fallback(monkeypatch, tmp_path):
+def test_http_voyage_native_empty_is_success_without_sidecar_fallback(
+    monkeypatch, tmp_path
+):
     app = _source_app(tmp_path)
-    fallback = [[{
-        "source_identity": "empty-native-session",
-        "source_type": "session",
-        "raw_text": "native 空结果时的原始 session",
-    }]]
     monkeypatch.setattr(bridge, "SOURCE_APP", app)
     monkeypatch.setattr(bridge, "TOKEN", "test-token")
     monkeypatch.setattr(
         bridge,
         "search_source_rankings",
-        lambda query, limit, filters, harness: ("provider query", fallback, fallback),
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("an empty native ranking is still a successful query")
+        ),
     )
     monkeypatch.setattr(bridge, "recall", lambda *_args, **_kwargs: "")
     server = ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
@@ -2751,8 +5399,9 @@ def test_http_native_empty_uses_session_sidecar_fallback(monkeypatch, tmp_path):
         thread.join(timeout=2)
         app.store.close()
     assert status == 200
-    assert body["results"] == fallback[0]
-    assert body["results_text"] == "native 空结果时的原始 session"
+    assert body["results"] == []
+    assert body["results_text"] == ""
+    assert body["retrieval_backend"] == "voyage_lance_bm25_rrf"
     assert "retrieval_degraded" not in body
 
 

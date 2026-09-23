@@ -3,11 +3,21 @@ import hashlib, logging, os, signal, threading, time
 from pathlib import Path
 from .config import Config
 from .discovery import _project_roots, discover_sources
-from .parsers import parse_file
+from .parsers import complete_line_offset, parse_file
 from .store import Store
 from .client import SyncClient
 from .native import NativeFunes
 log=logging.getLogger("funes.sync")
+
+
+def _is_appendable_source(source) -> bool:
+    return source.kind in {
+        "codex", "pi", "claude", "codex_session", "pi_session", "claude_session",
+    } or source.kind.endswith("session")
+
+
+def _cursor_offset(source, size: int) -> int:
+    return complete_line_offset(source.path, size) if _is_appendable_source(source) else size
 
 class SyncDaemon:
     def __init__(self, config=None, store=None, client=None):
@@ -19,7 +29,7 @@ class SyncDaemon:
         self._source_cache=None; self._source_cache_at=0.0; self._source_cache_lock=threading.Lock()
         self._backfill_marker = self.config.state_dir / "initial-backfill.complete"
         self._source_schema_marker = self.config.state_dir / "source-schema-v2.complete"
-        self._zero_record_marker = self.config.state_dir / "zero-record-repair-v1.complete"
+        self._zero_record_marker = self.config.state_dir / "zero-record-repair-v2.complete"
         self._automation_identity_marker = self.config.state_dir / "automation-identity-v2.complete"
         remote_fingerprint=hashlib.sha256(self.config.remote_url.rstrip("/").encode()).hexdigest()[:16]
         self._remote_source_marker = self.config.state_dir / f"remote-source-v1-{remote_fingerprint}.complete"
@@ -78,10 +88,11 @@ class SyncDaemon:
             for source in sources:
                 try:
                     stat = source.path.stat()
+                    offset = _cursor_offset(source, stat.st_size)
                 except OSError:
                     continue
                 self.store.register_source(source, stat)
-                self.store.set_cursor(source.source_key, stat.st_size, stat.st_ino, stat.st_size)
+                self.store.set_cursor(source.source_key, offset, stat.st_ino, stat.st_size)
             self._backfill_marker.parent.mkdir(parents=True, exist_ok=True)
             self._backfill_marker.write_text(str(time.time()), encoding="utf-8")
             self._source_schema_marker.write_text(str(time.time()), encoding="utf-8")
@@ -105,14 +116,25 @@ class SyncDaemon:
             # No full reparse for unchanged files; append-only growth resumes at the byte cursor.
             if not refresh_source_schema and not repair_zero_record and not repair_automation and old and old[0] == st.st_size and old[1] == st.st_mtime and old[2] == st.st_ino:
                 continue
-            appendable = s.kind in {"codex", "pi", "claude", "codex_session", "pi_session", "claude_session"} or s.kind.endswith("session")
-            if not refresh_source_schema and not repair_zero_record and not repair_automation and has_records and appendable and cur and cur.get("inode")==st.st_ino and st.st_size>=cur.get("size",0):
-                start=cur.get("offset",0)
+            appendable = _is_appendable_source(s)
+            try:
+                offset = _cursor_offset(s, st.st_size)
+                can_append = not refresh_source_schema and not repair_zero_record and not repair_automation and (has_records or seeded_without_backfill) and appendable and cur and cur.get("inode")==st.st_ino and st.st_size>=cur.get("size",0)
+                if can_append:
+                    candidate = int(cur.get("offset", 0))
+                    # Legacy versions advanced cursors past an unterminated
+                    # JSONL record. A valid cursor normally returns after one
+                    # byte of look-behind; only a legacy mid-line cursor scans
+                    # backward and triggers this one-time full reconciliation.
+                    if complete_line_offset(s.path, candidate) == candidate:
+                        start = candidate
+            except OSError:
+                continue
             chunks=parse_file(s,start)
             total += self.store.upsert_chunks(chunks)
             if start == 0:
                 self.store.reconcile_source(s.source_key, {c.record_id for c in chunks})
-            self.store.set_cursor(s.source_key,st.st_size,st.st_ino,st.st_size)
+            self.store.set_cursor(s.source_key,offset,st.st_ino,st.st_size)
         if (self.config.initial_backfill or refresh_source_schema) and not self._backfill_marker.exists():
             self._backfill_marker.parent.mkdir(parents=True, exist_ok=True)
             self._backfill_marker.write_text(str(time.time()), encoding="utf-8")
@@ -134,20 +156,20 @@ class SyncDaemon:
         force: bool = False,
         interruptible: bool = False,
     ) -> dict:
-        """Queue only local identities absent from the durable remote source store."""
+        """Queue absent identities without acknowledging pending local revisions."""
         required=("meta_value","record_ids_after","enqueue_records","set_meta")
         if any(not hasattr(self.store,name) for name in required):
-            return {"complete":True,"checked":0,"queued":0,"skipped":True}
+            return {"complete":True,"checked":0,"queued":0,"acknowledged":0,"skipped":True}
         if force:
             self._remote_source_marker.unlink(missing_ok=True)
             self.store.set_meta(self._remote_source_cursor_key,"")
         if self._remote_source_marker.exists():
-            return {"complete":True,"checked":0,"queued":0}
+            return {"complete":True,"checked":0,"queued":0,"acknowledged":0}
         cursor=self.store.meta_value(self._remote_source_cursor_key) or ""
-        checked=queued=batches=0
+        checked=queued=acknowledged=batches=0
         while max_batches is None or batches<max_batches:
             if interruptible and (not self.running or self._wake.is_set()):
-                return {"complete":False,"checked":checked,"queued":queued,"interrupted":True}
+                return {"complete":False,"checked":checked,"queued":queued,"acknowledged":acknowledged,"interrupted":True}
             identities=self.store.record_ids_after(cursor,5000)
             if not identities:
                 complete=self.store.pending_count()==0
@@ -155,18 +177,21 @@ class SyncDaemon:
                     self._remote_source_marker.parent.mkdir(parents=True,exist_ok=True)
                     self._remote_source_marker.write_text(str(time.time()),encoding="utf-8")
                     self.store.set_meta(self._remote_source_cursor_key,"")
-                return {"complete":complete,"checked":checked,"queued":queued}
+                return {"complete":complete,"checked":checked,"queued":queued,"acknowledged":acknowledged}
             try:
                 missing=self.client.missing_source_identities(identities)
             except Exception as exc:
                 log.warning("remote source inventory unavailable: %s",type(exc).__name__)
-                return {"complete":False,"checked":checked,"queued":queued,"error":type(exc).__name__}
+                return {"complete":False,"checked":checked,"queued":queued,"acknowledged":acknowledged,"error":type(exc).__name__}
+            # Presence proves neither the current revision nor its durability.
+            # Only a completed durable ingest may acknowledge pending updates,
+            # including tombstones and metadata changes to session records.
             queued+=self.store.enqueue_records(missing)
             checked+=len(identities)
             batches+=1
             cursor=identities[-1]
             self.store.set_meta(self._remote_source_cursor_key,cursor)
-        return {"complete":False,"checked":checked,"queued":queued}
+        return {"complete":False,"checked":checked,"queued":queued,"acknowledged":acknowledged}
 
     def state_status(self) -> dict:
         return {
@@ -269,7 +294,14 @@ class SyncDaemon:
                 self._wake.wait(max(1,self.config.interval)); self._wake.clear()
                 continue
             self.scan_once()
-            inventory=self.reconcile_remote_sources(None if once else 16,interruptible=True)
+            # In continuous mode, drain already durable local records before
+            # spending a long interval on the cross-device identity inventory.
+            # A large first-run queue must not be starved by reconciliation:
+            # each inventory request is remote I/O and can take several
+            # seconds, while the queue is the source-of-truth delivery path.
+            inventory={"complete": self._remote_source_marker.exists(), "checked": 0, "queued": 0, "acknowledged": 0}
+            if once:
+                inventory=self.reconcile_remote_sources(None,interruptible=True)
             # A one-shot backfill must drain the durable queue completely when
             # the remote is available; otherwise the first startup would leave
             # most history pending until the next 5-minute pass.  The continuous
@@ -291,9 +323,17 @@ class SyncDaemon:
                     # then rescan before sending another batch.
                     if not self.running or self._wake.is_set():
                         break
+                # Reconcile only after the current durable queue is empty.  A
+                # bounded one-batch step preserves cross-device dedupe without
+                # blocking future uploads; the next loop drains any identities
+                # that this step queues.
+                if self.running and not self.store.pending_count():
+                    inventory=self.reconcile_remote_sources(1,interruptible=True)
             if once: break
             if not self.running: break
-            wait=1 if not inventory.get("complete") and inventory.get("checked") else max(1,self.config.interval)
+            wait=1 if self.store.pending_count() > 0 or (
+                not inventory.get("complete") and inventory.get("checked")
+            ) else max(1,self.config.interval)
             self._wake.wait(wait); self._wake.clear()
         finally:
             self._stop_watcher()

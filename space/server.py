@@ -344,20 +344,32 @@ def source_readiness_state() -> dict[str, object]:
             "restoring": False,
             "error": "postgres_unavailable" if postgres_configured else "source_store_unavailable",
         }
-    if getattr(app.syncer, "backend", None) == "postgres" and not app.syncer.restoring:
-        if app.syncer.check_ready() and app.restore_result < 0:
+    restoring = bool(getattr(app.syncer, "restoring", False))
+    probe_ok = True
+    if getattr(app.syncer, "backend", None) == "postgres" and not restoring:
+        probe = getattr(app.syncer, "probe_ready", None)
+        if callable(probe):
+            probe_ok = bool(probe())
+        else:
+            check = getattr(app.syncer, "check_ready", None)
+            probe_ok = bool(check()) if callable(check) else True
+        if probe_ok and getattr(app, "restore_result", 0) < 0:
             app.restore_result = 0
-    restoring = bool(app.syncer.restoring)
-    restore_failed = bool(app.syncer.restore_failed)
+    restoring = bool(getattr(app.syncer, "restoring", False))
+    restore_failed = bool(getattr(app.syncer, "restore_failed", False))
+    ready = not restoring and not restore_failed and probe_ok
     state: dict[str, object] = {
         "configured": True,
-        "ready": not restoring and not restore_failed,
+        "ready": ready,
         "restoring": restoring,
-        "restored": app.restore_result,
+        "restored": getattr(app, "restore_result", 0),
     }
     if restoring:
-        state["progress"] = getattr(app.syncer, "progress", {})
-    if restore_failed:
+        progress_val = getattr(app.syncer, "_progress", None)
+        if progress_val is None:
+            progress_val = getattr(app.syncer, "progress", {})
+        state["progress"] = dict(progress_val)
+    if restore_failed or not probe_ok:
         state["error"] = (
             "postgres_unavailable"
             if getattr(app.syncer, "backend", None) == "postgres"
@@ -1481,6 +1493,7 @@ def _native_update(
         ),
         "native_index_error": error,
         "native_generation": int(item.get("native_generation") or 0),
+        "retrieval_generation": int(item.get("retrieval_generation") or 0),
     }
 
 
@@ -1896,16 +1909,44 @@ def reconcile_canonical_index(app) -> dict[str, object]:
     _canonical_reconcile_phase(app, "validating_status")
     status_documents = []
     valid_updates = []
-    for update in updates:
-        current = app.store.get(update["source_identity"])
-        if (
-            current is None
-            or str(current.get("source_version", "")) != update["source_version"]
-            or str(current.get("content_hash", "")) != update["content_hash"]
-        ):
-            continue
-        status_documents.append({**current, **update})
-        valid_updates.append(update)
+    if hasattr(app.store, "get_many"):
+        identities = [
+            str(u["source_identity"])
+            for u in updates
+            if u.get("source_identity") is not None
+        ]
+        hydrated = {
+            str(d["source_identity"]): d
+            for d in app.store.get_many(identities)
+            if isinstance(d, dict) and d.get("source_identity") is not None
+        }
+        for update in updates:
+            ident = str(update.get("source_identity", ""))
+            current = hydrated.get(ident)
+            if (
+                current is None
+                or str(current.get("source_version", "")) != str(update.get("source_version", ""))
+                or str(current.get("content_hash", "")) != str(update.get("content_hash", ""))
+                or int(current.get("native_generation") or 0) != int(update.get("native_generation") or 0)
+                or int(current.get("retrieval_generation") or 0) != int(update.get("retrieval_generation") or 0)
+            ):
+                continue
+            status_documents.append({**current, **update})
+            valid_updates.append(update)
+    else:
+        for update in updates:
+            ident = str(update.get("source_identity", ""))
+            current = app.store.get(ident)
+            if (
+                current is None
+                or str(current.get("source_version", "")) != str(update.get("source_version", ""))
+                or str(current.get("content_hash", "")) != str(update.get("content_hash", ""))
+                or int(current.get("native_generation") or 0) != int(update.get("native_generation") or 0)
+                or int(current.get("retrieval_generation") or 0) != int(update.get("retrieval_generation") or 0)
+            ):
+                continue
+            status_documents.append({**current, **update})
+            valid_updates.append(update)
     pending_marker = None
     if any(update["native_index_status"] == "indexed" for update in valid_updates):
         previous = app.store.native_optimize_checkpoint()

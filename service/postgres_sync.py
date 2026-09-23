@@ -156,6 +156,31 @@ class PostgresSync:
                 return {"uploaded": False, "durable": False,
                         "reason": "postgres_unavailable"}
 
+    def ack_committed(self, docs: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+        """Acknowledge already-persisted rows and commit the sync timestamp.
+
+        The caller already durably committed these records to self.store.
+        Verify readiness and commit sync_state under synchronous_commit=on,
+        without re-ingesting or updating the source rows.
+        """
+        with self.upload_lock:
+            if not self.check_ready():
+                return {"uploaded": False, "durable": False,
+                        "reason": "postgres_unavailable"}
+            try:
+                records = list(docs or [])
+                with self.store.lock, self.store.conn:
+                    self.store.conn.execute("SET LOCAL synchronous_commit=on").close()
+                    self.store.set_sync(last_sync=utc_now(), last_error=None)
+                return {"uploaded": True, "durable": True,
+                        "backend": self.backend, "records": len(records)}
+            except Exception:
+                self._unavailable()
+                return {"uploaded": False, "durable": False,
+                        "reason": "postgres_unavailable"}
+
+    ack_persisted = ack_committed
+
     def upload_reindex_control(self, control: dict[str, Any]) -> dict[str, Any]:
         """Persist the control before the caller makes it runnable/wakes workers."""
         generation = int(control.get("generation", 0))

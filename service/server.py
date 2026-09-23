@@ -4223,6 +4223,15 @@ def prepare_ingest_documents(app: Any, docs: list[dict[str, Any]]) -> list[dict[
     return prepared
 
 
+def _sync_committed_documents(app: Any, canonical: list[dict[str, Any]]) -> dict[str, Any]:
+    syncer = getattr(app, "syncer", None)
+    if syncer is not None and getattr(syncer, "store", None) is getattr(app, "store", None):
+        ack_fn = getattr(syncer, "ack_committed", None) or getattr(syncer, "ack_persisted", None)
+        if callable(ack_fn):
+            return ack_fn(canonical)
+    return app.syncer.upload(canonical)
+
+
 def _persist_translation_documents(app: Any, documents: list[dict[str, Any]]) -> dict[str, Any]:
     """Translate and durably write derived fields without ever replacing raw text."""
     if not documents:
@@ -4287,7 +4296,7 @@ def _persist_translation_documents(app: Any, documents: list[dict[str, Any]]) ->
     canonical = app.store.get_many(changed)
     if not canonical:
         return {"attempted": len(active), "updated": 0, "durable": True}
-    sync = app.syncer.upload(canonical)
+    sync = _sync_committed_documents(app, canonical)
     if not sync.get("durable"):
         app.store.mark_translations_pending(canonical)
     return {
@@ -4334,7 +4343,7 @@ def ingest_documents(app: Any, docs: list[dict[str, Any]]) -> dict[str, Any]:
     result = app.store.ingest(prepared)
     identities = [str(item["source_identity"]) for item in result["items"]]
     canonical = app.store.get_many(identities)
-    raw_sync = app.syncer.upload(canonical)
+    raw_sync = _sync_committed_documents(app, canonical)
     result.update(
         accepted=result["created"] + result["updated"] + result["deduped"],
         durable=bool(raw_sync.get("durable")),

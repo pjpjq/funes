@@ -83,9 +83,12 @@ class SourceStoreDouble:
     def ingest(self, records):
         results = []
         for record in records:
+            status = "updated" if ("memory", record.get("source_identity")) in self.records else "created"
             self._put(record)
-            results.append({"source_identity": record["source_identity"], "status": "created"})
-        return {"created": len(records), "updated": 0, "deduped": 0, "items": results}
+            results.append({"source_identity": record["source_identity"], "status": status})
+        created = sum(1 for r in results if r["status"] == "created")
+        updated = sum(1 for r in results if r["status"] == "updated")
+        return {"created": created, "updated": updated, "deduped": 0, "items": results}
 
     def get(self, identity):
         value = self.records.get(("memory", identity))
@@ -120,6 +123,12 @@ class SourceStoreDouble:
         with self.conn:
             self.records[("sync", "state")] = values
             self.events.append("sync_state")
+
+    def update_native_index(self, updates):
+        self.events.append("update_native_index")
+
+    def mark_translations_pending(self, records):
+        self.events.append("mark_translations_pending")
 
     def close(self):
         self.events.append("close")
@@ -410,3 +419,113 @@ def test_space_post_disconnect_is_sanitized(monkeypatch):
     handler.send_json.assert_called_once_with(
         503, {"ok": False, "durable": False, "error": "postgres_unavailable"}
     )
+
+
+def test_ingest_documents_fastpath_avoids_reingesting_rows():
+    store = SourceStoreDouble()
+    syncer = PostgresSync(store)
+    app = SimpleNamespace(store=store, syncer=syncer)
+    docs = [
+        {"source_identity": "doc-1", "source_version": "v1", "raw_text": "hello"},
+        {"source_identity": "doc-2", "source_version": "v1", "raw_text": "world"},
+    ]
+    with mock.patch.object(server, "prepare_ingest_documents", return_value=docs), \
+         mock.patch.object(syncer, "_restore_record", side_effect=AssertionError("re-ingest triggered")):
+        result = server.ingest_documents(app, docs)
+    assert result["durable"] is True
+    assert result["accepted"] == 2
+    assert result["sync"]["records"] == 2
+    assert result["sync"]["backend"] == "postgres"
+    # Rows ingested once, not re-ingested by syncer
+    assert store.events.count("persist:memory") == 2
+    assert "synchronous_commit" in store.events
+    assert "sync_state" in store.events
+    assert store.commits == len(docs) + 1
+
+
+def test_persist_translation_documents_fastpath_avoids_reingesting_rows():
+    store = SourceStoreDouble()
+    syncer = PostgresSync(store)
+    translator = SimpleNamespace(normalize_many=lambda texts: [("norm:" + t, "hash", "v1", "ok") for t in texts])
+    app = SimpleNamespace(store=store, syncer=syncer, translator=translator)
+    store.ingest([{
+        "source_identity": "trans-1", "source_version": "v1", "content_hash": "h1",
+        "retrieval_generation": 0, "translation_status": "pending_provider",
+        "native_index_status": None, "raw_text": "hello translation",
+    }])
+    docs = store.get_many(["trans-1"])
+    with mock.patch.object(syncer, "_restore_record", side_effect=AssertionError("re-ingest triggered")):
+        result = server._persist_translation_documents(app, docs)
+    assert result["durable"] is True
+    assert result["updated"] == 1
+    assert "sync_state" in store.events
+
+
+def test_ack_committed_persists_sync_state_under_synchronous_commit():
+    store = SourceStoreDouble()
+    syncer = PostgresSync(store)
+    docs = [{"source_identity": "doc-1"}, {"source_identity": "doc-2"}]
+    with mock.patch.object(syncer, "_restore_record", side_effect=AssertionError("re-ingest")):
+        result = syncer.ack_committed(docs)
+    assert result == {"uploaded": True, "durable": True, "backend": "postgres", "records": 2}
+    assert "synchronous_commit" in store.events
+    assert "sync_state" in store.events
+    assert store.commits == 1
+    assert syncer.ack_persisted == syncer.ack_committed
+
+
+def test_ack_committed_fails_closed_when_unavailable():
+    store = SourceStoreDouble()
+    syncer = PostgresSync(store)
+    store.available = False
+    result = syncer.ack_committed([{"source_identity": "doc-1"}])
+    assert result == {"uploaded": False, "durable": False, "reason": "postgres_unavailable"}
+    assert syncer.restore_failed is True
+
+    store.available = True
+    syncer.check_ready()
+    store.fail_commit = True
+    result = syncer.ack_committed([{"source_identity": "doc-1"}])
+    assert result == {"uploaded": False, "durable": False, "reason": "postgres_unavailable"}
+    assert syncer.restore_failed is True
+    assert store.events[-1] == "rollback"
+
+
+def test_ingest_documents_fails_closed_when_ack_committed_unavailable():
+    store = SourceStoreDouble()
+    syncer = PostgresSync(store)
+    app = SimpleNamespace(store=store, syncer=syncer)
+    docs = [{"source_identity": "fail-1", "source_version": "v1", "content_hash": "hash-fail-1", "raw_text": "text"}]
+    with mock.patch.object(server, "prepare_ingest_documents", return_value=docs), \
+         mock.patch.object(syncer, "ack_committed", return_value={"uploaded": False, "durable": False, "reason": "postgres_unavailable"}):
+        result = server.ingest_documents(app, docs)
+    assert result["durable"] is False
+    assert result["sync"]["reason"] == "postgres_unavailable"
+    assert "update_native_index" in store.events
+
+
+def test_sync_committed_documents_falls_back_to_upload():
+    store = SourceStoreDouble()
+    docs = [{"source_identity": "doc-fallback"}]
+
+    class FallbackSyncer:
+        def __init__(self, store):
+            self.store = store
+            self.uploaded = []
+        def upload(self, canonical):
+            self.uploaded.append(canonical)
+            return {"uploaded": True, "durable": True, "records": len(canonical)}
+
+    syncer1 = FallbackSyncer(store)
+    app1 = SimpleNamespace(store=store, syncer=syncer1)
+    res1 = server._sync_committed_documents(app1, docs)
+    assert res1["durable"] is True
+    assert syncer1.uploaded == [docs]
+
+    different_store = SourceStoreDouble()
+    syncer2 = PostgresSync(different_store)
+    syncer2.upload = mock.Mock(return_value={"uploaded": True, "durable": True, "records": 1})
+    app2 = SimpleNamespace(store=store, syncer=syncer2)
+    res2 = server._sync_committed_documents(app2, docs)
+    assert res2["durable"] is True
+    syncer2.upload.assert_called_once_with(docs)

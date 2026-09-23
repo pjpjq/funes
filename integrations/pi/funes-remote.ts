@@ -2,7 +2,7 @@
 // machine-specific value; settings come from env/config/Keychain at runtime.
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { execFileSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 
 export function configuredRemoteUrl(): string {
@@ -58,14 +58,49 @@ function zshrcEnv(name: "FUNES_API_TOKEN" | "FUNES_HF_TOKEN" | "HF_TOKEN"): stri
   } catch { return ""; }
 }
 
-const token = process.env.FUNES_API_TOKEN || keychain("funes-api-token") || zshrcEnv("FUNES_API_TOKEN");
-const hubToken = process.env.FUNES_HF_TOKEN || process.env.HF_TOKEN || keychain("funes-hf-token") || zshrcEnv("FUNES_HF_TOKEN") || zshrcEnv("HF_TOKEN");
+function secretFileEnv(name: "FUNES_API_TOKEN" | "FUNES_HF_TOKEN" | "HF_TOKEN"): string {
+  if (process.platform !== "linux") return "";
+  const path = process.env.FUNES_ENV_FILE || `${process.env.HOME || homedir()}/.config/funes/env`;
+  try {
+    // This file is a process-environment fallback, not general shell syntax.
+    // Reject group/world-readable files and only accept literal assignments so
+    // starting pi can never evaluate commands from it.
+    const stat = statSync(path);
+    if (!stat.isFile()) return "";
+    if ((stat.mode & 0o077) !== 0) return "";
+    if (typeof process.getuid === "function" && stat.uid !== process.getuid()) return "";
+    for (const sourceLine of readFileSync(path, "utf8").split(/\r?\n/)) {
+      const line = sourceLine.trim().replace(/^export\s+/, "");
+      const value = line.match(/^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
+      if (!value || value[1] !== name) continue;
+      const raw = value[2].trim();
+      if (
+        raw.length >= 2
+        && ((raw.startsWith("'") && raw.endsWith("'"))
+          || (raw.startsWith('"') && raw.endsWith('"')))
+      ) return raw.slice(1, -1);
+      return raw;
+    }
+  } catch {}
+  return "";
+}
+
+const token = process.env.FUNES_API_TOKEN || secretFileEnv("FUNES_API_TOKEN") || keychain("funes-api-token") || zshrcEnv("FUNES_API_TOKEN");
+const hubToken = process.env.FUNES_HF_TOKEN || process.env.HF_TOKEN || secretFileEnv("FUNES_HF_TOKEN") || secretFileEnv("HF_TOKEN") || keychain("funes-hf-token") || zshrcEnv("FUNES_HF_TOKEN") || zshrcEnv("HF_TOKEN");
 
 function envNumber(name: string): number | undefined {
   const raw = process.env[name];
   if (raw === undefined || raw.trim() === "") return undefined;
   const value = Number(raw);
   return Number.isFinite(value) ? value : undefined;
+}
+
+function firstEnvNumber(names: string[]): number | undefined {
+  for (const name of names) {
+    const value = envNumber(name);
+    if (value !== undefined) return value;
+  }
+  return undefined;
 }
 
 function bounded(value: number | undefined, fallback: number, minimum: number, maximum: number): number {
@@ -90,7 +125,106 @@ const remoteAttemptTimeoutMs = bounded(
 const remoteReadyTimeoutMs = bounded((envNumber("FUNES_REMOTE_READY_TIMEOUT") ?? 8) * 1_000, 8_000, 1_000, 15_000);
 const remoteReadyPolls = Math.floor(bounded(envNumber("FUNES_REMOTE_READY_POLLS"), 8, 1, 30));
 
-type FetchResult = Awaited<ReturnType<typeof fetch>>;
+type FetchResponse = Awaited<ReturnType<typeof fetch>>;
+type FetchResult = {
+  response: FetchResponse;
+  value: unknown;
+  validJson: boolean;
+};
+
+type CallBudget = {
+  timeoutMs: number;
+  attempts: number;
+  attemptTimeoutMs: number;
+  readyTimeoutMs: number;
+  readyPolls: number;
+};
+
+const manualBudget: CallBudget = {
+  timeoutMs: remoteTimeoutMs,
+  attempts: remoteAttempts,
+  attemptTimeoutMs: remoteAttemptTimeoutMs,
+  readyTimeoutMs: remoteReadyTimeoutMs,
+  readyPolls: remoteReadyPolls,
+};
+
+const recallTimeoutMs = (() => {
+  const ms = firstEnvNumber(["FUNES_REMOTE_RECALL_TIMEOUT_MS", "FUNES_REMOTE_SEARCH_TIMEOUT_MS"]);
+  if (ms !== undefined) return bounded(ms, 18_000, 100, 60_000);
+  const sec = firstEnvNumber(["FUNES_REMOTE_RECALL_TIMEOUT", "FUNES_REMOTE_SEARCH_TIMEOUT"]);
+  if (sec !== undefined) return bounded(sec * 1_000, 18_000, 100, 60_000);
+  return 18_000;
+})();
+
+const recallAttempts = Math.floor(
+  bounded(
+    firstEnvNumber([
+      "FUNES_REMOTE_RECALL_ATTEMPTS",
+      "FUNES_REMOTE_SEARCH_ATTEMPTS",
+    ]),
+    2,
+    1,
+    5,
+  ),
+);
+
+const recallAttemptTimeoutMs = (() => {
+  const ms = firstEnvNumber([
+    "FUNES_REMOTE_RECALL_ATTEMPT_TIMEOUT_MS",
+    "FUNES_REMOTE_SEARCH_ATTEMPT_TIMEOUT_MS",
+  ]);
+  if (ms !== undefined) return bounded(ms, 8_000, 100, 30_000);
+  const sec = firstEnvNumber([
+    "FUNES_REMOTE_RECALL_ATTEMPT_TIMEOUT",
+    "FUNES_REMOTE_SEARCH_ATTEMPT_TIMEOUT",
+  ]);
+  if (sec !== undefined) return bounded(sec * 1_000, 8_000, 100, 30_000);
+  return 8_000;
+})();
+
+const manualRecallBudget: CallBudget = {
+  timeoutMs: recallTimeoutMs,
+  attempts: recallAttempts,
+  attemptTimeoutMs: recallAttemptTimeoutMs,
+  readyTimeoutMs: 2_000,
+  readyPolls: 1,
+};
+
+const autoRecallTimeoutMs = (() => {
+  const ms = firstEnvNumber([
+    "FUNES_REMOTE_AUTO_RECALL_TIMEOUT_MS",
+    "FUNES_REMOTE_AUTO_SEARCH_TIMEOUT_MS",
+  ]);
+  if (ms !== undefined) return bounded(ms, 2_500, 100, 10_000);
+  const sec = firstEnvNumber([
+    "FUNES_REMOTE_AUTO_RECALL_TIMEOUT",
+    "FUNES_REMOTE_AUTO_SEARCH_TIMEOUT",
+  ]);
+  if (sec !== undefined) return bounded(sec * 1_000, 2_500, 100, 10_000);
+  return 2_500;
+})();
+
+const autoRecallAttemptTimeoutMs = (() => {
+  const ms = firstEnvNumber([
+    "FUNES_REMOTE_AUTO_RECALL_ATTEMPT_TIMEOUT_MS",
+    "FUNES_REMOTE_AUTO_SEARCH_ATTEMPT_TIMEOUT_MS",
+  ]);
+  if (ms !== undefined) return bounded(ms, autoRecallTimeoutMs, 100, 10_000);
+  const sec = firstEnvNumber([
+    "FUNES_REMOTE_AUTO_RECALL_ATTEMPT_TIMEOUT",
+    "FUNES_REMOTE_AUTO_SEARCH_ATTEMPT_TIMEOUT",
+  ]);
+  if (sec !== undefined) return bounded(sec * 1_000, autoRecallTimeoutMs, 100, 10_000);
+  return autoRecallTimeoutMs;
+})();
+
+const automaticRecallBudget: CallBudget = {
+  timeoutMs: autoRecallTimeoutMs,
+  attempts: 1,
+  attemptTimeoutMs: autoRecallAttemptTimeoutMs,
+  readyTimeoutMs: 1_750,
+  readyPolls: 1,
+};
 
 class RequestTimeoutError extends Error {
   constructor() {
@@ -106,7 +240,18 @@ function now(): number {
 async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<FetchResult> {
   const controller = new AbortController();
   let timer: ReturnType<typeof setTimeout> | undefined;
-  const request = fetch(url, { ...init, redirect: "manual", signal: controller.signal });
+  const request = fetch(url, { ...init, redirect: "manual", signal: controller.signal }).then(
+    async (response): Promise<FetchResult> => {
+      if (statusOfResponse(response) === 204) {
+        return { response, value: undefined, validJson: false };
+      }
+      try {
+        return { response, value: await response.json(), validJson: true };
+      } catch {
+        return { response, value: undefined, validJson: false };
+      }
+    },
+  );
   const timeout = new Promise<never>((_, reject) => {
     timer = setTimeout(() => {
       controller.abort();
@@ -121,6 +266,10 @@ async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: numbe
 }
 
 function statusOf(response: FetchResult): number {
+  return statusOfResponse(response.response);
+}
+
+function statusOfResponse(response: FetchResponse): number {
   const status = Number(response.status);
   if (Number.isFinite(status) && status > 0) return status;
   return response.ok ? 200 : 500;
@@ -128,7 +277,7 @@ function statusOf(response: FetchResult): number {
 
 function isSuccess(response: FetchResult): boolean {
   const status = statusOf(response);
-  return response.ok || (status >= 200 && status < 300);
+  return response.response.ok || (status >= 200 && status < 300);
 }
 
 function isRetryableStatus(status: number): boolean {
@@ -137,14 +286,25 @@ function isRetryableStatus(status: number): boolean {
   return status === 408 || status === 425 || status === 429 || status >= 500;
 }
 
-function retryDelay(response: FetchResult | undefined, attempt: number): number {
+function retryDelay(response: FetchResult | undefined, attempt: number, recall: boolean = false): number {
   const exponential = Math.min(30_000, 1_000 * 2 ** (attempt + 1));
-  const retryAfter = response?.headers?.get("retry-after");
-  if (!retryAfter) return exponential;
-  const seconds = Number(retryAfter);
-  if (Number.isFinite(seconds) && seconds >= 0) return Math.max(exponential, Math.min(30_000, seconds * 1_000));
-  const date = Date.parse(retryAfter);
-  if (Number.isFinite(date)) return Math.max(exponential, Math.min(30_000, Math.max(0, date - now())));
+  const status = response ? statusOf(response) : 0;
+  const retryAfter = response?.response.headers?.get("retry-after");
+  if (retryAfter) {
+    const seconds = Number(retryAfter);
+    if (Number.isFinite(seconds) && seconds >= 0) {
+      const ms = seconds * 1_000;
+      return recall ? Math.min(30_000, ms) : Math.max(exponential, Math.min(30_000, ms));
+    }
+    const date = Date.parse(retryAfter);
+    if (Number.isFinite(date)) {
+      const ms = Math.max(0, date - now());
+      return recall ? Math.min(30_000, ms) : Math.max(exponential, Math.min(30_000, ms));
+    }
+  }
+  if (recall && status === 503) {
+    return 500;
+  }
   return exponential;
 }
 
@@ -161,16 +321,12 @@ type ReadyState = "ready" | "warming" | "transient" | "unknown" | "permanent";
 
 async function probeReady(headers: Record<string, string>, timeoutMs: number): Promise<ReadyState> {
   try {
-    const response = await fetchWithTimeout(`${base}/ready`, { method: "GET", headers }, timeoutMs);
+    const response = await fetchWithTimeout(`${base}/ready/search`, { method: "GET", headers }, timeoutMs);
     const status = statusOf(response);
     if (!isSuccess(response)) return isRetryableStatus(status) ? "transient" : "permanent";
     if (status === 204) return "ready";
-    let value: unknown;
-    try {
-      value = await response.json();
-    } catch {
-      return "unknown";
-    }
+    if (!response.validJson) return "unknown";
+    const value = response.value;
     if (!value || typeof value !== "object") return "ready";
     const payload = value as Record<string, unknown>;
     const warm = payload.native_warm;
@@ -185,14 +341,14 @@ async function probeReady(headers: Record<string, string>, timeoutMs: number): P
   }
 }
 
-async function waitUntilReady(headers: Record<string, string>, deadline: number): Promise<ReadyState> {
+async function waitUntilReady(headers: Record<string, string>, deadline: number, budget: CallBudget): Promise<ReadyState> {
   let state: ReadyState = "transient";
-  for (let poll = 0; poll < remoteReadyPolls; poll += 1) {
+  for (let poll = 0; poll < budget.readyPolls; poll += 1) {
     const remaining = deadline - now();
     if (remaining <= 0) break;
-    state = await probeReady(headers, Math.min(remoteReadyTimeoutMs, remaining));
+    state = await probeReady(headers, Math.min(budget.readyTimeoutMs, remaining));
     if (state === "ready" || state === "unknown" || state === "permanent") return state;
-    if (poll + 1 >= remoteReadyPolls) break;
+    if (poll + 1 >= budget.readyPolls) break;
     // A warming response is expected during a cold Space start. Keep the poll
     // interval short, but let the shared deadline stop it deterministically.
     if (!(await sleepUntil(2_000, deadline))) break;
@@ -208,7 +364,9 @@ function shouldRecall(prompt: string): boolean {
   return /(之前|上次|历史|做过|决定|决策|测试结果|偏好|已有实现|为什么放弃|以前|回忆|prior|previous|history|earlier|last time|we decided|decision|past work|preference|already implemented|old bug|regression)/i.test(prompt);
 }
 
-async function call(path: string, body: Record<string, unknown>) {
+async function call(path: string, body: Record<string, unknown>, budget?: CallBudget) {
+  const isRecall = path === "/search" || path === "/recall";
+  const activeBudget = budget ?? (isRecall ? manualRecallBudget : manualBudget);
   if (!base || !token) return null;
   let encodedBody: string;
   try {
@@ -225,9 +383,12 @@ async function call(path: string, body: Record<string, unknown>) {
     headers.Authorization = `Bearer ${token}`;
   }
 
-  const deadline = now() + remoteTimeoutMs;
-  if (path === "/search" || path === "/recall") {
-    const ready = await waitUntilReady(headers, deadline);
+  const deadline = now() + activeBudget.timeoutMs;
+  // /search already owns its cold-restore/degraded behavior. Giving a
+  // readiness probe inside the bounded automatic budget can suppress an
+  // otherwise successful recall, so only the legacy /recall path preflights.
+  if (path === "/recall") {
+    const ready = await waitUntilReady(headers, deadline, activeBudget);
     // A permanent readiness response (most commonly 401/403) must not be
     // followed by a duplicate POST. A still-warming service can be queried if
     // the bounded poll count was reached before the overall deadline.
@@ -235,7 +396,7 @@ async function call(path: string, body: Record<string, unknown>) {
   }
 
   let lastResponse: FetchResult | undefined;
-  for (let attempt = 0; attempt < remoteAttempts; attempt += 1) {
+  for (let attempt = 0; attempt < activeBudget.attempts; attempt += 1) {
     const remaining = deadline - now();
     if (remaining <= 0) break;
     lastResponse = undefined;
@@ -247,16 +408,13 @@ async function call(path: string, body: Record<string, unknown>) {
           headers,
           body: encodedBody,
         },
-        Math.min(remoteAttemptTimeoutMs, remaining),
+        Math.min(activeBudget.attemptTimeoutMs, remaining),
       );
       const status = statusOf(response);
       if (isSuccess(response)) {
-        try {
-          return await response.json();
-        } catch {
-          // A truncated/invalid JSON body is transient; let the bounded retry
-          // loop recover without changing the response shape for valid calls.
-        }
+        if (response.validJson) return response.value;
+        // A truncated/invalid JSON body is transient; let the bounded retry
+        // loop recover without changing the response shape for valid calls.
       } else {
         // Never retry authentication or other caller errors.  Only provider /
         // gateway failures and explicit rate limits are transient here.
@@ -268,10 +426,10 @@ async function call(path: string, body: Record<string, unknown>) {
       // are bounded by the shared deadline and safe to retry.
     }
 
-    if (attempt + 1 >= remoteAttempts) break;
+    if (attempt + 1 >= activeBudget.attempts) break;
     const remainingAfterAttempt = deadline - now();
     if (remainingAfterAttempt <= 0) break;
-    if (!(await sleepUntil(retryDelay(lastResponse, attempt), deadline))) break;
+    if (!(await sleepUntil(retryDelay(lastResponse, attempt, isRecall), deadline))) break;
   }
   return null;
 }
@@ -282,19 +440,28 @@ export default function funesRemote(pi: ExtensionAPI) {
     label: "funes recall",
     description: "Search unified Codex, Pi and Claude memory and return original raw context.",
     parameters: { type: "object", properties: { query: { type: "string" }, limit: { type: "integer" } }, required: ["query"] },
-    execute: async (_id: string, args: Record<string, unknown>) => ({ content: [{ type: "text", text: JSON.stringify(await call("/search", args), null, 2) }], details: {} }),
+    execute: async (_id: string, args: Record<string, unknown>) => ({ content: [{ type: "text", text: JSON.stringify(await call("/search", args, manualRecallBudget), null, 2) }], details: {} }),
   });
   pi.registerTool({
     name: "funes_get",
     label: "funes get",
     description: "Read one original unified memory record.",
     parameters: { type: "object", properties: { record_id: { type: "string" } }, required: ["record_id"] },
-    execute: async (_id: string, args: Record<string, unknown>) => ({ content: [{ type: "text", text: JSON.stringify(await call("/get", { id: args.record_id }), null, 2) }], details: {} }),
+    execute: async (_id: string, args: Record<string, unknown>) => ({ content: [{ type: "text", text: JSON.stringify(await call("/get", { id: args.record_id }, manualBudget), null, 2) }], details: {} }),
   });
   pi.on("before_agent_start", async (event) => {
     const prompt = String(event.prompt || "").trim();
     if (!shouldRecall(prompt)) return;
-    const result: any = await call("/search", { query: prompt, limit: 5 });
+    let result: any;
+    try {
+      result = await call(
+        "/search",
+        { query: prompt, limit: 5 },
+        automaticRecallBudget,
+      );
+    } catch {
+      return;
+    }
     const hits = Array.isArray(result?.results) ? result.results : [];
     if (!hits.length) return;
     const context = hits.map((hit: any, i: number) => `${i + 1}. ${String(hit.raw_text || "").slice(0, 1200)}`).join("\n");

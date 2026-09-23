@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import subprocess
 import sys
@@ -76,11 +77,19 @@ def warm_interval() -> float:
     return min(max(value, 0.0), 3600.0)
 
 
-def stamp_path(base: str) -> Path:
+def canonical_memory_ref(value: str) -> str:
+    memory = str(value or "").strip().rstrip("/")
+    prefix = "hf://datasets/"
+    return memory[len(prefix) :] if memory.startswith(prefix) else memory
+
+
+def stamp_path(base: str, memory: str = "") -> Path:
     state_dir = Path(
         os.environ.get("FUNES_SYNC_STATE_DIR", "~/.local/share/funes-sync")
     ).expanduser()
-    remote_hash = hashlib.sha256(base.encode("utf-8")).hexdigest()[:16]
+    remote_hash = hashlib.sha256(
+        (base + "\0" + canonical_memory_ref(memory)).encode("utf-8")
+    ).hexdigest()[:16]
     return state_dir / f"native-warm-{remote_hash}.last-success"
 
 
@@ -103,7 +112,8 @@ def main() -> None:
     base = os.environ.get("FUNES_REMOTE_URL", "").rstrip("/")
     if not base:
         return
-    stamp = stamp_path(base)
+    memory = os.environ.get("FUNES_NATIVE_MEMORY", "").strip()
+    stamp = stamp_path(base, memory)
     if recently_warmed(stamp, warm_interval()):
         return
 
@@ -126,8 +136,12 @@ def main() -> None:
     }
     if hub_token:
         headers["Authorization"] = "Bearer " + hub_token
+    payload = {"memory": memory} if memory else {}
     request = urllib.request.Request(
-        base + "/warm", data=b"{}", headers=headers, method="POST"
+        base + "/warm",
+        data=json.dumps(payload, separators=(",", ":")).encode(),
+        headers=headers,
+        method="POST",
     )
     try:
         opener = urllib.request.build_opener(NoRedirectHandler())

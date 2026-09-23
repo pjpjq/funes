@@ -25,6 +25,7 @@ import urllib.error
 import urllib.request
 import zlib
 from collections import Counter
+from contextlib import closing
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -41,7 +42,42 @@ FIELDS = (
     "retrieval_updated_at", "native_index_version", "native_index_status",
     "native_index_profile", "native_index_memory", "native_indexed_at",
     "native_index_error", "retrieval_generation",
+    "native_generation", "embedding_generation",
+)
+SOURCE_METADATA_FIELDS = (
+    "device_id",
+    "project",
+    "repo",
+    "worktree",
+    "source_agent",
+    "source_type",
+    "session_id",
+    "message_id",
+    "role",
+    "timestamp",
+    "source_path",
+    "agent_type",
+    "parent_session_id",
+    "agent_id",
+)
+SOURCE_METADATA_CLOCK_FIELDS = (*SOURCE_METADATA_FIELDS, "metadata_json")
+SOURCE_METADATA_CLOCK_KEY = "_source_metadata_clocks"
+DERIVED_INPUT_FIELDS = (
+    "retrieval_text",
+    "translation_hash",
+    "translation_version",
+    "translation_status",
+    "retrieval_updated_at",
+    "native_index_version",
+    "native_index_status",
+    "native_index_profile",
+    "native_index_memory",
+    "native_indexed_at",
+    "native_index_error",
+    "retrieval_generation",
     "native_generation",
+    "embedding_generation",
+    "source_missing",
 )
 CJK_RE = re.compile(r"[\u3400-\u9fff\uf900-\ufaff]")
 PROMPT_VERSION = "funes-retrieval-v2"
@@ -56,8 +92,23 @@ NATIVE_SESSION_TYPES = {
 }
 LOW_VALUE_CONTENT_TYPES = {"tool_call", "tool_result", "shell_output", "progress"}
 NATIVE_TERMINAL_STATUSES = {"indexed", "held_secret", "held_invalid"}
-NATIVE_CHECKPOINT_STATE_VERSION = 1
+NATIVE_CHECKPOINT_STATE_VERSION = 2
 FTS_SCHEMA_VERSION = 3
+
+
+def _is_legacy_codex_automation_output(
+    source_agent: object, source_type: object, source_path: object
+) -> bool:
+    """Identify old automation run output that was once imported as memory."""
+    path = str(source_path or "").replace("\\", "/").lower()
+    return (
+        str(source_agent or "").lower() == "codex"
+        and str(source_type or "").lower() == "memory"
+        and "/.codex/automations/" in path
+        and not path.endswith((".md", ".toml"))
+    )
+
+
 RETRIEVAL_PROMPT = """You are a retrieval normalization engine.
 Convert the natural-language Chinese portions of the input into concise English optimized for semantic retrieval.
 Rules:
@@ -210,6 +261,48 @@ def stable_rrf(
     return [items[key] for key in ordered[:limit]]
 
 
+MEMORIES_SECONDARY_INDEXES: tuple[tuple[str, str], ...] = (
+    (
+        "memories_source_agent_role_idx",
+        "CREATE INDEX IF NOT EXISTS memories_source_agent_role_idx ON memories(source_agent, role)",
+    ),
+    (
+        "memories_source_agent_type_idx",
+        "CREATE INDEX IF NOT EXISTS memories_source_agent_type_idx ON memories(source_agent, source_type)",
+    ),
+    (
+        "memories_translation_pending_idx",
+        """CREATE INDEX IF NOT EXISTS memories_translation_pending_idx
+        ON memories(updated_at,id)
+        WHERE translation_status='pending_provider'
+        AND COALESCE(native_index_status, '') != 'waiting_durability'""",
+    ),
+    (
+        "memories_canonical_pending_idx",
+        """CREATE INDEX IF NOT EXISTS memories_canonical_pending_idx
+        ON memories(
+            CASE WHEN native_index_status='retry' THEN 1 ELSE 0 END,
+            COALESCE(retrieval_updated_at,updated_at),id)
+        WHERE native_index_pending=1""",
+    ),
+)
+
+MEMORIES_GENERATION_INDEXES: tuple[tuple[str, str], ...] = (
+    (
+        "memories_retrieval_generation_idx",
+        "CREATE INDEX IF NOT EXISTS memories_retrieval_generation_idx ON memories(retrieval_generation)",
+    ),
+    (
+        "memories_native_generation_idx",
+        "CREATE INDEX IF NOT EXISTS memories_native_generation_idx ON memories(native_generation)",
+    ),
+    (
+        "memories_embedding_generation_idx",
+        "CREATE INDEX IF NOT EXISTS memories_embedding_generation_idx ON memories(embedding_generation)",
+    ),
+)
+
+
 class Store:
     def __init__(self, data_dir: str):
         self.data_dir = Path(data_dir)
@@ -224,7 +317,26 @@ class Store:
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA busy_timeout=5000")
         self._bulk_restore_depth = 0
+        self._bulk_restore_prev_pragmas: dict[str, Any] | None = None
         self._init_schema()
+
+    def _read_connection(self) -> sqlite3.Connection:
+        """Open a short-lived WAL reader that never waits on ``self.lock``.
+
+        The main connection and Python lock serialize durable writes.  Recall
+        and get are read-only and SQLite WAL can safely serve their last
+        committed snapshot while an ingest transaction is active.
+        """
+        conn = sqlite3.connect(
+            f"file:{self.db_path}?mode=ro",
+            uri=True,
+            check_same_thread=False,
+            timeout=5,
+        )
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA query_only=ON")
+        conn.execute("PRAGMA busy_timeout=5000")
+        return conn
 
     def _init_schema(self) -> None:
         with self.conn:
@@ -238,6 +350,7 @@ class Store:
                     retrieval_text TEXT NOT NULL,
                     search_identifiers TEXT NOT NULL DEFAULT '',
                     metadata_json TEXT NOT NULL DEFAULT '{}',
+                    source_metadata_clock_json TEXT NOT NULL DEFAULT '{}',
                     source_agent TEXT, source_type TEXT, device_id TEXT, project TEXT,
                     repo TEXT, worktree TEXT, session_id TEXT, message_id TEXT, role TEXT,
                     timestamp TEXT, source_path TEXT, content_hash TEXT NOT NULL,
@@ -252,6 +365,7 @@ class Store:
                     native_index_pending INTEGER NOT NULL DEFAULT 1,
                     retrieval_generation INTEGER NOT NULL DEFAULT 0,
                     native_generation INTEGER NOT NULL DEFAULT 0,
+                    embedding_generation INTEGER NOT NULL DEFAULT 0,
                     UNIQUE(source_identity)
                 );
                 CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
@@ -267,6 +381,7 @@ class Store:
                     snapshot_path TEXT, restored_at TEXT,
                     native_optimize_provider TEXT, native_optimize_model TEXT,
                     native_optimize_dimensions INTEGER, native_optimize_schema_version INTEGER,
+                    native_optimize_layout_version INTEGER NOT NULL DEFAULT 0,
                     native_optimize_memory TEXT,
                     native_optimize_fingerprint TEXT, native_optimize_index_fingerprint TEXT,
                     native_optimize_status TEXT, native_optimized_at TEXT,
@@ -279,7 +394,8 @@ class Store:
                     native_held_count INTEGER NOT NULL DEFAULT 0,
                     native_invalid_count INTEGER NOT NULL DEFAULT 0,
                     native_checkpoint_state_version INTEGER NOT NULL DEFAULT 0,
-                    fts_schema_version INTEGER NOT NULL DEFAULT 0
+                    fts_schema_version INTEGER NOT NULL DEFAULT 0,
+                    fts_ready INTEGER NOT NULL DEFAULT 1
                 );
                 INSERT OR IGNORE INTO sync_state(id) VALUES(1);
                 CREATE TABLE IF NOT EXISTS reindex_controls (
@@ -289,10 +405,6 @@ class Store:
                     row_cursor INTEGER NOT NULL DEFAULT 0,
                     applied_at TEXT
                 );
-                CREATE INDEX IF NOT EXISTS memories_source_agent_role_idx
-                    ON memories(source_agent, role);
-                CREATE INDEX IF NOT EXISTS memories_source_agent_type_idx
-                    ON memories(source_agent, source_type);
                 """
             )
             # Upgrades from the first HTTP prototype are additive and safe on a
@@ -316,15 +428,25 @@ class Store:
                 self.conn.execute(
                     "ALTER TABLE memories ADD COLUMN search_identifiers TEXT NOT NULL DEFAULT ''"
                 )
+            if "source_metadata_clock_json" not in columns:
+                self.conn.execute(
+                    """ALTER TABLE memories ADD COLUMN source_metadata_clock_json
+                    TEXT NOT NULL DEFAULT '{}'"""
+                )
             if "native_index_pending" not in columns:
                 self.conn.execute(
                     "ALTER TABLE memories ADD COLUMN native_index_pending INTEGER NOT NULL DEFAULT 1"
                 )
-            for name in ("retrieval_generation", "native_generation"):
+            for name in (
+                "retrieval_generation",
+                "native_generation",
+                "embedding_generation",
+            ):
                 if name not in columns:
                     self.conn.execute(
                         f"ALTER TABLE memories ADD COLUMN {name} INTEGER NOT NULL DEFAULT 0"
                     )
+            self._create_generation_indexes_locked()
             cache_columns = {row[1] for row in self.conn.execute("PRAGMA table_info(translation_cache)")}
             for name in ("translation_hash", "translation_version", "translation_status"):
                 if name not in cache_columns:
@@ -335,6 +457,7 @@ class Store:
                 ("native_optimize_model", "TEXT"),
                 ("native_optimize_dimensions", "INTEGER"),
                 ("native_optimize_schema_version", "INTEGER"),
+                ("native_optimize_layout_version", "INTEGER NOT NULL DEFAULT 0"),
                 ("native_optimize_memory", "TEXT"),
                 ("native_optimize_fingerprint", "TEXT"),
                 ("native_optimize_index_fingerprint", "TEXT"),
@@ -350,6 +473,10 @@ class Store:
                 ("native_invalid_count", "INTEGER NOT NULL DEFAULT 0"),
                 ("native_checkpoint_state_version", "INTEGER NOT NULL DEFAULT 0"),
                 ("fts_schema_version", "INTEGER NOT NULL DEFAULT 0"),
+                # Existing databases already have a complete FTS built by the
+                # pre-readiness code. Only begin_bulk_restore() may invalidate
+                # it, so the migration default must preserve that state.
+                ("fts_ready", "INTEGER NOT NULL DEFAULT 1"),
             ):
                 if name not in sync_columns:
                     self.conn.execute(f"ALTER TABLE sync_state ADD COLUMN {name} {sql_type}")
@@ -370,10 +497,22 @@ class Store:
                 ).fetchone()[0]
                 or 0
             )
-            if (
-                fts_columns != ["raw_text", "retrieval_text", "search_identifiers"]
-                or fts_version < FTS_SCHEMA_VERSION
-            ):
+            fts_ready = bool(
+                self.conn.execute(
+                    "SELECT fts_ready FROM sync_state WHERE id=1"
+                ).fetchone()[0]
+            )
+            rebuild_incomplete_fts = os.getenv(
+                "FUNES_BULK_RESTORE_REBUILD_FTS", "true"
+            ).strip().lower() in {"1", "true", "yes", "on"}
+            expected_fts_columns = ["raw_text", "retrieval_text", "search_identifiers"]
+            fts_shape_mismatch = fts_columns != expected_fts_columns
+            should_rebuild_fts = (
+                fts_shape_mismatch
+                or (fts_ready and fts_version < FTS_SCHEMA_VERSION)
+                or (not fts_ready and rebuild_incomplete_fts)
+            )
+            if fts_shape_mismatch or should_rebuild_fts:
                 # The first sidecar indexed only the derived retrieval shadow.
                 # Rebuild exactly once at startup so existing durable raw rows
                 # become the primary lexical source without client re-upload.
@@ -382,20 +521,22 @@ class Store:
                     """UPDATE memories SET search_identifiers=
                     funes_identifiers(raw_text, retrieval_text)"""
                 )
-                if fts_columns != [
-                    "raw_text", "retrieval_text", "search_identifiers"
-                ]:
+                if fts_shape_mismatch:
                     self.conn.execute("DROP TABLE memories_fts")
                     self.conn.execute(
                         """CREATE VIRTUAL TABLE memories_fts USING fts5(
                         raw_text, retrieval_text, search_identifiers,
                         content='memories', content_rowid='id', tokenize='unicode61')"""
                     )
-                self.conn.execute("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')")
-                self.conn.execute(
-                    "UPDATE sync_state SET fts_schema_version=? WHERE id=1",
-                    (FTS_SCHEMA_VERSION,),
-                )
+                if should_rebuild_fts:
+                    self.conn.execute(
+                        "INSERT INTO memories_fts(memories_fts) VALUES('rebuild')"
+                    )
+                    self.conn.execute(
+                        """UPDATE sync_state SET fts_schema_version=?,fts_ready=1
+                        WHERE id=1""",
+                        (FTS_SCHEMA_VERSION,),
+                    )
             self._create_fts_triggers_locked()
 
             native_state_version = int(
@@ -406,6 +547,22 @@ class Store:
             )
             if native_state_version < NATIVE_CHECKPOINT_STATE_VERSION:
                 self._drop_native_state_triggers_locked()
+                # Early unified-memory builds imported every Codex automation
+                # run/evaluation file as durable memory. Discovery has since
+                # been narrowed to instructions and explicit memory files, but
+                # restored source snapshots can still contain those large
+                # legacy rows. Keep their raw text and lexical availability;
+                # classify them as existing low-value progress so checkpoint
+                # rebuilds never send them through a paid embedder again.
+                self.conn.execute(
+                    """UPDATE memories SET content_type='progress'
+                    WHERE lower(COALESCE(source_agent,''))='codex'
+                    AND lower(COALESCE(source_type,''))='memory'
+                    AND replace(lower(COALESCE(source_path,'')),char(92),'/')
+                        LIKE '%/.codex/automations/%'
+                    AND lower(COALESCE(source_path,'')) NOT LIKE '%.md'
+                    AND lower(COALESCE(source_path,'')) NOT LIKE '%.toml'"""
+                )
                 state = self.conn.execute(
                     """SELECT native_checkpoint_profile,native_checkpoint_memory,
                     native_optimize_fingerprint,native_optimize_memory
@@ -437,19 +594,65 @@ class Store:
                     profile, memory, initialize=True
                 )
             self._create_native_state_triggers_locked()
-            self.conn.execute(
-                """CREATE INDEX IF NOT EXISTS memories_translation_pending_idx
-                ON memories(updated_at,id)
-                WHERE translation_status='pending_provider'
-                AND COALESCE(native_index_status, '') != 'waiting_durability'"""
-            )
-            self.conn.execute(
-                """CREATE INDEX IF NOT EXISTS memories_canonical_pending_idx
-                ON memories(
-                    CASE WHEN native_index_status='retry' THEN 1 ELSE 0 END,
-                    COALESCE(retrieval_updated_at,updated_at),id)
-                WHERE native_index_pending=1"""
-            )
+            self._create_secondary_indexes_locked()
+
+    def _drop_secondary_indexes_locked(self) -> None:
+        for name, _ in MEMORIES_SECONDARY_INDEXES:
+            self.conn.execute(f"DROP INDEX IF EXISTS {name}")
+
+    def _create_generation_indexes_locked(self) -> None:
+        for _name, sql in MEMORIES_GENERATION_INDEXES:
+            self.conn.execute(sql)
+
+    def _create_secondary_indexes_locked(self) -> None:
+        for _name, sql in MEMORIES_SECONDARY_INDEXES:
+            self.conn.execute(sql)
+
+    def _save_and_apply_bulk_pragmas_locked(self) -> None:
+        if self._bulk_restore_prev_pragmas is None:
+            prev_sync = self.conn.execute("PRAGMA synchronous").fetchone()[0]
+            prev_cache = self.conn.execute("PRAGMA cache_size").fetchone()[0]
+            prev_mmap = self.conn.execute("PRAGMA mmap_size").fetchone()[0]
+            self._bulk_restore_prev_pragmas = {
+                "synchronous": prev_sync,
+                "cache_size": prev_cache,
+                "mmap_size": prev_mmap,
+            }
+
+        sync_val = os.getenv("FUNES_BULK_RESTORE_SYNCHRONOUS", "NORMAL").strip().upper()
+        if sync_val in ("OFF", "0"):
+            self.conn.execute("PRAGMA synchronous = OFF")
+        elif sync_val in ("NORMAL", "1"):
+            self.conn.execute("PRAGMA synchronous = NORMAL")
+        elif sync_val in ("FULL", "2"):
+            self.conn.execute("PRAGMA synchronous = FULL")
+        elif sync_val:
+            self.conn.execute(f"PRAGMA synchronous = {sync_val}")
+
+        cache_val = os.getenv("FUNES_BULK_RESTORE_CACHE_SIZE", "-64000").strip()
+        try:
+            self.conn.execute(f"PRAGMA cache_size = {int(cache_val)}")
+        except (ValueError, sqlite3.OperationalError):
+            self.conn.execute("PRAGMA cache_size = -64000")
+
+        mmap_val = os.getenv("FUNES_BULK_RESTORE_MMAP_SIZE", str(256 * 1024 * 1024)).strip()
+        try:
+            self.conn.execute(f"PRAGMA mmap_size = {int(mmap_val)}")
+        except (ValueError, sqlite3.OperationalError):
+            self.conn.execute("PRAGMA mmap_size = 268435456")
+
+    def _restore_pragmas_locked(self) -> None:
+        prev = self._bulk_restore_prev_pragmas
+        self._bulk_restore_prev_pragmas = None
+        if not prev:
+            return
+        if "synchronous" in prev:
+            self.conn.execute(f"PRAGMA synchronous = {prev['synchronous']}")
+        if "cache_size" in prev:
+            self.conn.execute(f"PRAGMA cache_size = {prev['cache_size']}")
+        if "mmap_size" in prev:
+            self.conn.execute(f"PRAGMA mmap_size = {prev['mmap_size']}")
+        self.conn.execute("PRAGMA shrink_memory")
 
     def _drop_fts_triggers_locked(self) -> None:
         for trigger in ("memories_ai", "memories_ad", "memories_au"):
@@ -572,7 +775,7 @@ class Store:
                 content_hash,content_type,source_missing,translation_hash,
                 translation_version,native_index_version,native_index_status,
                 native_index_profile,native_index_memory,native_indexed_at,
-                native_generation ON memories
+                native_generation,embedding_generation ON memories
             WHEN (old.source_identity IS NOT new.source_identity
                 OR old.source_version IS NOT new.source_version
                 OR old.raw_text IS NOT new.raw_text
@@ -587,7 +790,8 @@ class Store:
                 OR old.native_index_profile IS NOT new.native_index_profile
                 OR old.native_index_memory IS NOT new.native_index_memory
                 OR old.native_indexed_at IS NOT new.native_indexed_at
-                OR old.native_generation IS NOT new.native_generation)
+                OR old.native_generation IS NOT new.native_generation
+                OR old.embedding_generation IS NOT new.embedding_generation)
             BEGIN
             UPDATE sync_state SET
                 native_index_revision=native_index_revision+
@@ -702,6 +906,16 @@ class Store:
         created = updated = deduped = 0
         results = []
         with self.lock, self.conn:
+            default_embedding_generation: int | None = None
+
+            def get_default_embedding_generation() -> int:
+                nonlocal default_embedding_generation
+                if default_embedding_generation is None:
+                    default_embedding_generation = (
+                        self._latest_embedding_generation_locked()
+                    )
+                return default_embedding_generation
+
             for doc in docs:
                 raw = str(doc.get("raw_text", doc.get("text", "")))
                 if not raw:
@@ -709,46 +923,89 @@ class Store:
                 retrieval = str(doc.get("retrieval_text") or normalize_text(raw))
                 search_identifiers = technical_index_text(raw, retrieval)
                 metadata = dict(doc.get("metadata") or {})
+
+                def supplied(name: str) -> bool:
+                    return name in doc or name in metadata
+
+                def incoming(name: str) -> Any:
+                    return doc[name] if name in doc else metadata.get(name)
+
                 source_identity = str(doc.get("source_identity") or self._identity(doc, metadata, raw))
                 source_version = str(doc.get("source_version", metadata.get("source_version", "")))
                 content_hash = hashlib.sha256(raw.encode("utf-8")).hexdigest()
                 now = utc_now()
+                incoming_updated_explicit = (
+                    "updated_at" in doc or "updated_at" in metadata
+                )
+                incoming_metadata_clocks_explicit = (
+                    SOURCE_METADATA_CLOCK_KEY in doc
+                )
                 incoming_updated = doc.get("updated_at", metadata.get("updated_at")) or now
+                incoming_metadata_clocks = self._incoming_source_metadata_clocks(
+                    doc.get(SOURCE_METADATA_CLOCK_KEY), incoming_updated
+                )
+                incoming_metadata_clock_json = (
+                    self._serialize_source_metadata_clocks(
+                        incoming_metadata_clocks
+                    )
+                )
                 row = self.conn.execute(
-                    """SELECT id, content_hash, source_version, updated_at, retrieval_text,
+                    """SELECT id, content_hash, source_version, updated_at, raw_text, retrieval_text,
+                    metadata_json, source_metadata_clock_json,
+                    device_id, project, repo, worktree, source_agent,
+                    source_type, session_id, message_id, role, timestamp, source_path,
+                    agent_type, parent_session_id, agent_id,
                     translation_hash, translation_version, translation_status,
                     retrieval_updated_at, native_index_version, native_index_status,
                     native_index_profile, native_index_memory, native_indexed_at,
                     native_index_error, source_missing,
-                    retrieval_generation, native_generation
+                    retrieval_generation, native_generation, embedding_generation
                     FROM memories WHERE source_identity=?""",
                     (source_identity,),
                 ).fetchone()
                 values = {k: doc.get(k, metadata.get(k)) for k in FIELDS if k not in ("content_hash", "ingested_at", "updated_at")}
+                if _is_legacy_codex_automation_output(
+                    values.get("source_agent"),
+                    values.get("source_type"),
+                    values.get("source_path"),
+                ):
+                    # Pre-filter releases briefly discovered automation run
+                    # logs as persistent memory. Retain their raw source while
+                    # keeping operational output out of paid embeddings.
+                    values["content_type"] = "progress"
                 values["source_missing"] = int(bool(values.get("source_missing", False)))
                 values["retrieval_generation"] = int(values.get("retrieval_generation") or 0)
                 values["native_generation"] = int(values.get("native_generation") or 0)
+                embedding_generation_supplied = (
+                    supplied("embedding_generation")
+                )
+                incoming_embedding_generation = int(
+                    values.get("embedding_generation") or 0
+                )
+                if row is not None:
+                    incoming_embedding_generation = max(
+                        incoming_embedding_generation
+                        if embedding_generation_supplied
+                        else int(row["embedding_generation"] or 0),
+                        int(row["embedding_generation"] or 0),
+                    )
+                elif embedding_generation_supplied:
+                    pass
+                else:
+                    incoming_embedding_generation = max(
+                        incoming_embedding_generation,
+                        get_default_embedding_generation(),
+                    )
+                values["embedding_generation"] = incoming_embedding_generation
                 if row and row["content_hash"] == content_hash and row["source_version"] == source_version:
                     derived_supplied = any(
-                        name in doc
-                        for name in (
-                            "retrieval_text",
-                            "translation_hash",
-                            "translation_version",
-                            "translation_status",
-                            "retrieval_updated_at",
-                            "native_index_version",
-                            "native_index_status",
-                            "native_index_profile",
-                            "native_index_memory",
-                            "native_indexed_at",
-                            "native_index_error",
-                            "retrieval_generation",
-                            "native_generation",
-                            "source_missing",
-                        )
+                        supplied(name) for name in DERIVED_INPUT_FIELDS
                     )
-                    incoming_status = values.get("translation_status") if "translation_status" in doc else row["translation_status"]
+                    incoming_status = (
+                        incoming("translation_status")
+                        if supplied("translation_status")
+                        else row["translation_status"]
+                    )
                     current_status = row["translation_status"]
                     retryable = {"pending_provider", "fallback_provider_error", "fallback_no_provider"}
                     final = {
@@ -759,12 +1016,24 @@ class Store:
                         "skipped_low_value",
                     }
                     would_regress = current_status in final and incoming_status in retryable
-                    incoming_retrieval = retrieval if "retrieval_text" in doc else row["retrieval_text"]
-                    incoming_translation_hash = values.get("translation_hash") if "translation_hash" in doc else row["translation_hash"]
-                    incoming_translation_version = values.get("translation_version") if "translation_version" in doc else row["translation_version"]
+                    incoming_retrieval = (
+                        str(incoming("retrieval_text") or normalize_text(raw))
+                        if supplied("retrieval_text")
+                        else row["retrieval_text"]
+                    )
+                    incoming_translation_hash = (
+                        incoming("translation_hash")
+                        if supplied("translation_hash")
+                        else row["translation_hash"]
+                    )
+                    incoming_translation_version = (
+                        incoming("translation_version")
+                        if supplied("translation_version")
+                        else row["translation_version"]
+                    )
                     incoming_retrieval_updated_at = (
-                        values.get("retrieval_updated_at")
-                        if "retrieval_updated_at" in doc
+                        incoming("retrieval_updated_at")
+                        if supplied("retrieval_updated_at")
                         else row["retrieval_updated_at"]
                     )
                     # Legacy deltas have no generation and therefore belong to
@@ -794,17 +1063,17 @@ class Store:
                     )
                     incoming_source_missing = (
                         values["source_missing"]
-                        if "source_missing" in doc
+                        if supplied("source_missing")
                         else row["source_missing"]
                     )
                     source_missing_changed = incoming_source_missing != row["source_missing"]
                     incoming_native = (
-                        values.get("native_index_version") if "native_index_version" in doc else row["native_index_version"],
-                        values.get("native_index_status") if "native_index_status" in doc else row["native_index_status"],
-                        values.get("native_index_profile") if "native_index_profile" in doc else row["native_index_profile"],
-                        values.get("native_index_memory") if "native_index_memory" in doc else row["native_index_memory"],
-                        values.get("native_indexed_at") if "native_indexed_at" in doc else row["native_indexed_at"],
-                        values.get("native_index_error") if "native_index_error" in doc else row["native_index_error"],
+                        incoming("native_index_version") if supplied("native_index_version") else row["native_index_version"],
+                        incoming("native_index_status") if supplied("native_index_status") else row["native_index_status"],
+                        incoming("native_index_profile") if supplied("native_index_profile") else row["native_index_profile"],
+                        incoming("native_index_memory") if supplied("native_index_memory") else row["native_index_memory"],
+                        incoming("native_indexed_at") if supplied("native_indexed_at") else row["native_indexed_at"],
+                        incoming("native_index_error") if supplied("native_index_error") else row["native_index_error"],
                     )
                     incoming_native_generation = values["native_generation"]
                     if incoming_native_generation < row["native_generation"]:
@@ -819,6 +1088,7 @@ class Store:
                         incoming_native_generation = row["native_generation"]
                     if source_missing_changed and not any(
                         name in doc
+                        or name in metadata
                         for name in (
                             "native_index_version",
                             "native_index_status",
@@ -871,6 +1141,7 @@ class Store:
                         incoming_source_missing,
                         *incoming_native,
                         incoming_native_generation,
+                        incoming_embedding_generation,
                     )
                     current_derived = (
                         row["retrieval_text"],
@@ -887,7 +1158,105 @@ class Store:
                         row["native_indexed_at"],
                         row["native_index_error"],
                         row["native_generation"],
+                        row["embedding_generation"],
                     )
+
+                    def source_metadata_value(name: str) -> str | None:
+                        value = incoming(name) if supplied(name) else row[name]
+                        return None if value is None else str(value)
+
+                    candidate_metadata_values = tuple(
+                        source_metadata_value(name) for name in SOURCE_METADATA_FIELDS
+                    )
+                    current_metadata_values = tuple(
+                        row[name] for name in SOURCE_METADATA_FIELDS
+                    )
+                    current_metadata_json = self._canonical_metadata_json(
+                        row["metadata_json"]
+                    )
+                    candidate_metadata_json = (
+                        self._canonical_metadata_json(metadata)
+                        if "metadata" in doc
+                        else current_metadata_json
+                    )
+                    metadata_values = current_metadata_values
+                    metadata_json = current_metadata_json
+                    current_metadata_clocks = self._source_metadata_clocks(
+                        row["source_metadata_clock_json"], row["updated_at"]
+                    )
+                    metadata_clocks = dict(current_metadata_clocks)
+                    joined_values = list(current_metadata_values)
+                    for index, (name, current, candidate) in enumerate(
+                        zip(
+                            SOURCE_METADATA_FIELDS,
+                            current_metadata_values,
+                            candidate_metadata_values,
+                            strict=True,
+                        )
+                    ):
+                        if not supplied(name):
+                            continue
+                        if (
+                            not incoming_updated_explicit
+                            and not incoming_metadata_clocks_explicit
+                            and candidate == current
+                        ):
+                            continue
+                        incoming_clock = incoming_metadata_clocks[name]
+                        clock_order = self._updated_at_key(incoming_clock)
+                        current_clock = current_metadata_clocks[name]
+                        current_clock_order = self._updated_at_key(current_clock)
+                        if clock_order > current_clock_order:
+                            joined_values[index] = candidate
+                            metadata_clocks[name] = incoming_clock
+                        elif clock_order == current_clock_order:
+                            joined_values[index] = self._source_metadata_join(
+                                current, candidate
+                            )
+                            metadata_clocks[name] = max(
+                                current_clock, incoming_clock
+                            )
+                    metadata_values = tuple(joined_values)
+                    if "metadata" in doc:
+                        implicit_unchanged_metadata = (
+                            not incoming_updated_explicit
+                            and not incoming_metadata_clocks_explicit
+                            and candidate_metadata_json == current_metadata_json
+                        )
+                        incoming_clock = incoming_metadata_clocks["metadata_json"]
+                        clock_order = self._updated_at_key(incoming_clock)
+                        current_clock = current_metadata_clocks["metadata_json"]
+                        current_clock_order = self._updated_at_key(current_clock)
+                        if implicit_unchanged_metadata:
+                            pass
+                        elif clock_order > current_clock_order:
+                            metadata_json = candidate_metadata_json
+                            metadata_clocks["metadata_json"] = incoming_clock
+                        elif clock_order == current_clock_order:
+                            metadata_json = max(
+                                current_metadata_json, candidate_metadata_json
+                            )
+                            metadata_clocks["metadata_json"] = max(
+                                current_clock, incoming_clock
+                            )
+                    metadata_updated_at = max(
+                        [str(row["updated_at"]), *metadata_clocks.values()],
+                        key=lambda value: (self._updated_at_key(value), value),
+                    )
+                    metadata_clock_json = self._serialize_source_metadata_clocks(
+                        metadata_clocks
+                    )
+                    current_metadata_clock_json = (
+                        self._serialize_source_metadata_clocks(
+                            current_metadata_clocks
+                        )
+                    )
+                    metadata_changed = (
+                        metadata_values != current_metadata_values
+                        or metadata_json != current_metadata_json
+                        or metadata_clock_json != current_metadata_clock_json
+                    )
+                    derived_changed = False
                     if derived_supplied and not would_regress and incoming_derived != current_derived:
                         # Raw revisions and derived retrieval shadows have separate
                         # lifecycles.  A reconciled shadow must update in place even
@@ -900,7 +1269,8 @@ class Store:
                             source_missing=?,
                             native_index_version=?, native_index_status=?, native_index_profile=?,
                             native_index_memory=?, native_indexed_at=?,
-                            native_index_error=?, native_generation=? WHERE id=?""",
+                            native_index_error=?, native_generation=?,
+                            embedding_generation=? WHERE id=?""",
                             (
                                 incoming_derived[0],
                                 technical_index_text(raw, incoming_derived[0]),
@@ -908,8 +1278,40 @@ class Store:
                                 row["id"],
                             ),
                         )
+                        derived_changed = True
+                    if metadata_changed:
+                        # Source attribution can move independently of immutable
+                        # source bytes and their derived translation/native state.
+                        # Keep its timestamp monotonic so an older restored delta
+                        # cannot roll the attribution back.
+                        self.conn.execute(
+                            """UPDATE memories SET
+                            device_id=?,project=?,repo=?,worktree=?,source_agent=?,
+                            source_type=?,session_id=?,message_id=?,role=?,timestamp=?,
+                            source_path=?,agent_type=?,parent_session_id=?,agent_id=?,
+                            metadata_json=?,source_metadata_clock_json=?,updated_at=?
+                            WHERE id=?""",
+                            (
+                                *metadata_values,
+                                metadata_json,
+                                metadata_clock_json,
+                                metadata_updated_at,
+                                row["id"],
+                            ),
+                        )
+                    if derived_changed or metadata_changed:
                         updated += 1
-                        results.append({"id": row["id"], "status": "derived_updated", "source_identity": source_identity})
+                        results.append(
+                            {
+                                "id": row["id"],
+                                "status": (
+                                    "derived_updated"
+                                    if derived_changed
+                                    else "metadata_updated"
+                                ),
+                                "source_identity": source_identity,
+                            }
+                        )
                     else:
                         deduped += 1
                         results.append({"id": row["id"], "status": "deduped", "source_identity": source_identity})
@@ -923,40 +1325,43 @@ class Store:
                 if row:
                     self.conn.execute(
                         """UPDATE memories SET source_version=?, raw_text=?, retrieval_text=?,
-                        search_identifiers=?, metadata_json=?,
+                        search_identifiers=?, metadata_json=?, source_metadata_clock_json=?,
                         source_agent=?, source_type=?, device_id=?, project=?, repo=?, worktree=?, session_id=?,
                         message_id=?, role=?, timestamp=?, source_path=?, content_hash=?, updated_at=?, retrieval_updated_at=?, content_type=?,
                         source_missing=?, agent_type=?, parent_session_id=?, agent_id=?, translation_hash=?, translation_version=?, translation_status=?,
                         native_index_version=?, native_index_status=?, native_index_profile=?,
                         native_index_memory=?, native_indexed_at=?, native_index_error=?,
-                        retrieval_generation=?, native_generation=? WHERE id=?""",
-                        (source_version, raw, retrieval, search_identifiers, json.dumps(metadata, ensure_ascii=False),
+                        retrieval_generation=?, native_generation=?,
+                        embedding_generation=? WHERE id=?""",
+                        (source_version, raw, retrieval, search_identifiers, json.dumps(metadata, ensure_ascii=False), incoming_metadata_clock_json,
                          values.get("source_agent"), values.get("source_type"), values.get("device_id"),
                          values.get("project"), values.get("repo"), values.get("worktree"), values.get("session_id"),
                          values.get("message_id"), values.get("role"), values.get("timestamp"), values.get("source_path"),
                          content_hash, incoming_updated, values.get("retrieval_updated_at"), values.get("content_type"), values["source_missing"], values.get("agent_type"),
                          values.get("parent_session_id"), values.get("agent_id"), values.get("translation_hash"), values.get("translation_version"), values.get("translation_status"),
                          values.get("native_index_version"), values.get("native_index_status"), values.get("native_index_profile"), values.get("native_index_memory"), values.get("native_indexed_at"), values.get("native_index_error"),
-                         values["retrieval_generation"], values["native_generation"], row["id"]),
+                         values["retrieval_generation"], values["native_generation"],
+                         values["embedding_generation"], row["id"]),
                     )
                     updated += 1
                     results.append({"id": row["id"], "status": "updated", "source_identity": source_identity})
                 else:
                     cur = self.conn.execute(
-                        """INSERT INTO memories(source_identity,source_version,raw_text,retrieval_text,search_identifiers,metadata_json,
+                        """INSERT INTO memories(source_identity,source_version,raw_text,retrieval_text,search_identifiers,metadata_json,source_metadata_clock_json,
                         source_agent,source_type,device_id,project,repo,worktree,session_id,message_id,role,timestamp,
                         source_path,content_hash,ingested_at,updated_at,retrieval_updated_at,content_type,source_missing,agent_type,parent_session_id,agent_id,translation_hash,translation_version,translation_status,
                         native_index_version,native_index_status,native_index_profile,native_index_memory,native_indexed_at,native_index_error,
-                        retrieval_generation,native_generation)
-                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                        (source_identity, source_version, raw, retrieval, search_identifiers, json.dumps(metadata, ensure_ascii=False),
+                        retrieval_generation,native_generation,embedding_generation)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (source_identity, source_version, raw, retrieval, search_identifiers, json.dumps(metadata, ensure_ascii=False), incoming_metadata_clock_json,
                          values.get("source_agent"), values.get("source_type"), values.get("device_id"), values.get("project"),
                          values.get("repo"), values.get("worktree"), values.get("session_id"), values.get("message_id"),
                          values.get("role"), values.get("timestamp"), values.get("source_path"), content_hash, values.get("ingested_at") or now, incoming_updated, values.get("retrieval_updated_at"),
                          values.get("content_type"), values["source_missing"], values.get("agent_type"),
                          values.get("parent_session_id"), values.get("agent_id"), values.get("translation_hash"), values.get("translation_version"), values.get("translation_status"),
                          values.get("native_index_version"), values.get("native_index_status"), values.get("native_index_profile"), values.get("native_index_memory"), values.get("native_indexed_at"), values.get("native_index_error"),
-                         values["retrieval_generation"], values["native_generation"]),
+                         values["retrieval_generation"], values["native_generation"],
+                         values["embedding_generation"]),
                     )
                     created += 1
                     results.append({"id": cur.lastrowid, "status": "created", "source_identity": source_identity})
@@ -973,6 +1378,78 @@ class Store:
             except ValueError:
                 return (1, text)
         return key(candidate) < key(current)
+
+    @staticmethod
+    def _updated_at_key(value: Any) -> tuple[int, Any]:
+        """Order numeric and RFC3339 timestamps on one stable time axis."""
+        text = str(value or "")
+        try:
+            return (2, datetime.fromtimestamp(float(text), timezone.utc).timestamp())
+        except (ValueError, OverflowError, OSError):
+            pass
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return (2, parsed.timestamp())
+        except (ValueError, OverflowError, OSError):
+            return (1, text)
+
+    @staticmethod
+    def _source_metadata_clocks(value: Any, fallback: Any) -> dict[str, str]:
+        if isinstance(value, dict):
+            parsed = value
+        else:
+            try:
+                parsed = json.loads(str(value or "{}"))
+            except json.JSONDecodeError:
+                parsed = {}
+        if not isinstance(parsed, dict):
+            parsed = {}
+        fallback_text = str(fallback or "")
+        return {
+            name: str(parsed.get(name) or fallback_text)
+            for name in SOURCE_METADATA_CLOCK_FIELDS
+        }
+
+    @classmethod
+    def _incoming_source_metadata_clocks(
+        cls, value: Any, updated_at: Any
+    ) -> dict[str, str]:
+        clocks = cls._source_metadata_clocks(value, updated_at)
+        upper = cls._updated_at_key(updated_at)
+        updated_text = str(updated_at or "")
+        return {
+            name: updated_text if cls._updated_at_key(clock) > upper else clock
+            for name, clock in clocks.items()
+        }
+
+    @staticmethod
+    def _serialize_source_metadata_clocks(clocks: dict[str, str]) -> str:
+        return json.dumps(
+            clocks, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+
+    @staticmethod
+    def _canonical_metadata_json(value: Any) -> str:
+        try:
+            metadata = json.loads(value) if isinstance(value, str) else value
+        except json.JSONDecodeError:
+            metadata = str(value or "")
+        return json.dumps(
+            metadata if metadata is not None else {},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+
+    @staticmethod
+    def _source_metadata_join(current: str | None, incoming: str | None) -> str | None:
+        """Join one equal-time source field with a stable None/string order."""
+        current_key = (0, "") if current is None else (1, str(current))
+        incoming_key = (0, "") if incoming is None else (1, str(incoming))
+        return incoming if incoming_key > current_key else current
 
     @staticmethod
     def _newer_timestamp(candidate: Any, current: Any) -> bool:
@@ -1015,6 +1492,9 @@ class Store:
         out = dict(row)
         out.pop("search_identifiers", None)
         out.pop("native_index_pending", None)
+        out[SOURCE_METADATA_CLOCK_KEY] = self._source_metadata_clocks(
+            out.pop("source_metadata_clock_json", "{}"), out.get("updated_at")
+        )
         out["source_missing"] = bool(out.get("source_missing"))
         try:
             out["metadata"] = json.loads(out.pop("metadata_json") or "{}")
@@ -1023,14 +1503,19 @@ class Store:
         return out
 
     def get(self, ident: str | int) -> dict[str, Any] | None:
-        with self.lock:
-            row = self.conn.execute(
+        reader = self._read_connection()
+        try:
+            row = reader.execute(
                 "SELECT * FROM memories WHERE source_identity=? ORDER BY id LIMIT 1",
                 (str(ident),),
             ).fetchone()
             if row is None:
-                row = self.conn.execute("SELECT * FROM memories WHERE id=?", (str(ident),)).fetchone()
+                row = reader.execute(
+                    "SELECT * FROM memories WHERE id=?", (str(ident),)
+                ).fetchone()
             return self._row(row) if row else None
+        finally:
+            reader.close()
 
     def get_many(self, identities: list[str]) -> list[dict[str, Any]]:
         """Return canonical stored rows without exceeding SQLite's bind limit."""
@@ -1083,9 +1568,26 @@ class Store:
                     SELECT COALESCE(max(generation), 0) AS value FROM reindex_controls
                     UNION ALL SELECT COALESCE(max(retrieval_generation), 0) FROM memories
                     UNION ALL SELECT COALESCE(max(native_generation), 0) FROM memories
+                    UNION ALL SELECT COALESCE(max(embedding_generation), 0) FROM memories
                     )"""
                 ).fetchone()[0]
             )
+
+    def _latest_embedding_generation_locked(self) -> int:
+        return int(
+            self.conn.execute(
+                """SELECT max(value) FROM (
+                SELECT COALESCE(max(generation), 0) AS value
+                FROM reindex_controls WHERE scope='all'
+                UNION ALL
+                SELECT COALESCE(max(embedding_generation), 0) FROM memories
+                )"""
+            ).fetchone()[0]
+        )
+
+    def latest_embedding_generation(self) -> int:
+        with self.lock:
+            return self._latest_embedding_generation_locked()
 
     def next_reindex_control(self, scope: str) -> dict[str, Any]:
         if scope not in REINDEX_SCOPES:
@@ -1152,6 +1654,7 @@ class Store:
                 item = dict(row)
                 retrieval_generation = int(item.get("retrieval_generation") or 0)
                 native_generation = int(item.get("native_generation") or 0)
+                embedding_generation = int(item.get("embedding_generation") or 0)
                 retrieval_values = (
                     item.get("retrieval_text"), item.get("translation_hash"),
                     item.get("translation_version"), item.get("translation_status"),
@@ -1165,7 +1668,7 @@ class Store:
                 )
                 current_values = (
                     *retrieval_values, retrieval_generation, *native_values,
-                    native_generation,
+                    native_generation, embedding_generation,
                 )
                 if generation > retrieval_generation:
                     retrieval_generation = generation
@@ -1188,9 +1691,18 @@ class Store:
                     ):
                         native_values = (None, None, None, None, None, None)
                         native_reset += 1
+                if scope == "all" and generation > embedding_generation:
+                    embedding_generation = generation
+                    if (
+                        self._canonical_reindex_eligible(item)
+                        and item.get("native_index_status") != "waiting_durability"
+                        and any(value is not None for value in native_values)
+                    ):
+                        native_values = (None, None, None, None, None, None)
+                        native_reset += 1
                 next_values = (
                     *retrieval_values, retrieval_generation, *native_values,
-                    native_generation,
+                    native_generation, embedding_generation,
                 )
                 if next_values != current_values:
                     self.conn.execute(
@@ -1199,7 +1711,8 @@ class Store:
                         translation_version=?, translation_status=?, retrieval_updated_at=?,
                         retrieval_generation=?, native_index_version=?, native_index_status=?,
                         native_index_profile=?, native_index_memory=?, native_indexed_at=?,
-                        native_index_error=?, native_generation=?
+                        native_index_error=?, native_generation=?,
+                        embedding_generation=?
                         WHERE id=?""",
                         (
                             next_values[0],
@@ -1293,6 +1806,35 @@ class Store:
                 (max(1, int(limit)),),
             ).fetchall()
             return [self._row(row) for row in rows]
+
+    def native_index_failure_counts(self) -> dict[str, int]:
+        """Return allowlisted pending diagnostics without exposing row data."""
+        counts = {
+            "timeout": 0,
+            "native_exit": 0,
+            "invalid_report": 0,
+            "stale": 0,
+            "durability_pending": 0,
+            "other": 0,
+        }
+        categories = {
+            "TimeoutExpired": "timeout",
+            "native_exit": "native_exit",
+            "invalid_report": "invalid_report",
+            "native_stale": "stale",
+            "durability_pending": "durability_pending",
+        }
+        with self.lock:
+            rows = self.conn.execute(
+                """SELECT native_index_error,count(*) AS amount FROM memories
+                WHERE native_index_error IS NOT NULL AND (
+                    native_index_pending=1 OR native_index_status='waiting_durability'
+                ) GROUP BY native_index_error"""
+            ).fetchall()
+        for row in rows:
+            category = categories.get(str(row["native_index_error"]), "other")
+            counts[category] += int(row["amount"])
+        return counts
 
     @staticmethod
     def _native_state_fingerprint(state: dict[str, Any]) -> str:
@@ -1503,6 +2045,7 @@ class Store:
             "model": row["native_optimize_model"],
             "dimensions": row["native_optimize_dimensions"],
             "schema_version": row["native_optimize_schema_version"],
+            "index_layout_version": int(row["native_optimize_layout_version"] or 0),
             "memory": row["native_optimize_memory"],
             "fingerprint": row["native_optimize_fingerprint"],
             "index_fingerprint": row["native_optimize_index_fingerprint"],
@@ -1515,16 +2058,21 @@ class Store:
         """Apply a monotonic durable optimize marker restored from snapshots/deltas."""
         incoming_at = str(checkpoint.get("optimized_at") or "")
         incoming_revision = int(checkpoint.get("revision") or 0)
+        incoming_layout_version = int(checkpoint.get("index_layout_version") or 0)
         if not incoming_at or not checkpoint.get("fingerprint"):
             return False
         with self.lock, self.conn:
             current = self.conn.execute(
                 """SELECT native_optimized_at,native_optimize_revision,
                 native_optimize_status,native_optimize_memory,
-                native_optimize_fingerprint FROM sync_state WHERE id=1"""
+                native_optimize_fingerprint,native_optimize_layout_version
+                FROM sync_state WHERE id=1"""
             ).fetchone()
             if current:
                 current_revision = int(current["native_optimize_revision"] or 0)
+                current_layout_version = int(
+                    current["native_optimize_layout_version"] or 0
+                )
                 current_at = str(current["native_optimized_at"] or "")
                 current_namespace = (
                     str(current["native_optimize_memory"] or ""),
@@ -1534,6 +2082,8 @@ class Store:
                     str(checkpoint.get("memory") or ""),
                     str(checkpoint.get("fingerprint") or ""),
                 )
+                if incoming_layout_version < current_layout_version:
+                    return False
                 if current_namespace == incoming_namespace:
                     if incoming_revision < current_revision:
                         return False
@@ -1553,6 +2103,7 @@ class Store:
             self.conn.execute(
                 """UPDATE sync_state SET native_optimize_provider=?, native_optimize_model=?,
                 native_optimize_dimensions=?, native_optimize_schema_version=?,
+                native_optimize_layout_version=?,
                 native_optimize_memory=?,
                 native_optimize_fingerprint=?, native_optimize_index_fingerprint=?,
                 native_optimize_status=?, native_optimized_at=?,
@@ -1560,6 +2111,7 @@ class Store:
                 (
                     checkpoint.get("provider"), checkpoint.get("model"),
                     checkpoint.get("dimensions"), checkpoint.get("schema_version"),
+                    incoming_layout_version,
                     checkpoint.get("memory"),
                     checkpoint.get("fingerprint"), checkpoint.get("index_fingerprint"),
                     checkpoint.get("status"), incoming_at, incoming_revision,
@@ -1641,10 +2193,11 @@ class Store:
         if filters.get("until"):
             clauses.append("m.timestamp <= ?"); params.append(str(filters["until"]))
         facet = (" AND " + " AND ".join(clauses)) if clauses else ""
-        with self.lock:
+        reader = self._read_connection()
+        try:
             strict_fts_failed = False
             try:
-                rows = self.conn.execute(
+                rows = reader.execute(
                     """SELECT m.*, bm25(memories_fts, 5.0, 1.0, 2.0) AS score FROM memories_fts
                     JOIN memories m ON m.id=memories_fts.rowid WHERE memories_fts MATCH ?""" + facet +
                     " ORDER BY score LIMIT ?", [query, *params, limit]
@@ -1668,7 +2221,7 @@ class Store:
                     term for term in technical_terms if term.casefold() not in facet_terms
                 ] or technical_terms
                 if technical_terms:
-                    technical_rows = self.conn.execute(
+                    technical_rows = reader.execute(
                         """SELECT m.*, bm25(memories_fts, 5.0, 1.0, 2.0) AS score FROM memories_fts
                         JOIN memories m ON m.id=memories_fts.rowid WHERE memories_fts MATCH ?"""
                         + facet
@@ -1718,7 +2271,7 @@ class Store:
                         pattern = f"%{escaped}%"
                         technical_params.extend((pattern, pattern))
                         score_params.extend((pattern, pattern, min(32, len(term))))
-                    technical_rows = self.conn.execute(
+                    technical_rows = reader.execute(
                         f"SELECT m.*, 0.0 AS score FROM memories m WHERE ({technical_clauses}){facet} ORDER BY ({technical_score}) DESC, m.updated_at DESC LIMIT ?",
                         [
                             *technical_params,
@@ -1754,7 +2307,7 @@ class Store:
             if allow_broad_scan and not rows and strict_fts_failed:
                 # FTS MATCH is intentionally strict; a plain substring fallback keeps recall useful.
                 like = "%" + query.replace("%", "\\%") + "%"
-                rows = self.conn.execute("SELECT m.*, 0.0 AS score FROM memories m WHERE (m.retrieval_text LIKE ? ESCAPE '\\' OR m.raw_text LIKE ? ESCAPE '\\')" + facet.replace("m.", "m.") + " ORDER BY m.updated_at DESC LIMIT ?", [like, like, *params, limit]).fetchall()
+                rows = reader.execute("SELECT m.*, 0.0 AS score FROM memories m WHERE (m.retrieval_text LIKE ? ESCAPE '\\' OR m.raw_text LIKE ? ESCAPE '\\')" + facet.replace("m.", "m.") + " ORDER BY m.updated_at DESC LIMIT ?", [like, like, *params, limit]).fetchall()
             if allow_broad_scan and not rows and cjk_ratio(query) > 0:
                 # unicode61 does not segment every CJK script consistently;
                 # retain a character-level shadow fallback for Chinese recall.
@@ -1762,13 +2315,15 @@ class Store:
                 if chars:
                     text_clauses = " OR ".join("(m.retrieval_text LIKE ? OR m.raw_text LIKE ?)" for _ in chars)
                     text_params = [v for c in chars for v in (f"%{c}%", f"%{c}%")]
-                    rows = self.conn.execute(f"SELECT m.*, 0.0 AS score FROM memories m WHERE ({text_clauses}){facet} ORDER BY m.updated_at DESC LIMIT ?", [*text_params, *params, limit]).fetchall()
+                    rows = reader.execute(f"SELECT m.*, 0.0 AS score FROM memories m WHERE ({text_clauses}){facet} ORDER BY m.updated_at DESC LIMIT ?", [*text_params, *params, limit]).fetchall()
             results = [self._row(r) for r in rows]
-            # Optional embedding/rerank integrations can be injected by callers
-            # without making the durable store depend on a model runtime.
-            if rerank is not None:
-                results = list(rerank(query, results))
-            return results
+        finally:
+            reader.close()
+        # Optional embedding/rerank integrations can be injected by callers
+        # without making the durable store depend on a model runtime.
+        if rerank is not None:
+            results = list(rerank(query, results))
+        return results
 
     def sources(self) -> list[dict[str, Any]]:
         with self.lock:
@@ -1778,6 +2333,10 @@ class Store:
     def reindex(self) -> int:
         with self.lock, self.conn:
             self.conn.execute("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')")
+            self.conn.execute(
+                "UPDATE sync_state SET fts_schema_version=?,fts_ready=1 WHERE id=1",
+                (FTS_SCHEMA_VERSION,),
+            )
             return int(self.conn.execute("SELECT count(*) FROM memories").fetchone()[0])
 
     def count(self) -> int:
@@ -1805,29 +2364,28 @@ class Store:
 
     def snapshot(self, path: Path) -> None:
         with self.lock:
-            rows = self.conn.execute("SELECT * FROM memories ORDER BY id").fetchall()
-            cache = self.conn.execute(
-                "SELECT query,rewritten,created_at,translation_hash,translation_version,translation_status "
-                "FROM translation_cache ORDER BY query"
-            ).fetchall()
-            controls = self.conn.execute(
-                """SELECT generation,scope,created_at FROM reindex_controls
-                ORDER BY generation"""
-            ).fetchall()
             optimize = self.native_optimize_checkpoint()
             native_state = self.native_index_state_record()
             path.parent.mkdir(parents=True, exist_ok=True)
             opener = gzip.open if path.name.endswith(".gz") else open
             with opener(path, "wt", encoding="utf-8") as f:
-                for row in rows:
+                for row in self.conn.execute(
+                    "SELECT * FROM memories ORDER BY id"
+                ):
                     d = self._row(row)
                     d["_funes_record"] = "memory"
                     f.write(json.dumps(d, ensure_ascii=False) + "\n")
-                for row in cache:
+                for row in self.conn.execute(
+                    "SELECT query,rewritten,created_at,translation_hash,translation_version,translation_status "
+                    "FROM translation_cache ORDER BY query"
+                ):
                     d = dict(row)
                     d["_funes_record"] = "translation_cache"
                     f.write(json.dumps(d, ensure_ascii=False) + "\n")
-                for row in controls:
+                for row in self.conn.execute(
+                    """SELECT generation,scope,created_at FROM reindex_controls
+                    ORDER BY generation"""
+                ):
                     d = dict(row)
                     d["_funes_record"] = "reindex_control"
                     f.write(json.dumps(d, ensure_ascii=False) + "\n")
@@ -1853,60 +2411,64 @@ class Store:
         self, documents: Any, batch_size: int = 500, *, apply_controls: bool = True
     ) -> int:
         """Restore a stream without materialising a multi-gigabyte snapshot."""
-        total = 0
-        batch: list[dict[str, Any]] = []
-        for item in documents:
-            if not isinstance(item, dict):
-                continue
-            item = dict(item)
-            record_type = item.pop("_funes_record", "memory")
-            if record_type == "reindex_control":
-                if batch:
+        self.begin_bulk_restore()
+        try:
+            total = 0
+            batch: list[dict[str, Any]] = []
+            for item in documents:
+                if not isinstance(item, dict):
+                    continue
+                item = dict(item)
+                record_type = item.pop("_funes_record", "memory")
+                if record_type == "reindex_control":
+                    if batch:
+                        result = self.ingest(batch)
+                        total += result["created"] + result["updated"]
+                        batch = []
+                    self.record_reindex_control(item)
+                    continue
+                if record_type == "native_optimize_checkpoint":
+                    if batch:
+                        result = self.ingest(batch)
+                        total += result["created"] + result["updated"]
+                        batch = []
+                    self.set_native_optimize_checkpoint(item)
+                    continue
+                if record_type == "native_index_state":
+                    if batch:
+                        result = self.ingest(batch)
+                        total += result["created"] + result["updated"]
+                        batch = []
+                    self.set_native_index_state(item)
+                    continue
+                if record_type == "translation_cache":
+                    query = str(item.get("query", ""))
+                    rewritten = str(item.get("rewritten", ""))
+                    if query and rewritten:
+                        self.translation_put(
+                            query,
+                            rewritten,
+                            status=str(item.get("translation_status") or "ok"),
+                            translation_hash=str(item.get("translation_hash") or ""),
+                            translation_version=str(item.get("translation_version") or PROMPT_VERSION),
+                        )
+                    continue
+                if record_type != "memory":
+                    continue
+                item["metadata"] = item.pop("metadata", item.pop("metadata_json", {}))
+                batch.append(item)
+                if len(batch) >= batch_size:
                     result = self.ingest(batch)
                     total += result["created"] + result["updated"]
                     batch = []
-                self.record_reindex_control(item)
-                continue
-            if record_type == "native_optimize_checkpoint":
-                if batch:
-                    result = self.ingest(batch)
-                    total += result["created"] + result["updated"]
-                    batch = []
-                self.set_native_optimize_checkpoint(item)
-                continue
-            if record_type == "native_index_state":
-                if batch:
-                    result = self.ingest(batch)
-                    total += result["created"] + result["updated"]
-                    batch = []
-                self.set_native_index_state(item)
-                continue
-            if record_type == "translation_cache":
-                query = str(item.get("query", ""))
-                rewritten = str(item.get("rewritten", ""))
-                if query and rewritten:
-                    self.translation_put(
-                        query,
-                        rewritten,
-                        status=str(item.get("translation_status") or "ok"),
-                        translation_hash=str(item.get("translation_hash") or ""),
-                        translation_version=str(item.get("translation_version") or PROMPT_VERSION),
-                    )
-                continue
-            if record_type != "memory":
-                continue
-            item["metadata"] = item.pop("metadata", item.pop("metadata_json", {}))
-            batch.append(item)
-            if len(batch) >= batch_size:
+            if batch:
                 result = self.ingest(batch)
                 total += result["created"] + result["updated"]
-                batch = []
-        if batch:
-            result = self.ingest(batch)
-            total += result["created"] + result["updated"]
-        if apply_controls:
-            self.drain_reindex_controls(batch_size)
-        return total
+            if apply_controls:
+                self.drain_reindex_controls(batch_size)
+            return total
+        finally:
+            self.finish_bulk_restore()
 
     def restore(self, path: Path, *, apply_controls: bool = True) -> int:
         if not path.exists():
@@ -1925,13 +2487,41 @@ class Store:
 
     def begin_bulk_restore(self) -> None:
         """Suspend per-row indexes while one logical restore is in flight."""
-        with self.lock, self.conn:
+        with self.lock:
             if self._bulk_restore_depth == 0:
-                self._drop_fts_triggers_locked()
-                self._drop_native_state_triggers_locked()
+                previous_fts_ready = bool(
+                    self.conn.execute(
+                        "SELECT fts_ready FROM sync_state WHERE id=1"
+                    ).fetchone()[0]
+                )
+                self._save_and_apply_bulk_pragmas_locked()
+                try:
+                    with self.conn:
+                        # FTS triggers are disabled for bulk replay. Mark the
+                        # derived index unavailable before the first restored
+                        # row so a crash or opt-out can never look complete.
+                        self.conn.execute(
+                            "UPDATE sync_state SET fts_ready=0 WHERE id=1"
+                        )
+                        self._drop_fts_triggers_locked()
+                        self._drop_native_state_triggers_locked()
+                        self._drop_secondary_indexes_locked()
+                except Exception:
+                    try:
+                        with self.conn:
+                            self.conn.execute(
+                                "UPDATE sync_state SET fts_ready=? WHERE id=1",
+                                (int(previous_fts_ready),),
+                            )
+                            self._create_secondary_indexes_locked()
+                            self._create_fts_triggers_locked()
+                            self._create_native_state_triggers_locked()
+                    finally:
+                        self._restore_pragmas_locked()
+                    raise
             self._bulk_restore_depth += 1
 
-    def finish_bulk_restore(self) -> None:
+    def finish_bulk_restore(self, *, rebuild_fts: bool | None = None) -> None:
         """Rebuild derived indexes once after the outermost restore."""
         with self.lock:
             if self._bulk_restore_depth <= 0:
@@ -1939,22 +2529,54 @@ class Store:
             self._bulk_restore_depth -= 1
             if self._bulk_restore_depth:
                 return
-            with self.conn:
-                state = self.conn.execute(
-                    """SELECT native_checkpoint_profile,native_checkpoint_memory
-                    FROM sync_state WHERE id=1"""
-                ).fetchone()
-                self._rebuild_native_checkpoint_state_locked(
-                    str(state["native_checkpoint_profile"] or ""),
-                    str(state["native_checkpoint_memory"] or ""),
-                )
-                # FTS5 external-content tables need an explicit rebuild after
-                # restoring rows from a JSONL snapshot.
-                self.conn.execute(
-                    "INSERT INTO memories_fts(memories_fts) VALUES('rebuild')"
-                )
-                self._create_fts_triggers_locked()
-                self._create_native_state_triggers_locked()
+            try:
+                with self.conn:
+                    try:
+                        state = self.conn.execute(
+                            """SELECT native_checkpoint_profile,native_checkpoint_memory
+                            FROM sync_state WHERE id=1"""
+                        ).fetchone()
+                        if state is not None:
+                            self._rebuild_native_checkpoint_state_locked(
+                                str(state["native_checkpoint_profile"] or ""),
+                                str(state["native_checkpoint_memory"] or ""),
+                            )
+                        # FTS5 external-content tables need an explicit rebuild after
+                        # restoring rows from a JSONL snapshot. A Space can disable
+                        # this optional, very expensive derived-index step while its
+                        # durable Voyage/Lance index is authoritative. The generic
+                        # service keeps the historical default of rebuilding FTS.
+                        if rebuild_fts is None:
+                            rebuild_fts = os.getenv(
+                                "FUNES_BULK_RESTORE_REBUILD_FTS", "true"
+                            ).strip().lower() in {"1", "true", "yes", "on"}
+                        if rebuild_fts:
+                            self.conn.execute(
+                                "INSERT INTO memories_fts(memories_fts) VALUES('rebuild')"
+                            )
+                            self.conn.execute(
+                                """UPDATE sync_state
+                                SET fts_ready=1,fts_schema_version=? WHERE id=1""",
+                                (FTS_SCHEMA_VERSION,),
+                            )
+                    finally:
+                        try:
+                            self._create_secondary_indexes_locked()
+                        finally:
+                            try:
+                                self._create_fts_triggers_locked()
+                            finally:
+                                self._create_native_state_triggers_locked()
+            finally:
+                self._restore_pragmas_locked()
+
+    def fts_ready(self) -> bool:
+        """Whether the sidecar FTS contains every restored source row."""
+        with closing(self._read_connection()) as conn:
+            row = conn.execute(
+                "SELECT fts_ready FROM sync_state WHERE id=1"
+            ).fetchone()
+            return bool(row and row[0])
 
 
 class Translator:
@@ -2113,24 +2735,73 @@ class Translator:
         return self.normalize_document(raw)[0]
 
 
+class RestoreFiles(list):
+    """File list returned by restore file enumeration carrying Hub metadata."""
+
+    def __init__(
+        self,
+        files: list[str],
+        manifest: dict[str, Any] | None = None,
+        revision: str | None = None,
+    ):
+        super().__init__(files)
+        self.manifest = manifest
+        self.revision = revision
+
+
 class SnapshotSync:
-    def __init__(self, store: Store):
+    def __init__(self, store: Store, *, rebuild_fts: bool | None = None):
         self.store = store
+        self.rebuild_fts = (
+            self._truth("FUNES_BULK_RESTORE_REBUILD_FTS", True)
+            if rebuild_fts is None
+            else rebuild_fts
+        )
         # Snapshot creation and Hub upload must be one serialized operation.
         # Without this lock, concurrent /sync requests can upload an older
         # snapshot after a newer one and roll the durable dataset backwards.
-        self.upload_lock = threading.Lock()
+        self.upload_lock = threading.RLock()
         self.repo = os.getenv("FUNES_STORAGE_REPO") or os.getenv("FUNES_MEMORY", "")
         self.token = os.getenv("HF_TOKEN", "")
         self.filename = os.getenv("FUNES_SNAPSHOT_FILE", "funes-snapshot.jsonl.gz")
         self.prefix = os.getenv("FUNES_SNAPSHOT_PREFIX", "funes-snapshot-")
         self.delta_prefix = os.getenv("FUNES_DELTA_PREFIX", "funes-delta-")
+        self.delta_dir = (os.getenv("FUNES_DELTA_DIR", "deltas") or "").strip("/")
         self.control_prefix = os.getenv("FUNES_REINDEX_PREFIX", "funes-reindex-")
+        self.manifest_filename = os.getenv(
+            "FUNES_RESTORE_MANIFEST_FILE", "funes-restore-manifest-v1.json"
+        )
+        checkpoint_filename = os.getenv(
+            "FUNES_RESTORE_CHECKPOINT_FILE", "funes-restore-checkpoint-v1.json"
+        )
+        if not self._safe_repo_filename(checkpoint_filename):
+            raise ValueError("invalid restore checkpoint filename")
+        self.restore_checkpoint_filename = checkpoint_filename
         self.restore_batch = max(50, int(os.getenv("FUNES_RESTORE_BATCH", "500")))
+        try:
+            restore_download_workers = int(
+                os.getenv("FUNES_RESTORE_DOWNLOAD_WORKERS", "16")
+            )
+        except ValueError:
+            restore_download_workers = 16
+        self.restore_download_workers = max(1, min(restore_download_workers, 32))
+        self._restore_prefetch_root: Path | None = None
+        self._restore_revision: str | None = None
+        self._restore_manifest: dict[str, Any] | None = None
+        self.covered_revision: str | None = None
         self.restore_failed = False
         self.restore_error = None
         self.restored = False
         self.restoring = False
+        self._progress_lock = threading.Lock()
+        self._restore_progress: dict[str, Any] = {
+            "phase": "idle",
+            "current": None,
+            "completed": 0,
+            "total": 0,
+            "rows": 0,
+            "bytes": 0,
+        }
         self.storage_key = (
             os.getenv("FUNES_STORAGE_KEY")
             or os.getenv("FUNES_API_TOKEN")
@@ -2147,43 +2818,581 @@ class SnapshotSync:
         self.restore_failed = True
         self.restore_error = type(exc).__name__
         self.store.set_sync(last_error=self.restore_error)
+        self._update_restore_progress(phase="failed", current=None, error=self.restore_error)
         return -1
+
+    def _update_restore_progress(self, **values: Any) -> None:
+        with self._progress_lock:
+            self._restore_progress.update(values)
+
+    @property
+    def progress(self) -> dict[str, Any]:
+        with self._progress_lock:
+            return dict(self._restore_progress)
+
+    @property
+    def restore_checkpoint_path(self) -> Path:
+        if not self._safe_repo_filename(self.restore_checkpoint_filename):
+            raise ValueError("invalid restore checkpoint filename")
+        return self.store.data_dir / self.restore_checkpoint_filename
+
+    @staticmethod
+    def _canonical_json_bytes(data: Any) -> bytes:
+        return json.dumps(
+            data,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+
+    @classmethod
+    def _canonical_digest(cls, data: Any) -> str:
+        return hashlib.sha256(cls._canonical_json_bytes(data)).hexdigest()
 
     def snapshot_path(self) -> Path:
         return self.store.data_dir / self.filename
+
+    def delta_target(self, digest: str) -> str:
+        shard = digest[:2] if len(digest) >= 2 else digest.zfill(2)
+        filename = f"{self.delta_prefix}{digest}.jsonl.gz.enc"
+        if self.delta_dir:
+            return f"{self.delta_dir}/{shard}/{filename}"
+        return filename
+
+    @staticmethod
+    def _safe_repo_filename(value: Any) -> bool:
+        return (
+            isinstance(value, str)
+            and value not in {".", ".."}
+            and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,254}", value)
+            is not None
+        )
+
+    @staticmethod
+    def _safe_repo_path(value: Any) -> bool:
+        if not isinstance(value, str) or not value:
+            return False
+        parts = value.split("/")
+        return all(
+            part not in {".", ".."}
+            and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,254}", part) is not None
+            for part in parts
+        )
+
+    def _is_delta_name(self, name: str) -> bool:
+        encrypted_suffixes = (".jsonl.enc", ".jsonl.gz.enc")
+        if not (
+            isinstance(name, str)
+            and self._safe_repo_path(name)
+            and name.endswith(encrypted_suffixes)
+            and bool(self.delta_prefix)
+        ):
+            return False
+        if "/" not in name:
+            return name.startswith(self.delta_prefix)
+        if name.count("/") < 2:
+            return False
+        prefix, shard, filename = name.rsplit("/", 2)
+        valid_dirs = {
+            d.strip("/")
+            for d in (self.delta_dir, "deltas")
+            if d and d.strip("/")
+        }
+        return prefix in valid_dirs and filename.startswith(self.delta_prefix)
+
+    def _validate_restore_manifest(
+        self, value: Any, repo_files: set[str]
+    ) -> dict[str, Any]:
+        if not isinstance(value, dict) or set(value) != {
+            "version",
+            "snapshot",
+            "deltas",
+            "controls",
+        }:
+            raise ValueError("invalid restore manifest schema")
+        if type(value["version"]) is not int or value["version"] != 1:
+            raise ValueError("unsupported restore manifest version")
+        snapshot = value["snapshot"]
+        deltas = value["deltas"]
+        controls = value["controls"]
+        if not isinstance(deltas, list) or not isinstance(controls, list):
+            raise ValueError("invalid restore manifest entries")
+        encrypted_suffixes = (".jsonl.enc", ".jsonl.gz.enc")
+        if not (
+            self._safe_repo_filename(snapshot)
+            and snapshot.endswith(encrypted_suffixes)
+            and (
+                snapshot == self.filename + ".enc"
+                or (bool(self.prefix) and snapshot.startswith(self.prefix))
+            )
+        ):
+            raise ValueError("invalid restore manifest snapshot")
+        for name in deltas:
+            if not self._is_delta_name(name):
+                raise ValueError("invalid restore manifest delta")
+        if len(deltas) != len(set(deltas)):
+            raise ValueError("duplicate restore manifest delta")
+
+        for name in controls:
+            if not (
+                self._safe_repo_filename(name)
+                and bool(self.control_prefix)
+                and name.startswith(self.control_prefix)
+                and name.endswith(encrypted_suffixes)
+            ):
+                raise ValueError("invalid restore manifest control")
+        if len(controls) != len(set(controls)):
+            raise ValueError("duplicate restore manifest control")
+        referenced = [snapshot, *deltas, *controls]
+        if len(referenced) != len(set(referenced)):
+            raise ValueError("duplicate restore manifest entry")
+        if any(name not in repo_files for name in referenced):
+            raise FileNotFoundError("restore manifest references missing object")
+        return {
+            "version": 1,
+            "snapshot": snapshot,
+            "deltas": list(deltas),
+            "controls": list(controls),
+        }
+
+    def _download_restore_manifest(
+        self, repo_files: set[str], revision: str
+    ) -> dict[str, Any]:
+        from huggingface_hub import hf_hub_download
+
+        downloaded = hf_hub_download(
+            repo_id=self.repo,
+            repo_type="dataset",
+            filename=self.manifest_filename,
+            revision=revision,
+            token=self.token,
+            local_dir=str(self.store.data_dir / "remote"),
+        )
+        path = Path(downloaded)
+        if not path.is_file() or path.stat().st_size > 16 * 1024 * 1024:
+            raise ValueError("invalid restore manifest file")
+        return self._validate_restore_manifest(
+            json.loads(path.read_text(encoding="utf-8")), repo_files
+        )
+
+    def _manifest_bytes(self, manifest: dict[str, Any]) -> bytes:
+        if not self._safe_repo_filename(self.manifest_filename):
+            raise ValueError("invalid restore manifest filename")
+        references = {
+            manifest["snapshot"],
+            *manifest["deltas"],
+            *manifest["controls"],
+        }
+        validated = self._validate_restore_manifest(manifest, references)
+        return (
+            json.dumps(
+                validated,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode("utf-8")
+
+    def _commit_with_manifest(
+        self,
+        api: Any,
+        encrypted: Path,
+        target: str,
+        manifest: dict[str, Any],
+        commit_message: str,
+        parent_commit: str,
+    ) -> Any:
+        from huggingface_hub import CommitOperationAdd
+
+        return api.create_commit(
+            repo_id=self.repo,
+            repo_type="dataset",
+            operations=[
+                CommitOperationAdd(
+                    path_in_repo=target, path_or_fileobj=str(encrypted)
+                ),
+                CommitOperationAdd(
+                    path_in_repo=self.manifest_filename,
+                    path_or_fileobj=self._manifest_bytes(manifest),
+                ),
+            ],
+            commit_message=commit_message,
+            parent_commit=parent_commit,
+        )
+
+    @staticmethod
+    def _commit_oid(result: Any) -> str | None:
+        oid = getattr(result, "oid", "")
+        return oid if isinstance(oid, str) and oid else None
+
+    def _source_artifact_names(self, repo_files: set[str]) -> set[str]:
+        encrypted_suffixes = (".jsonl.enc", ".jsonl.gz.enc")
+        return {
+            name
+            for name in repo_files
+            if name.endswith(encrypted_suffixes)
+            and (
+                name == self.filename + ".enc"
+                or (bool(self.prefix) and name.startswith(self.prefix))
+                or self._is_delta_name(name)
+                or (bool(self.control_prefix) and name.startswith(self.control_prefix))
+            )
+        }
+
+    def _advance_coverage(
+        self, state: dict[str, Any], commit_result: Any
+    ) -> None:
+        oid = self._commit_oid(commit_result)
+        if oid and (
+            self.covered_revision == state["head"]
+            or not self._source_artifact_names(state["repo_files"])
+        ):
+            self.covered_revision = oid
+
+    def _repo_tree_files(
+        self, api: Any, revision: str
+    ) -> tuple[set[str], dict[str, str]]:
+        repo_files = set()
+        blob_ids = {}
+        for item in api.list_repo_tree(
+            self.repo,
+            repo_type="dataset",
+            recursive=True,
+            revision=revision,
+            token=self.token,
+        ):
+            name = getattr(item, "path", "")
+            if isinstance(name, str):
+                repo_files.add(name)
+                blob_id = getattr(item, "blob_id", "")
+                if isinstance(blob_id, str) and blob_id:
+                    blob_ids[name] = blob_id
+        return repo_files, blob_ids
+
+    def _remote_restore_state(self, api: Any) -> dict[str, Any]:
+        info = api.repo_info(
+            repo_id=self.repo,
+            repo_type="dataset",
+            token=self.token,
+        )
+        head = getattr(info, "sha", "")
+        if not isinstance(head, str) or not head:
+            raise RuntimeError("Hub repository head is unavailable")
+        repo_files, blob_ids = self._repo_tree_files(api, head)
+        manifest = None
+        if self.manifest_filename in repo_files:
+            manifest = self._download_restore_manifest(repo_files, head)
+        return {
+            "head": head,
+            "manifest": manifest,
+            "repo_files": repo_files,
+            "blob_ids": blob_ids,
+        }
+
+    def _commit_manifest_append(
+        self,
+        api: Any,
+        encrypted: Path,
+        target: str,
+        field: str,
+        commit_message: str,
+        state: dict[str, Any],
+    ) -> tuple[bool, bool]:
+        last_error = None
+        legacy_target = (
+            Path(target).name if field == "deltas" and "/" in target else None
+        )
+        for _ in range(3):
+            manifest = state["manifest"]
+            if manifest is None:
+                raise RuntimeError("active restore manifest disappeared")
+            if target in manifest[field] or (
+                legacy_target is not None and legacy_target in manifest[field]
+            ):
+                return False, True
+            updated_manifest = {
+                **manifest,
+                field: [*manifest[field], target],
+            }
+            try:
+                commit_result = self._commit_with_manifest(
+                    api,
+                    encrypted,
+                    target,
+                    updated_manifest,
+                    commit_message,
+                    state["head"],
+                )
+                self._advance_coverage(state, commit_result)
+                return True, False
+            except Exception as exc:
+                last_error = exc
+                latest = self._remote_restore_state(api)
+                if latest["head"] == state["head"]:
+                    raise
+                state = latest
+        manifest = state["manifest"]
+        if manifest is not None and (
+            target in manifest[field]
+            or (legacy_target is not None and legacy_target in manifest[field])
+        ):
+            return False, True
+        raise RuntimeError("restore manifest changed repeatedly") from last_error
+
+    @staticmethod
+    def _manifest_suffix(base: list[str], current: list[str]) -> list[str]:
+        if current[: len(base)] != base:
+            raise RuntimeError("restore manifest history is not append-only")
+        return current[len(base) :]
+
+    def _commit_compact_snapshot(
+        self,
+        api: Any,
+        encrypted: Path,
+        target: str,
+        commit_message: str,
+        base_state: dict[str, Any],
+    ) -> tuple[Any, bool]:
+        base_manifest = base_state["manifest"]
+        base_snapshot_blob = None
+        if base_manifest is not None:
+            base_snapshot_blob = base_state["blob_ids"].get(
+                base_manifest["snapshot"]
+            )
+        state = base_state
+        desired_manifest = {
+            "version": 1,
+            "snapshot": target,
+            "deltas": [],
+            "controls": [],
+        }
+        last_error = None
+        for _ in range(3):
+            try:
+                commit_result = self._commit_with_manifest(
+                    api,
+                    encrypted,
+                    target,
+                    desired_manifest,
+                    commit_message,
+                    state["head"],
+                )
+                retained_suffix = bool(
+                    desired_manifest["deltas"] or desired_manifest["controls"]
+                )
+                return commit_result, retained_suffix
+            except Exception as exc:
+                last_error = exc
+                latest = self._remote_restore_state(api)
+                if latest["head"] == state["head"]:
+                    raise
+                latest_manifest = latest["manifest"]
+                if base_manifest is None or latest_manifest is None:
+                    raise RuntimeError(
+                        "cannot safely merge concurrent snapshot compaction"
+                    ) from exc
+                latest_snapshot_blob = latest["blob_ids"].get(
+                    latest_manifest["snapshot"]
+                )
+                if (
+                    latest_manifest["snapshot"] != base_manifest["snapshot"]
+                    or not base_snapshot_blob
+                    or latest_snapshot_blob != base_snapshot_blob
+                ):
+                    raise RuntimeError("concurrent snapshot compaction won") from exc
+                desired_manifest = {
+                    "version": 1,
+                    "snapshot": target,
+                    "deltas": self._manifest_suffix(
+                        base_manifest["deltas"], latest_manifest["deltas"]
+                    ),
+                    "controls": self._manifest_suffix(
+                        base_manifest["controls"], latest_manifest["controls"]
+                    ),
+                }
+                state = latest
+        raise RuntimeError("snapshot compaction changed repeatedly") from last_error
+
+    def _load_restore_checkpoint(
+        self,
+        revision: str | None,
+        manifest: dict[str, Any] | None,
+        files: list[str],
+    ) -> set[str]:
+        return self._load_restore_checkpoint_state(revision, manifest, files)[0]
+
+    def _record_restore_checkpoint(
+        self,
+        revision: str | None,
+        manifest: dict[str, Any] | None,
+        files: list[str],
+        completed: list[str],
+        *,
+        derived_ready: bool = False,
+    ) -> None:
+        target = self.restore_checkpoint_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        manifest_digest = (
+            self._canonical_digest(manifest) if manifest is not None else None
+        )
+        files_digest = self._canonical_digest(list(files))
+        data = {
+            "version": 1,
+            "revision": revision,
+            "manifest_digest": manifest_digest,
+            "files_digest": files_digest,
+            "files": list(files),
+            "completed": list(completed),
+            "derived_ready": bool(derived_ready),
+        }
+        encoded = self._canonical_json_bytes(data)
+        fd, tmp = tempfile.mkstemp(
+            prefix="funes-checkpoint-",
+            dir=str(target.parent),
+        )
+        try:
+            os.chmod(tmp, 0o600)
+            with os.fdopen(fd, "wb") as f:
+                f.write(encoded)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, target)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+
+    def _load_restore_checkpoint_state(
+        self,
+        revision: str | None,
+        manifest: dict[str, Any] | None,
+        files: list[str],
+    ) -> tuple[set[str], bool]:
+        """Return the completed prefix and whether derived indexes are durable.
+
+        Older checkpoint files intentionally default to ``False`` for the
+        derived marker.  That makes a pre-upgrade or crash-interrupted restore
+        rebuild FTS and secondary indexes once instead of risking silent misses.
+        """
+        path = self.restore_checkpoint_path
+        if not path.is_file():
+            return set(), False
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict):
+                return set(), False
+            if raw.get("version") != 1:
+                return set(), False
+            if raw.get("revision") != revision:
+                return set(), False
+            manifest_digest = (
+                self._canonical_digest(manifest) if manifest is not None else None
+            )
+            if raw.get("manifest_digest") != manifest_digest:
+                return set(), False
+            files_list = list(files)
+            if raw.get("files") != files_list:
+                return set(), False
+            if raw.get("files_digest") != self._canonical_digest(files_list):
+                return set(), False
+            completed = raw.get("completed")
+            if (
+                not isinstance(completed, list)
+                or len(completed) > len(files_list)
+                or len(completed) != len(set(completed))
+                or any(not isinstance(f, str) for f in completed)
+                or files_list[: len(completed)] != completed
+            ):
+                return set(), False
+            return set(completed), bool(raw.get("derived_ready", False))
+        except Exception:
+            return set(), False
+
+    def _remove_restore_checkpoint(self) -> None:
+        try:
+            target = self.restore_checkpoint_path
+            if target.exists():
+                target.unlink()
+        except (OSError, ValueError):
+            pass
 
     def _repo_files(self) -> list[str]:
         """List snapshot and delta objects without exposing repository contents."""
         from huggingface_hub import HfApi
         api = HfApi(token=self.token)
-        files = []
-        for item in api.list_repo_tree(self.repo, repo_type="dataset", recursive=True, token=self.token):
-            name = getattr(item, "path", "")
-            if (
-                name == self.filename + ".enc"
-                or name.startswith(self.prefix)
-                or name.startswith(self.delta_prefix)
-                or name.startswith(self.control_prefix)
-            ):
-                if name.endswith((".jsonl.enc", ".jsonl.gz.enc")):
-                    files.append(name)
+        state = self._remote_restore_state(api)
+        self._restore_revision = state["head"]
+        manifest = state["manifest"]
+        self._restore_manifest = manifest
+        repo_files = state["repo_files"]
+        if manifest is not None:
+            return RestoreFiles(
+                [
+                    manifest["snapshot"],
+                    *manifest["deltas"],
+                    *manifest["controls"],
+                ],
+                manifest=manifest,
+                revision=state["head"],
+            )
+        files = list(self._source_artifact_names(repo_files))
         snapshots = sorted(name for name in files if name == self.filename + ".enc" or name.startswith(self.prefix))
-        deltas = sorted(name for name in files if name.startswith(self.delta_prefix))
+        deltas = sorted(
+            (name for name in files if self._is_delta_name(name)),
+            key=lambda name: (1 if "/" in name else 0, name),
+        )
         controls = sorted(name for name in files if name.startswith(self.control_prefix))
         # Controls replay last and carry monotonic per-derived-field generations.
         # This makes immutable hash-named deltas safe regardless of their order.
-        return snapshots + deltas + controls
+        return RestoreFiles(
+            snapshots + deltas + controls,
+            manifest=None,
+            revision=state["head"],
+        )
+
+    def _repo_files_metadata(
+        self,
+    ) -> tuple[list[str], dict[str, Any] | None, str | None]:
+        files = self._repo_files()
+        return (
+            list(files),
+            getattr(files, "manifest", self._restore_manifest),
+            getattr(files, "revision", self._restore_revision),
+        )
 
     def _restore_file(self, filename: str) -> int:
-        from huggingface_hub import hf_hub_download
-        downloaded = hf_hub_download(
-            repo_id=self.repo,
-            repo_type="dataset",
-            filename=filename,
-            token=self.token,
-            local_dir=str(self.store.data_dir / "remote"),
-        )
-        encrypted = Path(downloaded)
+        encrypted = None
+        if self._restore_prefetch_root is not None:
+            relative = Path(filename)
+            candidate = self._restore_prefetch_root / relative
+            if (
+                not relative.is_absolute()
+                and ".." not in relative.parts
+                and candidate.is_file()
+            ):
+                encrypted = candidate
+        if encrypted is None:
+            from huggingface_hub import hf_hub_download
+
+            downloaded = hf_hub_download(
+                repo_id=self.repo,
+                repo_type="dataset",
+                filename=filename,
+                revision=self._restore_revision,
+                token=self.token,
+                local_dir=str(self.store.data_dir / "remote"),
+            )
+            encrypted = Path(downloaded)
+        try:
+            file_bytes = encrypted.stat().st_size if encrypted.is_file() else 0
+        except OSError:
+            file_bytes = 0
+        if file_bytes:
+            with self._progress_lock:
+                self._restore_progress["bytes"] += file_bytes
         if not filename.endswith(".enc"):
             if not self._truth("FUNES_ALLOW_PLAINTEXT_SOURCE_RESTORE"):
                 raise RuntimeError("plaintext source snapshot restore is disabled")
@@ -2197,6 +3406,28 @@ class SnapshotSync:
                 self._iter_file(plaintext), self.restore_batch, apply_controls=False
             )
 
+    def _prefetch_restore_files(self, filenames: list[str]) -> Path | None:
+        """Download immutable restore inputs concurrently, with serial fallback."""
+        if len(filenames) < 2 or self.restore_download_workers <= 1:
+            return None
+        try:
+            from huggingface_hub import snapshot_download
+
+            root = snapshot_download(
+                repo_id=self.repo,
+                repo_type="dataset",
+                token=self.token,
+                allow_patterns=filenames,
+                revision=self._restore_revision,
+                local_dir=str(self.store.data_dir / "remote"),
+                max_workers=self.restore_download_workers,
+            )
+        except Exception:
+            # Prefetch is only a latency optimization. The ordered per-file
+            # path below remains authoritative and preserves fail-closed restore.
+            return None
+        return Path(root)
+
     @staticmethod
     def _iter_file(path: Path):
         opener = gzip.open if path.suffix == ".gz" else open
@@ -2206,44 +3437,164 @@ class SnapshotSync:
                     yield json.loads(line)
 
     def restore(self) -> int:
-        if self.repo and self.token:
-            try:
-                self.store.begin_bulk_restore()
+        with self.upload_lock:
+            if self.repo and self.token:
                 try:
-                    files = self._repo_files()
-                    if not files:
-                        # Backwards-compatible single-file snapshot lookup.
-                        files = [self.filename + ".enc"]
-                    restored = 0
-                    for filename in files:
-                        restored += self._restore_file(filename)
-                    # A complete Hub restore can replay an old generation-zero
-                    # revision into an id below a partially persisted row cursor.
-                    # Rewind only here; ordinary local restarts keep their cursor.
-                    self.store.compact_reindex_controls(replay=True)
-                    self.store.drain_reindex_controls(self.restore_batch)
-                finally:
-                    self.store.finish_bulk_restore()
-                self.restored = True
-                return restored
-            except Exception as exc:  # optional recovery must never stop serving
-                status = getattr(getattr(exc, "response", None), "status_code", None)
-                if status == 404 and self._truth("FUNES_ALLOW_EMPTY_REMOTE"):
+                    self._restore_revision = None
+                    self._restore_manifest = None
+                    self.covered_revision = None
+                    restored_revision = None
+                    self._update_restore_progress(
+                        phase="listing",
+                        current=None,
+                        completed=0,
+                        total=0,
+                        rows=0,
+                        bytes=0,
+                    )
+                    bulk_active = False
+                    restore_completed = False
+                    try:
+                        files, manifest, restored_revision = self._repo_files_metadata()
+                        self._restore_revision = restored_revision
+                        self._restore_manifest = manifest
+                        if not files:
+                            # Backwards-compatible single-file snapshot lookup.
+                            files = [self.filename + ".enc"]
+                        completed_files, derived_ready = self._load_restore_checkpoint_state(
+                            restored_revision, manifest, list(files)
+                        )
+                        completed_order = [f for f in files if f in completed_files]
+                        restored = 0
+                        remaining_files = [f for f in files if f not in completed_files]
+                        self._update_restore_progress(
+                            phase="prefetching" if remaining_files else "indexing",
+                            current=None,
+                            completed=len(completed_order),
+                            total=len(files),
+                        )
+                        # A fully completed checkpoint is safe to skip only when
+                        # the previous run recorded the derived-index commit.
+                        # Older checkpoints and crash-interrupted restores rebuild.
+                        if remaining_files or not derived_ready:
+                            self.store.begin_bulk_restore()
+                            bulk_active = True
+                        self._restore_prefetch_root = self._prefetch_restore_files(
+                            remaining_files
+                        )
+                        try:
+                            for filename in files:
+                                if filename in completed_files:
+                                    continue
+                                self._update_restore_progress(
+                                    phase="restoring", current=filename
+                                )
+                                restored += self._restore_file(filename)
+                                completed_order.append(filename)
+                                self._record_restore_checkpoint(
+                                    restored_revision,
+                                    manifest,
+                                    list(files),
+                                    completed_order,
+                                )
+                                self._update_restore_progress(
+                                    completed=len(completed_order),
+                                    rows=restored,
+                                    current=None,
+                                )
+                        finally:
+                            self._restore_prefetch_root = None
+                        # A complete Hub restore can replay an old generation-zero
+                        # revision into an id below a partially persisted row cursor.
+                        # Rewind only here; ordinary local restarts keep their cursor.
+                        self._update_restore_progress(
+                            phase="indexing", current="reindex_controls"
+                        )
+                        self.store.compact_reindex_controls(replay=True)
+                        self.store.drain_reindex_controls(self.restore_batch)
+                        restore_completed = True
+                    finally:
+                        if bulk_active:
+                            self._update_restore_progress(
+                                phase="indexing", current="memories_fts"
+                            )
+                            self.store.finish_bulk_restore(
+                                rebuild_fts=self.rebuild_fts
+                            )
+                            self._record_restore_checkpoint(
+                                restored_revision,
+                                manifest,
+                                list(files),
+                                completed_order,
+                                derived_ready=True,
+                            )
+                        if restore_completed:
+                            self._remove_restore_checkpoint()
+                    self.covered_revision = restored_revision
+                    self._restore_revision = None
+                    self._restore_manifest = None
+                    self.restore_failed = False
+                    self.restore_error = None
+                    self.store.set_sync(last_error=None)
                     self.restored = True
-                    return 0
+                    self._update_restore_progress(
+                        phase="completed",
+                        current=None,
+                        completed=len(files),
+                        total=len(files),
+                        rows=restored,
+                    )
+                    return restored
+                except Exception as exc:  # optional recovery must never stop serving
+                    self._restore_revision = None
+                    self._restore_manifest = None
+                    status = getattr(getattr(exc, "response", None), "status_code", None)
+                    if status == 404 and self._truth("FUNES_ALLOW_EMPTY_REMOTE"):
+                        self.restore_failed = False
+                        self.restore_error = None
+                        self.store.set_sync(last_error=None)
+                        self.restored = True
+                        return 0
+                    return self._fail_restore(exc)
+            local = self.snapshot_path()
+            if not local.exists():
+                self.restore_failed = False
+                self.restore_error = None
+                self.store.set_sync(last_error=None)
+                self.restored = True
+                self._update_restore_progress(
+                    phase="completed", current=None, completed=0, total=0, rows=0, bytes=0
+                )
+                return 0
+            try:
+                local_bytes = local.stat().st_size if local.is_file() else 0
+                self._update_restore_progress(
+                    phase="restoring",
+                    current=local.name,
+                    completed=0,
+                    total=1,
+                    rows=0,
+                    bytes=local_bytes,
+                )
+                restored = self.store.restore(local, apply_controls=False)
+                self._update_restore_progress(phase="indexing", current="reindex_controls")
+                self.store.compact_reindex_controls()
+                self.store.drain_reindex_controls(self.restore_batch)
+                self.restore_failed = False
+                self.restore_error = None
+                self.store.set_sync(last_error=None)
+                self.restored = True
+                self._update_restore_progress(
+                    phase="completed",
+                    current=None,
+                    completed=1,
+                    total=1,
+                    rows=restored,
+                    bytes=local_bytes,
+                )
+                return restored
+            except Exception as exc:
                 return self._fail_restore(exc)
-        local = self.snapshot_path()
-        if not local.exists():
-            self.restored = True
-            return 0
-        try:
-            restored = self.store.restore(local, apply_controls=False)
-            self.store.compact_reindex_controls()
-            self.store.drain_reindex_controls(self.restore_batch)
-            self.restored = True
-            return restored
-        except Exception as exc:
-            return self._fail_restore(exc)
 
     def _secret_gate(self, path: Path) -> tuple[bool, str]:
         """Run the same TruffleHog CLI contract used by native `funes push`.
@@ -2382,13 +3733,50 @@ class SnapshotSync:
                     }
                 try:
                     from huggingface_hub import HfApi
-                    HfApi(token=self.token).upload_file(
-                        path_or_fileobj=str(encrypted),
-                        path_in_repo=name,
-                        repo_id=self.repo,
-                        repo_type="dataset",
-                        commit_message="funes encrypted reindex control",
-                    )
+                    api = HfApi(token=self.token)
+                    state = self._remote_restore_state(api)
+                    manifest = state["manifest"]
+                    if manifest is not None:
+                        _, already_uploaded = self._commit_manifest_append(
+                            api,
+                            encrypted,
+                            name,
+                            "controls",
+                            "funes encrypted reindex control",
+                            state,
+                        )
+                        if already_uploaded:
+                            self.store.set_sync(
+                                last_sync=utc_now(),
+                                snapshot_path=str(encrypted),
+                                last_error=None,
+                            )
+                            return {
+                                "uploaded": False,
+                                "durable": True,
+                                "already_uploaded": True,
+                                "generation": generation,
+                                "scope": scope,
+                            }
+                    else:
+                        commit_result = api.upload_file(
+                            path_or_fileobj=str(encrypted),
+                            path_in_repo=name,
+                            repo_id=self.repo,
+                            repo_type="dataset",
+                            commit_message="funes encrypted reindex control",
+                        )
+                        self._advance_coverage(state, commit_result)
+                        latest = self._remote_restore_state(api)
+                        if latest["manifest"] is not None:
+                            self._commit_manifest_append(
+                                api,
+                                encrypted,
+                                name,
+                                "controls",
+                                "funes encrypted reindex control",
+                                latest,
+                            )
                 except Exception as exc:
                     reason = type(exc).__name__
                     self.store.set_sync(last_error=reason)
@@ -2409,6 +3797,8 @@ class SnapshotSync:
             # avoids rewriting a multi-gigabyte snapshot for every new turn and
             # makes retries idempotent.  `/sync` without documents still emits a
             # compact full snapshot for operators.
+            api = None
+            state = None
             if docs is not None:
                 durable_docs = list(docs)
                 if not any(
@@ -2418,30 +3808,116 @@ class SnapshotSync:
                     durable_docs.append(self.store.native_index_state_record())
                 digest = hashlib.sha256(json.dumps(durable_docs, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:24]
                 # Content addressing makes a retry upload the same immutable
-                # object. Restore is order-independent because Store.ingest
-                # applies updated_at LWW rather than trusting filename order.
+                # object. Restore does not trust filename order: source revisions
+                # use their row high-water while source metadata uses persisted
+                # per-field clocks with deterministic equal-time joins.
                 path = self.store.data_dir / f"{self.delta_prefix}{digest}.jsonl.gz"
                 self._write_jsonl_gzip(durable_docs, path)
             else:
                 path = self.snapshot_path()
+                if self.repo and self.token:
+                    try:
+                        self._encryption_key()
+                        from huggingface_hub import HfApi
+                        api = HfApi(token=self.token)
+                        state = self._remote_restore_state(api)
+                        if (
+                            self._source_artifact_names(state["repo_files"])
+                            and self.covered_revision != state["head"]
+                        ):
+                            reason = "remote_history_not_restored"
+                            self.store.set_sync(
+                                last_error=reason, snapshot_path=str(path)
+                            )
+                            return {
+                                "uploaded": False,
+                                "durable": False,
+                                "path": str(path),
+                                "reason": reason,
+                            }
+                    except Exception as exc:
+                        reason = type(exc).__name__
+                        self.store.set_sync(
+                            last_error=reason, snapshot_path=str(path)
+                        )
+                        return {
+                            "uploaded": False,
+                            "durable": False,
+                            "path": str(path),
+                            "reason": reason,
+                        }
                 self.store.snapshot(path)
             if not self.repo or not self.token:
                 self.store.set_sync(last_sync=utc_now(), snapshot_path=str(path), last_error=None)
                 if self.repo or self._truth("FUNES_REQUIRE_DURABLE_ACK"):
                     return {"uploaded": False, "durable": False, "path": str(path), "reason": "HF storage not configured"}
                 return {"uploaded": False, "durable": True, "path": str(path), "reason": "local durable store"}
-            target = (path.name if docs is not None else self.filename) + ".enc"
-            api = None
+            if docs is not None:
+                try:
+                    self._encryption_key()
+                except Exception as exc:
+                    reason = type(exc).__name__
+                    self.store.set_sync(last_error=reason, snapshot_path=str(path))
+                    return {
+                        "uploaded": False,
+                        "durable": False,
+                        "path": str(path),
+                        "reason": reason,
+                    }
+            target = (
+                self.delta_target(digest)
+                if docs is not None
+                else self.filename + ".enc"
+            )
+            legacy_target = (
+                f"{path.name}.enc"
+                if docs is not None and "/" in target
+                else None
+            )
+            manifest = None
             if docs is not None:
                 try:
                     from huggingface_hub import HfApi
                     api = HfApi(token=self.token)
-                    if api.file_exists(
-                        repo_id=self.repo,
-                        filename=target,
-                        repo_type="dataset",
-                        token=self.token,
-                    ):
+                    state = self._remote_restore_state(api)
+                    manifest = state["manifest"]
+                    if manifest is not None:
+                        already_durable = (
+                            target in manifest["deltas"]
+                            or (
+                                legacy_target is not None
+                                and legacy_target in manifest["deltas"]
+                            )
+                        )
+                    else:
+                        already_durable = api.file_exists(
+                            repo_id=self.repo,
+                            filename=target,
+                            repo_type="dataset",
+                            revision=state["head"],
+                            token=self.token,
+                        )
+                        if not already_durable and legacy_target is not None:
+                            already_durable = api.file_exists(
+                                repo_id=self.repo,
+                                filename=legacy_target,
+                                repo_type="dataset",
+                                revision=state["head"],
+                                token=self.token,
+                            )
+                        if already_durable:
+                            latest = self._remote_restore_state(api)
+                            if latest["manifest"] is not None:
+                                state = latest
+                                manifest = latest["manifest"]
+                                already_durable = (
+                                    target in manifest["deltas"]
+                                    or (
+                                        legacy_target is not None
+                                        and legacy_target in manifest["deltas"]
+                                    )
+                                )
+                    if already_durable:
                         path.unlink(missing_ok=True)
                         self.store.set_sync(last_sync=utc_now(), snapshot_path=str(path), last_error=None)
                         return {
@@ -2450,11 +3926,15 @@ class SnapshotSync:
                             "path": str(path),
                             "already_uploaded": True,
                         }
-                except Exception:
-                    # Existence probing is only an idempotency optimization. A
-                    # transient read failure must not prevent the authoritative
-                    # upload attempt below.
-                    api = None
+                except Exception as exc:
+                    reason = type(exc).__name__
+                    self.store.set_sync(last_error=reason, snapshot_path=str(path))
+                    return {
+                        "uploaded": False,
+                        "durable": False,
+                        "path": str(path),
+                        "reason": reason,
+                    }
             try:
                 encrypted = path.with_name(path.name + ".enc")
                 self._encrypt_file(path, encrypted)
@@ -2466,7 +3946,64 @@ class SnapshotSync:
                 if api is None:
                     from huggingface_hub import HfApi
                     api = HfApi(token=self.token)
-                api.upload_file(path_or_fileobj=str(encrypted), path_in_repo=target, repo_id=self.repo, repo_type="dataset", commit_message="funes encrypted source delta" if docs is not None else "funes encrypted source snapshot")
+                commit_message = (
+                    "funes encrypted source delta"
+                    if docs is not None
+                    else "funes encrypted source snapshot"
+                )
+                if docs is None:
+                    commit_result, retained_suffix = self._commit_compact_snapshot(
+                        api,
+                        encrypted,
+                        target,
+                        commit_message,
+                        state,
+                    )
+                    oid = self._commit_oid(commit_result)
+                    if oid and not retained_suffix:
+                        self.covered_revision = oid
+                elif manifest is not None:
+                    _, already_uploaded = self._commit_manifest_append(
+                        api,
+                        encrypted,
+                        target,
+                        "deltas",
+                        commit_message,
+                        state,
+                    )
+                    if already_uploaded:
+                        path.unlink(missing_ok=True)
+                        encrypted.unlink(missing_ok=True)
+                        self.store.set_sync(
+                            last_sync=utc_now(),
+                            snapshot_path=str(path),
+                            last_error=None,
+                        )
+                        return {
+                            "uploaded": False,
+                            "durable": True,
+                            "path": str(path),
+                            "already_uploaded": True,
+                        }
+                else:
+                    commit_result = api.upload_file(
+                        path_or_fileobj=str(encrypted),
+                        path_in_repo=target,
+                        repo_id=self.repo,
+                        repo_type="dataset",
+                        commit_message=commit_message,
+                    )
+                    self._advance_coverage(state, commit_result)
+                    latest = self._remote_restore_state(api)
+                    if latest["manifest"] is not None:
+                        self._commit_manifest_append(
+                            api,
+                            encrypted,
+                            target,
+                            "deltas",
+                            commit_message,
+                            latest,
+                        )
                 if docs is not None:
                     path.unlink(missing_ok=True)
                 encrypted.unlink(missing_ok=True)
@@ -2486,6 +4023,80 @@ FINAL_TRANSLATION_STATUSES = {
 }
 
 
+def _same_revision_derived_change(
+    item: dict[str, Any],
+    metadata: dict[str, Any],
+    existing: dict[str, Any],
+    raw: str,
+) -> bool:
+    """Return whether supplied derived state can change the stored revision."""
+    def supplied(name: str) -> bool:
+        return name in item or name in metadata
+
+    def incoming(name: str) -> Any:
+        return item[name] if name in item else metadata.get(name)
+
+    if supplied("source_missing") and bool(incoming("source_missing")) != bool(
+        existing.get("source_missing")
+    ):
+        return True
+
+    current_retrieval_generation = int(existing.get("retrieval_generation") or 0)
+    incoming_retrieval_generation = (
+        int(incoming("retrieval_generation") or 0)
+        if supplied("retrieval_generation")
+        else current_retrieval_generation
+    )
+    if incoming_retrieval_generation > current_retrieval_generation:
+        return True
+    if incoming_retrieval_generation >= current_retrieval_generation:
+        retrieval_values = {
+            "retrieval_text": str(incoming("retrieval_text") or normalize_text(raw))
+            if supplied("retrieval_text")
+            else existing.get("retrieval_text"),
+            "translation_hash": incoming("translation_hash")
+            if supplied("translation_hash")
+            else existing.get("translation_hash"),
+            "translation_version": incoming("translation_version")
+            if supplied("translation_version")
+            else existing.get("translation_version"),
+            "translation_status": incoming("translation_status")
+            if supplied("translation_status")
+            else existing.get("translation_status"),
+            "retrieval_updated_at": incoming("retrieval_updated_at")
+            if supplied("retrieval_updated_at")
+            else existing.get("retrieval_updated_at"),
+        }
+        if any(retrieval_values[name] != existing.get(name) for name in retrieval_values):
+            return True
+
+    current_native_generation = int(existing.get("native_generation") or 0)
+    incoming_native_generation = (
+        int(incoming("native_generation") or 0)
+        if supplied("native_generation")
+        else current_native_generation
+    )
+    if incoming_native_generation > current_native_generation:
+        return True
+    if incoming_native_generation >= current_native_generation:
+        for name in (
+            "native_index_version",
+            "native_index_status",
+            "native_index_profile",
+            "native_index_memory",
+            "native_indexed_at",
+            "native_index_error",
+        ):
+            if supplied(name) and incoming(name) != existing.get(name):
+                return True
+
+    if supplied("embedding_generation"):
+        return int(incoming("embedding_generation") or 0) > int(
+            existing.get("embedding_generation") or 0
+        )
+    return False
+
+
 def prepare_ingest_documents(app: Any, docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Build the raw-first durable representation without calling a provider."""
     prepared = []
@@ -2493,6 +4104,7 @@ def prepare_ingest_documents(app: Any, docs: list[dict[str, Any]]) -> list[dict[
     # once: each lookup computes MAX values over the current source table, so a
     # per-document lookup turns a historical backfill into O(batch * rows).
     generation = app.store.latest_reindex_generation()
+    embedding_generation = app.store.latest_embedding_generation()
     for doc in docs:
         if not isinstance(doc, dict):
             raise ValueError("each document must be an object")
@@ -2503,31 +4115,70 @@ def prepare_ingest_documents(app: Any, docs: list[dict[str, Any]]) -> list[dict[
         metadata = item.get("metadata") or {}
         if not isinstance(metadata, dict):
             raise ValueError("metadata must be an object")
+
+        def supplied(name: str) -> bool:
+            return name in item or name in metadata
+
+        def incoming(name: str) -> Any:
+            return item[name] if name in item else metadata.get(name)
+
         identity = str(item.get("source_identity") or app.store._identity(item, metadata, raw))
         item["source_identity"] = identity
-        item["retrieval_generation"] = generation
-        item["native_generation"] = generation
         source_version = str(item.get("source_version", metadata.get("source_version", "")))
         content_hash = hashlib.sha256(raw.encode("utf-8")).hexdigest()
         existing = app.store.get(identity)
-        same_final_revision = bool(
+        same_revision = bool(
             existing
             and existing.get("content_hash") == content_hash
             and str(existing.get("source_version", "")) == source_version
+        )
+        derived_change = bool(
+            same_revision
+            and _same_revision_derived_change(item, metadata, existing, raw)
+        )
+        if same_revision and not derived_change:
+            # Source attribution refreshes are independent of the immutable raw
+            # revision. Let Store.ingest preserve every derived generation and
+            # checkpoint instead of stamping the latest global reindex epoch.
+            prepared.append(item)
+            continue
+        if same_revision:
+            for name in (
+                "retrieval_generation",
+                "native_generation",
+                "embedding_generation",
+            ):
+                if not supplied(name):
+                    item[name] = int(existing.get(name) or 0)
+        else:
+            item["retrieval_generation"] = generation
+            item["native_generation"] = generation
+            item["embedding_generation"] = embedding_generation
+        same_final_revision = bool(
+            same_revision
             and existing.get("translation_status") in FINAL_TRANSLATION_STATUSES
         )
-        if same_final_revision and not item.get("retrieval_text"):
+        supplied_retrieval = (
+            incoming("retrieval_text") if supplied("retrieval_text") else None
+        )
+        if same_final_revision and not supplied_retrieval:
             item["retrieval_text"] = existing.get("retrieval_text") or normalize_text(raw)
             for name in ("translation_hash", "translation_version", "translation_status"):
-                if existing.get(name) is not None:
-                    item.setdefault(name, existing[name])
+                if not supplied(name) and existing.get(name) is not None:
+                    item[name] = existing[name]
             prepared.append(item)
             continue
-        if item.get("retrieval_text"):
+        if supplied_retrieval:
             prepared.append(item)
             continue
-        source_type = str(item.get("source_type", item.get("kind", ""))).lower()
-        content_type = str(item.get("content_type", "")).lower()
+        source_type = str(
+            incoming("source_type")
+            if supplied("source_type")
+            else item.get("kind", "")
+        ).lower()
+        content_type = str(
+            incoming("content_type") if supplied("content_type") else ""
+        ).lower()
         native_session = source_type in {
             "session",
             "codex",
@@ -2691,6 +4342,11 @@ def ingest_documents(app: Any, docs: list[dict[str, Any]]) -> dict[str, Any]:
     )
     result["translation"] = {"attempted": 0, "updated": 0, "durable": True}
     if not result["durable"]:
+        durability_sensitive = {
+            str(item["source_identity"])
+            for item in result["items"]
+            if item["status"] in {"created", "updated", "derived_updated"}
+        }
         app.store.update_native_index(
             [
                 {
@@ -2704,6 +4360,7 @@ def ingest_documents(app: Any, docs: list[dict[str, Any]]) -> dict[str, Any]:
                     "native_generation": int(item.get("native_generation") or 0),
                 }
                 for item in canonical
+                if str(item["source_identity"]) in durability_sensitive
             ]
         )
         result["error"] = "durability_pending"
@@ -2723,38 +4380,47 @@ def queue_reindex(app: Any, scope: str) -> dict[str, Any]:
                 "error": "restore_in_progress" if app.syncer.restoring else "restore_failed",
             }
         control = app.store.next_reindex_control(scope)
-        sync = app.syncer.upload_reindex_control(control)
-        if not sync.get("durable"):
+        upload_lock = getattr(app.syncer, "upload_lock", None) or threading.RLock()
+        with upload_lock:
+            sync = app.syncer.upload_reindex_control(control)
+            if not sync.get("durable"):
+                return {
+                    "queued": False,
+                    "durable": False,
+                    "scope": scope,
+                    "error": str(sync.get("reason") or "durability_pending"),
+                }
+            app.store.record_reindex_control(control)
+            app.store.compact_reindex_controls()
+            wake = getattr(app, "reindex_wake", None)
+            if wake is not None:
+                wake.set()
             return {
-                "queued": False,
-                "durable": False,
+                "queued": True,
+                "durable": True,
                 "scope": scope,
-                "error": str(sync.get("reason") or "durability_pending"),
+                "generation": int(control["generation"]),
             }
-        app.store.record_reindex_control(control)
-        app.store.compact_reindex_controls()
-        wake = getattr(app, "reindex_wake", None)
-        if wake is not None:
-            wake.set()
-        return {
-            "queued": True,
-            "durable": True,
-            "scope": scope,
-            "generation": int(control["generation"]),
-        }
     lock = getattr(app, "reindex_lock", None) or threading.Lock()
     with lock:
         return persist_control()
 
 
 class App:
-    def __init__(self):
-        # Free Gradio Spaces do not expose /data.  The Hub snapshot remains the
-        # durable source of truth; operators can override this with a writable
-        # mounted volume when one is available.
-        self.store = Store(os.getenv("FUNES_DATA_DIR", "/tmp/funes-data"))
+    def __init__(self, *, rebuild_fts: bool | None = None):
+        # PostgreSQL is an explicit source-store cutover. Never fall back to an
+        # empty SQLite store if the configured database is unavailable/unready.
+        data_dir = os.getenv("FUNES_DATA_DIR", "/tmp/funes-data")
+        if os.getenv("FUNES_POSTGRES_DSN"):
+            from service.postgres import PostgresStore
+            from service.postgres_sync import PostgresSync
+
+            self.store = PostgresStore(data_dir)
+            self.syncer = PostgresSync(self.store, rebuild_fts=rebuild_fts)
+        else:
+            self.store = Store(data_dir)
+            self.syncer = SnapshotSync(self.store, rebuild_fts=rebuild_fts)
         self.translator = Translator(self.store)
-        self.syncer = SnapshotSync(self.store)
         self.restore_result = 0
         self.restore_done = threading.Event()
         self.reconcile_stop = threading.Event()
@@ -2824,14 +4490,22 @@ class App:
     def _reindex_background(self) -> None:
         self.restore_done.wait()
         while not self.reindex_stop.is_set():
-            result = self.store.apply_pending_reindex_controls(
-                getattr(self, "reindex_batch_size", 500)
-            )
-            if result["applied"]:
-                self.reconcile_wake.set()
-            if result["scanned"] or result["applied"]:
-                continue
-            self.store.compact_reindex_controls()
+            # Restore failure is a closed gate, including the control worker.
+            # PG readiness probes can later reconnect without a Space restart.
+            if not self.syncer.restoring and not self.syncer.restore_failed:
+                try:
+                    result = self.store.apply_pending_reindex_controls(
+                        getattr(self, "reindex_batch_size", 500)
+                    )
+                    if result["applied"]:
+                        self.reconcile_wake.set()
+                    if result["scanned"] or result["applied"]:
+                        continue
+                    self.store.compact_reindex_controls()
+                except Exception:
+                    if getattr(self.syncer, "backend", None) != "postgres":
+                        raise
+                    self.syncer.check_ready()
             self.reindex_wake.wait(self.reconcile_interval)
             self.reindex_wake.clear()
 
@@ -2919,6 +4593,7 @@ def make_handler(app: App):
             # HTTP always returns raw source truth, never its English shadow.
             item = dict(item)
             item.pop("retrieval_text", None)
+            item.pop(SOURCE_METADATA_CLOCK_KEY, None)
             return item
 
         def do_GET(self) -> None:
@@ -2928,24 +4603,78 @@ def make_handler(app: App):
                 return self._json(200, {"status": "ok", "service": "funes"})
             if route == "/ready":
                 try:
+                    if (
+                        getattr(app.syncer, "backend", None) == "postgres"
+                        and not app.syncer.check_ready()
+                    ):
+                        return self._json(503, {"status": "not_ready", "error": "postgres_unavailable"})
                     if app.syncer.restoring:
-                        return self._json(503, {"status": "restoring"})
+                        progress = getattr(app.syncer, "progress", {})
+                        return self._json(
+                            503,
+                            {
+                                "status": "restoring",
+                                "phase": progress.get("phase", "restoring"),
+                                "current": progress.get("current"),
+                                "completed": progress.get("completed", 0),
+                                "total": progress.get("total", 0),
+                                "rows": progress.get("rows", 0),
+                                "bytes": progress.get("bytes", 0),
+                                "progress": progress,
+                            },
+                        )
                     if app.syncer.restore_failed:
                         return self._json(503, {"status": "not_ready", "error": "restore_failed"})
-                    count = app.store.count()
-                    return self._json(200, {"status": "ready", "documents": count, "restored": app.restore_result})
+                    # PostgreSQL readiness must not COUNT/scan source history.
+                    count = (
+                        None if getattr(app.syncer, "backend", None) == "postgres"
+                        else app.store.count()
+                    )
+                    return self._json(
+                        200,
+                        {
+                            "status": "ready",
+                            "documents": count,
+                            "restored": app.restore_result,
+                            "progress": getattr(app.syncer, "progress", {}),
+                        },
+                    )
                 except Exception as exc:
+                    if getattr(app.syncer, "backend", None) == "postgres":
+                        return self._json(503, {"status": "not_ready", "error": "postgres_unavailable"})
                     return self._json(503, {"status": "not_ready", "error": type(exc).__name__})
             if route in PROTECTED and self._authorized():
-                if route == "/sources":
-                    return self._json(200, {"sources": app.store.sources()})
-                if route == "/sync/status":
-                    return self._json(200, app.store.sync_status())
-                if route == "/get":
-                    params = parse_qs(urlparse(self.path).query)
-                    ident = params.get("source_identity", params.get("id", [""]))[0]
-                    item = app.store.get(ident)
-                    return self._json(200 if item else 404, self._public(item) if item else {"error": "not_found"})
+                try:
+                    if (
+                        getattr(app.syncer, "backend", None) == "postgres"
+                        and not app.syncer.check_ready()
+                    ):
+                        return self._json(503, {"error": "postgres_unavailable", "durable": False})
+                    if route == "/sources":
+                        return self._json(200, {"sources": app.store.sources()})
+                    if route == "/sync/status":
+                        if app.syncer.restoring:
+                            return self._json(
+                                503,
+                                {
+                                    "status": "restoring",
+                                    "restore_progress": getattr(
+                                        app.syncer, "progress", {}
+                                    ),
+                                },
+                            )
+                        status = app.store.sync_status()
+                        status["restore_progress"] = getattr(app.syncer, "progress", {})
+                        return self._json(200, status)
+                    if route == "/get":
+                        params = parse_qs(urlparse(self.path).query)
+                        ident = params.get("source_identity", params.get("id", [""]))[0]
+                        item = app.store.get(ident)
+                        return self._json(200 if item else 404, self._public(item) if item else {"error": "not_found"})
+                except Exception:
+                    if getattr(app.syncer, "backend", None) == "postgres":
+                        return self._json(503, {"error": "postgres_unavailable", "durable": False})
+                    raise
             return self._json(404, {"error": "not_found"})
 
         def do_POST(self) -> None:
@@ -2955,6 +4684,11 @@ def make_handler(app: App):
                 return
             try:
                 body = self._body()
+                if (
+                    getattr(app.syncer, "backend", None) == "postgres"
+                    and not app.syncer.check_ready()
+                ):
+                    return self._json(503, {"error": "postgres_unavailable", "durable": False})
                 if self.path == "/sources/check":
                     if app.syncer.restoring or app.syncer.restore_failed:
                         error = "restore_in_progress" if app.syncer.restoring else "restore_failed"
@@ -3019,13 +4753,28 @@ def make_handler(app: App):
                     result = queue_reindex(app, str(body.get("scope", "")))
                     return self._json(202 if result.get("durable") else 503, result)
                 if self.path == "/sync":
+                    if app.syncer.restoring or app.syncer.restore_failed:
+                        error = "restore_in_progress" if app.syncer.restoring else "restore_failed"
+                        return self._json(503, {"error": error, "durable": False})
                     result = app.syncer.upload()
                     return self._json(200 if result.get("durable") else 503, result)
                 if self.path == "/sync/status":
+                    if app.syncer.restoring:
+                        return self._json(
+                            503,
+                            {
+                                "status": "restoring",
+                                "restore_progress": getattr(
+                                    app.syncer, "progress", {}
+                                ),
+                            },
+                        )
                     return self._json(200, app.store.sync_status())
             except (ValueError, json.JSONDecodeError) as exc:
                 return self._json(400, {"error": str(exc)})
             except Exception as exc:
+                if getattr(app.syncer, "backend", None) == "postgres":
+                    return self._json(503, {"error": "postgres_unavailable", "durable": False})
                 return self._json(500, {"error": type(exc).__name__})
 
     return Handler

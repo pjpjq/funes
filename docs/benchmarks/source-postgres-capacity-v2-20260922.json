@@ -1,0 +1,714 @@
+{
+  "source_sha256": "8f72d49271e326f30acb489b921c686ac3b4c4186cd991d251475205c4467003",
+  "schema_version": 2,
+  "source_writes": false,
+  "production_requests": false,
+  "status": "passed",
+  "source_stat_before": {
+    "device": 64769,
+    "inode": 1049966,
+    "size": 25935802368,
+    "mtime_ns": 1790067827338367987
+  },
+  "source_rows": 3590437,
+  "sample_table_counts": {
+    "memories": 10000,
+    "translation_cache": 63,
+    "sync_state": 1,
+    "reindex_controls": 0
+  },
+  "sample_selection": "deterministic equally spaced source IDs, endpoints included; verified dense ID interval",
+  "source_schema_sha256": {
+    "memories": "ec4286f028d102b98e76752384ed12346229ac0c219922d94913ccfe28dccd94",
+    "translation_cache": "6d59032cc29bc3812315f529304e5754a93d22944ea616c681e6a14b470ef7ab",
+    "sync_state": "8038e2d2502b2372d4acf078d36eb42e961a80cee994d5ef63d06c44fef7a59a",
+    "reindex_controls": "5bdeb9f4bdf0e6de7cdb40ce9fb7af4d983fbdc9a1b3cf808a98224c47854e1c"
+  },
+  "sample_file_bytes": 71938048,
+  "sampling_seconds": 0.5595132509988616,
+  "source_sample": {
+    "memories": {
+      "rows": 10000,
+      "sha256": "59e511a001f3d3c3bcd0b5ec19e4ef85195c583c52df88422e174553a4e6eb24",
+      "column_sha256": {
+        "id": "64377bd694c505f9f21be1945182a124fd63562646aa98e7a1b05c3e2aa6d32c",
+        "source_identity": "6c741a8eee710f5bfaa2f5f1effe1761ba46ee688d6b849ad22c41e49f03032e",
+        "source_version": "15edecfbc4719160520c7e79cf39b305509e89a156761698f773257b9c31cc3d",
+        "raw_text": "691676c23bc91a877db5528e54f863792256a8466467bc3449286475bc2130c3",
+        "retrieval_text": "6031049ebf54d8fe1ef8dcc3ac1d2ab5a30681c9b9fa990a0ab06150214073e6",
+        "search_identifiers": "155becf17232cb70ed817431a15f62e003e4246c831c3b5588a4eaf2bc2dddf9",
+        "metadata_json": "883e22e714ba6a5e7a3d54ed9985c3f159c12d40ed2c5683789c966561e217d7",
+        "source_metadata_clock_json": "3348fca6827b72dd29c20f6a92953fee6233be1a46bfee33a1d5cb416855e0de",
+        "source_agent": "7cd04bbec49b7dfe798ec614274b39900fca28b468717de189481c06da6245bb",
+        "source_type": "b8a7a1e12b89c0dc35be71d2040b1a861d6bedd02090386d875fcb2ef415fa80",
+        "device_id": "158fc51ab9f61e0f1b51c2a2c457a8fa50e5cfa6891329c591b6b9e76a403c9d",
+        "project": "141864f59c317e521a4b78877c8cc16ae24389fdae39321092e54c4617a77202",
+        "repo": "083e2a6b35ea346ce886c78c516ced586bf09b0498b758198f1e5c32f503936e",
+        "worktree": "bc6cd9dc8d77e4c6a07a00c88f0b8acd70ad68206c205cdc2bb272e8063f9abe",
+        "session_id": "f372ced07b7a4dbf72a4df4ad1d506bda943352004c70c5dcade2e19ab728215",
+        "message_id": "b1de2185a45137652b1f2ca720f349cbbe82cfd32868250c8aac92dd042d056e",
+        "role": "a67160647e5fef97e0b04759504595faceee3764b56839e0577529c4abe0d66e",
+        "timestamp": "66fba210f4ffaae05de362914e9b545af0e1298d4d2c11533f3911d76831b900",
+        "source_path": "a1f5496a8844d7d72f1da25a83141a6fc0a899a1097e9a4033c029bcffd5f2cd",
+        "content_hash": "55fc30f71cc81ebec4760012005de9f024c9de69717b12654a648bb7a0e6f111",
+        "ingested_at": "89e7557c6c81ab0b1020e30a80f650f29e733f74aef4d4145174f95c16fdef8f",
+        "updated_at": "616fbe669fb584ba912c44ca042a715e93fc1f4240af5738aa0b73f55ff73815",
+        "retrieval_updated_at": "6de0d2f71b20fd365f8d33445d96b6646d4826e201b6854d8b591cdcf1e72f65",
+        "content_type": "abdcaa0d41558dcd50e5b4e29e8e69f159824f9dda679ed8efd28d1b0271a1ee",
+        "source_missing": "737e84c3a244ae2741b170c26bae9004d0ac50381daa51cb3cab5e0ddea1440e",
+        "agent_type": "25972a804ab7862d58983d1696d02334dc865785f260b530409215ac0be86fcb",
+        "parent_session_id": "2d269e62d04082f552bf902e19bbc468762e3571f4df35b82aa59deeb674b169",
+        "agent_id": "8f0193605a3e9ad02fb323ee0566d729ca57d2e0999ba2768841a1f36e92bf7a",
+        "translation_hash": "5fbdda2df811f65a609d7990d9488d5eed366d45854a1e0cebfdca3b1098b9c5",
+        "translation_version": "61273a641288eb36a5975b602eee97111bd8144e84c7334293f733ec4680d65b",
+        "translation_status": "4aba1141aaf4ba4eb9791eeba8fc6d25bf926c4608e63d3f629ae9c0278f7af1",
+        "native_index_version": "08f2d91cba81f6a6b564d789749a9fc33803955b56f51c2bc85f52ba495c9df0",
+        "native_index_status": "8539f48f7f5f0dfb15c6155b40a74712f8fce74db54f536e05caa181a436b5a0",
+        "native_index_profile": "a6ab4a6fb12c2b40b607787adf765517a0d43cb83d91835ff74457ffd9a4dbae",
+        "native_index_memory": "5acaaadb10c9e5ee39dff5c69e36e2c04664a3b906184ca891d8dc49d87a9228",
+        "native_indexed_at": "0dafc01122e4880a543af355827b7fe2e0b8511ec843c45c39d22052f8148343",
+        "native_index_error": "ad3deaa24fb9aec2977fc2d0183f82ebdc990023f2008c7adc635127f0b215b6",
+        "native_index_pending": "52bdf7fafb5e67535db37c5020187af51ecf9142bd4b0181d6c5cd5658d7d942",
+        "retrieval_generation": "00a4ada77fa263ecdce3a773805ffa4cd7ff3f6e1f3f80b7ba5128209bea28b7",
+        "native_generation": "187f992cbb88a7a587764e18ffb00f6dd48b4fe4404bcff0b866ec22260c9d54",
+        "embedding_generation": "a32ccb1a001606a72dc44282e5acfb70a90f9eba7577513d1c8e34d948de8104"
+      },
+      "payload_bytes": 61518806,
+      "column_payload_bytes": {
+        "id": 66903,
+        "source_identity": 640000,
+        "source_version": 640000,
+        "raw_text": 17770767,
+        "retrieval_text": 17268929,
+        "search_identifiers": 10386877,
+        "metadata_json": 1683146,
+        "source_metadata_clock_json": 7100565,
+        "source_agent": 49931,
+        "source_type": 69805,
+        "device_id": 236610,
+        "project": 100,
+        "repo": 0,
+        "worktree": 249152,
+        "session_id": 352296,
+        "message_id": 435198,
+        "role": 55732,
+        "timestamp": 234864,
+        "source_path": 1074891,
+        "content_hash": 640000,
+        "ingested_at": 320000,
+        "updated_at": 317371,
+        "retrieval_updated_at": 317371,
+        "content_type": 115905,
+        "source_missing": 10000,
+        "agent_type": 40178,
+        "parent_session_id": 103836,
+        "agent_id": 680,
+        "translation_hash": 639808,
+        "translation_version": 179946,
+        "translation_status": 218501,
+        "native_index_version": 84352,
+        "native_index_status": 9394,
+        "native_index_profile": 85760,
+        "native_index_memory": 37520,
+        "native_indexed_at": 42176,
+        "native_index_error": 242,
+        "native_index_pending": 10000,
+        "retrieval_generation": 10000,
+        "native_generation": 10000,
+        "embedding_generation": 10000
+      },
+      "nul_fields": {
+        "raw_text": 5,
+        "retrieval_text": 5
+      },
+      "literal_escape_fields": {},
+      "row_payload_bytes": {
+        "min": 1326,
+        "p50": 2484,
+        "p90": 18639,
+        "p99": 19619,
+        "max": 25319,
+        "mean": 6151.8806
+      }
+    },
+    "translation_cache": {
+      "rows": 63,
+      "sha256": "451fdc13012359579a033d503b03e8ab614f836acb557026b430e2f9520d1180",
+      "column_sha256": {
+        "query": "c2cf742f97e613ec9539d68f8de9d7ecb506ea93b836182739db493387ae75bf",
+        "rewritten": "58428e3898578014b7ccf70cda6c8e6ff5b5954c20b8302d98e511213cf62d5f",
+        "created_at": "b5644148993f380a84ee185573a72eecfdc0b7afe3137ab74e5928a217530626",
+        "translation_hash": "5c5269f0db72fea738e179d3e17be581afa9dd6f215a6b1244b3fc0f5b15837b",
+        "translation_version": "ef0157df2615f2d2d654fed6a4868f38f30fbcfbdfd5ae002e10a20d52bac2a0",
+        "translation_status": "77e5e8cfacabf89ac185f1aa2fcc8ce98007746879f771255a373da1a6d73919"
+      },
+      "payload_bytes": 43809,
+      "column_payload_bytes": {
+        "query": 4032,
+        "rewritten": 36501,
+        "created_at": 2016,
+        "translation_hash": 0,
+        "translation_version": 1134,
+        "translation_status": 126
+      },
+      "nul_fields": {},
+      "literal_escape_fields": {},
+      "row_payload_bytes": {
+        "min": 155,
+        "p50": 585,
+        "p90": 926,
+        "p99": 2856,
+        "max": 2982,
+        "mean": 695.3809523809524
+      }
+    },
+    "sync_state": {
+      "rows": 1,
+      "sha256": "a0f41a9093e9f8a510432ca9d7e317ebb071cc48d9c0c6696443a4609a77ace2",
+      "column_sha256": {
+        "id": "7415b13f232d5450a053be2c4e677f4a601fccb96250754b1b618418aaad68a5",
+        "last_sync": "f8bbc18c5db9c6ce5c576a25da5631d884d59a29f0f1c2dcd2015c9bef52ca54",
+        "last_error": "d6ea56195ea9eb5a12854bdd2341626c84e296529391911db0c6bd1cc2fea5af",
+        "snapshot_path": "2d6ff0d2b366aa272b603dbedc4310576e0447bd50026f069f020a857a0adb7c",
+        "restored_at": "82b1b09c988542f7326cd58d2950e4271214f1f524ce383700ea43a36f65e36a",
+        "native_optimize_provider": "1f56fbb0621beefdcdcc186e7da4bfff584d74fe4e914547d4cdba05ea8e762e",
+        "native_optimize_model": "c1d15c877514524f1c86c0ff0cd9694eb5ad29af91f89ecfb5114bfc0ccf91f9",
+        "native_optimize_dimensions": "4aae5a40ef7cf85d3a1c3cf891a228b8b4497013a63aace501ee6a9105fbb822",
+        "native_optimize_schema_version": "1f626d671bdbbfe666bffe176a9d847874dca34c9bbab05aca7ca35e5ce7907f",
+        "native_optimize_layout_version": "ddc7c0778c5fac0f94f7174c244e32f101655740018ae8223360378c4e98799a",
+        "native_optimize_memory": "850af9d2b413a5723556b49303da5af6c744d5f1c2df3c6fec1b6961d702e57d",
+        "native_optimize_fingerprint": "cdb1186d9b8740ad2a671f16fa2eb45ed6e43d2dabbb41d3e450024e4b05ba77",
+        "native_optimize_index_fingerprint": "37050116925d37bb36841b05dc7b148a0c69b36dc5e3163a13516a51e8114436",
+        "native_optimize_status": "4ded2f43d888ad7959052ee2631e2ac449772975a0568da57fe49dd19043bc9a",
+        "native_optimized_at": "3d42cb5295b2c41a75ef38a8e419651eb7c6c40b0eec637cbea704c06d6881aa",
+        "native_optimize_revision": "e5ae4685cdb663b186b0e6fbf213d139c27f3de68e96972b5a8a7d96b2a56eb2",
+        "native_checkpoint_profile": "287c29bc376dee86f14bb5e2e1c0bb3ea58b0c67e3710382319c2af6631644e4",
+        "native_checkpoint_memory": "2ba6f24bfcd2ab5e934c29690a4561e2f34fa34d673a6d46b3665c8b629e05b3",
+        "native_index_revision": "39ca011d46e001a60d4bb868d788a4a2152f706e286cb019e5763ab51540aa54",
+        "native_eligible_count": "c4a686b72396595c4e4163d737095224b54d4f79179fcbbccd3088454c62ce64",
+        "native_indexed_count": "04413e2dd1a9a12c66c509a157627f26fb827cb6e8c26a042d54f2efd39d722e",
+        "native_held_count": "8166a093fc8611ca7f188ed1c3b22756fdaac019af876811aa9047c338bf347a",
+        "native_invalid_count": "798eecfe5cd55837d50c4db19827c8d47023b4945b7c4608bd83aef03ef75185",
+        "native_checkpoint_state_version": "19de3296a9d7152d78cf04c080b6c4355aa3b417d5c1041b82b5cd44febc16b6",
+        "fts_schema_version": "a22b5050bc4de066940f0a467ed5be17b4db4fb1068beacae633e5559904c59a",
+        "fts_ready": "f27b65d05f774b29fb48178c07a489f9af81632c40b731b1eec1480adaf8384f"
+      },
+      "payload_bytes": 279,
+      "column_payload_bytes": {
+        "id": 1,
+        "last_sync": 0,
+        "last_error": 0,
+        "snapshot_path": 0,
+        "restored_at": 0,
+        "native_optimize_provider": 6,
+        "native_optimize_model": 13,
+        "native_optimize_dimensions": 4,
+        "native_optimize_schema_version": 1,
+        "native_optimize_layout_version": 1,
+        "native_optimize_memory": 28,
+        "native_optimize_fingerprint": 64,
+        "native_optimize_index_fingerprint": 0,
+        "native_optimize_status": 7,
+        "native_optimized_at": 32,
+        "native_optimize_revision": 4,
+        "native_checkpoint_profile": 64,
+        "native_checkpoint_memory": 28,
+        "native_index_revision": 7,
+        "native_eligible_count": 7,
+        "native_indexed_count": 6,
+        "native_held_count": 2,
+        "native_invalid_count": 1,
+        "native_checkpoint_state_version": 1,
+        "fts_schema_version": 1,
+        "fts_ready": 1
+      },
+      "nul_fields": {},
+      "literal_escape_fields": {},
+      "row_payload_bytes": {
+        "min": 279,
+        "p50": 279,
+        "p90": 279,
+        "p99": 279,
+        "max": 279,
+        "mean": 279.0
+      }
+    },
+    "reindex_controls": {
+      "rows": 0,
+      "sha256": "c9e8f5b8e84f3cb6d7b80fbab3218f027f0b800024beacfe4fe1c4dba588b39f",
+      "column_sha256": {
+        "generation": "a04b9c47091b9e144d79af23b2fdc560e7fc86a18ca83b434d46f54064a47eaa",
+        "scope": "7588ad43d13a6a5a0343f50ed4e7542b0d7fd9bbd3d2367181b8f7830dfa38e2",
+        "created_at": "9f871552340c9c4b732e441be65e6873bc0390e76fbe566fdbe630e5c38e7fe5",
+        "row_cursor": "0b8d96cc40336d937588eeb3b116354d07564be8eb2576269d1bd726f7af8c35",
+        "applied_at": "d0026067551022874fb8be4bdc0c88b0e89c2d7261eda68b7aa47975fba18109"
+      },
+      "payload_bytes": 0,
+      "column_payload_bytes": {
+        "generation": 0,
+        "scope": 0,
+        "created_at": 0,
+        "row_cursor": 0,
+        "applied_at": 0
+      },
+      "nul_fields": {},
+      "literal_escape_fields": {},
+      "row_payload_bytes": {
+        "min": 0,
+        "p50": 0,
+        "p90": 0,
+        "p99": 0,
+        "max": 0,
+        "mean": 0.0
+      }
+    }
+  },
+  "source_sample_total_payload_bytes": 61562894,
+  "same_sample_as_original": true,
+  "raw_text_bytes": {
+    "total": 17770767,
+    "mean": 1777.0767,
+    "median": 344.0,
+    "p95_nearest_rank": 6002,
+    "min": 1,
+    "max": 11052
+  },
+  "server_version_num": 160015,
+  "migration_logical_readback": {
+    "baseline_all_columns_equal": true,
+    "before_finalize_all_columns_equal": true,
+    "final_all_columns_equal_except_declared_derived_state": true,
+    "rebuilt_fields": {
+      "memories": [
+        "native_index_pending"
+      ],
+      "sync_state": [
+        "fts_ready",
+        "fts_schema_version",
+        "native_checkpoint_state_version",
+        "native_eligible_count",
+        "native_indexed_count",
+        "native_held_count",
+        "native_invalid_count"
+      ]
+    },
+    "final_table_digests": {
+      "memories": {
+        "rows": 10000,
+        "sha256": "93b43704918bba0fa4018bb03c19593091caaef60bfb4f973082b8e4e3283191",
+        "nul_fields": {
+          "raw_text": 5,
+          "retrieval_text": 5
+        }
+      },
+      "translation_cache": {
+        "rows": 63,
+        "sha256": "08203003435cef3a8311c04e85aa447c3a1a8747b957c648b39c258350680058",
+        "nul_fields": {}
+      },
+      "reindex_controls": {
+        "rows": 0,
+        "sha256": "3cb78516ffc502f6accfdd4d70564828779cbd544042eb190136115330ee14eb",
+        "nul_fields": {}
+      },
+      "sync_state": {
+        "rows": 1,
+        "sha256": "8a3822b505846497cc25b6cb668ce58e507f612760f57dcb1e0c134085b766f4",
+        "nul_fields": {}
+      }
+    }
+  },
+  "sizes": {
+    "relations": {
+      "funes_schema_state": {
+        "kind": "r",
+        "heap_main_bytes": 8192,
+        "table_including_toast_bytes": 16384,
+        "base_index_bytes": 16384,
+        "toast_including_own_indexes_bytes": 8192,
+        "other_forks_bytes": 0,
+        "total_bytes": 32768
+      },
+      "funes_source_migration": {
+        "kind": "r",
+        "heap_main_bytes": 8192,
+        "table_including_toast_bytes": 32768,
+        "base_index_bytes": 16384,
+        "toast_including_own_indexes_bytes": 24576,
+        "other_forks_bytes": 0,
+        "total_bytes": 49152
+      },
+      "memories": {
+        "kind": "r",
+        "heap_main_bytes": 19922944,
+        "table_including_toast_bytes": 48914432,
+        "base_index_bytes": 2187264,
+        "toast_including_own_indexes_bytes": 28966912,
+        "other_forks_bytes": 24576,
+        "total_bytes": 51101696
+      },
+      "memories_id_seq": {
+        "kind": "S",
+        "heap_main_bytes": 8192,
+        "table_including_toast_bytes": 8192,
+        "base_index_bytes": 0,
+        "toast_including_own_indexes_bytes": 0,
+        "other_forks_bytes": 0,
+        "total_bytes": 8192
+      },
+      "reindex_controls": {
+        "kind": "r",
+        "heap_main_bytes": 0,
+        "table_including_toast_bytes": 8192,
+        "base_index_bytes": 8192,
+        "toast_including_own_indexes_bytes": 8192,
+        "other_forks_bytes": 0,
+        "total_bytes": 16384
+      },
+      "sync_state": {
+        "kind": "r",
+        "heap_main_bytes": 8192,
+        "table_including_toast_bytes": 16384,
+        "base_index_bytes": 16384,
+        "toast_including_own_indexes_bytes": 8192,
+        "other_forks_bytes": 0,
+        "total_bytes": 32768
+      },
+      "translation_cache": {
+        "kind": "r",
+        "heap_main_bytes": 49152,
+        "table_including_toast_bytes": 98304,
+        "base_index_bytes": 16384,
+        "toast_including_own_indexes_bytes": 24576,
+        "other_forks_bytes": 24576,
+        "total_bytes": 114688
+      }
+    },
+    "indexes": {
+      "funes_schema_state_pkey": 16384,
+      "funes_source_migration_pkey": 16384,
+      "memories_canonical_pending_idx": 204800,
+      "memories_embedding_generation_idx": 90112,
+      "memories_native_generation_idx": 90112,
+      "memories_pkey": 245760,
+      "memories_retrieval_generation_idx": 90112,
+      "memories_source_agent_role_idx": 90112,
+      "memories_source_agent_type_idx": 90112,
+      "memories_source_identity_key": 1277952,
+      "memories_translation_pending_idx": 8192,
+      "reindex_controls_pkey": 8192,
+      "sync_state_pkey": 16384,
+      "translation_cache_pkey": 16384
+    },
+    "total_bytes": 51355648
+  },
+  "physical_shadow": {
+    "rows": 10000,
+    "null_rows": 4002,
+    "omitted_equal_text_bytes": 9240285,
+    "stored_nonnull_text_bytes": 8033006
+  },
+  "index_definitions": {
+    "funes_schema_state_pkey": "CREATE UNIQUE INDEX funes_schema_state_pkey ON funes_capacity_v2_24328d4c509049e69467db82471c6da3.funes_schema_state USING btree (id)",
+    "funes_source_migration_pkey": "CREATE UNIQUE INDEX funes_source_migration_pkey ON funes_capacity_v2_24328d4c509049e69467db82471c6da3.funes_source_migration USING btree (id)",
+    "memories_canonical_pending_idx": "CREATE INDEX memories_canonical_pending_idx ON funes_capacity_v2_24328d4c509049e69467db82471c6da3.memories USING btree ((\nCASE\n    WHEN (native_index_status = 'retry'::text) THEN 1\n    ELSE 0\nEND), COALESCE(retrieval_updated_at, updated_at), id) WHERE (native_index_pending = 1)",
+    "memories_embedding_generation_idx": "CREATE INDEX memories_embedding_generation_idx ON funes_capacity_v2_24328d4c509049e69467db82471c6da3.memories USING btree (embedding_generation)",
+    "memories_native_generation_idx": "CREATE INDEX memories_native_generation_idx ON funes_capacity_v2_24328d4c509049e69467db82471c6da3.memories USING btree (native_generation)",
+    "memories_pkey": "CREATE UNIQUE INDEX memories_pkey ON funes_capacity_v2_24328d4c509049e69467db82471c6da3.memories USING btree (id)",
+    "memories_retrieval_generation_idx": "CREATE INDEX memories_retrieval_generation_idx ON funes_capacity_v2_24328d4c509049e69467db82471c6da3.memories USING btree (retrieval_generation)",
+    "memories_source_agent_role_idx": "CREATE INDEX memories_source_agent_role_idx ON funes_capacity_v2_24328d4c509049e69467db82471c6da3.memories USING btree (source_agent, role)",
+    "memories_source_agent_type_idx": "CREATE INDEX memories_source_agent_type_idx ON funes_capacity_v2_24328d4c509049e69467db82471c6da3.memories USING btree (source_agent, source_type)",
+    "memories_source_identity_key": "CREATE UNIQUE INDEX memories_source_identity_key ON funes_capacity_v2_24328d4c509049e69467db82471c6da3.memories USING btree (source_identity)",
+    "memories_translation_pending_idx": "CREATE INDEX memories_translation_pending_idx ON funes_capacity_v2_24328d4c509049e69467db82471c6da3.memories USING btree (updated_at, id) WHERE ((translation_status = 'pending_provider'::text) AND (COALESCE(native_index_status, ''::text) <> 'waiting_durability'::text))",
+    "reindex_controls_pkey": "CREATE UNIQUE INDEX reindex_controls_pkey ON funes_capacity_v2_24328d4c509049e69467db82471c6da3.reindex_controls USING btree (generation)",
+    "sync_state_pkey": "CREATE UNIQUE INDEX sync_state_pkey ON funes_capacity_v2_24328d4c509049e69467db82471c6da3.sync_state USING btree (id)",
+    "translation_cache_pkey": "CREATE UNIQUE INDEX translation_cache_pkey ON funes_capacity_v2_24328d4c509049e69467db82471c6da3.translation_cache USING btree (query)"
+  },
+  "memory_columns": [
+    {
+      "name": "id",
+      "type": "bigint",
+      "nullable": "NO",
+      "generated": "NEVER"
+    },
+    {
+      "name": "source_identity",
+      "type": "text",
+      "nullable": "NO",
+      "generated": "NEVER"
+    },
+    {
+      "name": "source_version",
+      "type": "text",
+      "nullable": "NO",
+      "generated": "NEVER"
+    },
+    {
+      "name": "raw_text",
+      "type": "text",
+      "nullable": "NO",
+      "generated": "NEVER"
+    },
+    {
+      "name": "retrieval_text",
+      "type": "text",
+      "nullable": "YES",
+      "generated": "NEVER"
+    },
+    {
+      "name": "search_identifiers",
+      "type": "text",
+      "nullable": "NO",
+      "generated": "NEVER"
+    },
+    {
+      "name": "metadata_json",
+      "type": "text",
+      "nullable": "NO",
+      "generated": "NEVER"
+    },
+    {
+      "name": "source_metadata_clock_json",
+      "type": "text",
+      "nullable": "NO",
+      "generated": "NEVER"
+    },
+    {
+      "name": "source_agent",
+      "type": "text",
+      "nullable": "YES",
+      "generated": "NEVER"
+    },
+    {
+      "name": "source_type",
+      "type": "text",
+      "nullable": "YES",
+      "generated": "NEVER"
+    },
+    {
+      "name": "device_id",
+      "type": "text",
+      "nullable": "YES",
+      "generated": "NEVER"
+    },
+    {
+      "name": "project",
+      "type": "text",
+      "nullable": "YES",
+      "generated": "NEVER"
+    },
+    {
+      "name": "repo",
+      "type": "text",
+      "nullable": "YES",
+      "generated": "NEVER"
+    },
+    {
+      "name": "worktree",
+      "type": "text",
+      "nullable": "YES",
+      "generated": "NEVER"
+    },
+    {
+      "name": "session_id",
+      "type": "text",
+      "nullable": "YES",
+      "generated": "NEVER"
+    },
+    {
+      "name": "message_id",
+      "type": "text",
+      "nullable": "YES",
+      "generated": "NEVER"
+    },
+    {
+      "name": "role",
+      "type": "text",
+      "nullable": "YES",
+      "generated": "NEVER"
+    },
+    {
+      "name": "timestamp",
+      "type": "text",
+      "nullable": "YES",
+      "generated": "NEVER"
+    },
+    {
+      "name": "source_path",
+      "type": "text",
+      "nullable": "YES",
+      "generated": "NEVER"
+    },
+    {
+      "name": "content_hash",
+      "type": "text",
+      "nullable": "NO",
+      "generated": "NEVER"
+    },
+    {
+      "name": "ingested_at",
+      "type": "text",
+      "nullable": "NO",
+      "generated": "NEVER"
+    },
+    {
+      "name": "updated_at",
+      "type": "text",
+      "nullable": "NO",
+      "generated": "NEVER"
+    },
+    {
+      "name": "retrieval_updated_at",
+      "type": "text",
+      "nullable": "YES",
+      "generated": "NEVER"
+    },
+    {
+      "name": "content_type",
+      "type": "text",
+      "nullable": "YES",
+      "generated": "NEVER"
+    },
+    {
+      "name": "source_missing",
+      "type": "integer",
+      "nullable": "NO",
+      "generated": "NEVER"
+    },
+    {
+      "name": "agent_type",
+      "type": "text",
+      "nullable": "YES",
+      "generated": "NEVER"
+    },
+    {
+      "name": "parent_session_id",
+      "type": "text",
+      "nullable": "YES",
+      "generated": "NEVER"
+    },
+    {
+      "name": "agent_id",
+      "type": "text",
+      "nullable": "YES",
+      "generated": "NEVER"
+    },
+    {
+      "name": "translation_hash",
+      "type": "text",
+      "nullable": "YES",
+      "generated": "NEVER"
+    },
+    {
+      "name": "translation_version",
+      "type": "text",
+      "nullable": "YES",
+      "generated": "NEVER"
+    },
+    {
+      "name": "translation_status",
+      "type": "text",
+      "nullable": "YES",
+      "generated": "NEVER"
+    },
+    {
+      "name": "native_index_version",
+      "type": "text",
+      "nullable": "YES",
+      "generated": "NEVER"
+    },
+    {
+      "name": "native_index_status",
+      "type": "text",
+      "nullable": "YES",
+      "generated": "NEVER"
+    },
+    {
+      "name": "native_index_profile",
+      "type": "text",
+      "nullable": "YES",
+      "generated": "NEVER"
+    },
+    {
+      "name": "native_index_memory",
+      "type": "text",
+      "nullable": "YES",
+      "generated": "NEVER"
+    },
+    {
+      "name": "native_indexed_at",
+      "type": "text",
+      "nullable": "YES",
+      "generated": "NEVER"
+    },
+    {
+      "name": "native_index_error",
+      "type": "text",
+      "nullable": "YES",
+      "generated": "NEVER"
+    },
+    {
+      "name": "native_index_pending",
+      "type": "integer",
+      "nullable": "NO",
+      "generated": "NEVER"
+    },
+    {
+      "name": "retrieval_generation",
+      "type": "bigint",
+      "nullable": "NO",
+      "generated": "NEVER"
+    },
+    {
+      "name": "native_generation",
+      "type": "bigint",
+      "nullable": "NO",
+      "generated": "NEVER"
+    },
+    {
+      "name": "embedding_generation",
+      "type": "bigint",
+      "nullable": "NO",
+      "generated": "NEVER"
+    }
+  ],
+  "index_methods": [
+    "btree"
+  ],
+  "toast_detail": {
+    "main_bytes": 28508160,
+    "index_bytes": 434176,
+    "table_including_forks_bytes": 28532736
+  },
+  "runtime_ready_without_pg_fts": true,
+  "projection": {
+    "full_rows": 3590437,
+    "sample_rows": 10000,
+    "factor": 359.0437,
+    "components_bytes": {
+      "heap_main_bytes": 7153207528.6528,
+      "table_including_toast_bytes": 17562418648.678402,
+      "base_index_bytes": 785323359.4368,
+      "toast_including_own_indexes_bytes": 10400387262.0544,
+      "other_forks_bytes": 8823857.9712,
+      "total_bytes": 18347742008.1152
+    },
+    "fixed_auxiliary_bytes": 253952,
+    "single_replica_total_bytes": 18347995960.1152,
+    "single_replica_total_gib": 17.087902836608887,
+    "replicated": false,
+    "budget_gib": 20,
+    "excludes": [
+      "WAL",
+      "backups",
+      "temporary maintenance space",
+      "future growth",
+      "other schemas"
+    ]
+  },
+  "source_stat_unchanged": true,
+  "owned_schema_removed": true,
+  "temporary_sample_removed": true,
+  "elapsed_seconds": 33.32531912500053,
+  "client_peak_rss_bytes": 82579456
+}

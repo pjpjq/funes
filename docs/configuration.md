@@ -100,7 +100,7 @@ environment: never commit it, write it into these files, or include it in logs.
 | `FUNES_BIN` | Binary path recorded in supported MCP registrations and used by the pi bridge. Hook workers instead find `funes` on `PATH` or in common install directories. |
 | `FUNES_MEMORY` | Per-run memory override understood by the pi extension; otherwise its binding from `funes add pi [memory]` is used. |
 | `FUNES_INDEX_MEMORY` | Optional blue/green build target for the Space canonical reconciler. It defaults to `FUNES_MEMORY`; set it to a new private dataset when changing embedding spaces. |
-| `FUNES_NATIVE_PRIMARY` | When `true`, `funes-sync` delegates production index/push to native Funes instead of the migration HTTP path. |
+| `FUNES_NATIVE_PRIMARY` | Legacy opt-in. When `true`, macOS also runs a local native index/push helper. Keep the default `false` when the remote Space has a canonical reconciler. |
 | `FUNES_NATIVE_FALLBACK` | Remote-read fallback policy. `false` disables substitution of the offline local memory; production sets `false`. The standalone default is enabled. |
 | `FUNES_EMBEDDING_PROVIDER` | Runtime embedding provider: `local` or `voyage`. Standalone default: `local`; production image default: `voyage`. |
 | `FUNES_EMBEDDING_MODEL` | Voyage embedding model; default `voyage-4-lite`. Local embedding remains pinned to `BAAI/bge-small-en-v1.5`. |
@@ -118,6 +118,7 @@ environment: never commit it, write it into these files, or include it in logs.
 | `FUNES_SYNC_BATCH` | Maximum records per HTTP ingest segment; default `50`. |
 | `FUNES_SYNC_MAX_BATCH_BYTES` | Maximum serialized source bytes per ingest segment; default `16777216` (16 MiB). A single already-chunked record is never dropped. |
 | `FUNES_REMOTE_TIMEOUT` | Total deadline for starting and polling one durable ingest operation; default `900` seconds. |
+| `FUNES_REMOTE_ATTEMPT_TIMEOUT` | Bounded per-request network attempt timeout for ingest POST and polling requests; default `30` seconds (safe range `1..55`s). |
 | `FUNES_REMOTE_MAX_RESPONSE_BYTES` | Maximum ingest/status response body; default `1048576` (1 MiB). |
 | `FUNES_HTTP_GZIP` | Compress HTTP ingest bodies when beneficial; enabled by default. |
 | `FUNES_INGEST_OPERATION_TIMEOUT` | Space-side durable worker deadline; default `1800` seconds. A stall fail-stops the process for platform restart without ACKing local data. |

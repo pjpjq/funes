@@ -12,14 +12,25 @@ use anyhow::{anyhow, Context, Result};
 
 use super::dataset;
 
+/// An exclusive advisory lock on any path. Explicitly unlocking before closing prevents a file
+/// descriptor inherited during a concurrent `fork` from extending the guard's lifetime.
+#[derive(Debug)]
+pub(crate) struct FileLock(#[allow(dead_code)] File);
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
 /// An exclusive advisory lock on the local memory, released on drop (and on process death).
 #[derive(Debug)]
-pub struct MemoryLock(#[allow(dead_code)] File);
+pub struct MemoryLock(#[allow(dead_code)] FileLock);
 
 /// Take an exclusive advisory lock on `path`, creating the file and its directory if needed. `None`
 /// if another holder has it — including this process, which `flock` treats no differently. Never
 /// blocks; released when the returned handle drops, and on process death.
-pub(crate) fn try_lock_file(path: &Path) -> Result<Option<File>> {
+pub(crate) fn try_lock_file(path: &Path) -> Result<Option<FileLock>> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
@@ -30,7 +41,7 @@ pub(crate) fn try_lock_file(path: &Path) -> Result<Option<File>> {
         .open(path)
         .with_context(|| format!("opening the lock at {}", path.display()))?;
     match f.try_lock() {
-        Ok(()) => Ok(Some(f)),
+        Ok(()) => Ok(Some(FileLock(f))),
         Err(TryLockError::WouldBlock) => Ok(None),
         Err(TryLockError::Error(e)) => Err(e).with_context(|| format!("locking {}", path.display())),
     }
@@ -71,5 +82,21 @@ mod tests {
         assert!(try_lock_file(&dir.path().join("b.lock")).unwrap().is_some());
         drop(held);
         assert!(try_lock_file(&path).unwrap().is_some());
+    }
+
+    #[test]
+    fn dropping_a_lock_releases_an_inherited_descriptor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("inherited.lock");
+        let held = try_lock_file(&path).unwrap().expect("a free lock is taken");
+        let inherited = held.0.try_clone().unwrap();
+
+        drop(held);
+
+        let regained = try_lock_file(&path)
+            .unwrap()
+            .expect("dropping the guard explicitly unlocks before inherited descriptors close");
+        drop(inherited);
+        drop(regained);
     }
 }

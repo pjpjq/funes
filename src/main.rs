@@ -296,11 +296,7 @@ enum Cmd {
         #[arg(long, required_unless_present = "all", conflicts_with = "all")]
         retrieval_text: bool,
         /// Regenerate retrieval shadows and force all eligible canonical rows through indexing.
-        #[arg(
-            long,
-            required_unless_present = "retrieval_text",
-            conflicts_with = "retrieval_text"
-        )]
+        #[arg(long, required_unless_present = "retrieval_text", conflicts_with = "retrieval_text")]
         all: bool,
     },
 }
@@ -691,13 +687,9 @@ async fn main() -> Result<()> {
         Cmd::Sync { command } => run_sync_command(command),
         Cmd::Doctor => run_sync_command(SyncCommand::Doctor),
         Cmd::Sources => run_sync_command(SyncCommand::Sources),
-        Cmd::Reindex {
-            retrieval_text: _,
-            all,
-        } => run_sync_args(&[
-            "reindex",
-            if all { "--all" } else { "--retrieval-text" },
-        ]),
+        Cmd::Reindex { retrieval_text: _, all } => {
+            run_sync_args(&["reindex", if all { "--all" } else { "--retrieval-text" }])
+        }
     }
 }
 

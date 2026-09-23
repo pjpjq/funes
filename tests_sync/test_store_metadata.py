@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
+import stat
+import time
 from datetime import datetime
-from pathlib import PureWindowsPath
+from pathlib import Path, PureWindowsPath
 from types import SimpleNamespace
 
 import pytest
@@ -289,6 +292,45 @@ def test_record_inventory_cursor_and_missing_queue_are_restart_safe(tmp_path):
         reopened.close()
 
 
+def test_retired_sources_never_reenter_remote_inventory(tmp_path):
+    cfg = Config(tmp_path, tmp_path / ".state", tmp_path / "config.toml")
+    store = Store(config=cfg)
+    active = Source("active", "codex", tmp_path / "active.jsonl", "device")
+    retired = Source(
+        "retired",
+        "codex_memory",
+        tmp_path / ".codex" / "automations" / "job" / "runs" / "run.jsonl",
+        "device",
+    )
+    try:
+        for source in (active, retired):
+            store.register_source(source)
+            store.upsert_chunks(
+                [
+                    Chunk(
+                        record_id=f"record:{source.source_key}",
+                        source_key=source.source_key,
+                        kind=source.kind,
+                        path=str(source.path),
+                        session_id=source.source_key,
+                        ordinal=0,
+                        role="user",
+                        text="raw",
+                        raw_text="raw",
+                    )
+                ]
+            )
+        store.ack(["record:active", "record:retired"])
+        store.db.execute("UPDATE sources SET retired=1 WHERE source_key='retired'")
+        store.db.commit()
+
+        assert store.record_ids_after("", 10) == ["record:active"]
+        assert store.enqueue_records(["record:retired", "record:active"]) == 1
+        assert [row["record_id"] for row in store.pending(10)] == ["record:active"]
+    finally:
+        store.close()
+
+
 def test_source_and_upload_counts_are_exact(tmp_path):
     cfg = Config(tmp_path, tmp_path / ".state", tmp_path / "config.toml")
     store = Store(config=cfg)
@@ -415,6 +457,18 @@ def test_existing_database_gets_meta_migration_without_data_loss(tmp_path):
         CREATE TABLE queue(record_id TEXT PRIMARY KEY,attempts INTEGER DEFAULT 0,next_at REAL DEFAULT 0,last_error TEXT,queued_at REAL);
         CREATE TABLE cursors(source_key TEXT PRIMARY KEY,offset INTEGER DEFAULT 0,inode INTEGER,size INTEGER,updated_at REAL);
         INSERT INTO queue(record_id,attempts,next_at,last_error,queued_at) VALUES('pending',0,0,NULL,1);
+        INSERT INTO sources(
+            source_key,kind,path,device_id,project,active,size,mtime,inode,updated_at
+        ) VALUES(
+            'legacy-run','codex_memory',
+            '/Users/test/.codex/automations/job/runs/run.jsonl',
+            'device','',1,42,1,1,1
+        );
+        INSERT INTO records(
+            record_id,source_key,content_hash,version,payload,updated_at
+        ) VALUES('legacy-record','legacy-run','hash',1,'{"raw_text":"retained"}',1);
+        INSERT INTO queue(record_id,attempts,next_at,last_error,queued_at)
+        VALUES('legacy-record',0,0,NULL,1);
         """
     )
     connection.commit()
@@ -424,6 +478,13 @@ def test_existing_database_gets_meta_migration_without_data_loss(tmp_path):
     store = Store(config=cfg)
     try:
         assert store.pending_count() == 1
+        retired = store.db.execute(
+            "SELECT active,retired FROM sources WHERE source_key='legacy-run'"
+        ).fetchone()
+        assert tuple(retired) == (0, 1)
+        assert store.get("legacy-record")["raw_text"] == "retained"
+        assert "legacy-record" not in store.record_ids_after("", 10)
+        assert store.meta_value("legacy_automation_retirement_v1")
         assert store.meta_value("last_successful_sync") is None
         indexes = {
             row[0]
@@ -431,6 +492,171 @@ def test_existing_database_gets_meta_migration_without_data_loss(tmp_path):
                 "SELECT name FROM sqlite_master WHERE type='index'"
             )
         }
-        assert {"records_source", "queue_failed", "queue_schedule", "sources_active_kind"}.issubset(indexes)
+        assert {"records_source", "queue_failed", "queue_schedule", "queue_ready_order", "sources_active_kind"}.issubset(indexes)
+    finally:
+        store.close()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits are not available on Windows")
+def test_new_store_restricts_state_directory_and_sqlite_files(tmp_path):
+    state = tmp_path / "custom-state"
+    state.mkdir(mode=0o755)
+    state.chmod(0o755)
+    cfg = Config(tmp_path, state, tmp_path / "config.toml")
+    database = state / "sync.db"
+    store = Store(config=cfg)
+    try:
+        store.set_meta("permission-test", "written")
+        sidecars = [Path(f"{database}-wal"), Path(f"{database}-shm")]
+        assert all(path.exists() for path in sidecars)
+        assert stat.S_IMODE(state.stat().st_mode) == 0o700
+        assert all(
+            stat.S_IMODE(path.stat().st_mode) == 0o600
+            for path in [database, *sidecars]
+        )
+    finally:
+        store.close()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits are not available on Windows")
+def test_existing_store_restricts_sqlite_files_without_data_loss(tmp_path):
+    state = tmp_path / "custom-state"
+    state.mkdir(mode=0o755)
+    database = state / "sync.db"
+    legacy = sqlite3.connect(database)
+    legacy.execute("PRAGMA journal_mode=WAL")
+    legacy.execute("CREATE TABLE retained(value TEXT NOT NULL)")
+    legacy.execute("INSERT INTO retained(value) VALUES('private payload')")
+    legacy.commit()
+    sidecars = [Path(f"{database}-wal"), Path(f"{database}-shm")]
+    assert all(path.exists() for path in sidecars)
+    state.chmod(0o755)
+    for path in [database, *sidecars]:
+        path.chmod(0o644)
+
+    cfg = Config(tmp_path, state, tmp_path / "config.toml")
+    store = Store(config=cfg)
+    try:
+        assert store.db.execute("SELECT value FROM retained").fetchone()[0] == "private payload"
+        assert stat.S_IMODE(state.stat().st_mode) == 0o700
+        assert all(
+            stat.S_IMODE(path.stat().st_mode) == 0o600
+            for path in [database, *sidecars]
+        )
+    finally:
+        store.close()
+        legacy.close()
+
+
+def test_pending_query_plan_uses_ready_order_index_without_temp_btree(tmp_path):
+    cfg = Config(tmp_path, tmp_path / ".state", tmp_path / "config.toml")
+    store = Store(config=cfg)
+    now = time.time()
+    try:
+        source = Source("source", "codex", tmp_path / "session.jsonl", "device")
+        store.register_source(source)
+        chunks = [
+            Chunk(
+                record_id=f"record:{i:02d}",
+                source_key="source",
+                kind="codex",
+                path=str(source.path),
+                session_id="session",
+                ordinal=i,
+                role="user",
+                text=f"payload {i}",
+                raw_text=f"payload {i}",
+            )
+            for i in range(10)
+        ]
+        store.upsert_chunks(chunks)
+        store.db.execute(
+            "UPDATE queue SET next_at=? WHERE record_id IN ('record:08', 'record:09')",
+            (now + 3600,),
+        )
+        store.db.commit()
+
+        plan = store.db.execute(
+            "EXPLAIN QUERY PLAN SELECT q.*,r.payload FROM queue q JOIN records r ON r.record_id=q.record_id WHERE q.next_at<=? ORDER BY q.queued_at LIMIT ?",
+            (now, 50),
+        ).fetchall()
+        details = [row[3] for row in plan]
+        assert any("queue_ready_order" in detail for detail in details)
+        assert not any("USE TEMP B-TREE FOR ORDER BY" in detail for detail in details)
+
+        pending = store.pending(limit=50, now=now)
+        assert len(pending) == 8
+        assert [r["record_id"] for r in pending] == [f"record:{i:02d}" for i in range(8)]
+
+        limited = store.pending(limit=3, now=now)
+        assert [r["record_id"] for r in limited] == ["record:00", "record:01", "record:02"]
+    finally:
+        store.close()
+
+
+def test_ack_session_records_preserves_all_source_kinds_and_checkpoint(tmp_path):
+    cfg = Config(tmp_path, tmp_path / ".state", tmp_path / "config.toml")
+    store = Store(config=cfg)
+    try:
+        sources = [
+            Source("s_codex", "codex", tmp_path / "codex.jsonl", "dev"),
+            Source("s_codex_s", "codex_session", tmp_path / "codex_s.jsonl", "dev"),
+            Source("s_pi", "pi", tmp_path / "pi.jsonl", "dev"),
+            Source("s_pi_s", "pi_session", tmp_path / "pi_s.jsonl", "dev"),
+            Source("s_claude", "claude", tmp_path / "claude.jsonl", "dev"),
+            Source("s_claude_s", "claude_session", tmp_path / "claude_s.jsonl", "dev"),
+            Source("s_mem", "codex_memory", tmp_path / "memory.md", "dev"),
+            Source("s_agents", "agents_md", tmp_path / "AGENTS.md", "dev"),
+            Source("s_persist", "persistent", tmp_path / "persist.json", "dev"),
+            Source("s_retired", "codex", tmp_path / "retired.jsonl", "dev"),
+        ]
+        for s in sources:
+            store.register_source(s)
+        store.db.execute("UPDATE sources SET retired=1 WHERE source_key='s_retired'")
+        store.db.commit()
+
+        chunks = [
+            Chunk(
+                record_id=f"rec_{s.source_key}",
+                source_key=s.source_key,
+                kind=s.kind,
+                path=str(s.path),
+                session_id="sess",
+                ordinal=0,
+                role="user",
+                text="content",
+                raw_text="content",
+            )
+            for s in sources
+        ]
+        store.upsert_chunks(chunks)
+        assert store.pending_count() == 10
+        previous_changes = store.db.total_changes
+
+        # Empty list returns 0
+        assert store.ack_session_records([]) == 0
+        assert store.pending_count() == 10
+
+        # Non-existent ID returns 0
+        assert store.ack_session_records(["non_existent_id"]) == 0
+        assert store.pending_count() == 10
+
+        # Identity-only ACK cannot confirm any source kind is durably uploaded.
+        all_ids = [c.record_id for c in chunks] + ["non_existent_id"]
+        deleted = store.ack_session_records(all_ids)
+
+        assert deleted == 0
+        assert store.pending_count() == 10
+
+        remaining = [r["record_id"] for r in store.pending(limit=10)]
+        assert set(remaining) == {c.record_id for c in chunks}
+
+        sync_meta = store.meta_value("last_successful_sync")
+        assert sync_meta is None
+
+        # Repeated compatibility calls remain zero-write no-ops.
+        assert store.ack_session_records(all_ids) == 0
+        assert store.pending_count() == 10
+        assert store.db.total_changes == previous_changes
     finally:
         store.close()

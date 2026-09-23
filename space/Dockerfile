@@ -5,10 +5,10 @@ RUN apt-get update \
     && curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh \
         | sh -s -- -b /usr/local/bin v3.95.5
 
-# The HF cpu-basic builder previously stopped during a highly parallel Rust
-# build. Keep the dependency graph serial and isolate it from Python/docs-only
-# changes so a retry can reuse the downloaded crate layer.
-ENV CARGO_BUILD_JOBS=1 \
+# The HF cpu-basic builder previously stopped during an unbounded parallel Rust
+# build, while one job exceeded the platform's cold-build timeout. Two jobs keep
+# memory bounded and leave enough parallelism to finish the dependency graph.
+ENV CARGO_BUILD_JOBS=2 \
     CARGO_INCREMENTAL=0 \
     CARGO_PROFILE_RELEASE_LTO=off
 COPY Cargo.toml Cargo.lock ./
@@ -39,8 +39,8 @@ ENV FUNES_HOME=/data/.funes \
     FUNES_RERANK_MODEL=rerank-3-lite \
     FUNES_NATIVE_FALLBACK=false \
     FUNES_RETRIEVAL_LANGUAGE_MODE=raw \
-    FUNES_CANONICAL_INDEX_BATCH=1024 \
-    FUNES_CANONICAL_INDEX_INTERVAL=1
+    FUNES_CANONICAL_INDEX_ACTIVE_INTERVAL=1 \
+    FUNES_CANONICAL_INDEX_IDLE_INTERVAL=300
 RUN mkdir -p /data/.funes/sources
 WORKDIR /app
 EXPOSE 7860

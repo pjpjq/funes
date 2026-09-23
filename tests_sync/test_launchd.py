@@ -65,8 +65,12 @@ class LaunchctlRunner:
             label = args[-1].rsplit("/", 1)[-1]
             code = 0 if label in self.loaded else 113
             return SimpleNamespace(returncode=code, stdout="")
-        path = Path(args[-1])
-        label = plistlib.loads(path.read_bytes())["Label"]
+        target = args[-1]
+        if args[1] == "bootout" and target.startswith("gui/"):
+            label = target.rsplit("/", 1)[-1]
+        else:
+            path = Path(target)
+            label = plistlib.loads(path.read_bytes())["Label"]
         if args[1] == "bootstrap":
             if label == self.fail_bootstrap_label and self.fail_bootstrap_times:
                 self.fail_bootstrap_times -= 1
@@ -140,6 +144,189 @@ def test_install_writes_dual_plists_and_atomic_secret_free_helpers(tmp_path, mon
     commands = [entry[0] for entry in calls]
     assert sum(command[1] == "print" for command in commands) == 6
     assert sum(command[1] == "bootstrap" for command in commands) == 2
+
+
+def test_install_without_native_primary_removes_legacy_helper(tmp_path, monkeypatch):
+    config = configured(tmp_path)
+    config.native_primary = False
+    main_path, native_path = plist_paths(config.home)
+    native_script, warm_helper = helper_paths(config)
+    old_plists = owned_plist_bytes(config)
+    native_script.parent.mkdir(parents=True, exist_ok=True)
+    native_script.write_text("legacy native helper\n", encoding="utf-8")
+    warm_helper.write_text("legacy warm helper\n", encoding="utf-8")
+    calls = []
+    runner = LaunchctlRunner(calls)
+    runner.loaded.update({LABEL, NATIVE_LABEL})
+    monkeypatch.setattr("sync.launchd.persist_keychain_credentials", lambda: None)
+    monkeypatch.setattr("sync.launchd.subprocess.run", runner)
+
+    installed = install(config=config, python="/usr/bin/python3")
+
+    assert installed == (main_path,)
+    assert main_path.exists()
+    assert not native_path.exists()
+    assert not native_script.exists()
+    assert not warm_helper.exists()
+    assert runner.loaded == {LABEL}
+    assert old_plists[native_path] != main_path.read_bytes()
+    commands = [entry[0] for entry in calls]
+    assert sum(command[1] == "bootout" for command in commands) == 2
+    assert sum(command[1] == "bootstrap" for command in commands) == 1
+
+
+def test_lifecycle_without_native_primary_manages_only_main(tmp_path, monkeypatch):
+    config = configured(tmp_path)
+    config.native_primary = False
+    calls = []
+    runner = LaunchctlRunner(calls)
+    monkeypatch.setattr("sync.launchd.persist_keychain_credentials", lambda: None)
+    monkeypatch.setattr("sync.launchd.subprocess.run", runner)
+    install(config=config)
+    calls.clear()
+
+    stop(config=config)
+    start(config=config)
+    restart(config=config)
+
+    commands = [entry[0] for entry in calls]
+    mutated = [command for command in commands if command[1] in {"bootout", "bootstrap"}]
+    assert all(command[-1] == str(plist_path(config.home)) for command in mutated)
+    assert sum(command[1] == "bootout" for command in mutated) == 2
+    assert sum(command[1] == "bootstrap" for command in mutated) == 2
+    assert runner.loaded == {LABEL}
+
+
+def test_disabling_native_primary_removes_helpers_from_old_state_dir(
+    tmp_path, monkeypatch
+):
+    config = configured(tmp_path)
+    calls = []
+    runner = LaunchctlRunner(calls)
+    monkeypatch.setattr("sync.launchd.persist_keychain_credentials", lambda: None)
+    monkeypatch.setattr("sync.launchd.subprocess.run", runner)
+    install(config=config)
+    old_helpers = helper_paths(config)
+    assert all(path.exists() for path in old_helpers)
+
+    config.state_dir = tmp_path / "new-state"
+    config.native_primary = False
+    installed = install(config=config)
+
+    assert installed == (plist_path(config.home),)
+    assert all(not path.exists() for path in old_helpers)
+    assert all(not path.exists() for path in helper_paths(config))
+    assert runner.loaded == {LABEL}
+
+
+def test_disabling_native_primary_rolls_back_files_and_agents_on_failure(
+    tmp_path, monkeypatch
+):
+    config = configured(tmp_path)
+    calls = []
+    runner = LaunchctlRunner(calls)
+    monkeypatch.setattr("sync.launchd.persist_keychain_credentials", lambda: None)
+    monkeypatch.setattr("sync.launchd.subprocess.run", runner)
+    install(config=config)
+    artifacts = (*plist_paths(config.home), *helper_paths(config))
+    before = {path: path.read_bytes() for path in artifacts}
+    config.native_primary = False
+    runner.fail_bootstrap_label = LABEL
+    runner.fail_bootstrap_times = 1
+
+    with pytest.raises(RuntimeError, match="launchctl bootstrap failed"):
+        install(config=config)
+
+    assert runner.loaded == {LABEL, NATIVE_LABEL}
+    assert {path: path.read_bytes() for path in artifacts} == before
+
+
+def test_disabling_native_primary_stops_loaded_helper_with_missing_plist(
+    tmp_path, monkeypatch
+):
+    config = configured(tmp_path)
+    calls = []
+    runner = LaunchctlRunner(calls)
+    monkeypatch.setattr("sync.launchd.persist_keychain_credentials", lambda: None)
+    monkeypatch.setattr("sync.launchd.subprocess.run", runner)
+    install(config=config)
+    native_plist_path(config.home).unlink()
+    config.native_primary = False
+    calls.clear()
+
+    started = start(config=config)
+
+    assert started == (plist_path(config.home),)
+    assert runner.loaded == {LABEL}
+    assert any(
+        command[:2] == ["launchctl", "bootout"]
+        and command[-1] == f"gui/{os.getuid()}/{NATIVE_LABEL}"
+        for command, _kwargs in calls
+    )
+
+
+def test_restarting_without_native_primary_stops_loaded_helper_with_missing_plist(
+    tmp_path, monkeypatch
+):
+    config = configured(tmp_path)
+    calls = []
+    runner = LaunchctlRunner(calls)
+    monkeypatch.setattr("sync.launchd.persist_keychain_credentials", lambda: None)
+    monkeypatch.setattr("sync.launchd.subprocess.run", runner)
+    install(config=config)
+    native_plist_path(config.home).unlink()
+    config.native_primary = False
+    calls.clear()
+
+    restarted = restart(config=config)
+
+    assert restarted == (plist_path(config.home),)
+    assert runner.loaded == {LABEL}
+    assert any(
+        command[:2] == ["launchctl", "bootout"]
+        and command[-1] == f"gui/{os.getuid()}/{NATIVE_LABEL}"
+        for command, _kwargs in calls
+    )
+
+
+def test_native_reinstall_preserves_helpers_when_state_paths_alias(
+    tmp_path, monkeypatch
+):
+    real_state = tmp_path / "real-state"
+    real_state.mkdir()
+    alias_state = tmp_path / "alias-state"
+    alias_state.symlink_to(real_state, target_is_directory=True)
+    config = configured(tmp_path)
+    config.state_dir = alias_state
+    calls = []
+    runner = LaunchctlRunner(calls)
+    monkeypatch.setattr("sync.launchd.persist_keychain_credentials", lambda: None)
+    monkeypatch.setattr("sync.launchd.subprocess.run", runner)
+    install(config=config)
+
+    config.state_dir = real_state
+    install(config=config)
+
+    assert all(path.exists() for path in helper_paths(config))
+    assert runner.loaded == {LABEL, NATIVE_LABEL}
+
+
+def test_uninstall_removes_helpers_from_old_state_dir(tmp_path, monkeypatch):
+    config = configured(tmp_path)
+    calls = []
+    runner = LaunchctlRunner(calls)
+    monkeypatch.setattr("sync.launchd.persist_keychain_credentials", lambda: None)
+    monkeypatch.setattr("sync.launchd.subprocess.run", runner)
+    install(config=config)
+    old_helpers = helper_paths(config)
+    config.state_dir = tmp_path / "new-state"
+    config.native_primary = False
+
+    uninstall(config=config)
+
+    assert all(not path.exists() for path in old_helpers)
+    assert all(not path.exists() for path in helper_paths(config))
+    assert runner.loaded == set()
 
 
 def test_install_conflict_is_detected_before_any_change(tmp_path, monkeypatch):
@@ -413,6 +600,8 @@ def test_upgrade_preserves_only_allowlisted_nonsecret_tuning(tmp_path, monkeypat
             "FUNES_STATE_DIR": str(config.state_dir),
             "FUNES_SYNC_BATCH": "5",
             "FUNES_REMOTE_TIMEOUT": "180",
+            "FUNES_REMOTE_ATTEMPT_TIMEOUT": "40",
+            "FUNES_REMOTE_TRANSIENT_RETRIES": "25",
             "FUNES_API_TOKEN": "old-api-secret",
         },
         {
@@ -433,6 +622,8 @@ def test_upgrade_preserves_only_allowlisted_nonsecret_tuning(tmp_path, monkeypat
     native = plistlib.loads(native_plist_path(config.home).read_bytes())["EnvironmentVariables"]
     assert main["FUNES_SYNC_BATCH"] == "5"
     assert main["FUNES_REMOTE_TIMEOUT"] == "180"
+    assert main["FUNES_REMOTE_ATTEMPT_TIMEOUT"] == "40"
+    assert main["FUNES_REMOTE_TRANSIENT_RETRIES"] == "25"
     assert native["FUNES_NATIVE_BACKFILL_PUSH_EVERY"] == "20"
     assert native["FUNES_NATIVE_BACKFILL_SLEEP"] == "9"
     assert "FUNES_API_TOKEN" not in main
@@ -447,6 +638,7 @@ def test_explicit_tuning_overrides_previous_plist(tmp_path, monkeypatch):
             "FUNES_STATE_DIR": str(config.state_dir),
             "FUNES_SYNC_BATCH": "5",
             "FUNES_REMOTE_TIMEOUT": "180",
+            "FUNES_REMOTE_TRANSIENT_RETRIES": "25",
         },
         {
             "FUNES_SYNC_STATE_DIR": str(config.state_dir),
@@ -456,6 +648,8 @@ def test_explicit_tuning_overrides_previous_plist(tmp_path, monkeypatch):
     )
     monkeypatch.setenv("FUNES_SYNC_BATCH", "11")
     monkeypatch.setenv("FUNES_REMOTE_TIMEOUT", "44")
+    monkeypatch.setenv("FUNES_REMOTE_ATTEMPT_TIMEOUT", "35")
+    monkeypatch.setenv("FUNES_REMOTE_TRANSIENT_RETRIES", "77")
     monkeypatch.setenv("FUNES_NATIVE_BACKFILL_PUSH_EVERY", "3")
     monkeypatch.setenv("FUNES_NATIVE_BACKFILL_SLEEP", "4")
     calls = []
@@ -469,6 +663,8 @@ def test_explicit_tuning_overrides_previous_plist(tmp_path, monkeypatch):
     native = plistlib.loads(native_plist_path(config.home).read_bytes())["EnvironmentVariables"]
     assert main["FUNES_SYNC_BATCH"] == "11"
     assert main["FUNES_REMOTE_TIMEOUT"] == "44"
+    assert main["FUNES_REMOTE_ATTEMPT_TIMEOUT"] == "35"
+    assert main["FUNES_REMOTE_TRANSIENT_RETRIES"] == "77"
     assert native["FUNES_NATIVE_BACKFILL_PUSH_EVERY"] == "3"
     assert native["FUNES_NATIVE_BACKFILL_SLEEP"] == "4"
 
@@ -479,6 +675,8 @@ def test_configured_tuning_overrides_previous_plist(tmp_path, monkeypatch):
         "[sync]\n"
         "batch_size = 13\n"
         "remote_timeout = 91\n"
+        "remote_attempt_timeout = 20\n"
+        "remote_transient_retries = 42\n"
         "native_backfill_push_every = 6\n"
         "native_backfill_sleep = 8\n",
         encoding="utf-8",
@@ -489,6 +687,7 @@ def test_configured_tuning_overrides_previous_plist(tmp_path, monkeypatch):
             "FUNES_STATE_DIR": str(config.state_dir),
             "FUNES_SYNC_BATCH": "5",
             "FUNES_REMOTE_TIMEOUT": "180",
+            "FUNES_REMOTE_TRANSIENT_RETRIES": "25",
         },
         {
             "FUNES_SYNC_STATE_DIR": str(config.state_dir),
@@ -507,6 +706,8 @@ def test_configured_tuning_overrides_previous_plist(tmp_path, monkeypatch):
     native = plistlib.loads(native_plist_path(config.home).read_bytes())["EnvironmentVariables"]
     assert main["FUNES_SYNC_BATCH"] == "13"
     assert main["FUNES_REMOTE_TIMEOUT"] == "91"
+    assert main["FUNES_REMOTE_ATTEMPT_TIMEOUT"] == "20"
+    assert main["FUNES_REMOTE_TRANSIENT_RETRIES"] == "42"
     assert native["FUNES_NATIVE_BACKFILL_PUSH_EVERY"] == "6"
     assert native["FUNES_NATIVE_BACKFILL_SLEEP"] == "8"
 
@@ -734,3 +935,41 @@ def test_dangling_old_state_directory_blocks_install(tmp_path, monkeypatch):
     assert exc.value.as_dict()["migrations"][0]["reason"] == "queue_unreadable"
     assert keychain_calls == []
     assert launchctl_calls == []
+
+
+def test_render_plist_preserves_remote_transient_retries_and_prunes_secrets(tmp_path):
+    from sync.launchd import render_plist
+
+    config = configured(tmp_path)
+
+    # 1. Default without any configuration -> not present in env
+    env_default = render_plist(config=config)["EnvironmentVariables"]
+    assert "FUNES_REMOTE_TRANSIENT_RETRIES" not in env_default
+    assert "FUNES_REMOTE_TIMEOUT" not in env_default
+    assert "FUNES_REMOTE_ATTEMPT_TIMEOUT" not in env_default
+
+    # 2. Inherited from previous_env -> preserved, secret pruned
+    prev_env = {
+        "FUNES_REMOTE_TRANSIENT_RETRIES": "50",
+        "FUNES_REMOTE_TIMEOUT": "120",
+        "FUNES_REMOTE_ATTEMPT_TIMEOUT": "25",
+        "FUNES_API_TOKEN": "secret-token",
+    }
+    env_prev = render_plist(config=config, previous_env=prev_env)["EnvironmentVariables"]
+    assert env_prev["FUNES_REMOTE_TRANSIENT_RETRIES"] == "50"
+    assert env_prev["FUNES_REMOTE_TIMEOUT"] == "120"
+    assert env_prev["FUNES_REMOTE_ATTEMPT_TIMEOUT"] == "25"
+    assert "FUNES_API_TOKEN" not in env_prev
+
+    # 3. Configured in config.toml -> overrides previous_env
+    config.config_path.write_text(
+        "[sync]\n"
+        "remote_transient_retries = 33\n"
+        "remote_timeout = 88\n"
+        "remote_attempt_timeout = 22\n",
+        encoding="utf-8",
+    )
+    env_cfg = render_plist(config=config, previous_env=prev_env)["EnvironmentVariables"]
+    assert env_cfg["FUNES_REMOTE_TRANSIENT_RETRIES"] == "33"
+    assert env_cfg["FUNES_REMOTE_TIMEOUT"] == "88"
+    assert env_cfg["FUNES_REMOTE_ATTEMPT_TIMEOUT"] == "22"

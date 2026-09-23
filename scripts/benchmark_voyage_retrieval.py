@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import http.client
 import json
 import math
 import os
@@ -23,7 +24,6 @@ import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -100,6 +100,7 @@ EMBEDDING_PROFILE_FIELDS = (
 KNOWN_RETRIEVAL_DEGRADATIONS = frozenset(
     {"voyage_unavailable", "native_mcp_busy", "native_mcp_unavailable"}
 )
+MAX_HTTP_ERROR_BODY_BYTES = 16 * 1024
 
 
 @dataclass(frozen=True)
@@ -124,6 +125,172 @@ class HttpRecallObservation:
     @property
     def verified_voyage(self) -> bool:
         return not self.validation_failures
+
+
+@dataclass(frozen=True)
+class _HttpTransportConfig:
+    target_host: str
+    target_port: int
+    connect_host: str
+    connect_port: int
+    request_target: str
+    target_scheme: str
+    transport: str
+    proxy_used: bool
+    tunnel: bool
+
+
+_RETRYABLE_HTTP_DISCONNECTS = (
+    http.client.RemoteDisconnected,
+    http.client.IncompleteRead,
+    ConnectionResetError,
+    ConnectionAbortedError,
+    BrokenPipeError,
+)
+
+
+class _PersistentFunesHttpClient:
+    """One active HTTP/1.1 connection, with one safe retry after disconnect."""
+
+    def __init__(self, *, endpoint: str, token: str, timeout: float) -> None:
+        self._config = _http_transport_config(endpoint)
+        self._token = token
+        self._timeout = timeout
+        self._connection: http.client.HTTPConnection | None = None
+        self.connection_attempts = 0
+        self.connections_opened = 0
+        self.request_attempts = 0
+        self.disconnect_retries = 0
+
+    @property
+    def transport(self) -> str:
+        return self._config.transport
+
+    @property
+    def proxy_used(self) -> bool:
+        return self._config.proxy_used
+
+    def _new_connection(self) -> http.client.HTTPConnection:
+        config = self._config
+        if config.target_scheme == "https":
+            connection: http.client.HTTPConnection = http.client.HTTPSConnection(
+                config.connect_host,
+                config.connect_port,
+                timeout=self._timeout,
+            )
+        else:
+            connection = http.client.HTTPConnection(
+                config.connect_host,
+                config.connect_port,
+                timeout=self._timeout,
+            )
+        if config.tunnel:
+            # Target Authorization belongs only to the request inside the tunnel.
+            connection.set_tunnel(config.target_host, config.target_port, headers={})
+        return connection
+
+    def _ensure_connected(self) -> http.client.HTTPConnection:
+        if self._connection is None:
+            self._connection = self._new_connection()
+        if self._connection.sock is None:
+            self.connection_attempts += 1
+            self._connection.connect()
+            self.connections_opened += 1
+        return self._connection
+
+    def _discard_connection(self) -> None:
+        if self._connection is not None:
+            connection = self._connection
+            self._connection = None
+            try:
+                connection.close()
+            except (OSError, http.client.HTTPException):
+                pass
+
+    def close(self) -> None:
+        self._discard_connection()
+
+    def post_recall(self, query: str) -> tuple[int, object]:
+        body = json.dumps(
+            {"query": query, "limit": 5},
+            ensure_ascii=False,
+        ).encode("utf-8")
+        response_body: bytes
+        status: int
+        for retry in range(2):
+            try:
+                connection = self._ensure_connected()
+                self.request_attempts += 1
+                connection.request(
+                    "POST",
+                    self._config.request_target,
+                    body=body,
+                    headers={
+                        "Authorization": "Bearer " + self._token,
+                        "Content-Type": "application/json",
+                        "Accept": "application/json",
+                        "Connection": "keep-alive",
+                    },
+                )
+                response = connection.getresponse()
+                status = int(response.status)
+                if status < 200 or status >= 300:
+                    response_reusable = False
+                    try:
+                        error_bytes_read = len(
+                            response.read(MAX_HTTP_ERROR_BODY_BYTES + 1)
+                        )
+                        isclosed = getattr(response, "isclosed", None)
+                        response_reusable = (
+                            error_bytes_read <= MAX_HTTP_ERROR_BODY_BYTES
+                            and callable(isclosed)
+                            and bool(isclosed())
+                        )
+                    except (
+                        TimeoutError,
+                        OSError,
+                        http.client.HTTPException,
+                        TypeError,
+                        ValueError,
+                    ):
+                        pass
+                    finally:
+                        try:
+                            response.close()
+                        except (OSError, http.client.HTTPException, ValueError):
+                            response_reusable = False
+                    if not response_reusable:
+                        self._discard_connection()
+                    raise BenchmarkError(f"Funes recall HTTP {status}")
+                try:
+                    # Exhausting the response is required before this connection can
+                    # safely carry the next benchmark request.
+                    response_body = response.read()
+                finally:
+                    response.close()
+                break
+            except _RETRYABLE_HTTP_DISCONNECTS as exc:
+                self._discard_connection()
+                if retry == 0:
+                    # POST /recall is retrieval-only, so one replay on a fresh
+                    # connection is safe. Never retry timeouts or arbitrary errors.
+                    self.disconnect_retries += 1
+                    continue
+                raise BenchmarkError(
+                    f"Funes recall transport failure ({type(exc).__name__})"
+                ) from None
+            except (TimeoutError, OSError, http.client.HTTPException) as exc:
+                self._discard_connection()
+                raise BenchmarkError(
+                    f"Funes recall transport failure ({type(exc).__name__})"
+                ) from None
+        else:  # pragma: no cover - the bounded loop either breaks or raises
+            raise AssertionError("unreachable HTTP retry state")
+
+        try:
+            return status, json.loads(response_body)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            raise BenchmarkError("Funes recall returned malformed JSON") from None
 
 
 class EmbeddingCache:
@@ -793,10 +960,25 @@ def run_voyage_benchmark(
 
 
 def _validate_remote_url(value: str) -> str:
-    parsed = urllib.parse.urlsplit(value)
+    if (
+        not value
+        or "?" in value
+        or "#" in value
+        or any(character.isspace() or ord(character) < 32 for character in value)
+    ):
+        raise BenchmarkError("FUNES_REMOTE_URL must be an http(s) base URL without credentials")
+    try:
+        parsed = urllib.parse.urlsplit(value)
+        hostname = parsed.hostname
+        parsed.port
+    except ValueError:
+        raise BenchmarkError(
+            "FUNES_REMOTE_URL must be an http(s) base URL without credentials"
+        ) from None
     if (
         parsed.scheme not in ("http", "https")
         or not parsed.netloc
+        or hostname is None
         or parsed.username is not None
         or parsed.password is not None
         or parsed.query
@@ -804,6 +986,71 @@ def _validate_remote_url(value: str) -> str:
     ):
         raise BenchmarkError("FUNES_REMOTE_URL must be an http(s) base URL without credentials")
     return value.rstrip("/") + "/recall"
+
+
+def _http_transport_config(endpoint: str) -> _HttpTransportConfig:
+    parsed = urllib.parse.urlsplit(endpoint)
+    target_host = parsed.hostname
+    if target_host is None:  # _validate_remote_url has already checked this.
+        raise AssertionError("validated HTTP endpoint has no hostname")
+    target_port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    proxy_value = urllib.request.getproxies().get(parsed.scheme)
+    proxy_used = bool(proxy_value) and not urllib.request.proxy_bypass(parsed.netloc)
+    request_target = parsed.path or "/"
+
+    if not proxy_used:
+        return _HttpTransportConfig(
+            target_host=target_host,
+            target_port=target_port,
+            connect_host=target_host,
+            connect_port=target_port,
+            request_target=request_target,
+            target_scheme=parsed.scheme,
+            transport=f"direct_{parsed.scheme}_keep_alive",
+            proxy_used=False,
+            tunnel=False,
+        )
+
+    if not isinstance(proxy_value, str):
+        raise BenchmarkError("HTTP proxy configuration is unsupported")
+    try:
+        proxy = urllib.parse.urlsplit(proxy_value)
+        proxy_host = proxy.hostname
+        proxy_port = proxy.port
+    except ValueError:
+        raise BenchmarkError("HTTP proxy configuration is unsupported") from None
+    if (
+        proxy.scheme != "http"
+        or proxy_host is None
+        or proxy.username is not None
+        or proxy.password is not None
+        or proxy.query
+        or proxy.fragment
+        or proxy.path not in ("", "/")
+    ):
+        raise BenchmarkError(
+            "HTTP proxy must be an unauthenticated http:// host for this benchmark"
+        )
+    proxy_port = proxy_port or 80
+    if parsed.scheme == "https":
+        transport = "https_over_http_connect_keep_alive"
+        tunnel = True
+        request_target = parsed.path or "/"
+    else:
+        transport = "http_via_http_proxy_keep_alive"
+        tunnel = False
+        request_target = endpoint
+    return _HttpTransportConfig(
+        target_host=target_host,
+        target_port=target_port,
+        connect_host=proxy_host,
+        connect_port=proxy_port,
+        request_target=request_target,
+        target_scheme=parsed.scheme,
+        transport=transport,
+        proxy_used=True,
+        tunnel=tunnel,
+    )
 
 
 def _recorded_embedding_profile(value: object) -> dict[str, object] | None:
@@ -850,33 +1097,13 @@ def _degraded_reason(value: object) -> str | None:
 
 
 def _funes_recall(
-    endpoint: str,
-    token: str,
+    client: _PersistentFunesHttpClient,
     query: str,
-    timeout: float,
     *,
     expected_backend: str,
     expected_profile: dict[str, object],
 ) -> HttpRecallObservation:
-    request = urllib.request.Request(
-        endpoint,
-        data=json.dumps({"query": query, "limit": 5}, ensure_ascii=False).encode("utf-8"),
-        headers={
-            "Authorization": "Bearer " + token,
-            "Content-Type": "application/json",
-        },
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            status = int(getattr(response, "status", 200))
-            payload = json.loads(response.read())
-    except urllib.error.HTTPError as exc:
-        raise BenchmarkError(f"Funes recall HTTP {exc.code}") from None
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        raise BenchmarkError(f"Funes recall transport failure ({type(exc).__name__})") from None
-    except (TypeError, ValueError, json.JSONDecodeError):
-        raise BenchmarkError("Funes recall returned malformed JSON") from None
+    status, payload = client.post_recall(query)
     if not isinstance(payload, dict) or not isinstance(payload.get("results"), list):
         raise BenchmarkError("Funes recall response has no results list")
     backend_value = payload.get("retrieval_backend")
@@ -973,33 +1200,32 @@ def run_http_latency(
     ):
         raise BenchmarkError("expected HTTP Voyage backend/profile is invalid")
     endpoint = _validate_remote_url(remote_url)
-
-    warmup = _funes_recall(
-        endpoint,
-        token,
-        HTTP_LATENCY_CASES[0][1],
-        timeout,
-        expected_backend=expected_backend,
-        expected_profile=expected_profile,
-    )
+    client = _PersistentFunesHttpClient(endpoint=endpoint, token=token, timeout=timeout)
     samples: dict[str, list[float]] = {category: [] for category, _ in HTTP_LATENCY_CASES}
     statuses: dict[str, int] = {}
     observations: list[HttpRecallObservation] = []
-    for index in range(requests):
-        category, query = HTTP_LATENCY_CASES[index % len(HTTP_LATENCY_CASES)]
-        started = time.monotonic()
-        observation = _funes_recall(
-            endpoint,
-            token,
-            query,
-            timeout,
+    try:
+        warmup = _funes_recall(
+            client,
+            HTTP_LATENCY_CASES[0][1],
             expected_backend=expected_backend,
             expected_profile=expected_profile,
         )
-        elapsed_ms = (time.monotonic() - started) * 1000
-        samples[category].append(elapsed_ms)
-        observations.append(observation)
-        statuses[str(observation.status)] = statuses.get(str(observation.status), 0) + 1
+        for index in range(requests):
+            category, query = HTTP_LATENCY_CASES[index % len(HTTP_LATENCY_CASES)]
+            started = time.monotonic()
+            observation = _funes_recall(
+                client,
+                query,
+                expected_backend=expected_backend,
+                expected_profile=expected_profile,
+            )
+            elapsed_ms = (time.monotonic() - started) * 1000
+            samples[category].append(elapsed_ms)
+            observations.append(observation)
+            statuses[str(observation.status)] = statuses.get(str(observation.status), 0) + 1
+    finally:
+        client.close()
 
     all_samples = [sample for category_samples in samples.values() for sample in category_samples]
     failure_counts: dict[str, int] = {}
@@ -1023,7 +1249,28 @@ def run_http_latency(
         "warmup_requests": 1,
         "end_to_end_latency_ms": end_to_end_latency,
         "latency_ms": end_to_end_latency,
-        "latency_scope": "client-observed warm POST /recall round trip",
+        "latency_scope": (
+            "client-observed POST /recall round trip after one unmeasured warmup; "
+            "uses the warmup connection when available and includes reconnect/retry time"
+        ),
+        "transport": client.transport,
+        "proxy_used": client.proxy_used,
+        "connection_reuse": {
+            "mode": "single_persistent_connection_with_bounded_reconnect",
+            "scope": "warmup_and_measured_requests",
+            "logical_requests": requests + 1,
+            "request_attempts": client.request_attempts,
+            "transport_connection_attempts": client.connection_attempts,
+            "transport_connections_opened": client.connections_opened,
+            "transport_reconnections": max(0, client.connections_opened - 1),
+            "disconnect_retries": client.disconnect_retries,
+            "max_disconnect_retries_per_request": 1,
+            "single_transport_connection_for_warmup_and_measurements": (
+                client.connections_opened == 1
+            ),
+            "response_bodies_fully_read": True,
+            "redirects_followed": False,
+        },
         "by_category": {
             category: {
                 "requests": len(category_samples),

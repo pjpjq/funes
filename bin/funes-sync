@@ -3,6 +3,27 @@
 set -eu
 ROOT=${FUNES_SYNC_ROOT:-$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)}
 export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"
+if [ -z "${PYTHON:-}" ]; then
+  for candidate in \
+    "${FUNES_SYNC_VENV_PYTHON:-}" \
+    "${HOME:-}/.local/share/funes-sync/venv/bin/python" \
+    /opt/homebrew/bin/python3 \
+    /usr/local/bin/python3
+  do
+    if [ -n "$candidate" ] && [ -x "$candidate" ]; then
+      PYTHON=$candidate
+      break
+    fi
+  done
+  if [ -z "${PYTHON:-}" ]; then
+    PYTHON=$(command -v python3 || true)
+  fi
+  if [ -z "$PYTHON" ]; then
+    echo "funes-sync: Python 3 was not found" >&2
+    exit 127
+  fi
+  export PYTHON
+fi
 if [ -z "${FUNES_API_TOKEN:-}" ] && command -v security >/dev/null 2>&1; then
   FUNES_API_TOKEN="$(security find-generic-password -a "${USER:-$(id -un)}" -s funes-api-token -w 2>/dev/null || true)"
   if [ -n "$FUNES_API_TOKEN" ]; then export FUNES_API_TOKEN; fi
@@ -27,4 +48,4 @@ if [ -z "${FUNES_API_TOKEN:-}" ] || [ -z "${FUNES_HF_TOKEN:-}" ]; then
     fi
   fi
 fi
-exec "${PYTHON:-python3}" -m sync "$@"
+exec "$PYTHON" -m sync "$@"

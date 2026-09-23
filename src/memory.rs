@@ -31,8 +31,8 @@ use lance::dataset::Dataset;
 use crate::hub::{client, hf_token, is_offline_error, is_remote_shorthand, parse_hf};
 use crate::inference::{self, EmbeddingProfile};
 use dataset::{
-    DIM, EMBEDDING_DIMENSIONS_KEY, EMBEDDING_FINGERPRINT_KEY, EMBEDDING_MODEL_KEY,
-    EMBEDDING_PROVIDER_KEY, EMBEDDING_SCHEMA_VERSION_KEY,
+    DIM, EMBEDDING_DIMENSIONS_KEY, EMBEDDING_FINGERPRINT_KEY, EMBEDDING_MODEL_KEY, EMBEDDING_PROVIDER_KEY,
+    EMBEDDING_SCHEMA_VERSION_KEY,
 };
 
 /// A memory to recall from: a local Lance directory or a remote dataset on the HF Hub.
@@ -582,6 +582,9 @@ mod tests {
 
         assert!(check_compat_with_profile(&ds, &stored).is_ok());
         let error = check_compat_with_profile(&ds, &expected).unwrap_err().to_string();
-        assert!(error.contains("embedding_model") || error.contains("embedding_fingerprint"), "{error}");
+        assert!(
+            error.contains("embedding_model") || error.contains("embedding_fingerprint"),
+            "{error}"
+        );
     }
 }

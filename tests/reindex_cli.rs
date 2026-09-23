@@ -7,9 +7,7 @@ fn fake_sync(root: &Path, exit_code: i32) -> std::path::PathBuf {
     let path = root.join("funes-sync");
     fs::write(
         &path,
-        format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$FUNES_TEST_CLI_LOG\"\nexit {exit_code}\n"
-        ),
+        format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$FUNES_TEST_CLI_LOG\"\nexit {exit_code}\n"),
     )
     .unwrap();
     let mut permissions = fs::metadata(&path).unwrap().permissions();
@@ -44,10 +42,7 @@ fn reindex_forwards_exact_scope() {
 
 #[test]
 fn reindex_requires_exactly_one_scope() {
-    for args in [
-        vec!["reindex"],
-        vec!["reindex", "--retrieval-text", "--all"],
-    ] {
+    for args in [vec!["reindex"], vec!["reindex", "--retrieval-text", "--all"]] {
         let root = tempfile::tempdir().unwrap();
         let (output, log) = run(root.path(), &args, 0);
         assert!(!output.status.success());

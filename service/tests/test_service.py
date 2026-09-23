@@ -1,4 +1,5 @@
 import gzip
+import hashlib
 import json
 import os
 import sqlite3
@@ -11,16 +12,16 @@ from http.client import HTTPConnection
 from pathlib import Path
 from http.server import ThreadingHTTPServer
 
-from service.server import QUERY_PROMPT_VERSION, QUERY_RETRIEVAL_PROMPT, RETRIEVAL_PROMPT, App, Store, Translator, make_handler, persist_translation_documents, prepare_ingest_documents
+from service.server import FTS_SCHEMA_VERSION, QUERY_PROMPT_VERSION, QUERY_RETRIEVAL_PROMPT, RETRIEVAL_PROMPT, App, Store, Translator, ingest_documents, make_handler, persist_translation_documents, prepare_ingest_documents
 
 
 class ServiceTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.old = {k: os.environ.get(k) for k in ("FUNES_DATA_DIR", "FUNES_AUTH_TOKEN", "FUNES_API_TOKEN", "FUNES_STORAGE_KEY", "FUNES_STORAGE_REPO", "FUNES_SNAPSHOT_FILE", "HF_TOKEN", "FUNES_REQUIRE_DURABLE_ACK", "FUNES_ALLOW_EMPTY_REMOTE", "FUNES_MAX_BODY_BYTES", "FUNES_RETRIEVAL_LANGUAGE_MODE", "TRANSLATION_BASE_URL", "TRANSLATION_API_KEY", "TRANSLATION_MODEL", "TRANSLATION_MAX_PER_INGEST", "TRANSLATION_QUERY_MAX_TOKENS", "TRANSLATION_RECONCILE_INTERVAL", "RETURN_RETRIEVAL_TEXT")}
+        self.old = {k: os.environ.get(k) for k in ("FUNES_DATA_DIR", "FUNES_AUTH_TOKEN", "FUNES_API_TOKEN", "FUNES_STORAGE_KEY", "FUNES_STORAGE_REPO", "FUNES_SNAPSHOT_FILE", "FUNES_RESTORE_MANIFEST_FILE", "HF_TOKEN", "FUNES_REQUIRE_DURABLE_ACK", "FUNES_ALLOW_EMPTY_REMOTE", "FUNES_MAX_BODY_BYTES", "FUNES_RETRIEVAL_LANGUAGE_MODE", "FUNES_BULK_RESTORE_REBUILD_FTS", "TRANSLATION_BASE_URL", "TRANSLATION_API_KEY", "TRANSLATION_MODEL", "TRANSLATION_MAX_PER_INGEST", "TRANSLATION_QUERY_MAX_TOKENS", "TRANSLATION_RECONCILE_INTERVAL", "RETURN_RETRIEVAL_TEXT")}
         os.environ["FUNES_DATA_DIR"] = self.tmp.name
         os.environ["FUNES_AUTH_TOKEN"] = "test-token"
-        for k in ("FUNES_API_TOKEN", "FUNES_STORAGE_KEY", "FUNES_STORAGE_REPO", "FUNES_SNAPSHOT_FILE", "HF_TOKEN", "FUNES_REQUIRE_DURABLE_ACK", "FUNES_ALLOW_EMPTY_REMOTE", "FUNES_MAX_BODY_BYTES", "FUNES_RETRIEVAL_LANGUAGE_MODE", "TRANSLATION_BASE_URL", "TRANSLATION_API_KEY", "TRANSLATION_MODEL", "TRANSLATION_MAX_PER_INGEST", "TRANSLATION_QUERY_MAX_TOKENS", "TRANSLATION_RECONCILE_INTERVAL", "RETURN_RETRIEVAL_TEXT"):
+        for k in ("FUNES_API_TOKEN", "FUNES_STORAGE_KEY", "FUNES_STORAGE_REPO", "FUNES_SNAPSHOT_FILE", "FUNES_RESTORE_MANIFEST_FILE", "HF_TOKEN", "FUNES_REQUIRE_DURABLE_ACK", "FUNES_ALLOW_EMPTY_REMOTE", "FUNES_MAX_BODY_BYTES", "FUNES_RETRIEVAL_LANGUAGE_MODE", "FUNES_BULK_RESTORE_REBUILD_FTS", "TRANSLATION_BASE_URL", "TRANSLATION_API_KEY", "TRANSLATION_MODEL", "TRANSLATION_MAX_PER_INGEST", "TRANSLATION_QUERY_MAX_TOKENS", "TRANSLATION_RECONCILE_INTERVAL", "RETURN_RETRIEVAL_TEXT"):
             os.environ.pop(k, None)
 
     def tearDown(self):
@@ -31,16 +32,99 @@ class ServiceTests(unittest.TestCase):
                 os.environ[k] = v
         self.tmp.cleanup()
 
+    @staticmethod
+    def trace_read_connections(store, statements):
+        original = store._read_connection
+
+        def traced():
+            connection = original()
+            connection.set_trace_callback(statements.append)
+            return connection
+
+        return mock.patch.object(store, "_read_connection", side_effect=traced)
+
     def test_dedupe_and_update(self):
         store = Store(self.tmp.name)
         first = {"source_path": "a.md", "source_version": "1", "raw_text": "hello world", "project": "p"}
         self.assertEqual(store.ingest([first])["created"], 1)
+        before_retry = store.get("a.md")
         self.assertEqual(store.ingest([first])["deduped"], 1)
+        after_retry = store.get("a.md")
+        self.assertEqual(
+            after_retry["_source_metadata_clocks"],
+            before_retry["_source_metadata_clocks"],
+        )
+        self.assertEqual(after_retry["updated_at"], before_retry["updated_at"])
         changed = dict(first, source_version="2", raw_text="hello revised")
         self.assertEqual(store.ingest([changed])["updated"], 1)
         self.assertEqual(store.count(), 1)
         self.assertEqual(store.get("a.md")["raw_text"], "hello revised")
         store.close()
+
+    def test_native_index_failure_counts_are_allowlisted(self):
+        store = Store(self.tmp.name)
+        rows = [
+            {"source_identity": f"failure-{index}", "raw_text": "private raw"}
+            for index in range(6)
+        ]
+        store.ingest(rows)
+        failures = [
+            "TimeoutExpired",
+            "native_exit",
+            "invalid_report",
+            "native_stale",
+            "durability_pending",
+            "provider said private raw",
+        ]
+        with store.lock, store.conn:
+            for row, failure in zip(rows[:-2], failures[:-2], strict=True):
+                store.conn.execute(
+                    "UPDATE memories SET native_index_error=? WHERE source_identity=?",
+                    (failure, row["source_identity"]),
+                )
+            store.conn.execute(
+                "UPDATE memories SET native_index_error=? WHERE source_identity=?",
+                (failures[-1], rows[-1]["source_identity"]),
+            )
+        waiting = store.get(rows[-2]["source_identity"])
+        store.update_native_index(
+            [
+                {
+                    "source_identity": waiting["source_identity"],
+                    "source_version": waiting["source_version"],
+                    "content_hash": waiting["content_hash"],
+                    "native_index_version": None,
+                    "native_index_status": "waiting_durability",
+                    "native_index_profile": None,
+                    "native_index_memory": None,
+                    "native_indexed_at": None,
+                    "native_index_error": "durability_pending",
+                    "native_generation": waiting["native_generation"],
+                }
+            ]
+        )
+        with store.lock:
+            pending = store.conn.execute(
+                "SELECT native_index_pending FROM memories WHERE source_identity=?",
+                (waiting["source_identity"],),
+            ).fetchone()[0]
+        try:
+            counts = store.native_index_failure_counts()
+        finally:
+            store.close()
+        self.assertEqual(pending, 0)
+        self.assertEqual(
+            counts,
+            {
+                "timeout": 1,
+                "native_exit": 1,
+                "invalid_report": 1,
+                "stale": 1,
+                "durability_pending": 1,
+                "other": 1,
+            },
+        )
+        self.assertNotIn("private raw", json.dumps(counts))
 
     def test_legacy_retrieval_only_fts_migrates_to_raw_primary_once(self):
         store = Store(self.tmp.name)
@@ -146,25 +230,24 @@ class ServiceTests(unittest.TestCase):
             ]
         )
         statements = []
-        store.conn.set_trace_callback(statements.append)
         try:
-            self.assertEqual(
-                store.search("primaryneedle", allow_broad_scan=False)[0][
-                    "source_identity"
-                ],
-                "raw-hit",
-            )
-            self.assertEqual(
-                store.search(
-                    "之前的 Tailscale 延迟", allow_broad_scan=False
-                )[0]["source_identity"],
-                "identifier-hit",
-            )
-            self.assertEqual(
-                store.search('没有匹配 "', allow_broad_scan=False), []
-            )
+            with self.trace_read_connections(store, statements):
+                self.assertEqual(
+                    store.search("primaryneedle", allow_broad_scan=False)[0][
+                        "source_identity"
+                    ],
+                    "raw-hit",
+                )
+                self.assertEqual(
+                    store.search(
+                        "之前的 Tailscale 延迟", allow_broad_scan=False
+                    )[0]["source_identity"],
+                    "identifier-hit",
+                )
+                self.assertEqual(
+                    store.search('没有匹配 "', allow_broad_scan=False), []
+                )
         finally:
-            store.conn.set_trace_callback(None)
             store.close()
         self.assertFalse(any(" LIKE " in sql.upper() for sql in statements))
 
@@ -175,14 +258,18 @@ class ServiceTests(unittest.TestCase):
         finally:
             store.close()
 
-    def test_prepare_ingest_reads_reindex_generation_once_per_batch(self):
+    def test_prepare_ingest_reads_reindex_generations_once_per_batch(self):
         app = App()
         try:
             with mock.patch.object(
                 app.store,
                 "latest_reindex_generation",
                 wraps=app.store.latest_reindex_generation,
-            ) as latest:
+            ) as latest, mock.patch.object(
+                app.store,
+                "latest_embedding_generation",
+                wraps=app.store.latest_embedding_generation,
+            ) as latest_embedding:
                 prepared = prepare_ingest_documents(
                     app,
                     [
@@ -191,12 +278,75 @@ class ServiceTests(unittest.TestCase):
                     ],
                 )
             self.assertEqual(latest.call_count, 1)
+            self.assertEqual(latest_embedding.call_count, 1)
             self.assertEqual(
                 {item["retrieval_generation"] for item in prepared},
                 {app.store.latest_reindex_generation()},
             )
         finally:
             app.close()
+
+    def test_metadata_refresh_does_not_consume_pending_reindex_generation(self):
+        store = Store(self.tmp.name)
+        raw = "原始正文"
+        store.ingest(
+            [{
+                "source_identity": "metadata-before-drain",
+                "source_version": "v1",
+                "raw_text": raw,
+                "retrieval_text": "old retrieval shadow",
+                "updated_at": "2026-09-14T00:00:00Z",
+                "translation_hash": "old-translation",
+                "translation_status": "ok",
+                "native_index_version": "old-native",
+                "native_index_status": "indexed",
+                "native_index_profile": "profile-v1",
+                "native_index_memory": "memory-v1",
+                "source_missing": False,
+            }]
+        )
+        store.record_reindex_control(
+            {
+                "generation": 1,
+                "scope": "all",
+                "created_at": "2026-09-14T01:00:00Z",
+            }
+        )
+        app = mock.Mock(store=store)
+        app.syncer.upload.return_value = {"durable": True}
+        app.translator.pending_document.side_effect = AssertionError(
+            "unchanged derived values must not schedule provider work"
+        )
+        result = ingest_documents(
+            app,
+            [{
+                "source_identity": "metadata-before-drain",
+                "source_version": "v1",
+                "raw_text": raw,
+                "updated_at": "2026-09-14T02:00:00Z",
+                "device_id": "new-device",
+                "source_missing": False,
+            }],
+        )
+        before_drain = store.get("metadata-before-drain")
+        self.assertEqual(result["items"][0]["status"], "metadata_updated")
+        self.assertEqual(before_drain["retrieval_generation"], 0)
+        self.assertEqual(before_drain["native_generation"], 0)
+        self.assertEqual(before_drain["embedding_generation"], 0)
+        self.assertEqual(before_drain["retrieval_text"], "old retrieval shadow")
+        self.assertEqual(before_drain["native_index_status"], "indexed")
+        app.translator.pending_document.assert_not_called()
+
+        drained = store.drain_reindex_controls(10)
+        after_drain = store.get("metadata-before-drain")
+        self.assertEqual(drained["updated"], 1)
+        self.assertEqual(after_drain["retrieval_generation"], 1)
+        self.assertEqual(after_drain["native_generation"], 1)
+        self.assertEqual(after_drain["embedding_generation"], 1)
+        self.assertEqual(after_drain["retrieval_text"], raw)
+        self.assertEqual(after_drain["translation_status"], "pending_provider")
+        self.assertIsNone(after_drain["native_index_status"])
+        store.close()
 
     def test_same_revision_updates_only_derived_fields_in_place(self):
         store = Store(self.tmp.name)
@@ -228,6 +378,468 @@ class ServiceTests(unittest.TestCase):
         # successfully reconciled shadow.
         self.assertEqual(store.ingest([original])["deduped"], 1)
         self.assertEqual(store.get("derived-only")["translation_status"], "ok")
+        store.close()
+
+    def test_same_revision_updates_source_metadata_without_resetting_derived_state(self):
+        store = Store(self.tmp.name)
+        raw = "stable source bytes"
+        metadata_fields = (
+            "device_id",
+            "project",
+            "repo",
+            "worktree",
+            "source_agent",
+            "source_type",
+            "session_id",
+            "message_id",
+            "role",
+            "timestamp",
+            "source_path",
+            "agent_type",
+            "parent_session_id",
+            "agent_id",
+        )
+        original = {
+            "source_identity": "metadata-only",
+            "source_version": "v1",
+            "raw_text": raw,
+            "retrieval_text": "stable retrieval shadow",
+            "updated_at": "2026-09-14T01:00:00Z",
+            "content_type": "memory",
+            "source_missing": False,
+            "translation_hash": "translation-hash",
+            "translation_version": "translation-v1",
+            "translation_status": "ok",
+            "retrieval_updated_at": "2026-09-14T01:01:00Z",
+            "native_index_version": "native-v1",
+            "native_index_status": "indexed",
+            "native_index_profile": "profile-v1",
+            "native_index_memory": "memory-v1",
+            "native_indexed_at": "2026-09-14T01:02:00Z",
+            "native_index_error": "retained-checkpoint-detail",
+            "retrieval_generation": 4,
+            "native_generation": 5,
+            "embedding_generation": 6,
+            "metadata": {"label": "old", "nested": {"revision": 1}},
+            **{name: f"old-{name}" for name in metadata_fields},
+        }
+        self.assertEqual(store.ingest([original])["created"], 1)
+        with store.lock, store.conn:
+            store.conn.execute(
+                "UPDATE memories SET native_index_pending=0 WHERE source_identity=?",
+                (original["source_identity"],),
+            )
+        before = store.get(original["source_identity"])
+        derived_fields = (
+            "raw_text",
+            "retrieval_text",
+            "content_hash",
+            "source_version",
+            "translation_hash",
+            "translation_version",
+            "translation_status",
+            "retrieval_updated_at",
+            "native_index_version",
+            "native_index_status",
+            "native_index_profile",
+            "native_index_memory",
+            "native_indexed_at",
+            "native_index_error",
+            "retrieval_generation",
+            "native_generation",
+            "embedding_generation",
+            "content_type",
+            "source_missing",
+        )
+
+        refreshed = {
+            "source_identity": original["source_identity"],
+            "source_version": original["source_version"],
+            "raw_text": raw,
+            "updated_at": "2026-09-14T02:00:00Z",
+            "metadata": {"label": "new", "nested": {"revision": 2}},
+            **{name: f"new-{name}" for name in metadata_fields},
+        }
+        result = store.ingest([refreshed])
+        current = store.get(original["source_identity"])
+        self.assertEqual(result["updated"], 1)
+        self.assertEqual(result["items"][0]["status"], "metadata_updated")
+        self.assertEqual(
+            {name: current[name] for name in metadata_fields},
+            {name: refreshed[name] for name in metadata_fields},
+        )
+        self.assertEqual(current["metadata"], refreshed["metadata"])
+        self.assertEqual(current["updated_at"], refreshed["updated_at"])
+        self.assertEqual(
+            {name: current[name] for name in derived_fields},
+            {name: before[name] for name in derived_fields},
+        )
+        self.assertEqual(store.pending_translations(10), [])
+        with store.lock:
+            self.assertEqual(
+                store.conn.execute(
+                    "SELECT native_index_pending FROM memories WHERE source_identity=?",
+                    (original["source_identity"],),
+                ).fetchone()[0],
+                0,
+            )
+
+        # A legacy generation-zero delta may still replay later. Its older
+        # source timestamp must not roll current source metadata backward.
+        stale = {
+            **refreshed,
+            "updated_at": "2026-09-14T00:00:00Z",
+            "metadata": {"label": "stale"},
+            **{name: f"stale-{name}" for name in metadata_fields},
+        }
+        stale_result = store.ingest([stale])
+        current = store.get(original["source_identity"])
+        self.assertEqual(stale_result["items"][0]["status"], "deduped")
+        self.assertEqual(current["metadata"], refreshed["metadata"])
+        self.assertEqual(current["updated_at"], refreshed["updated_at"])
+        self.assertEqual(
+            {name: current[name] for name in metadata_fields},
+            {name: refreshed[name] for name in metadata_fields},
+        )
+
+        # A partial device-only refresh changes no other source metadata and
+        # does not invalidate the native/embedding checkpoint.
+        device_refresh = {
+            "source_identity": original["source_identity"],
+            "source_version": original["source_version"],
+            "raw_text": raw,
+            "updated_at": "2026-09-14T03:00:00Z",
+            "device_id": "newest-device",
+            "source_missing": False,
+        }
+        app = mock.Mock()
+        app.store = store
+        app.translator.pending_document.side_effect = AssertionError(
+            "metadata-only ingest must not schedule provider work"
+        )
+        app.syncer.upload.return_value = {"durable": True}
+        device_result = ingest_documents(app, [device_refresh])
+        current = store.get(original["source_identity"])
+        self.assertEqual(device_result["items"][0]["status"], "metadata_updated")
+        app.translator.pending_document.assert_not_called()
+        self.assertEqual(current["device_id"], "newest-device")
+        self.assertEqual(current["project"], refreshed["project"])
+        self.assertEqual(current["metadata"], refreshed["metadata"])
+        self.assertEqual(
+            {name: current[name] for name in derived_fields},
+            {name: before[name] for name in derived_fields},
+        )
+
+        # The canonical sync payload may carry the same source_missing value in
+        # metadata instead. A failed metadata-delta upload must still leave the
+        # already-durable native checkpoint usable for the retry.
+        app.syncer.upload.return_value = {
+            "uploaded": False,
+            "durable": False,
+            "reason": "offline",
+        }
+        failed_refresh = {
+            "source_identity": original["source_identity"],
+            "source_version": original["source_version"],
+            "raw_text": raw,
+            "updated_at": "2026-09-14T04:00:00Z",
+            "device_id": "retry-device",
+            "metadata": {**current["metadata"], "source_missing": False},
+        }
+        failed_result = ingest_documents(app, [failed_refresh])
+        current = store.get(original["source_identity"])
+        self.assertEqual(failed_result["items"][0]["status"], "metadata_updated")
+        self.assertFalse(failed_result["durable"])
+        self.assertEqual(failed_result["error"], "durability_pending")
+        self.assertEqual(current["native_index_status"], "indexed")
+        self.assertEqual(current["native_index_profile"], "profile-v1")
+        self.assertEqual(current["embedding_generation"], 6)
+        self.assertEqual(store.pending_translations(10), [])
+        app.translator.pending_document.assert_not_called()
+        with store.lock:
+            self.assertEqual(
+                store.conn.execute(
+                    "SELECT native_index_pending FROM memories WHERE source_identity=?",
+                    (original["source_identity"],),
+                ).fetchone()[0],
+                0,
+            )
+        store.close()
+
+    def test_equal_timestamp_metadata_deltas_restore_deterministically(self):
+        from service.server import SnapshotSync
+
+        os.environ.update(
+            FUNES_STORAGE_REPO="owner/private",
+            FUNES_STORAGE_KEY="test-storage-key",
+            HF_TOKEN="hf-test",
+        )
+        raw = "same immutable source"
+        fields = (
+            "device_id",
+            "project",
+            "repo",
+            "worktree",
+            "source_agent",
+            "source_type",
+            "session_id",
+            "message_id",
+            "role",
+            "timestamp",
+            "source_path",
+            "agent_type",
+            "parent_session_id",
+            "agent_id",
+        )
+        base = {
+            "source_identity": "metadata-tie",
+            "source_version": "v1",
+            "raw_text": raw,
+            "retrieval_text": "retained shadow",
+            "updated_at": "2026-09-14T00:00:00Z",
+            "translation_status": "ok",
+            "native_index_status": "indexed",
+            "native_index_profile": "profile-v1",
+            "native_index_memory": "memory-v1",
+            "metadata": {"label": "base"},
+            **{name: "base" for name in fields},
+            # Both replacements sort below their old values. A row-wide clock
+            # would incorrectly keep these values after the other partial delta
+            # advances updated_at.
+            "device_id": "old-device",
+            "project": "old-project",
+        }
+
+        def candidate(field, value, label):
+            return {
+                "source_identity": base["source_identity"],
+                "source_version": base["source_version"],
+                "raw_text": raw,
+                "updated_at": "2026-09-14T01:00:00Z",
+                "source_missing": False,
+                "metadata": {"label": label, "nested": {"value": label}},
+                field: value,
+            }
+
+        # This is the minimal non-commutative counterexample for a whole-state
+        # fingerprint: each equal-time delta changes a different source field.
+        deltas = [
+            {**candidate("device_id", "dev-0", "device"), "agent_id": None},
+            {**candidate("project", "proj-0", "project"), "agent_id": "b"},
+        ]
+        artifact_dir = Path(self.tmp.name) / "metadata-clock-artifacts"
+        artifact_dir.mkdir()
+        artifact_names = []
+        api = mock.Mock()
+        api.repo_info.return_value = mock.Mock(sha="head-1")
+        api.list_repo_tree.return_value = []
+        api.file_exists.return_value = False
+
+        def capture_upload(**kwargs):
+            name = kwargs["path_in_repo"]
+            target_path = artifact_dir / name
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            target_path.write_bytes(
+                Path(kwargs["path_or_fileobj"]).read_bytes()
+            )
+            artifact_names.append(name)
+            return mock.Mock(oid=f"head-{len(artifact_names) + 1}")
+
+        api.upload_file.side_effect = capture_upload
+        with mock.patch("huggingface_hub.HfApi", return_value=api):
+            for delta in deltas:
+                # Build the remote delta through the production canonical path.
+                # The private clock map must survive get_many -> encryption.
+                branch_dir = tempfile.TemporaryDirectory()
+                branch = Store(branch_dir.name)
+                try:
+                    branch.ingest([base])
+                    self.assertEqual(
+                        branch.ingest([delta])["items"][0]["status"],
+                        "metadata_updated",
+                    )
+                    durable = branch.get_many([base["source_identity"]])
+                    self.assertIn("_source_metadata_clocks", durable[0])
+                    self.assertTrue(SnapshotSync(branch).upload(durable)["durable"])
+                finally:
+                    branch.close()
+                    branch_dir.cleanup()
+
+        def replay(order):
+            target_dir = tempfile.TemporaryDirectory()
+            target = Store(target_dir.name)
+            target.ingest([base])
+            try:
+                with mock.patch(
+                    "huggingface_hub.hf_hub_download",
+                    side_effect=AssertionError("prefetched deltas must be used"),
+                ):
+                    for position, index in enumerate(order):
+                        reader = SnapshotSync(target)
+                        reader._restore_prefetch_root = artifact_dir
+                        reader._restore_file(artifact_names[index])
+                        if position == 0:
+                            # Reopen SQLite between artifacts: correctness must
+                            # come from persisted clocks, not in-memory state.
+                            target.close()
+                            target = Store(target_dir.name)
+                return target.get(base["source_identity"])
+            finally:
+                target.close()
+                target_dir.cleanup()
+
+        forward = replay((0, 1))
+        reverse = replay((1, 0))
+        self.assertEqual(
+            {name: forward[name] for name in (*fields, "metadata", "updated_at")},
+            {name: reverse[name] for name in (*fields, "metadata", "updated_at")},
+        )
+        self.assertIn(forward["metadata"], [delta["metadata"] for delta in deltas])
+        self.assertEqual(
+            (forward["device_id"], forward["project"]),
+            ("dev-0", "proj-0"),
+        )
+        self.assertEqual(forward["agent_id"], "b")
+        self.assertEqual(forward["raw_text"], raw)
+        self.assertEqual(forward["retrieval_text"], "retained shadow")
+        self.assertEqual(forward["native_index_status"], "indexed")
+
+    def test_source_metadata_fields_use_independent_high_water_clocks(self):
+        raw = "same immutable source"
+        base = {
+            "source_identity": "metadata-independent-clocks",
+            "source_version": "v1",
+            "raw_text": raw,
+            "retrieval_text": "retained shadow",
+            "updated_at": "2026-09-14T00:00:00Z",
+            "device_id": "old-device",
+            "project": "old-project",
+            "translation_status": "ok",
+            "native_index_status": "indexed",
+        }
+        device_t2 = {
+            "source_identity": base["source_identity"],
+            "source_version": "v1",
+            "raw_text": raw,
+            "updated_at": "2026-09-14T02:00:00Z",
+            "device_id": "dev-0",
+            "source_missing": False,
+        }
+        project_t1 = {
+            "source_identity": base["source_identity"],
+            "source_version": "v1",
+            "raw_text": raw,
+            "updated_at": "2026-09-14T01:00:00Z",
+            "project": "proj-0",
+            "source_missing": False,
+        }
+
+        results = []
+        for order in ((device_t2, project_t1), (project_t1, device_t2)):
+            directory = tempfile.TemporaryDirectory()
+            store = Store(directory.name)
+            try:
+                store.ingest([base])
+                statuses = [store.ingest([delta])["items"][0]["status"] for delta in order]
+                current = store.get(base["source_identity"])
+                self.assertEqual(statuses, ["metadata_updated", "metadata_updated"])
+                self.assertEqual(current["updated_at"], device_t2["updated_at"])
+                self.assertEqual(current["retrieval_text"], "retained shadow")
+                self.assertEqual(current["native_index_status"], "indexed")
+                results.append((current["device_id"], current["project"]))
+
+                stale = dict(
+                    device_t2,
+                    updated_at="2026-09-14T01:30:00Z",
+                    device_id="zzzz-device",
+                )
+                stale_result = store.ingest([stale])
+                self.assertEqual(stale_result["items"][0]["status"], "deduped")
+                self.assertEqual(store.get(base["source_identity"])["device_id"], "dev-0")
+            finally:
+                store.close()
+                directory.cleanup()
+        self.assertEqual(results, [("dev-0", "proj-0"), ("dev-0", "proj-0")])
+
+    def test_canonical_clock_only_payload_persists_provenance(self):
+        store = Store(self.tmp.name)
+        raw = "same immutable source"
+        identity = "metadata-clock-only"
+        store.ingest(
+            [{
+                "source_identity": identity,
+                "source_version": "v1",
+                "raw_text": raw,
+                "retrieval_text": "retained shadow",
+                "updated_at": "2026-09-14T00:00:00Z",
+                "project": "same-project",
+                "native_index_status": "indexed",
+            }]
+        )
+        canonical = store.get(identity)
+        canonical["updated_at"] = "2026-09-14T02:00:00Z"
+        canonical["_source_metadata_clocks"] = {
+            **canonical["_source_metadata_clocks"],
+            "project": canonical["updated_at"],
+        }
+        result = store.ingest([canonical])
+        current = store.get(identity)
+        self.assertEqual(result["items"][0]["status"], "metadata_updated")
+        self.assertEqual(
+            current["_source_metadata_clocks"]["project"],
+            canonical["updated_at"],
+        )
+        self.assertEqual(current["retrieval_text"], "retained shadow")
+        self.assertEqual(current["native_index_status"], "indexed")
+
+        stale = {
+            "source_identity": identity,
+            "source_version": "v1",
+            "raw_text": raw,
+            "updated_at": "2026-09-14T01:00:00Z",
+            "project": "zzzz-project",
+        }
+        self.assertEqual(store.ingest([stale])["items"][0]["status"], "deduped")
+        self.assertEqual(store.get(identity)["project"], "same-project")
+        store.close()
+
+    def test_source_metadata_clock_migration_accepts_legacy_database(self):
+        identity = "legacy-metadata-clock"
+        store = Store(self.tmp.name)
+        store.ingest(
+            [{
+                "source_identity": identity,
+                "source_version": "v1",
+                "raw_text": "same immutable source",
+                "updated_at": "2026-09-14T00:00:00Z",
+                "device_id": "old-device",
+            }]
+        )
+        store.close()
+        connection = sqlite3.connect(Path(self.tmp.name) / "funes.sqlite3")
+        connection.execute(
+            "ALTER TABLE memories DROP COLUMN source_metadata_clock_json"
+        )
+        connection.commit()
+        connection.close()
+
+        store = Store(self.tmp.name)
+        result = store.ingest(
+            [{
+                "source_identity": identity,
+                "source_version": "v1",
+                "raw_text": "same immutable source",
+                "updated_at": "2026-09-14T01:00:00Z",
+                "device_id": "dev-0",
+            }]
+        )
+        current = store.get(identity)
+        self.assertEqual(result["items"][0]["status"], "metadata_updated")
+        self.assertEqual(current["device_id"], "dev-0")
+        self.assertEqual(
+            current["_source_metadata_clocks"]["device_id"],
+            "2026-09-14T01:00:00Z",
+        )
         store.close()
 
     def test_same_revision_native_status_update_preserves_raw_and_retrieval(self):
@@ -376,6 +988,59 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(store.get("1")["raw_text"], "numeric identity")
         store.close()
 
+    def test_get_and_search_do_not_wait_for_writer_python_lock(self):
+        store = Store(self.tmp.name)
+        store.ingest(
+            [
+                {
+                    "source_identity": "read-target",
+                    "raw_text": "independent-reader-marker",
+                },
+                {"source_identity": "write-target", "raw_text": "writer row"},
+            ]
+        )
+        writer_ready = threading.Event()
+        release_writer = threading.Event()
+        read_done = threading.Event()
+        result = {}
+
+        def hold_uncommitted_write():
+            with store.lock:
+                store.conn.execute("BEGIN IMMEDIATE")
+                try:
+                    store.conn.execute(
+                        "UPDATE memories SET project='in-flight' WHERE source_identity='write-target'"
+                    )
+                    writer_ready.set()
+                    release_writer.wait(5)
+                finally:
+                    store.conn.rollback()
+
+        def read_while_writer_is_active():
+            result["get"] = store.get("read-target")
+            result["search"] = store.search("independent-reader-marker")
+            read_done.set()
+
+        writer = threading.Thread(target=hold_uncommitted_write)
+        reader = threading.Thread(target=read_while_writer_is_active)
+        writer.start()
+        self.assertTrue(writer_ready.wait(2))
+        reader.start()
+        try:
+            self.assertTrue(
+                read_done.wait(2),
+                "read-only get/search waited behind the writer Python lock",
+            )
+        finally:
+            release_writer.set()
+            writer.join(5)
+            reader.join(5)
+            store.close()
+        self.assertEqual(result["get"]["raw_text"], "independent-reader-marker")
+        self.assertEqual(
+            result["search"][0]["source_identity"], "read-target"
+        )
+
     def test_existing_identities_is_ordered_chunked_and_selects_no_raw_payload(self):
         store = Store(self.tmp.name)
         store.ingest(
@@ -464,9 +1129,11 @@ class ServiceTests(unittest.TestCase):
         status, found = self._request(server, "POST", "/search", {"query": "alpha"})
         self.assertEqual(status, 200)
         self.assertEqual(found["results"][0]["raw_text"], "alpha beta")
+        self.assertNotIn("_source_metadata_clocks", found["results"][0])
         status, item = self._request(server, "POST", "/get", {"id": ident})
         self.assertEqual(status, 200)
         self.assertEqual(item["source_path"], "x")
+        self.assertNotIn("_source_metadata_clocks", item)
 
     def test_sources_check_requires_auth_and_returns_only_present_and_missing(self):
         server = self._server()
@@ -621,26 +1288,22 @@ class ServiceTests(unittest.TestCase):
             ]
         )
         statements = []
-        store.conn.set_trace_callback(statements.append)
-
-        results = store.search(
-            "之前 Pi 里讨论过的 Tailscale 延迟",
-            filters={"source_agent": "pi", "role": "user"},
-        )
-
-        store.conn.set_trace_callback(None)
+        with self.trace_read_connections(store, statements):
+            results = store.search(
+                "之前 Pi 里讨论过的 Tailscale 延迟",
+                filters={"source_agent": "pi", "role": "user"},
+            )
         self.assertEqual([item["source_identity"] for item in results], ["target"])
         traced = "\n".join(statements).upper()
         self.assertIn("MATCH '\"TAILSCALE\"'", traced)
         self.assertNotIn(" LIKE ", traced)
 
         statements.clear()
-        store.conn.set_trace_callback(statements.append)
-        malformed_results = store.search(
-            '之前 Tailscale "',
-            filters={"source_agent": "pi", "role": "user"},
-        )
-        store.conn.set_trace_callback(None)
+        with self.trace_read_connections(store, statements):
+            malformed_results = store.search(
+                '之前 Tailscale "',
+                filters={"source_agent": "pi", "role": "user"},
+            )
         self.assertEqual(
             [item["source_identity"] for item in malformed_results], ["target"]
         )
@@ -668,14 +1331,11 @@ class ServiceTests(unittest.TestCase):
             ]
         )
         statements = []
-        store.conn.set_trace_callback(statements.append)
-
-        results = store.search(
-            "之前 Pi Tailscale 的延迟",
-            filters={"project": "fast"},
-        )
-
-        store.conn.set_trace_callback(None)
+        with self.trace_read_connections(store, statements):
+            results = store.search(
+                "之前 Pi Tailscale 的延迟",
+                filters={"project": "fast"},
+            )
         self.assertEqual([item["source_identity"] for item in results], ["fast-target"])
         self.assertFalse(any(" LIKE " in statement.upper() for statement in statements))
         store.close()
@@ -941,6 +1601,55 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(target.translation_get("cache-key"), "cached retrieval text")
         source.close(); target.close(); second_dir.cleanup()
 
+    def test_snapshot_streams_memory_cursor_without_fetchall(self):
+        source = Store(self.tmp.name)
+        source.ingest(
+            [
+                {"source_identity": f"stream-{index}", "raw_text": f"row {index}"}
+                for index in range(3)
+            ]
+        )
+        connection = source.conn
+        iterated = False
+
+        class StreamingCursor:
+            def __init__(self, cursor):
+                self.cursor = cursor
+
+            def __iter__(self):
+                nonlocal iterated
+                iterated = True
+                return iter(self.cursor)
+
+            def fetchall(self):
+                raise AssertionError("snapshot must not materialize the memories cursor")
+
+        class ConnectionProbe:
+            def execute(self, sql, *args):
+                cursor = connection.execute(sql, *args)
+                if "SELECT * FROM memories ORDER BY id" in " ".join(sql.split()):
+                    return StreamingCursor(cursor)
+                return cursor
+
+            def __getattr__(self, name):
+                return getattr(connection, name)
+
+        snapshot = Path(self.tmp.name) / "streamed.jsonl.gz"
+        source.conn = ConnectionProbe()
+        try:
+            source.snapshot(snapshot)
+        finally:
+            source.conn = connection
+        with gzip.open(snapshot, "rt", encoding="utf-8") as stream:
+            memories = [
+                json.loads(line)["source_identity"]
+                for line in stream
+                if '"_funes_record": "memory"' in line
+            ]
+        self.assertTrue(iterated)
+        self.assertEqual(memories, ["stream-0", "stream-1", "stream-2"])
+        source.close()
+
     def test_snapshot_roundtrip_preserves_retrieval_and_native_state(self):
         source = Store(self.tmp.name)
         source.ingest(
@@ -980,7 +1689,7 @@ class ServiceTests(unittest.TestCase):
                 if '"_funes_record": "native_index_state"' in line
             ]
         self.assertEqual(len(state_lines), 1)
-        self.assertEqual(state_lines[0]["state_version"], 1)
+        self.assertEqual(state_lines[0]["state_version"], 2)
         self.assertNotIn("raw_text", state_lines[0])
         after = target.native_index_checkpoint(profile, "memory-v1")
         self.assertEqual(after["revision"], before["revision"])
@@ -1009,6 +1718,821 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(len(rebuilds), 1, statements)
         self.assertEqual(target.search("single")[0]["source_identity"], "one")
         source.close(); target.close(); directory.cleanup()
+
+    def test_bulk_restore_drops_and_rebuilds_secondary_indexes_preserves_unique(self):
+        store = Store(self.tmp.name)
+        store.ingest([
+            {
+                "source_identity": "doc-1",
+                "source_agent": "codex",
+                "role": "user",
+                "source_type": "conversation",
+                "raw_text": "sample text",
+            }
+        ])
+
+        def get_indexes():
+            return {
+                row["name"]
+                for row in store.conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='memories'"
+                )
+            }
+
+        initial_indexes = get_indexes()
+        expected_secondaries = {
+            "memories_source_agent_role_idx",
+            "memories_source_agent_type_idx",
+            "memories_translation_pending_idx",
+            "memories_canonical_pending_idx",
+        }
+        for name in expected_secondaries:
+            self.assertIn(name, initial_indexes)
+        self.assertIn("sqlite_autoindex_memories_1", initial_indexes)
+
+        # 1. begin_bulk_restore drops 4 secondary indexes, preserves UNIQUE
+        store.begin_bulk_restore()
+        bulk_indexes = get_indexes()
+        self.assertIn("sqlite_autoindex_memories_1", bulk_indexes)
+        for name in expected_secondaries:
+            self.assertNotIn(name, bulk_indexes)
+        # Pragmas applied
+        self.assertEqual(store.conn.execute("PRAGMA synchronous").fetchone()[0], 1)
+        self.assertEqual(store.conn.execute("PRAGMA cache_size").fetchone()[0], -64000)
+        self.assertEqual(store.conn.execute("PRAGMA mmap_size").fetchone()[0], 268435456)
+
+        # 2. Nested restore does not repeat drops or prematurely rebuild
+        store.begin_bulk_restore()
+        self.assertEqual(store._bulk_restore_depth, 2)
+        nested_indexes = get_indexes()
+        for name in expected_secondaries:
+            self.assertNotIn(name, nested_indexes)
+
+        store.finish_bulk_restore()
+        self.assertEqual(store._bulk_restore_depth, 1)
+        after_nested_finish = get_indexes()
+        for name in expected_secondaries:
+            self.assertNotIn(name, after_nested_finish)
+
+        # 3. Outermost finish_bulk_restore restores all secondary indexes and pragmas
+        store.finish_bulk_restore()
+        self.assertEqual(store._bulk_restore_depth, 0)
+        final_indexes = get_indexes()
+        for name in expected_secondaries:
+            self.assertIn(name, final_indexes)
+        self.assertIn("sqlite_autoindex_memories_1", final_indexes)
+        # Pragmas restored
+        self.assertEqual(store.conn.execute("PRAGMA synchronous").fetchone()[0], 2)
+        self.assertEqual(store.conn.execute("PRAGMA cache_size").fetchone()[0], -2000)
+        self.assertEqual(store.conn.execute("PRAGMA mmap_size").fetchone()[0], 0)
+        store.close()
+
+    def test_bulk_restore_can_skip_derived_fts_rebuild(self):
+        store = Store(self.tmp.name)
+        try:
+            with mock.patch.dict(
+                os.environ, {"FUNES_BULK_RESTORE_REBUILD_FTS": "false"}
+            ):
+                store.begin_bulk_restore()
+                store.ingest(
+                    [
+                        {
+                            "source_identity": "restored-without-fts",
+                            "raw_text": "restored sentinel phrase",
+                        }
+                    ]
+                )
+                store.finish_bulk_restore()
+
+            # The expensive derived rebuild was skipped, but its schema marker,
+            # secondary indexes, triggers, and normal pragmas were restored.
+            self.assertEqual(
+                store.conn.execute(
+                    "SELECT fts_schema_version FROM sync_state WHERE id=1"
+                ).fetchone()[0],
+                FTS_SCHEMA_VERSION,
+            )
+            self.assertEqual(
+                store.conn.execute(
+                    "SELECT count(*) FROM memories_fts "
+                    "WHERE memories_fts MATCH 'sentinel'"
+                ).fetchone()[0],
+                0,
+            )
+            self.assertIsNotNone(
+                store.conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='index' "
+                    "AND name='memories_source_agent_role_idx'"
+                ).fetchone()
+            )
+            self.assertIsNotNone(
+                store.conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='trigger' "
+                    "AND name='memories_ai'"
+                ).fetchone()
+            )
+            self.assertEqual(store.conn.execute("PRAGMA synchronous").fetchone()[0], 2)
+
+            store.ingest(
+                [
+                    {
+                        "source_identity": "post-restore-trigger",
+                        "raw_text": "postrestore trigger phrase",
+                    }
+                ]
+            )
+            self.assertEqual(
+                store.conn.execute(
+                    "SELECT count(*) FROM memories_fts "
+                    "WHERE memories_fts MATCH 'postrestore'"
+                ).fetchone()[0],
+                1,
+            )
+        finally:
+            store.close()
+
+    def test_bulk_restore_rebuilds_fts_by_default(self):
+        store = Store(self.tmp.name)
+        try:
+            with mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("FUNES_BULK_RESTORE_REBUILD_FTS", None)
+                store.begin_bulk_restore()
+                store.ingest(
+                    [
+                        {
+                            "source_identity": "restored-with-default-fts",
+                            "raw_text": "default rebuild phrase",
+                        }
+                    ]
+                )
+                store.finish_bulk_restore()
+            self.assertEqual(
+                store.conn.execute(
+                    "SELECT count(*) FROM memories_fts "
+                    "WHERE memories_fts MATCH 'default'"
+                ).fetchone()[0],
+                1,
+            )
+        finally:
+            store.close()
+
+    def test_fts_ready_transitions(self):
+        store = Store(self.tmp.name)
+        try:
+            # 1. Default store has fts_ready == True (1)
+            self.assertTrue(store.fts_ready())
+            self.assertTrue(store.sync_status()["fts_ready"])
+
+            # 2. begin_bulk_restore sets fts_ready == False (0)
+            store.begin_bulk_restore()
+            self.assertFalse(store.fts_ready())
+            self.assertFalse(store.sync_status()["fts_ready"])
+
+            # 3. finish_bulk_restore with rebuild_fts=False keeps fts_ready == False
+            store.finish_bulk_restore(rebuild_fts=False)
+            self.assertFalse(store.fts_ready())
+            self.assertFalse(store.sync_status()["fts_ready"])
+
+            # 4. reindex sets fts_ready == True
+            store.reindex()
+            self.assertTrue(store.fts_ready())
+            self.assertTrue(store.sync_status()["fts_ready"])
+
+            # 5. begin again -> 0 -> finish with rebuild_fts=True -> 1
+            store.begin_bulk_restore()
+            self.assertFalse(store.fts_ready())
+            store.finish_bulk_restore(rebuild_fts=True)
+            self.assertTrue(store.fts_ready())
+            self.assertTrue(store.sync_status()["fts_ready"])
+        finally:
+            store.close()
+
+    def test_lock_free_count_and_sync_status_while_store_lock_acquired(self):
+        store = Store(self.tmp.name)
+        try:
+            store.ingest([{"source_identity": "doc-1", "raw_text": "hello lock-free"}])
+            with store.lock:
+                # With store.lock held (simulating a long-running write operation),
+                # count(), sync_status(), and fts_ready() must complete without deadlocking
+                # or blocking on self.lock.
+                self.assertEqual(store.count(), 1)
+                status = store.sync_status()
+                self.assertEqual(status["documents"], 1)
+                self.assertTrue(status["fts_ready"])
+                self.assertTrue(store.fts_ready())
+        finally:
+            store.close()
+
+    def test_restore_fts_readiness_on_skip_fts_vs_rebuild(self):
+        from service.server import SnapshotSync
+
+        store = Store(self.tmp.name)
+        try:
+            files = ["funes-snapshot.jsonl.gz.enc"]
+            manifest = {
+                "version": 1,
+                "snapshot": "funes-snapshot.jsonl.gz.enc",
+                "deltas": [],
+                "controls": [],
+            }
+            revision = "sha-rev-checkpoint-fts"
+
+            def mock_restore_file(filename):
+                return 1
+
+            # Test 1: rebuild_fts=False -> completes restore without rebuilding FTS;
+            # checkpoint is removed on completion, and store.fts_ready() is False.
+            syncer_skip = SnapshotSync(store, rebuild_fts=False)
+            syncer_skip.repo = "owner/private"
+            syncer_skip.token = "test-token"
+            checkpoint_path = syncer_skip.restore_checkpoint_path
+            with mock.patch.object(
+                syncer_skip, "_repo_files_metadata", return_value=(files, manifest, revision)
+            ), mock.patch.object(
+                syncer_skip, "_prefetch_restore_files", return_value=None
+            ), mock.patch.object(
+                syncer_skip, "_restore_file", side_effect=mock_restore_file
+            ):
+                result = syncer_skip.restore()
+
+            self.assertEqual(result, 1)
+            self.assertFalse(checkpoint_path.exists())
+            self.assertFalse(store.fts_ready())
+
+            # Test 2: rebuild_fts=True -> rebuilds FTS; checkpoint is removed
+            # on completion, and store.fts_ready() is True.
+            syncer_rebuild = SnapshotSync(store, rebuild_fts=True)
+            syncer_rebuild.repo = "owner/private"
+            syncer_rebuild.token = "test-token"
+            with mock.patch.object(
+                syncer_rebuild, "_repo_files_metadata", return_value=(files, manifest, revision)
+            ), mock.patch.object(
+                syncer_rebuild, "_prefetch_restore_files", return_value=None
+            ), mock.patch.object(
+                syncer_rebuild, "_restore_file", side_effect=mock_restore_file
+            ):
+                result = syncer_rebuild.restore()
+
+            self.assertEqual(result, 1)
+            self.assertFalse(checkpoint_path.exists())
+            self.assertTrue(store.fts_ready())
+        finally:
+            store.close()
+
+    def test_fts_migration_preserves_or_rebuilds_readiness(self):
+        store = Store(self.tmp.name)
+        try:
+            store.ingest([{"source_identity": "doc-1", "raw_text": "hello world"}])
+            self.assertTrue(store.fts_ready())
+
+            # Manually simulate unready state (e.g. restore with rebuild_fts=False)
+            with store.lock, store.conn:
+                store.conn.execute("UPDATE sync_state SET fts_ready=0 WHERE id=1")
+        finally:
+            store.close()
+
+        # Reopen with FUNES_BULK_RESTORE_REBUILD_FTS=false -> preserves fts_ready == False
+        os.environ["FUNES_BULK_RESTORE_REBUILD_FTS"] = "false"
+        try:
+            store_preserved = Store(self.tmp.name)
+            try:
+                self.assertFalse(store_preserved.fts_ready())
+            finally:
+                store_preserved.close()
+        finally:
+            os.environ.pop("FUNES_BULK_RESTORE_REBUILD_FTS", None)
+
+        # Reopen with FUNES_BULK_RESTORE_REBUILD_FTS=true -> rebuilds and sets fts_ready == True
+        os.environ["FUNES_BULK_RESTORE_REBUILD_FTS"] = "true"
+        try:
+            store_rebuilt = Store(self.tmp.name)
+            try:
+                self.assertTrue(store_rebuilt.fts_ready())
+            finally:
+                store_rebuilt.close()
+        finally:
+            os.environ.pop("FUNES_BULK_RESTORE_REBUILD_FTS", None)
+
+    def test_unready_fts_search_behavior(self):
+        from types import SimpleNamespace
+        import space.server as server
+
+        # 1. source_fts_ready helper checks
+        self.assertFalse(server.source_fts_ready(None))
+        app_restoring = SimpleNamespace(
+            syncer=SimpleNamespace(restoring=True, restore_failed=False),
+            store=SimpleNamespace(fts_ready=lambda: True),
+        )
+        self.assertFalse(server.source_fts_ready(app_restoring))
+
+        app_failed = SimpleNamespace(
+            syncer=SimpleNamespace(restoring=False, restore_failed=True),
+            store=SimpleNamespace(fts_ready=lambda: True),
+        )
+        self.assertFalse(server.source_fts_ready(app_failed))
+
+        app_unready = SimpleNamespace(
+            syncer=SimpleNamespace(restoring=False, restore_failed=False),
+            store=SimpleNamespace(fts_ready=lambda: False, count=lambda: 1),
+            translator=SimpleNamespace(rewrite_query=lambda q: q),
+        )
+        self.assertFalse(server.source_fts_ready(app_unready))
+
+        app_ready = SimpleNamespace(
+            syncer=SimpleNamespace(restoring=False, restore_failed=False),
+            store=SimpleNamespace(fts_ready=lambda: True),
+        )
+        self.assertTrue(server.source_fts_ready(app_ready))
+
+        # 2. search_source_rankings and search_source_bm25_rankings skip FTS when unready
+        with mock.patch.object(server, "source_app", return_value=app_unready):
+            query, semantic, lexical = server.search_source_rankings(
+                "query", 10, filters={}
+            )
+            self.assertEqual(query, "query")
+            self.assertEqual(semantic, [])
+            self.assertEqual(lexical, [])
+
+            sem_bm25, lex_bm25 = server.search_source_bm25_rankings(
+                "query", 10, filters={}
+            )
+            self.assertEqual(sem_bm25, [])
+            self.assertEqual(lex_bm25, [])
+
+        # 3. HTTP handler returns 503 source_fts_unavailable when sidecar FTS is not ready:
+        # Case A: non-voyage embedding provider
+        with mock.patch.object(server, "source_app", return_value=app_unready),              mock.patch.object(server, "TOKEN", "test-token"),              mock.patch.object(server, "embedding_profile", return_value={"provider": "local"}):
+            server_local = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+            thread = threading.Thread(target=server_local.serve_forever, daemon=True)
+            thread.start()
+            try:
+                conn = HTTPConnection(*server_local.server_address)
+                conn.request(
+                    "POST",
+                    "/search",
+                    json.dumps({"query": "hello"}).encode(),
+                    {"Authorization": "Bearer test-token", "Content-Type": "application/json"},
+                )
+                resp = conn.getresponse()
+                body = json.loads(resp.read().decode())
+                self.assertEqual(resp.status, 503)
+                self.assertEqual(body.get("error"), "source_fts_unavailable")
+            finally:
+                server_local.shutdown()
+                server_local.server_close()
+                thread.join(timeout=1)
+
+        # Case B: voyage provider with unsupported native filter (e.g. "since")
+        with mock.patch.object(server, "source_app", return_value=app_unready),              mock.patch.object(server, "TOKEN", "test-token"),              mock.patch.object(server, "embedding_profile", return_value={"provider": "voyage", "fingerprint": "fp"}):
+            server_voyage = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+            thread = threading.Thread(target=server_voyage.serve_forever, daemon=True)
+            thread.start()
+            try:
+                conn = HTTPConnection(*server_voyage.server_address)
+                conn.request(
+                    "POST",
+                    "/search",
+                    json.dumps({"query": "hello", "since": 12345}).encode(),
+                    {"Authorization": "Bearer test-token", "Content-Type": "application/json"},
+                )
+                resp = conn.getresponse()
+                body = json.loads(resp.read().decode())
+                self.assertEqual(resp.status, 503)
+                self.assertEqual(body.get("error"), "source_fts_unavailable")
+            finally:
+                server_voyage.shutdown()
+                server_voyage.server_close()
+                thread.join(timeout=1)
+
+    def test_bulk_restore_skips_embedding_generation_scan_for_explicit_generations(self):
+        store = Store(self.tmp.name)
+        try:
+            # 1. Bulk restore with explicit embedding_generation across multiple batches:
+            # Table scan (_latest_embedding_generation_locked) must be skipped entirely (0 calls).
+            docs = [
+                {
+                    "source_identity": f"doc-explicit-{i}",
+                    "raw_text": f"explicit generation {i}",
+                    "embedding_generation": 2,
+                }
+                for i in range(10)
+            ]
+            with mock.patch.object(
+                store,
+                "_latest_embedding_generation_locked",
+                wraps=store._latest_embedding_generation_locked,
+            ) as spy_gen:
+                total = store.restore_documents(docs, batch_size=3)
+                self.assertEqual(total, 10)
+                self.assertEqual(spy_gen.call_count, 0)
+
+            # All rows have their explicit generation preserved
+            rows = store.conn.execute(
+                "SELECT embedding_generation FROM memories WHERE source_identity LIKE 'doc-explicit-%'"
+            ).fetchall()
+            self.assertEqual(len(rows), 10)
+            self.assertTrue(all(r[0] == 2 for r in rows))
+
+            # Bulk restore lifecycle restored secondary indexes and depth
+            self.assertEqual(store._bulk_restore_depth, 0)
+            index_names = {
+                r["name"]
+                for r in store.conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='memories'"
+                )
+            }
+            self.assertIn("memories_source_agent_role_idx", index_names)
+
+            # 2. Bulk restore of legacy docs (missing embedding_generation) evaluates lazily
+            # once per batch, not once per document.
+            legacy_docs = [
+                {
+                    "source_identity": f"doc-legacy-{i}",
+                    "raw_text": f"legacy document {i}",
+                }
+                for i in range(6)
+            ]
+            with mock.patch.object(
+                store,
+                "_latest_embedding_generation_locked",
+                wraps=store._latest_embedding_generation_locked,
+            ) as spy_gen:
+                total = store.restore_documents(legacy_docs, batch_size=2)
+                self.assertEqual(total, 6)
+                self.assertEqual(spy_gen.call_count, 3)
+
+            legacy_rows = store.conn.execute(
+                "SELECT embedding_generation FROM memories WHERE source_identity LIKE 'doc-legacy-%'"
+            ).fetchall()
+            self.assertEqual(len(legacy_rows), 6)
+            self.assertTrue(all(r[0] == 2 for r in legacy_rows))
+
+            # 3. Normal ingest lazy evaluation and dedupe / update / CAS semantics
+            # Ingesting empty list does not call generation lookup
+            with mock.patch.object(
+                store,
+                "_latest_embedding_generation_locked",
+                wraps=store._latest_embedding_generation_locked,
+            ) as spy_gen:
+                store.ingest([])
+                self.assertEqual(spy_gen.call_count, 0)
+
+            # Ingesting existing row (dedupe / update) does not call generation lookup
+            with mock.patch.object(
+                store,
+                "_latest_embedding_generation_locked",
+                wraps=store._latest_embedding_generation_locked,
+            ) as spy_gen:
+                res = store.ingest([
+                    {
+                        "source_identity": "doc-explicit-0",
+                        "raw_text": "explicit generation 0",
+                    }
+                ])
+                self.assertEqual(res["deduped"], 1)
+                self.assertEqual(spy_gen.call_count, 0)
+
+            # Updating existing row preserves higher existing generation
+            store.ingest([
+                {
+                    "source_identity": "doc-explicit-0",
+                    "raw_text": "updated text",
+                    "embedding_generation": 1,
+                }
+            ])
+            val = store.conn.execute(
+                "SELECT embedding_generation FROM memories WHERE source_identity='doc-explicit-0'"
+            ).fetchone()[0]
+            self.assertEqual(val, 2)
+
+            # Updating existing row advances to higher incoming generation
+            store.ingest([
+                {
+                    "source_identity": "doc-explicit-0",
+                    "raw_text": "advanced text",
+                    "embedding_generation": 5,
+                }
+            ])
+            val = store.conn.execute(
+                "SELECT embedding_generation FROM memories WHERE source_identity='doc-explicit-0'"
+            ).fetchone()[0]
+            self.assertEqual(val, 5)
+
+            # Normal ingest of batch of new legacy rows fetches default generation lazily ONCE per batch
+            with mock.patch.object(
+                store,
+                "_latest_embedding_generation_locked",
+                wraps=store._latest_embedding_generation_locked,
+            ) as spy_gen:
+                store.ingest([
+                    {
+                        "source_identity": f"doc-normal-legacy-{i}",
+                        "raw_text": f"new normal legacy row {i}",
+                    }
+                    for i in range(5)
+                ])
+                self.assertEqual(spy_gen.call_count, 1)
+
+            val = store.conn.execute(
+                "SELECT embedding_generation FROM memories WHERE source_identity='doc-normal-legacy-0'"
+            ).fetchone()[0]
+            self.assertEqual(val, 5)
+
+            # Normal ingest of new row with explicit embedding_generation:
+            # Does NOT call _latest_embedding_generation_locked (0 calls).
+            with mock.patch.object(
+                store,
+                "_latest_embedding_generation_locked",
+                wraps=store._latest_embedding_generation_locked,
+            ) as spy_gen:
+                store.ingest([
+                    {
+                        "source_identity": "doc-normal-explicit",
+                        "raw_text": "new normal explicit row",
+                        "embedding_generation": 7,
+                    }
+                ])
+                self.assertEqual(spy_gen.call_count, 0)
+
+            val = store.conn.execute(
+                "SELECT embedding_generation FROM memories WHERE source_identity='doc-normal-explicit'"
+            ).fetchone()[0]
+            self.assertEqual(val, 7)
+        finally:
+            store.close()
+
+    def test_generation_indexes_and_covering_query_plans(self):
+        store = Store(self.tmp.name)
+        try:
+            # 1. Generation indexes exist initially
+            index_names = {
+                row["name"]
+                for row in store.conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='memories'"
+                )
+            }
+            self.assertIn("memories_retrieval_generation_idx", index_names)
+            self.assertIn("memories_native_generation_idx", index_names)
+            self.assertIn("memories_embedding_generation_idx", index_names)
+
+            # 2. Query plans use covering indexes for max() generation queries
+            plans_reindex = [
+                row[3]
+                for row in store.conn.execute(
+                    """EXPLAIN QUERY PLAN SELECT max(value) FROM (
+                    SELECT COALESCE(max(generation), 0) AS value FROM reindex_controls
+                    UNION ALL SELECT COALESCE(max(retrieval_generation), 0) FROM memories
+                    UNION ALL SELECT COALESCE(max(native_generation), 0) FROM memories
+                    UNION ALL SELECT COALESCE(max(embedding_generation), 0) FROM memories
+                    )"""
+                ).fetchall()
+            ]
+            self.assertTrue(any("COVERING INDEX memories_retrieval_generation_idx" in p for p in plans_reindex))
+            self.assertTrue(any("COVERING INDEX memories_native_generation_idx" in p for p in plans_reindex))
+            self.assertTrue(any("COVERING INDEX memories_embedding_generation_idx" in p for p in plans_reindex))
+
+            plans_embedding = [
+                row[3]
+                for row in store.conn.execute(
+                    """EXPLAIN QUERY PLAN SELECT max(value) FROM (
+                    SELECT COALESCE(max(generation), 0) AS value
+                    FROM reindex_controls WHERE scope='all'
+                    UNION ALL
+                    SELECT COALESCE(max(embedding_generation), 0) FROM memories
+                    )"""
+                ).fetchall()
+            ]
+            self.assertTrue(any("COVERING INDEX memories_embedding_generation_idx" in p for p in plans_embedding))
+
+            plans_single = [
+                row[3]
+                for row in store.conn.execute(
+                    "EXPLAIN QUERY PLAN SELECT COALESCE(max(embedding_generation), 0) FROM memories"
+                ).fetchall()
+            ]
+            self.assertTrue(any("COVERING INDEX memories_embedding_generation_idx" in p for p in plans_single))
+
+            # 3. Generation indexes are NOT dropped by begin_bulk_restore()
+            store.begin_bulk_restore()
+            bulk_index_names = {
+                row["name"]
+                for row in store.conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='memories'"
+                )
+            }
+            self.assertIn("memories_retrieval_generation_idx", bulk_index_names)
+            self.assertIn("memories_native_generation_idx", bulk_index_names)
+            self.assertIn("memories_embedding_generation_idx", bulk_index_names)
+            # Secondary indexes are dropped as expected
+            self.assertNotIn("memories_source_agent_role_idx", bulk_index_names)
+
+            # Query plan inside bulk restore still uses covering index
+            plans_bulk = [
+                row[3]
+                for row in store.conn.execute(
+                    "EXPLAIN QUERY PLAN SELECT COALESCE(max(embedding_generation), 0) FROM memories"
+                ).fetchall()
+            ]
+            self.assertTrue(any("COVERING INDEX memories_embedding_generation_idx" in p for p in plans_bulk))
+
+            store.finish_bulk_restore()
+
+            # 4. prepare_ingest_documents supplies embedding_generation so Store.ingest skips lookup
+            app = App()
+            try:
+                prepared = prepare_ingest_documents(app, [{"raw_text": "hello from prepared pipeline"}])
+                self.assertTrue(all("embedding_generation" in doc for doc in prepared))
+
+                with mock.patch.object(
+                    app.store,
+                    "_latest_embedding_generation_locked",
+                    wraps=app.store._latest_embedding_generation_locked,
+                ) as spy_gen:
+                    res = app.store.ingest(prepared)
+                    self.assertEqual(res["created"], 1)
+                    self.assertEqual(spy_gen.call_count, 0)
+            finally:
+                app.close()
+        finally:
+            store.close()
+
+    def test_bulk_restore_exception_in_restore_recovers_indexes_and_pragmas(self):
+        store = Store(self.tmp.name)
+        store.ingest([{"source_identity": "doc-err", "raw_text": "failure test"}])
+        expected_secondaries = {
+            "memories_source_agent_role_idx",
+            "memories_source_agent_type_idx",
+            "memories_translation_pending_idx",
+            "memories_canonical_pending_idx",
+        }
+
+        store.begin_bulk_restore()
+        try:
+            try:
+                # Simulate an error during restore
+                raise RuntimeError("restore aborted halfway")
+            finally:
+                store.finish_bulk_restore()
+        except RuntimeError:
+            pass
+
+        current_indexes = {
+            row["name"]
+            for row in store.conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='memories'"
+            )
+        }
+        for name in expected_secondaries:
+            self.assertIn(name, current_indexes)
+        self.assertIn("sqlite_autoindex_memories_1", current_indexes)
+        self.assertEqual(store.conn.execute("PRAGMA synchronous").fetchone()[0], 2)
+        self.assertEqual(store.conn.execute("PRAGMA cache_size").fetchone()[0], -2000)
+        self.assertEqual(store.conn.execute("PRAGMA mmap_size").fetchone()[0], 0)
+        store.close()
+
+    def test_bulk_restore_exception_in_fts_rebuild_still_recovers_indexes_and_pragmas(self):
+        store = Store(self.tmp.name)
+        store.ingest([{"source_identity": "doc-fts-err", "raw_text": "fts error test"}])
+        expected_secondaries = {
+            "memories_source_agent_role_idx",
+            "memories_source_agent_type_idx",
+            "memories_translation_pending_idx",
+            "memories_canonical_pending_idx",
+        }
+
+        store.begin_bulk_restore()
+        with mock.patch.object(
+            store,
+            "_rebuild_native_checkpoint_state_locked",
+            side_effect=sqlite3.OperationalError("simulated rebuild corruption"),
+        ):
+            with self.assertRaises(sqlite3.OperationalError):
+                store.finish_bulk_restore()
+
+        current_indexes = {
+            row["name"]
+            for row in store.conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='memories'"
+            )
+        }
+        for name in expected_secondaries:
+            self.assertIn(name, current_indexes)
+        self.assertIn("sqlite_autoindex_memories_1", current_indexes)
+        self.assertEqual(store.conn.execute("PRAGMA synchronous").fetchone()[0], 2)
+        self.assertEqual(store.conn.execute("PRAGMA cache_size").fetchone()[0], -2000)
+        self.assertEqual(store.conn.execute("PRAGMA mmap_size").fetchone()[0], 0)
+        store.close()
+
+    def test_bulk_restore_custom_pragmas_honored_and_restored(self):
+        store = Store(self.tmp.name)
+        with mock.patch.dict(
+            os.environ,
+            {
+                "FUNES_BULK_RESTORE_SYNCHRONOUS": "OFF",
+                "FUNES_BULK_RESTORE_CACHE_SIZE": "-32000",
+                "FUNES_BULK_RESTORE_MMAP_SIZE": "134217728",
+            },
+        ):
+            store.begin_bulk_restore()
+            self.assertEqual(store.conn.execute("PRAGMA synchronous").fetchone()[0], 0)
+            self.assertEqual(store.conn.execute("PRAGMA cache_size").fetchone()[0], -32000)
+            self.assertEqual(store.conn.execute("PRAGMA mmap_size").fetchone()[0], 134217728)
+            store.finish_bulk_restore()
+
+        self.assertEqual(store.conn.execute("PRAGMA synchronous").fetchone()[0], 2)
+        self.assertEqual(store.conn.execute("PRAGMA cache_size").fetchone()[0], -2000)
+        self.assertEqual(store.conn.execute("PRAGMA mmap_size").fetchone()[0], 0)
+        store.close()
+
+    def test_snapshot_large_dataset_streaming_preserves_byte_and_record_semantics(self):
+        source = Store(self.tmp.name)
+        docs = [
+            {
+                "source_identity": f"bulk-stream-{index}",
+                "source_version": f"v-{index}",
+                "raw_text": f"Raw payload number {index} with unicode 测试 and technical terms func_{index}()",
+                "role": "user" if index % 2 == 0 else "assistant",
+                "source_agent": "codex" if index % 3 == 0 else "claude",
+                "source_type": "conversation",
+                "metadata": {"batch": index // 100, "tag": f"item-{index}"},
+            }
+            for index in range(500)
+        ]
+        source.ingest(docs)
+        for i in range(20):
+            source.translation_put(f"query-{i}", f"rewritten-{i}")
+        for i in range(5):
+            source.record_reindex_control({"generation": i + 1, "scope": "all", "created_at": "2026-09-18T00:00:00Z"})
+
+        connection = source.conn
+        iterated = False
+
+        class StreamingCursor:
+            def __init__(self, cursor):
+                self.cursor = cursor
+
+            def __iter__(self):
+                nonlocal iterated
+                iterated = True
+                return iter(self.cursor)
+
+            def fetchall(self):
+                raise AssertionError("snapshot must not materialize via fetchall")
+
+        class ConnectionProbe:
+            def execute(self, sql, *args):
+                cursor = connection.execute(sql, *args)
+                if "SELECT * FROM memories ORDER BY id" in " ".join(sql.split()):
+                    return StreamingCursor(cursor)
+                return cursor
+
+            def __getattr__(self, name):
+                return getattr(connection, name)
+
+        snapshot_path = Path(self.tmp.name) / "large-streamed.jsonl.gz"
+        source.conn = ConnectionProbe()
+        try:
+            source.snapshot(snapshot_path)
+        finally:
+            source.conn = connection
+
+        self.assertTrue(iterated)
+
+        # Verify exact line by line content and ordering semantics
+        memory_records = []
+        translation_records = []
+        control_records = []
+        with gzip.open(snapshot_path, "rt", encoding="utf-8") as stream:
+            for line in stream:
+                rec = json.loads(line)
+                rec_type = rec.get("_funes_record")
+                if rec_type == "memory":
+                    memory_records.append(rec)
+                elif rec_type == "translation_cache":
+                    translation_records.append(rec)
+                elif rec_type == "reindex_control":
+                    control_records.append(rec)
+
+        self.assertEqual(len(memory_records), 500)
+        self.assertEqual(len(translation_records), 20)
+        self.assertEqual(len(control_records), 5)
+        ids = [r["id"] for r in memory_records]
+        self.assertEqual(ids, sorted(ids))
+        self.assertEqual([r["source_identity"] for r in memory_records[:3]], ["bulk-stream-0", "bulk-stream-1", "bulk-stream-2"])
+
+        target_dir = tempfile.TemporaryDirectory()
+        target = Store(target_dir.name)
+        restored = target.restore(snapshot_path, apply_controls=False)
+        self.assertEqual(restored, 500)
+        self.assertEqual(target.count(), 500)
+        item = target.get("bulk-stream-42")
+        self.assertIsNotNone(item)
+        self.assertIn("func_42()", item["raw_text"])
+        self.assertEqual(target.translation_get("query-5"), "rewritten-5")
+
+        source.close()
+        target.close()
+        target_dir.cleanup()
 
     def test_canonical_checkpoint_rebuilds_profile_mismatch_including_session(self):
         store = Store(self.tmp.name)
@@ -1077,6 +2601,44 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(checkpoint["pending"], 2)
             self.assertFalse(checkpoint["complete"])
             self.assertEqual(checkpoint["memory"], "new-memory")
+        finally:
+            store.close()
+
+    def test_legacy_codex_automation_output_is_retained_but_not_indexed(self):
+        store = Store(self.tmp.name)
+        store.ingest(
+            [
+                {
+                    "source_identity": "legacy-automation-run",
+                    "source_agent": "codex",
+                    "source_type": "memory",
+                    "source_path": "~/.codex/automations/daily/runs/run.jsonl",
+                    "content_type": "memory",
+                    "raw_text": "retained automation output",
+                },
+                {
+                    "source_identity": "automation-instructions",
+                    "source_agent": "codex",
+                    "source_type": "memory",
+                    "source_path": "~/.codex/automations/daily/automation.toml",
+                    "content_type": "memory",
+                    "raw_text": "retained automation instructions",
+                },
+            ]
+        )
+        try:
+            legacy = store.get("legacy-automation-run")
+            self.assertEqual(legacy["raw_text"], "retained automation output")
+            self.assertEqual(legacy["content_type"], "progress")
+            self.assertEqual(
+                {
+                    item["source_identity"]
+                    for item in store.canonical_index_candidates(
+                        10, "profile", "memory-a"
+                    )
+                },
+                {"automation-instructions"},
+            )
         finally:
             store.close()
 
@@ -1214,7 +2776,7 @@ class ServiceTests(unittest.TestCase):
             migrated.conn.execute(
                 "SELECT native_checkpoint_state_version FROM sync_state WHERE id=1"
             ).fetchone()[0],
-            1,
+            2,
         )
         self.assertEqual(
             migrated.conn.execute(
@@ -1226,6 +2788,88 @@ class ServiceTests(unittest.TestCase):
         reopened = Store(self.tmp.name)
         self.assertEqual(reopened.conn.total_changes, 0)
         reopened.close()
+
+    def test_embedding_generation_migration_is_additive_and_defaults_to_zero(self):
+        store = Store(self.tmp.name)
+        store.ingest([{"source_identity": "legacy", "raw_text": "raw"}])
+        store.close()
+        connection = sqlite3.connect(Path(self.tmp.name) / "funes.sqlite3")
+        with connection:
+            connection.execute("DROP TRIGGER memories_native_au")
+            connection.execute("DROP INDEX IF EXISTS memories_embedding_generation_idx")
+            connection.execute("ALTER TABLE memories DROP COLUMN embedding_generation")
+        connection.close()
+
+        migrated = Store(self.tmp.name)
+        try:
+            columns = {
+                row[1] for row in migrated.conn.execute("PRAGMA table_info(memories)")
+            }
+            self.assertIn("embedding_generation", columns)
+            self.assertEqual(migrated.get("legacy")["embedding_generation"], 0)
+            index_names = {
+                row["name"] for row in migrated.conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='memories'"
+                )
+            }
+            self.assertIn("memories_embedding_generation_idx", index_names)
+        finally:
+            migrated.close()
+
+    def test_native_state_v2_retires_legacy_automation_output_without_pending(self):
+        store = Store(self.tmp.name)
+        store.ingest(
+            [
+                {
+                    "source_identity": "legacy-automation-run",
+                    "source_agent": "codex",
+                    "source_type": "memory",
+                    "source_path": "~/.codex/automations/daily/runs/run.jsonl",
+                    "content_type": "memory",
+                    "raw_text": "retained automation output",
+                }
+            ]
+        )
+        with store.lock, store.conn:
+            # Recreate the durable shape written before automation outputs
+            # were removed from discovery and classified as low-value.
+            store.conn.execute(
+                """UPDATE memories SET content_type='memory',
+                native_index_status='indexed',native_index_version='v1',
+                native_index_profile='profile',native_index_memory='memory-a',
+                native_indexed_at='2026-09-15T00:00:00Z'"""
+            )
+            store.conn.execute(
+                """UPDATE sync_state SET native_checkpoint_profile='profile',
+                native_checkpoint_memory='memory-a',
+                native_checkpoint_state_version=1"""
+            )
+        store.close()
+
+        migrated = Store(self.tmp.name)
+        try:
+            self.assertEqual(
+                migrated.get("legacy-automation-run")["content_type"], "progress"
+            )
+            self.assertEqual(
+                migrated.canonical_index_candidates(10, "profile", "memory-a"),
+                [],
+            )
+            checkpoint = migrated.native_index_checkpoint(
+                {"fingerprint": "profile"}, "memory-a"
+            )
+            self.assertEqual(
+                migrated.conn.execute(
+                    """SELECT native_checkpoint_state_version
+                    FROM sync_state WHERE id=1"""
+                ).fetchone()[0],
+                2,
+            )
+            self.assertEqual(checkpoint["eligible"], 0)
+            self.assertEqual(checkpoint["indexed"], 0)
+            self.assertEqual(checkpoint["pending"], 0)
+        finally:
+            migrated.close()
 
     def test_held_invalid_is_terminal_and_does_not_regress(self):
         store = Store(self.tmp.name)
@@ -1369,6 +3013,112 @@ class ServiceTests(unittest.TestCase):
         finally:
             store.close()
 
+    def test_native_optimize_layout_version_migrates_legacy_sync_state(self):
+        store = Store(self.tmp.name)
+        marker = {
+            "fingerprint": "legacy-profile",
+            "status": "optimized",
+            "optimized_at": "2026-09-13T02:00:00Z",
+            "revision": 1,
+        }
+        self.assertTrue(store.set_native_optimize_checkpoint(marker))
+        store.close()
+
+        connection = sqlite3.connect(Path(self.tmp.name) / "funes.sqlite3")
+        with connection:
+            connection.execute(
+                "ALTER TABLE sync_state DROP COLUMN native_optimize_layout_version"
+            )
+        connection.close()
+
+        migrated = Store(self.tmp.name)
+        try:
+            columns = {
+                row[1]: row
+                for row in migrated.conn.execute("PRAGMA table_info(sync_state)")
+            }
+            self.assertIn("native_optimize_layout_version", columns)
+            self.assertEqual(columns["native_optimize_layout_version"][3], 1)
+            self.assertEqual(columns["native_optimize_layout_version"][4], "0")
+            checkpoint = migrated.native_optimize_checkpoint()
+            self.assertEqual(checkpoint["fingerprint"], "legacy-profile")
+            self.assertEqual(checkpoint["index_layout_version"], 0)
+        finally:
+            migrated.close()
+
+    def test_native_optimize_layout_version_snapshot_roundtrip(self):
+        source = Store(self.tmp.name)
+        marker = {
+            "fingerprint": "profile-v2",
+            "index_fingerprint": "index-v2",
+            "index_layout_version": 2,
+            "status": "optimized",
+            "optimized_at": "2026-09-13T02:00:00Z",
+            "revision": 4,
+        }
+        snapshot = Path(self.tmp.name) / "layout-version.jsonl.gz"
+        target_dir = tempfile.TemporaryDirectory()
+        target = Store(target_dir.name)
+        try:
+            self.assertTrue(source.set_native_optimize_checkpoint(marker))
+            source.snapshot(snapshot)
+            self.assertEqual(target.restore(snapshot), 0)
+            self.assertEqual(
+                target.native_optimize_checkpoint()["index_layout_version"], 2
+            )
+            with gzip.open(snapshot, "rt", encoding="utf-8") as stream:
+                optimize = next(
+                    json.loads(line)
+                    for line in stream
+                    if '"_funes_record": "native_optimize_checkpoint"' in line
+                )
+            self.assertEqual(optimize["index_layout_version"], 2)
+        finally:
+            source.close()
+            target.close()
+            target_dir.cleanup()
+
+    def test_native_optimize_old_marker_cannot_regress_layout_version(self):
+        store = Store(self.tmp.name)
+        current = {
+            "fingerprint": "profile",
+            "index_layout_version": 2,
+            "status": "optimized",
+            "optimized_at": "2026-09-13T02:00:00Z",
+            "revision": 1,
+        }
+        old_snapshot_marker = {
+            "fingerprint": "profile",
+            "status": "optimized",
+            "optimized_at": "2026-09-13T03:00:00Z",
+            "revision": 2,
+        }
+        legacy_dir = tempfile.TemporaryDirectory()
+        legacy = Store(legacy_dir.name)
+        try:
+            self.assertTrue(store.set_native_optimize_checkpoint(current))
+            self.assertEqual(
+                store.native_optimize_checkpoint()["index_layout_version"], 2
+            )
+            self.assertFalse(
+                store.set_native_optimize_checkpoint(old_snapshot_marker)
+            )
+            self.assertEqual(
+                store.native_optimize_checkpoint()["index_layout_version"], 2
+            )
+            self.assertEqual(store.native_optimize_checkpoint()["revision"], 1)
+
+            legacy.restore_documents(
+                [{**old_snapshot_marker, "_funes_record": "native_optimize_checkpoint"}]
+            )
+            self.assertEqual(
+                legacy.native_optimize_checkpoint()["index_layout_version"], 0
+            )
+        finally:
+            store.close()
+            legacy.close()
+            legacy_dir.cleanup()
+
     def test_http_never_returns_retrieval_text_even_when_legacy_flag_is_set(self):
         os.environ["RETURN_RETRIEVAL_TEXT"] = "true"
         server = self._server()
@@ -1448,6 +3198,7 @@ class ServiceTests(unittest.TestCase):
         self.assertIsNone(provider["native_index_status"])
         self.assertEqual(provider["retrieval_generation"], 2)
         self.assertEqual(provider["native_generation"], 2)
+        self.assertEqual(provider["embedding_generation"], 0)
         english = store.get("english-row")
         self.assertEqual(english["translation_status"], "pending_provider")
         self.assertIsNone(english["native_index_status"])
@@ -1468,12 +3219,40 @@ class ServiceTests(unittest.TestCase):
 
         # An older all-control arriving after generation 2 still clears the
         # independent native generation of canonical-eligible English rows.
+        provider = store.get("provider-row")
+        self.assertEqual(
+            store.update_native_index(
+                [
+                    {
+                        "source_identity": provider["source_identity"],
+                        "source_version": provider["source_version"],
+                        "content_hash": provider["content_hash"],
+                        "native_generation": provider["native_generation"],
+                        "native_index_version": "indexed-after-retrieval",
+                        "native_index_status": "indexed",
+                        "native_index_profile": "profile",
+                        "native_index_memory": "memory",
+                        "native_indexed_at": "2026-09-13T00:00:03Z",
+                    }
+                ]
+            ),
+            1,
+        )
         store.record_reindex_control(
             {"generation": 1, "scope": "all", "created_at": "2026-09-13T00:00:01Z"}
         )
         store.drain_reindex_controls(1)
         self.assertIsNone(store.get("english-row")["native_index_status"])
+        self.assertIsNone(store.get("provider-row")["native_index_status"])
         self.assertEqual(store.get("waiting-row")["native_index_status"], "waiting_durability")
+        self.assertEqual(store.get("provider-row")["embedding_generation"], 1)
+
+        # Rows first seen after an all-control inherit that embedding epoch,
+        # while legacy/incoming generation zero cannot regress an existing row.
+        store.ingest([{"source_identity": "new-after-all", "raw_text": "new"}])
+        self.assertEqual(store.get("new-after-all")["embedding_generation"], 1)
+        store.ingest([{**original, "embedding_generation": 0}])
+        self.assertEqual(store.get("provider-row")["embedding_generation"], 1)
         store.close()
 
     def test_reindex_row_cursor_is_bounded_and_survives_restart(self):
@@ -1637,6 +3416,225 @@ class ServiceTests(unittest.TestCase):
         self.assertIsNotNone(state["applied_at"])
         store.close()
 
+    def test_full_hub_restore_prefetches_remote_files_before_replay(self):
+        from service.server import SnapshotSync
+
+        store = Store(self.tmp.name)
+        syncer = SnapshotSync(store)
+        syncer.repo = "owner/private"
+        syncer.token = "test-token"
+        syncer.restore_download_workers = 16
+        files = ["funes-snapshot.jsonl.gz.enc", "funes-delta-a.jsonl.gz.enc"]
+        events = []
+
+        def prefetch(**kwargs):
+            events.append(("prefetch", kwargs))
+            return str(Path(self.tmp.name) / "remote")
+
+        def restore_file(filename):
+            events.append(("restore", filename))
+            return 1
+
+        with mock.patch.object(syncer, "_repo_files", return_value=files), mock.patch(
+            "huggingface_hub.snapshot_download", side_effect=prefetch
+        ), mock.patch.object(syncer, "_restore_file", side_effect=restore_file):
+            self.assertEqual(syncer.restore(), 2)
+
+        self.assertEqual([event[0] for event in events], ["prefetch", "restore", "restore"])
+        prefetch_kwargs = events[0][1]
+        self.assertEqual(prefetch_kwargs["repo_id"], "owner/private")
+        self.assertEqual(prefetch_kwargs["repo_type"], "dataset")
+        self.assertEqual(prefetch_kwargs["allow_patterns"], files)
+        self.assertEqual(prefetch_kwargs["max_workers"], 16)
+        self.assertEqual(prefetch_kwargs["token"], "test-token")
+        self.assertIsNone(syncer._restore_prefetch_root)
+        store.close()
+
+    def test_full_hub_restore_falls_back_when_prefetch_fails(self):
+        from service.server import SnapshotSync
+
+        store = Store(self.tmp.name)
+        syncer = SnapshotSync(store)
+        syncer.repo = "owner/private"
+        syncer.token = "test-token"
+        files = ["funes-snapshot.jsonl.gz.enc", "funes-delta-a.jsonl.gz.enc"]
+        with mock.patch.object(syncer, "_repo_files", return_value=files), mock.patch(
+            "huggingface_hub.snapshot_download", side_effect=OSError("offline")
+        ), mock.patch.object(syncer, "_restore_file", return_value=1) as restore_file:
+            self.assertEqual(syncer.restore(), 2)
+        self.assertEqual(
+            restore_file.call_args_list,
+            [mock.call(files[0]), mock.call(files[1])],
+        )
+        self.assertIsNone(syncer._restore_prefetch_root)
+        store.close()
+
+    def test_hub_restore_without_manifest_replays_legacy_history(self):
+        from service.server import SnapshotSync
+
+        store = Store(self.tmp.name)
+        syncer = SnapshotSync(store)
+        syncer.repo = "owner/private"
+        syncer.token = "test-token"
+        files = [
+            "funes-delta-b.jsonl.gz.enc",
+            "funes-snapshot-old.jsonl.gz.enc",
+            "funes-reindex-0002.jsonl.gz.enc",
+            "funes-snapshot.jsonl.gz.enc",
+            "funes-delta-a.jsonl.gz.enc",
+        ]
+        api = mock.Mock()
+        api.repo_info.return_value.sha = "head-1"
+        api.list_repo_tree.return_value = [mock.Mock(path=name) for name in files]
+        module = mock.Mock(HfApi=mock.Mock(return_value=api))
+        with mock.patch.dict("sys.modules", {"huggingface_hub": module}):
+            selected = syncer._repo_files()
+
+        self.assertEqual(
+            selected,
+            [
+                "funes-snapshot-old.jsonl.gz.enc",
+                "funes-snapshot.jsonl.gz.enc",
+                "funes-delta-a.jsonl.gz.enc",
+                "funes-delta-b.jsonl.gz.enc",
+                "funes-reindex-0002.jsonl.gz.enc",
+            ],
+        )
+        store.close()
+
+    def test_hub_restore_manifest_selects_only_active_history(self):
+        from service.server import SnapshotSync
+
+        store = Store(self.tmp.name)
+        syncer = SnapshotSync(store)
+        syncer.repo = "owner/private"
+        syncer.token = "test-token"
+        active = {
+            "version": 1,
+            "snapshot": "funes-snapshot-current.jsonl.gz.enc",
+            "deltas": ["funes-delta-later.jsonl.gz.enc"],
+            "controls": ["funes-reindex-0003.jsonl.gz.enc"],
+        }
+        manifest_path = Path(self.tmp.name) / syncer.manifest_filename
+        manifest_path.write_text(json.dumps(active), encoding="utf-8")
+        repo_files = [
+            syncer.manifest_filename,
+            "funes-snapshot-old.jsonl.gz.enc",
+            "funes-delta-old.jsonl.gz.enc",
+            active["snapshot"],
+            *active["deltas"],
+            *active["controls"],
+        ]
+        api = mock.Mock()
+        api.repo_info.return_value.sha = "head-1"
+        api.list_repo_tree.return_value = [mock.Mock(path=name) for name in repo_files]
+        module = mock.Mock(
+            HfApi=mock.Mock(return_value=api),
+            hf_hub_download=mock.Mock(return_value=str(manifest_path)),
+        )
+        with mock.patch.dict("sys.modules", {"huggingface_hub": module}):
+            selected = syncer._repo_files()
+
+        self.assertEqual(
+            selected,
+            [active["snapshot"], *active["deltas"], *active["controls"]],
+        )
+        self.assertEqual(api.list_repo_tree.call_args.kwargs["revision"], "head-1")
+        self.assertEqual(
+            module.hf_hub_download.call_args.kwargs["revision"], "head-1"
+        )
+        store.close()
+
+    def test_present_restore_manifest_fails_closed_when_malformed(self):
+        from service.server import SnapshotSync
+
+        invalid_manifests = [
+            {
+                "version": 2,
+                "snapshot": "funes-snapshot-current.jsonl.gz.enc",
+                "deltas": [],
+                "controls": [],
+            },
+            {
+                "version": 1,
+                "snapshot": "../funes-snapshot-current.jsonl.gz.enc",
+                "deltas": [],
+                "controls": [],
+            },
+            {
+                "version": 1,
+                "snapshot": "funes-snapshot-current.jsonl.gz.enc",
+                "deltas": ["wrong-prefix.jsonl.gz.enc"],
+                "controls": [],
+            },
+            {
+                "version": 1,
+                "snapshot": "funes-snapshot-current.jsonl.gz",
+                "deltas": [],
+                "controls": [],
+            },
+        ]
+        store = Store(self.tmp.name)
+        try:
+            for index, value in enumerate(invalid_manifests):
+                with self.subTest(index=index):
+                    syncer = SnapshotSync(store)
+                    syncer.repo = "owner/private"
+                    syncer.token = "test-token"
+                    manifest_path = Path(self.tmp.name) / f"invalid-{index}.json"
+                    manifest_path.write_text(json.dumps(value), encoding="utf-8")
+                    api = mock.Mock()
+                    api.repo_info.return_value.sha = "head-1"
+                    api.list_repo_tree.return_value = [
+                        mock.Mock(path=syncer.manifest_filename),
+                        mock.Mock(path="funes-snapshot-current.jsonl.gz.enc"),
+                    ]
+                    module = mock.Mock(
+                        HfApi=mock.Mock(return_value=api),
+                        hf_hub_download=mock.Mock(return_value=str(manifest_path)),
+                    )
+                    with mock.patch.dict(
+                        "sys.modules", {"huggingface_hub": module}
+                    ), mock.patch.object(syncer, "_restore_file") as restore_file:
+                        self.assertEqual(syncer.restore(), -1)
+                    self.assertTrue(syncer.restore_failed)
+                    restore_file.assert_not_called()
+        finally:
+            store.close()
+
+    def test_present_restore_manifest_fails_closed_on_missing_reference(self):
+        from service.server import SnapshotSync
+
+        store = Store(self.tmp.name)
+        syncer = SnapshotSync(store)
+        syncer.repo = "owner/private"
+        syncer.token = "test-token"
+        manifest = {
+            "version": 1,
+            "snapshot": "funes-snapshot-current.jsonl.gz.enc",
+            "deltas": ["funes-delta-missing.jsonl.gz.enc"],
+            "controls": [],
+        }
+        manifest_path = Path(self.tmp.name) / syncer.manifest_filename
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        api = mock.Mock()
+        api.repo_info.return_value.sha = "head-1"
+        api.list_repo_tree.return_value = [
+            mock.Mock(path=syncer.manifest_filename),
+            mock.Mock(path=manifest["snapshot"]),
+        ]
+        module = mock.Mock(
+            HfApi=mock.Mock(return_value=api),
+            hf_hub_download=mock.Mock(return_value=str(manifest_path)),
+        )
+        with mock.patch.dict(
+            "sys.modules", {"huggingface_hub": module}
+        ), mock.patch.object(syncer, "_restore_file") as restore_file:
+            self.assertEqual(syncer.restore(), -1)
+        self.assertTrue(syncer.restore_failed)
+        restore_file.assert_not_called()
+        store.close()
+
     def test_restore_compacts_history_and_skips_satisfied_updates(self):
         store = Store(self.tmp.name)
         store.ingest(
@@ -1674,7 +3672,17 @@ class ServiceTests(unittest.TestCase):
             [(4, "all"), (5, "retrieval_text")],
         )
         self.assertEqual(first["scanned"], 40)
-        self.assertEqual(first["updated"], 20)
+        # The newest retrieval control advances retrieval/native state first;
+        # the retained older all-control then advances the independent
+        # embedding epoch for every row.
+        self.assertEqual(first["updated"], 40)
+        self.assertEqual(
+            {
+                store.get(f"compact-row-{index}")["embedding_generation"]
+                for index in range(20)
+            },
+            {4},
+        )
 
         store.compact_reindex_controls(replay=True)
         replay = store.drain_reindex_controls(7)
@@ -1727,6 +3735,96 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(status, 503)
         self.assertFalse(body["queued"])
 
+    def test_queue_reindex_holds_upload_lock_until_control_is_local(self):
+        from service.server import SnapshotSync, queue_reindex
+
+        store = Store(self.tmp.name)
+        syncer = SnapshotSync(store)
+        app = mock.Mock(
+            store=store,
+            syncer=syncer,
+            reindex_lock=threading.Lock(),
+            reindex_wake=threading.Event(),
+        )
+        remote_committed = threading.Event()
+        competitor_attempted = threading.Event()
+        observed_local_counts = []
+        queue_results = []
+        errors = []
+        original_record = store.record_reindex_control
+
+        def upload_control(_control):
+            with syncer.upload_lock:
+                remote_committed.set()
+                if not competitor_attempted.wait(1):
+                    raise AssertionError("snapshot competitor did not start")
+                return {"uploaded": True, "durable": True}
+
+        def record_while_locked(control):
+            if not syncer.upload_lock._is_owned():
+                raise AssertionError("control record escaped the upload lock")
+            return original_record(control)
+
+        def queue_worker():
+            try:
+                queue_results.append(queue_reindex(app, "all"))
+            except BaseException as exc:
+                errors.append(exc)
+
+        def snapshot_competitor():
+            if not remote_committed.wait(1):
+                errors.append(AssertionError("remote control was not committed"))
+                return
+            competitor_attempted.set()
+            with syncer.upload_lock:
+                observed_local_counts.append(
+                    store.conn.execute("SELECT count(*) FROM reindex_controls").fetchone()[0]
+                )
+
+        with mock.patch.object(
+            syncer, "upload_reindex_control", side_effect=upload_control
+        ), mock.patch.object(
+            store, "record_reindex_control", side_effect=record_while_locked
+        ):
+            competitor = threading.Thread(target=snapshot_competitor)
+            queue = threading.Thread(target=queue_worker)
+            competitor.start()
+            queue.start()
+            queue.join(timeout=2)
+            competitor.join(timeout=2)
+
+        self.assertFalse(queue.is_alive())
+        self.assertFalse(competitor.is_alive())
+        self.assertEqual(errors, [])
+        self.assertTrue(queue_results[0]["durable"])
+        self.assertEqual(observed_local_counts, [1])
+        store.close()
+
+    def test_queue_reindex_remote_failure_does_not_create_local_control(self):
+        from service.server import SnapshotSync, queue_reindex
+
+        store = Store(self.tmp.name)
+        syncer = SnapshotSync(store)
+        app = mock.Mock(
+            store=store,
+            syncer=syncer,
+            reindex_lock=threading.Lock(),
+            reindex_wake=threading.Event(),
+        )
+        with mock.patch.object(
+            syncer,
+            "upload_reindex_control",
+            return_value={"uploaded": False, "durable": False, "reason": "offline"},
+        ):
+            result = queue_reindex(app, "all")
+
+        self.assertFalse(result["durable"])
+        self.assertEqual(
+            store.conn.execute("SELECT count(*) FROM reindex_controls").fetchone()[0],
+            0,
+        )
+        store.close()
+
     def test_reindex_control_is_encrypted_before_local_durable_ack(self):
         from service.server import SnapshotSync
         store = Store(self.tmp.name)
@@ -1749,6 +3847,581 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(result["reason"], "HF storage not configured")
         store.close()
 
+    def test_full_snapshot_and_manifest_are_one_atomic_commit(self):
+        from service.server import SnapshotSync
+
+        store = Store(self.tmp.name)
+        store.ingest([{"source_identity": "compact", "raw_text": "current"}])
+        os.environ.update(
+            FUNES_STORAGE_REPO="owner/private",
+            FUNES_STORAGE_KEY="test-storage-key",
+            HF_TOKEN="hf-test",
+        )
+        api = mock.Mock()
+        api.repo_info.return_value.sha = "head-1"
+        api.list_repo_tree.return_value = []
+        with mock.patch("huggingface_hub.HfApi", return_value=api):
+            syncer = SnapshotSync(store)
+            result = syncer.upload()
+
+        self.assertTrue(result["durable"])
+        api.upload_file.assert_not_called()
+        api.create_commit.assert_called_once()
+        kwargs = api.create_commit.call_args.kwargs
+        self.assertEqual(
+            set(kwargs),
+            {
+                "repo_id",
+                "repo_type",
+                "operations",
+                "commit_message",
+                "parent_commit",
+            },
+        )
+        self.assertEqual(kwargs["repo_id"], "owner/private")
+        self.assertEqual(kwargs["repo_type"], "dataset")
+        self.assertEqual(kwargs["parent_commit"], "head-1")
+        operations = {operation.path_in_repo: operation for operation in kwargs["operations"]}
+        snapshot_name = "funes-snapshot.jsonl.gz.enc"
+        self.assertEqual(set(operations), {snapshot_name, syncer.manifest_filename})
+        manifest = json.loads(operations[syncer.manifest_filename].path_or_fileobj)
+        self.assertEqual(
+            manifest,
+            {
+                "version": 1,
+                "snapshot": snapshot_name,
+                "deltas": [],
+                "controls": [],
+            },
+        )
+        self.assertEqual(kwargs["commit_message"], "funes encrypted source snapshot")
+        store.close()
+
+    def test_unrestored_active_manifest_cannot_compact(self):
+        from service.server import SnapshotSync
+
+        store = Store(self.tmp.name)
+        store.ingest([{"source_identity": "partial", "raw_text": "partial state"}])
+        os.environ.update(
+            FUNES_STORAGE_REPO="owner/private",
+            FUNES_STORAGE_KEY="test-storage-key",
+            HF_TOKEN="hf-test",
+        )
+        syncer = SnapshotSync(store)
+        manifest = {
+            "version": 1,
+            "snapshot": "funes-snapshot.jsonl.gz.enc",
+            "deltas": ["funes-delta-not-restored.jsonl.gz.enc"],
+            "controls": [],
+        }
+        manifest_path = Path(self.tmp.name) / syncer.manifest_filename
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        api = mock.Mock()
+        api.repo_info.return_value.sha = "head-active"
+        api.list_repo_tree.return_value = [
+            mock.Mock(path=syncer.manifest_filename, blob_id="manifest-active"),
+            mock.Mock(path=manifest["snapshot"], blob_id="snapshot-active"),
+            mock.Mock(path=manifest["deltas"][0], blob_id="delta-active"),
+        ]
+        original_snapshot = store.snapshot
+        with mock.patch("huggingface_hub.HfApi", return_value=api), mock.patch(
+            "huggingface_hub.hf_hub_download", return_value=str(manifest_path)
+        ), mock.patch.object(store, "snapshot", wraps=original_snapshot) as snapshot:
+            result = syncer.upload()
+
+        self.assertFalse(result["durable"])
+        snapshot.assert_not_called()
+        api.create_commit.assert_not_called()
+        store.close()
+
+    def test_unrestored_legacy_history_cannot_create_first_manifest(self):
+        from service.server import SnapshotSync
+
+        store = Store(self.tmp.name)
+        os.environ.update(
+            FUNES_STORAGE_REPO="owner/private",
+            FUNES_STORAGE_KEY="test-storage-key",
+            HF_TOKEN="hf-test",
+        )
+        syncer = SnapshotSync(store)
+        api = mock.Mock()
+        api.repo_info.return_value.sha = "head-legacy"
+        api.list_repo_tree.return_value = [
+            mock.Mock(
+                path="funes-snapshot-old.jsonl.gz.enc", blob_id="snapshot-old"
+            ),
+            mock.Mock(path="funes-delta-old.jsonl.gz.enc", blob_id="delta-old"),
+        ]
+        original_snapshot = store.snapshot
+        with mock.patch("huggingface_hub.HfApi", return_value=api), mock.patch.object(
+            store, "snapshot", wraps=original_snapshot
+        ) as snapshot:
+            result = syncer.upload()
+
+        self.assertFalse(result["durable"])
+        snapshot.assert_not_called()
+        api.create_commit.assert_not_called()
+        store.close()
+
+    def test_compaction_retries_with_only_concurrent_manifest_suffix(self):
+        from service.server import SnapshotSync
+
+        store = Store(self.tmp.name)
+        store.ingest([{"source_identity": "compact", "raw_text": "current"}])
+        os.environ.update(
+            FUNES_STORAGE_REPO="owner/private",
+            FUNES_STORAGE_KEY="test-storage-key",
+            HF_TOKEN="hf-test",
+        )
+        syncer = SnapshotSync(store)
+        syncer.covered_revision = "head-1"
+        snapshot_name = "funes-snapshot.jsonl.gz.enc"
+        old_delta = "funes-delta-old.jsonl.gz.enc"
+        new_delta = "funes-delta-concurrent.jsonl.gz.enc"
+        old_control = "funes-reindex-0001-old.jsonl.gz.enc"
+        new_control = "funes-reindex-0002-new.jsonl.gz.enc"
+        base_manifest = {
+            "version": 1,
+            "snapshot": snapshot_name,
+            "deltas": [old_delta],
+            "controls": [old_control],
+        }
+        concurrent_manifest = {
+            **base_manifest,
+            "deltas": [old_delta, new_delta],
+            "controls": [old_control, new_control],
+        }
+        base_path = Path(self.tmp.name) / "compact-head-1.json"
+        concurrent_path = Path(self.tmp.name) / "compact-head-2.json"
+        base_path.write_text(json.dumps(base_manifest), encoding="utf-8")
+        concurrent_path.write_text(json.dumps(concurrent_manifest), encoding="utf-8")
+        api = mock.Mock()
+        api.repo_info.side_effect = [mock.Mock(sha="head-1"), mock.Mock(sha="head-2")]
+        api.list_repo_tree.side_effect = [
+            [
+                mock.Mock(path=syncer.manifest_filename, blob_id="manifest-1"),
+                mock.Mock(path=snapshot_name, blob_id="snapshot-1"),
+                mock.Mock(path=old_delta, blob_id="delta-old"),
+                mock.Mock(path=old_control, blob_id="control-old"),
+            ],
+            [
+                mock.Mock(path=syncer.manifest_filename, blob_id="manifest-2"),
+                mock.Mock(path=snapshot_name, blob_id="snapshot-1"),
+                mock.Mock(path=old_delta, blob_id="delta-old"),
+                mock.Mock(path=new_delta, blob_id="delta-new"),
+                mock.Mock(path=old_control, blob_id="control-old"),
+                mock.Mock(path=new_control, blob_id="control-new"),
+            ],
+        ]
+        api.create_commit.side_effect = [
+            RuntimeError("stale parent"),
+            mock.Mock(oid="head-3"),
+        ]
+        snapshot_head_reads = []
+        original_snapshot = store.snapshot
+
+        def snapshot_after_head_read(path):
+            snapshot_head_reads.append(api.repo_info.call_count)
+            return original_snapshot(path)
+
+        with mock.patch("huggingface_hub.HfApi", return_value=api), mock.patch(
+            "huggingface_hub.hf_hub_download",
+            side_effect=[str(base_path), str(concurrent_path)],
+        ), mock.patch.object(store, "snapshot", side_effect=snapshot_after_head_read):
+            result = syncer.upload()
+
+        self.assertTrue(result["durable"])
+        self.assertEqual(snapshot_head_reads, [1])
+        self.assertEqual(
+            [call.kwargs["parent_commit"] for call in api.create_commit.call_args_list],
+            ["head-1", "head-2"],
+        )
+        operations = {
+            operation.path_in_repo: operation
+            for operation in api.create_commit.call_args_list[-1].kwargs["operations"]
+        }
+        manifest = json.loads(operations[syncer.manifest_filename].path_or_fileobj)
+        self.assertEqual(manifest["snapshot"], snapshot_name)
+        self.assertEqual(manifest["deltas"], [new_delta])
+        self.assertEqual(manifest["controls"], [new_control])
+        self.assertEqual(syncer.covered_revision, "head-1")
+        store.close()
+
+    def test_compaction_fails_closed_when_concurrent_snapshot_wins(self):
+        from service.server import SnapshotSync
+
+        store = Store(self.tmp.name)
+        os.environ.update(
+            FUNES_STORAGE_REPO="owner/private",
+            FUNES_STORAGE_KEY="test-storage-key",
+            HF_TOKEN="hf-test",
+        )
+        syncer = SnapshotSync(store)
+        syncer.covered_revision = "head-1"
+        snapshot_name = "funes-snapshot.jsonl.gz.enc"
+        manifest = {
+            "version": 1,
+            "snapshot": snapshot_name,
+            "deltas": [],
+            "controls": [],
+        }
+        base_path = Path(self.tmp.name) / "winner-head-1.json"
+        winner_path = Path(self.tmp.name) / "winner-head-2.json"
+        base_path.write_text(json.dumps(manifest), encoding="utf-8")
+        winner_path.write_text(json.dumps(manifest), encoding="utf-8")
+        api = mock.Mock()
+        api.repo_info.side_effect = [mock.Mock(sha="head-1"), mock.Mock(sha="head-2")]
+        api.list_repo_tree.side_effect = [
+            [
+                mock.Mock(path=syncer.manifest_filename, blob_id="manifest-1"),
+                mock.Mock(path=snapshot_name, blob_id="snapshot-1"),
+            ],
+            [
+                mock.Mock(path=syncer.manifest_filename, blob_id="manifest-2"),
+                mock.Mock(path=snapshot_name, blob_id="snapshot-2"),
+            ],
+        ]
+        api.create_commit.side_effect = RuntimeError("stale parent")
+        with mock.patch("huggingface_hub.HfApi", return_value=api), mock.patch(
+            "huggingface_hub.hf_hub_download",
+            side_effect=[str(base_path), str(winner_path)],
+        ):
+            result = syncer.upload()
+
+        self.assertFalse(result["durable"])
+        self.assertEqual(api.create_commit.call_count, 1)
+        store.close()
+
+    def test_successful_restore_then_compaction_resets_base_manifest_entries(self):
+        from service.server import SnapshotSync
+
+        store = Store(self.tmp.name)
+        os.environ.update(
+            FUNES_STORAGE_REPO="owner/private",
+            FUNES_STORAGE_KEY="test-storage-key",
+            HF_TOKEN="hf-test",
+        )
+        syncer = SnapshotSync(store)
+        manifest = {
+            "version": 1,
+            "snapshot": "funes-snapshot.jsonl.gz.enc",
+            "deltas": ["funes-delta-base.jsonl.gz.enc"],
+            "controls": ["funes-reindex-0001-base.jsonl.gz.enc"],
+        }
+        manifest_path = Path(self.tmp.name) / syncer.manifest_filename
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        tree = [
+            mock.Mock(path=syncer.manifest_filename, blob_id="manifest-base"),
+            mock.Mock(path=manifest["snapshot"], blob_id="snapshot-base"),
+            mock.Mock(path=manifest["deltas"][0], blob_id="delta-base"),
+            mock.Mock(path=manifest["controls"][0], blob_id="control-base"),
+        ]
+        api = mock.Mock()
+        api.repo_info.side_effect = [mock.Mock(sha="head-1"), mock.Mock(sha="head-1")]
+        api.list_repo_tree.return_value = tree
+        api.create_commit.return_value = mock.Mock(oid="head-2")
+        with mock.patch("huggingface_hub.HfApi", return_value=api), mock.patch(
+            "huggingface_hub.hf_hub_download", return_value=str(manifest_path)
+        ), mock.patch.object(syncer, "_restore_file", return_value=0), mock.patch.object(
+            syncer, "_prefetch_restore_files", return_value=None
+        ):
+            self.assertEqual(syncer.restore(), 0)
+            self.assertEqual(syncer.covered_revision, "head-1")
+            result = syncer.upload()
+
+        self.assertTrue(result["durable"])
+        self.assertEqual(syncer.covered_revision, "head-2")
+        operations = {
+            operation.path_in_repo: operation
+            for operation in api.create_commit.call_args.kwargs["operations"]
+        }
+        compacted = json.loads(
+            operations[syncer.manifest_filename].path_or_fileobj
+        )
+        self.assertEqual(compacted["deltas"], [])
+        self.assertEqual(compacted["controls"], [])
+        store.close()
+
+    def test_existing_delta_requires_manifest_membership_before_durable_ack(self):
+        from service.server import SnapshotSync
+
+        store = Store(self.tmp.name)
+        store.ingest([{"source_identity": "remote", "raw_text": "retry delta"}])
+        docs = store.get_many(["remote"])
+        os.environ.update(
+            FUNES_STORAGE_REPO="owner/private",
+            FUNES_STORAGE_KEY="test-storage-key",
+            HF_TOKEN="hf-test",
+        )
+        syncer = SnapshotSync(store)
+        durable_docs = [*docs, store.native_index_state_record()]
+        digest = hashlib.sha256(
+            json.dumps(
+                durable_docs,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()[:24]
+        delta_name = syncer.delta_target(digest)
+        snapshot_name = "funes-snapshot.jsonl.gz.enc"
+        manifest = {
+            "version": 1,
+            "snapshot": snapshot_name,
+            "deltas": [],
+            "controls": [],
+        }
+        manifest_path = Path(self.tmp.name) / syncer.manifest_filename
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        api = mock.Mock()
+        api.repo_info.return_value.sha = "head-1"
+        api.list_repo_tree.return_value = [
+            mock.Mock(path=syncer.manifest_filename),
+            mock.Mock(path=snapshot_name),
+            mock.Mock(path=delta_name),
+        ]
+        with mock.patch("huggingface_hub.HfApi", return_value=api), mock.patch(
+            "huggingface_hub.hf_hub_download", return_value=str(manifest_path)
+        ):
+            result = syncer.upload(docs)
+
+        self.assertTrue(result["durable"])
+        api.upload_file.assert_not_called()
+        api.create_commit.assert_called_once()
+        operations = {
+            operation.path_in_repo: operation
+            for operation in api.create_commit.call_args.kwargs["operations"]
+        }
+        self.assertEqual(
+            api.create_commit.call_args.kwargs["parent_commit"], "head-1"
+        )
+        self.assertEqual(set(operations), {delta_name, syncer.manifest_filename})
+        updated = json.loads(operations[syncer.manifest_filename].path_or_fileobj)
+        self.assertEqual(updated["deltas"], [delta_name])
+        store.close()
+
+    def test_stale_delta_writer_confirms_new_membership_before_durable_ack(self):
+        from service.server import SnapshotSync
+
+        store = Store(self.tmp.name)
+        store.ingest([{"source_identity": "ours", "raw_text": "our delta"}])
+        docs = store.get_many(["ours"])
+        os.environ.update(
+            FUNES_STORAGE_REPO="owner/private",
+            FUNES_STORAGE_KEY="test-storage-key",
+            HF_TOKEN="hf-test",
+        )
+        syncer = SnapshotSync(store)
+        snapshot_name = "funes-snapshot.jsonl.gz.enc"
+        concurrent_delta = "funes-delta-concurrent.jsonl.gz.enc"
+        durable_docs = [*docs, store.native_index_state_record()]
+        digest = hashlib.sha256(
+            json.dumps(
+                durable_docs,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()[:24]
+        delta_name = f"funes-delta-{digest}.jsonl.gz.enc"
+        base_manifest = {
+            "version": 1,
+            "snapshot": snapshot_name,
+            "deltas": [],
+            "controls": [],
+        }
+        concurrent_manifest = {
+            **base_manifest,
+            "deltas": [concurrent_delta, delta_name],
+        }
+        base_path = Path(self.tmp.name) / "manifest-head-1.json"
+        concurrent_path = Path(self.tmp.name) / "manifest-head-2.json"
+        base_path.write_text(json.dumps(base_manifest), encoding="utf-8")
+        concurrent_path.write_text(json.dumps(concurrent_manifest), encoding="utf-8")
+        api = mock.Mock()
+        api.repo_info.side_effect = [mock.Mock(sha="head-1"), mock.Mock(sha="head-2")]
+        api.list_repo_tree.side_effect = [
+            [
+                mock.Mock(path=syncer.manifest_filename, blob_id="manifest-1"),
+                mock.Mock(path=snapshot_name, blob_id="snapshot-1"),
+            ],
+            [
+                mock.Mock(path=syncer.manifest_filename, blob_id="manifest-2"),
+                mock.Mock(path=snapshot_name, blob_id="snapshot-1"),
+                mock.Mock(path=concurrent_delta, blob_id="delta-other"),
+                mock.Mock(path=delta_name, blob_id="delta-ours"),
+            ],
+        ]
+        api.create_commit.side_effect = RuntimeError("stale parent")
+        with mock.patch("huggingface_hub.HfApi", return_value=api), mock.patch(
+            "huggingface_hub.hf_hub_download",
+            side_effect=[str(base_path), str(concurrent_path)],
+        ):
+            result = syncer.upload(docs)
+
+        self.assertTrue(result["durable"])
+        self.assertFalse(result["uploaded"])
+        self.assertTrue(result["already_uploaded"])
+        self.assertEqual(api.create_commit.call_count, 1)
+        self.assertEqual(
+            [call.kwargs["parent_commit"] for call in api.create_commit.call_args_list],
+            ["head-1"],
+        )
+        self.assertEqual(concurrent_manifest["deltas"], [concurrent_delta, delta_name])
+        store.close()
+
+    def test_active_manifest_control_upload_is_one_atomic_commit(self):
+        from service.server import SnapshotSync
+
+        store = Store(self.tmp.name)
+        os.environ.update(
+            FUNES_STORAGE_REPO="owner/private",
+            FUNES_STORAGE_KEY="test-storage-key",
+            HF_TOKEN="hf-test",
+        )
+        syncer = SnapshotSync(store)
+        snapshot_name = "funes-snapshot.jsonl.gz.enc"
+        manifest = {
+            "version": 1,
+            "snapshot": snapshot_name,
+            "deltas": ["funes-delta-existing.jsonl.gz.enc"],
+            "controls": [],
+        }
+        manifest_path = Path(self.tmp.name) / "control-manifest-head-1.json"
+        concurrent_path = Path(self.tmp.name) / "control-manifest-head-2.json"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        api = mock.Mock()
+        api.repo_info.side_effect = [mock.Mock(sha="head-1"), mock.Mock(sha="head-2")]
+        control = store.next_reindex_control("all")
+        control_digest = hashlib.sha256(
+            json.dumps(
+                control,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()[:16]
+        control_name = (
+            f"funes-reindex-{control['generation']:020d}-{control_digest}.jsonl.gz.enc"
+        )
+        concurrent_control = (
+            "funes-reindex-00000000000000000001-aaaaaaaaaaaaaaaa.jsonl.gz.enc"
+        )
+        concurrent_manifest = {
+            **manifest,
+            "controls": [concurrent_control],
+        }
+        concurrent_path.write_text(json.dumps(concurrent_manifest), encoding="utf-8")
+        api.list_repo_tree.side_effect = [
+            [
+                mock.Mock(path=syncer.manifest_filename, blob_id="manifest-1"),
+                mock.Mock(path=snapshot_name, blob_id="snapshot-1"),
+                mock.Mock(path=manifest["deltas"][0], blob_id="delta-1"),
+                mock.Mock(path=control_name, blob_id="control-ours"),
+            ],
+            [
+                mock.Mock(path=syncer.manifest_filename, blob_id="manifest-2"),
+                mock.Mock(path=snapshot_name, blob_id="snapshot-1"),
+                mock.Mock(path=manifest["deltas"][0], blob_id="delta-1"),
+                mock.Mock(path=concurrent_control, blob_id="control-other"),
+                mock.Mock(path=control_name, blob_id="control-ours"),
+            ],
+        ]
+        api.create_commit.side_effect = [RuntimeError("stale parent"), None]
+        with mock.patch("huggingface_hub.HfApi", return_value=api), mock.patch(
+            "huggingface_hub.hf_hub_download",
+            side_effect=[str(manifest_path), str(concurrent_path)],
+        ):
+            result = syncer.upload_reindex_control(control)
+
+        self.assertTrue(result["durable"])
+        api.upload_file.assert_not_called()
+        self.assertEqual(api.create_commit.call_count, 2)
+        self.assertEqual(
+            [call.kwargs["parent_commit"] for call in api.create_commit.call_args_list],
+            ["head-1", "head-2"],
+        )
+        operations = {
+            operation.path_in_repo: operation
+            for operation in api.create_commit.call_args_list[-1].kwargs["operations"]
+        }
+        self.assertEqual(
+            api.create_commit.call_args_list[-1].kwargs["parent_commit"], "head-2"
+        )
+        control_names = [
+            name for name in operations if name.startswith("funes-reindex-")
+        ]
+        self.assertEqual(control_names, [control_name])
+        self.assertEqual(set(operations), {control_names[0], syncer.manifest_filename})
+        updated = json.loads(operations[syncer.manifest_filename].path_or_fileobj)
+        self.assertEqual(updated["deltas"], manifest["deltas"])
+        self.assertEqual(updated["controls"], [concurrent_control, *control_names])
+        store.close()
+
+    def test_local_delta_and_control_commits_advance_covered_revision(self):
+        from service.server import SnapshotSync
+
+        store = Store(self.tmp.name)
+        store.ingest([{"source_identity": "local", "raw_text": "local delta"}])
+        docs = store.get_many(["local"])
+        os.environ.update(
+            FUNES_STORAGE_REPO="owner/private",
+            FUNES_STORAGE_KEY="test-storage-key",
+            HF_TOKEN="hf-test",
+        )
+        syncer = SnapshotSync(store)
+        syncer.covered_revision = "head-1"
+        durable_docs = [*docs, store.native_index_state_record()]
+        digest = hashlib.sha256(
+            json.dumps(
+                durable_docs,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()[:24]
+        delta_name = f"funes-delta-{digest}.jsonl.gz.enc"
+        snapshot_name = "funes-snapshot.jsonl.gz.enc"
+        base_manifest = {
+            "version": 1,
+            "snapshot": snapshot_name,
+            "deltas": [],
+            "controls": [],
+        }
+        delta_manifest = {**base_manifest, "deltas": [delta_name]}
+        base_path = Path(self.tmp.name) / "coverage-head-1.json"
+        delta_path = Path(self.tmp.name) / "coverage-head-2.json"
+        base_path.write_text(json.dumps(base_manifest), encoding="utf-8")
+        delta_path.write_text(json.dumps(delta_manifest), encoding="utf-8")
+        api = mock.Mock()
+        api.repo_info.side_effect = [mock.Mock(sha="head-1"), mock.Mock(sha="head-2")]
+        api.list_repo_tree.side_effect = [
+            [
+                mock.Mock(path=syncer.manifest_filename, blob_id="manifest-1"),
+                mock.Mock(path=snapshot_name, blob_id="snapshot-1"),
+            ],
+            [
+                mock.Mock(path=syncer.manifest_filename, blob_id="manifest-2"),
+                mock.Mock(path=snapshot_name, blob_id="snapshot-1"),
+                mock.Mock(path=delta_name, blob_id="delta-local"),
+            ],
+        ]
+        api.create_commit.side_effect = [mock.Mock(oid="head-2"), mock.Mock(oid="head-3")]
+        with mock.patch("huggingface_hub.HfApi", return_value=api), mock.patch(
+            "huggingface_hub.hf_hub_download",
+            side_effect=[str(base_path), str(delta_path)],
+        ):
+            delta_result = syncer.upload(docs)
+            self.assertEqual(syncer.covered_revision, "head-2")
+            control_result = syncer.upload_reindex_control(
+                store.next_reindex_control("all")
+            )
+
+        self.assertTrue(delta_result["durable"])
+        self.assertTrue(control_result["durable"])
+        self.assertEqual(syncer.covered_revision, "head-3")
+        store.close()
+
     def test_existing_content_addressed_delta_is_durable_without_reupload(self):
         from service.server import SnapshotSync
         store = Store(self.tmp.name)
@@ -1759,6 +4432,8 @@ class ServiceTests(unittest.TestCase):
             HF_TOKEN="hf-test",
         )
         api = mock.Mock()
+        api.repo_info.return_value.sha = "head-1"
+        api.list_repo_tree.return_value = []
         api.file_exists.return_value = True
         module = mock.Mock(HfApi=mock.Mock(return_value=api))
         syncer = SnapshotSync(store)
@@ -1817,8 +4492,14 @@ class ServiceTests(unittest.TestCase):
         target_dir = tempfile.TemporaryDirectory()
         target = Store(target_dir.name)
         reader = SnapshotSync(target)
+        prefetch = target.data_dir / "remote"
+        prefetch.mkdir(parents=True)
+        prefetched_encrypted = prefetch / encrypted.name
+        prefetched_encrypted.write_bytes(encrypted.read_bytes())
+        reader._restore_prefetch_root = prefetch
         with mock.patch(
-            "huggingface_hub.hf_hub_download", return_value=str(encrypted)
+            "huggingface_hub.hf_hub_download",
+            side_effect=AssertionError("prefetched restore must not download twice"),
         ):
             self.assertEqual(reader._restore_file(encrypted.name), 1)
         self.assertEqual(target.get("restore-one")["raw_text"], "encrypted restore")
@@ -1837,6 +4518,1171 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(result["reason"], "restore_failed")
         store.close()
 
+
+
+    def test_delta_target_shards_deterministically_by_digest_prefix(self):
+        from service.server import SnapshotSync
+
+        store = Store(self.tmp.name)
+        syncer = SnapshotSync(store)
+        digest = "4a1b2c3d4e5f60718293a4b5"
+        self.assertEqual(
+            syncer.delta_target(digest),
+            "deltas/4a/funes-delta-4a1b2c3d4e5f60718293a4b5.jsonl.gz.enc",
+        )
+
+        with mock.patch.dict(os.environ, {"FUNES_DELTA_DIR": "archive/deltas", "FUNES_DELTA_PREFIX": "custom-delta-"}):
+            custom_syncer = SnapshotSync(store)
+            self.assertEqual(
+                custom_syncer.delta_target(digest),
+                "archive/deltas/4a/custom-delta-4a1b2c3d4e5f60718293a4b5.jsonl.gz.enc",
+            )
+
+        with mock.patch.dict(os.environ, {"FUNES_DELTA_DIR": ""}):
+            unsharded_syncer = SnapshotSync(store)
+            self.assertEqual(
+                unsharded_syncer.delta_target(digest),
+                "funes-delta-4a1b2c3d4e5f60718293a4b5.jsonl.gz.enc",
+            )
+        store.close()
+
+    def test_sharded_delta_deduplication_recognizes_legacy_root_deltas(self):
+        from service.server import SnapshotSync
+
+        store = Store(self.tmp.name)
+        store.ingest([{"source_identity": "legacy-dedupe", "raw_text": "text"}])
+        docs = store.get_many(["legacy-dedupe"])
+        os.environ.update(
+            FUNES_STORAGE_REPO="owner/private",
+            FUNES_STORAGE_KEY="test-storage-key",
+            HF_TOKEN="hf-test",
+        )
+        syncer = SnapshotSync(store)
+        durable_docs = [*docs, store.native_index_state_record()]
+        digest = hashlib.sha256(
+            json.dumps(
+                durable_docs,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()[:24]
+        legacy_delta = f"funes-delta-{digest}.jsonl.gz.enc"
+        sharded_delta = syncer.delta_target(digest)
+        self.assertNotEqual(legacy_delta, sharded_delta)
+
+        manifest = {
+            "version": 1,
+            "snapshot": "funes-snapshot.jsonl.gz.enc",
+            "deltas": [legacy_delta],
+            "controls": [],
+        }
+        manifest_path = Path(self.tmp.name) / "manifest-legacy-dedupe.json"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+        api = mock.Mock()
+        api.repo_info.return_value = mock.Mock(sha="head-1")
+        api.list_repo_tree.return_value = [
+            mock.Mock(path=syncer.manifest_filename, blob_id="m-1"),
+            mock.Mock(path="funes-snapshot.jsonl.gz.enc", blob_id="s-1"),
+            mock.Mock(path=legacy_delta, blob_id="d-1"),
+        ]
+        with mock.patch("huggingface_hub.HfApi", return_value=api), mock.patch(
+            "huggingface_hub.hf_hub_download", return_value=str(manifest_path)
+        ):
+            result = syncer.upload(docs)
+
+        self.assertTrue(result["durable"])
+        self.assertTrue(result["already_uploaded"])
+        self.assertFalse(result["uploaded"])
+        api.create_commit.assert_not_called()
+        api.upload_file.assert_not_called()
+        store.close()
+
+    def test_repo_files_orders_legacy_root_deltas_before_sharded_deltas_without_manifest(self):
+        from service.server import SnapshotSync
+
+        store = Store(self.tmp.name)
+        syncer = SnapshotSync(store)
+        syncer.repo = "owner/private"
+        syncer.token = "test-token"
+        repo_files = [
+            "funes-snapshot.jsonl.gz.enc",
+            "deltas/0b/funes-delta-0b2.jsonl.gz.enc",
+            "funes-delta-z.jsonl.gz.enc",
+            "deltas/0a/funes-delta-0a1.jsonl.gz.enc",
+            "funes-delta-a.jsonl.gz.enc",
+            "funes-reindex-0001.jsonl.gz.enc",
+            "deltas/invalid-not-three-parts.jsonl.gz.enc",
+            "other_dir/0a/funes-delta-0a1.jsonl.gz.enc",
+        ]
+        api = mock.Mock()
+        api.repo_info.return_value = mock.Mock(sha="head-1")
+        api.list_repo_tree.return_value = [mock.Mock(path=p) for p in repo_files]
+        with mock.patch("huggingface_hub.HfApi", return_value=api):
+            files = syncer._repo_files()
+
+        self.assertEqual(
+            files,
+            [
+                "funes-snapshot.jsonl.gz.enc",
+                "funes-delta-a.jsonl.gz.enc",
+                "funes-delta-z.jsonl.gz.enc",
+                "deltas/0a/funes-delta-0a1.jsonl.gz.enc",
+                "deltas/0b/funes-delta-0b2.jsonl.gz.enc",
+                "funes-reindex-0001.jsonl.gz.enc",
+            ],
+        )
+        store.close()
+
+    def test_restore_roundtrip_mixed_snapshot_legacy_and_sharded_deltas(self):
+        from service.server import SnapshotSync
+
+        os.environ["FUNES_STORAGE_KEY"] = "test-storage-key"
+        source_dir = tempfile.TemporaryDirectory()
+        source = Store(source_dir.name)
+        source.ingest([{"source_identity": "doc-snapshot", "raw_text": "from snapshot"}])
+        source.ingest([{"source_identity": "doc-legacy", "raw_text": "from legacy delta"}])
+        source.ingest([{"source_identity": "doc-sharded", "raw_text": "from sharded delta"}])
+
+        syncer_writer = SnapshotSync(source)
+        artifacts_dir = Path(self.tmp.name) / "mixed-restore-artifacts"
+        artifacts_dir.mkdir(parents=True, exist_ok=True)
+
+        # 1. Snapshot
+        snapshot_plain = artifacts_dir / "funes-snapshot.jsonl.gz"
+        snapshot_enc = artifacts_dir / "funes-snapshot.jsonl.gz.enc"
+        syncer_writer._write_jsonl_gzip(source.get_many(["doc-snapshot"]), snapshot_plain)
+        syncer_writer._encrypt_file(snapshot_plain, snapshot_enc)
+
+        # 2. Legacy delta
+        legacy_plain = artifacts_dir / "funes-delta-legacy.jsonl.gz"
+        legacy_enc = artifacts_dir / "funes-delta-legacy.jsonl.gz.enc"
+        syncer_writer._write_jsonl_gzip(source.get_many(["doc-legacy"]), legacy_plain)
+        syncer_writer._encrypt_file(legacy_plain, legacy_enc)
+
+        # 3. Sharded delta
+        sharded_dir = artifacts_dir / "deltas" / "3f"
+        sharded_dir.mkdir(parents=True, exist_ok=True)
+        sharded_plain = sharded_dir / "funes-delta-3f123.jsonl.gz"
+        sharded_enc = sharded_dir / "funes-delta-3f123.jsonl.gz.enc"
+        syncer_writer._write_jsonl_gzip(source.get_many(["doc-sharded"]), sharded_plain)
+        syncer_writer._encrypt_file(sharded_plain, sharded_enc)
+
+        # Restore target
+        target_dir = tempfile.TemporaryDirectory()
+        target = Store(target_dir.name)
+        syncer_reader = SnapshotSync(target)
+        syncer_reader.repo = "owner/private"
+        syncer_reader.token = "test-token"
+
+        manifest = {
+            "version": 1,
+            "snapshot": "funes-snapshot.jsonl.gz.enc",
+            "deltas": [
+                "funes-delta-legacy.jsonl.gz.enc",
+                "deltas/3f/funes-delta-3f123.jsonl.gz.enc",
+            ],
+            "controls": [],
+        }
+        manifest_path = artifacts_dir / syncer_reader.manifest_filename
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+        api = mock.Mock()
+        api.repo_info.return_value = mock.Mock(sha="head-1")
+        api.list_repo_tree.return_value = [
+            mock.Mock(path=syncer_reader.manifest_filename),
+            mock.Mock(path=manifest["snapshot"]),
+            mock.Mock(path=manifest["deltas"][0]),
+            mock.Mock(path=manifest["deltas"][1]),
+        ]
+
+        def fake_download(**kwargs):
+            return str(artifacts_dir / kwargs["filename"])
+
+        with mock.patch("huggingface_hub.HfApi", return_value=api), mock.patch(
+            "huggingface_hub.hf_hub_download", side_effect=fake_download
+        ):
+            restored_count = syncer_reader.restore()
+
+        self.assertEqual(restored_count, 3)
+        self.assertEqual(target.get("doc-snapshot")["raw_text"], "from snapshot")
+        self.assertEqual(target.get("doc-legacy")["raw_text"], "from legacy delta")
+        self.assertEqual(target.get("doc-sharded")["raw_text"], "from sharded delta")
+
+        source.close(); source_dir.cleanup()
+        target.close(); target_dir.cleanup()
+
+    def test_sharded_manifest_validation_rejects_traversal_and_malformed_deltas(self):
+        from service.server import SnapshotSync
+
+        store = Store(self.tmp.name)
+        syncer = SnapshotSync(store)
+        repo_files = {
+            "funes-snapshot.jsonl.gz.enc",
+            "deltas/ab/funes-delta-ab12.jsonl.gz.enc",
+        }
+        # Valid sharded delta passes
+        valid_manifest = {
+            "version": 1,
+            "snapshot": "funes-snapshot.jsonl.gz.enc",
+            "deltas": ["deltas/ab/funes-delta-ab12.jsonl.gz.enc"],
+            "controls": [],
+        }
+        validated = syncer._validate_restore_manifest(valid_manifest, repo_files)
+        self.assertEqual(validated["deltas"], ["deltas/ab/funes-delta-ab12.jsonl.gz.enc"])
+
+        # Path traversal fails
+        with self.assertRaises(ValueError):
+            syncer._validate_restore_manifest(
+                {**valid_manifest, "deltas": ["../deltas/ab/funes-delta-ab12.jsonl.gz.enc"]},
+                repo_files,
+            )
+        # Slashes traversal
+        with self.assertRaises(ValueError):
+            syncer._validate_restore_manifest(
+                {**valid_manifest, "deltas": ["deltas/../funes-delta-ab12.jsonl.gz.enc"]},
+                repo_files,
+            )
+        # Bad prefix under deltas/
+        with self.assertRaises(ValueError):
+            syncer._validate_restore_manifest(
+                {**valid_manifest, "deltas": ["deltas/ab/wrong-prefix.jsonl.gz.enc"]},
+                repo_files,
+            )
+        store.close()
+
+
+    def test_compaction_retains_concurrent_sharded_deltas(self):
+        from service.server import SnapshotSync
+
+        store = Store(self.tmp.name)
+        os.environ.update(
+            FUNES_STORAGE_REPO="owner/private",
+            FUNES_STORAGE_KEY="test-storage-key",
+            HF_TOKEN="hf-test",
+        )
+        syncer = SnapshotSync(store)
+        syncer.covered_revision = "head-1"
+        snapshot_name = "funes-snapshot.jsonl.gz.enc"
+        base_delta = "funes-delta-base.jsonl.gz.enc"
+        sharded_concurrent_delta = "deltas/ab/funes-delta-ab1234567890123456789012.jsonl.gz.enc"
+        base_manifest = {
+            "version": 1,
+            "snapshot": snapshot_name,
+            "deltas": [base_delta],
+            "controls": [],
+        }
+        concurrent_manifest = {
+            **base_manifest,
+            "deltas": [base_delta, sharded_concurrent_delta],
+        }
+        base_path = Path(self.tmp.name) / "compact-shard-head-1.json"
+        concurrent_path = Path(self.tmp.name) / "compact-shard-head-2.json"
+        base_path.write_text(json.dumps(base_manifest), encoding="utf-8")
+        concurrent_path.write_text(json.dumps(concurrent_manifest), encoding="utf-8")
+        api = mock.Mock()
+        api.repo_info.side_effect = [mock.Mock(sha="head-1"), mock.Mock(sha="head-2")]
+        api.list_repo_tree.side_effect = [
+            [
+                mock.Mock(path=syncer.manifest_filename, blob_id="manifest-1"),
+                mock.Mock(path=snapshot_name, blob_id="snapshot-1"),
+                mock.Mock(path=base_delta, blob_id="delta-base"),
+            ],
+            [
+                mock.Mock(path=syncer.manifest_filename, blob_id="manifest-2"),
+                mock.Mock(path=snapshot_name, blob_id="snapshot-1"),
+                mock.Mock(path=base_delta, blob_id="delta-base"),
+                mock.Mock(path=sharded_concurrent_delta, blob_id="delta-sharded"),
+            ],
+        ]
+        api.create_commit.side_effect = [
+            RuntimeError("stale parent"),
+            mock.Mock(oid="head-3"),
+        ]
+        with mock.patch("huggingface_hub.HfApi", return_value=api), mock.patch(
+            "huggingface_hub.hf_hub_download",
+            side_effect=[str(base_path), str(concurrent_path)],
+        ):
+            result = syncer.upload()
+
+        self.assertTrue(result["durable"])
+        operations = {
+            operation.path_in_repo: operation
+            for operation in api.create_commit.call_args_list[-1].kwargs["operations"]
+        }
+        manifest = json.loads(operations[syncer.manifest_filename].path_or_fileobj)
+        self.assertEqual(manifest["snapshot"], snapshot_name)
+        self.assertEqual(manifest["deltas"], [sharded_concurrent_delta])
+        store.close()
+
+    def test_unmanifested_existing_legacy_delta_is_durable_without_reupload(self):
+        from service.server import SnapshotSync
+
+        store = Store(self.tmp.name)
+        store.ingest([{"source_identity": "legacy-nomani", "raw_text": "text"}])
+        os.environ.update(
+            FUNES_STORAGE_REPO="owner/private",
+            FUNES_STORAGE_KEY="test-storage-key",
+            HF_TOKEN="hf-test",
+        )
+        docs = store.get_many(["legacy-nomani"])
+        syncer = SnapshotSync(store)
+        durable_docs = [*docs, store.native_index_state_record()]
+        digest = hashlib.sha256(
+            json.dumps(
+                durable_docs,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()[:24]
+        legacy_delta = f"funes-delta-{digest}.jsonl.gz.enc"
+        sharded_delta = syncer.delta_target(digest)
+
+        api = mock.Mock()
+        api.repo_info.return_value = mock.Mock(sha="head-1")
+        api.list_repo_tree.return_value = []
+        # Sharded target does not exist, but legacy target exists
+        def fake_file_exists(repo_id, filename, repo_type, revision, token):
+            return filename == legacy_delta
+
+        api.file_exists.side_effect = fake_file_exists
+        module = mock.Mock(HfApi=mock.Mock(return_value=api))
+        with mock.patch.dict("sys.modules", {"huggingface_hub": module}):
+            result = syncer.upload(docs)
+
+        self.assertTrue(result["durable"])
+        self.assertTrue(result["already_uploaded"])
+        api.upload_file.assert_not_called()
+        self.assertFalse(list(Path(self.tmp.name).glob("funes-delta-*.jsonl.gz")))
+        store.close()
+
+
+    def test_arbitrary_delta_dir_prefix_sharding_and_manifest_validation(self):
+        from service.server import SnapshotSync
+
+        store = Store(self.tmp.name)
+        with mock.patch.dict(
+            os.environ,
+            {
+                "FUNES_DELTA_DIR": "archive/nested/deltas",
+                "FUNES_DELTA_PREFIX": "funes-delta-",
+            },
+        ):
+            syncer = SnapshotSync(store)
+            self.assertEqual(syncer.delta_dir, "archive/nested/deltas")
+            digest = "ab1234567890abcdef123456"
+            target = syncer.delta_target(digest)
+            self.assertEqual(
+                target,
+                "archive/nested/deltas/ab/funes-delta-ab1234567890abcdef123456.jsonl.gz.enc",
+            )
+            # Accepts configured multi-level directory
+            self.assertTrue(syncer._is_delta_name(target))
+            # Accepts canonical deltas/ fallback
+            self.assertTrue(
+                syncer._is_delta_name(
+                    "deltas/ab/funes-delta-ab1234567890abcdef123456.jsonl.gz.enc"
+                )
+            )
+            # Accepts legacy root delta fallback
+            self.assertTrue(
+                syncer._is_delta_name(
+                    "funes-delta-ab1234567890abcdef123456.jsonl.gz.enc"
+                )
+            )
+            # Fails on path traversal
+            self.assertFalse(
+                syncer._is_delta_name(
+                    "archive/nested/deltas/../other/ab/funes-delta-ab.jsonl.gz.enc"
+                )
+            )
+            # Fails on unmatched directory
+            self.assertFalse(
+                syncer._is_delta_name(
+                    "other/nested/deltas/ab/funes-delta-ab.jsonl.gz.enc"
+                )
+            )
+            # Fails on insufficient segments
+            self.assertFalse(
+                syncer._is_delta_name(
+                    "archive/nested/deltas/funes-delta-ab.jsonl.gz.enc"
+                )
+            )
+
+            # Manifest validation accepts multi-level sharded delta alongside legacy root
+            manifest = {
+                "version": 1,
+                "snapshot": "funes-snapshot.jsonl.gz.enc",
+                "deltas": [
+                    "funes-delta-legacy.jsonl.gz.enc",
+                    target,
+                ],
+                "controls": [],
+            }
+            repo_files = {
+                syncer.manifest_filename,
+                manifest["snapshot"],
+                *manifest["deltas"],
+            }
+            validated = syncer._validate_restore_manifest(manifest, repo_files)
+            self.assertEqual(validated["deltas"], manifest["deltas"])
+
+            # _repo_files fallback orders legacy root deltas before multi-level sharded deltas
+            syncer.repo = "owner/private"
+            syncer.token = "test-token"
+            api = mock.Mock()
+            api.repo_info.return_value = mock.Mock(sha="head-1")
+            api.list_repo_tree.return_value = [
+                mock.Mock(path=manifest["snapshot"]),
+                mock.Mock(path=target),
+                mock.Mock(path="funes-delta-legacy.jsonl.gz.enc"),
+            ]
+            with mock.patch("huggingface_hub.HfApi", return_value=api):
+                ordered = syncer._repo_files()
+            self.assertEqual(
+                ordered,
+                [
+                    "funes-snapshot.jsonl.gz.enc",
+                    "funes-delta-legacy.jsonl.gz.enc",
+                    target,
+                ],
+            )
+        store.close()
+
+    def test_restore_checkpoint_filename_security(self):
+        from service.server import SnapshotSync
+
+        store = Store(self.tmp.name)
+        for bad in (
+            "../checkpoint.json",
+            "/tmp/bad.json",
+            "sub/cp.json",
+            "..",
+        ):
+            with mock.patch.dict(os.environ, {"FUNES_RESTORE_CHECKPOINT_FILE": bad}):
+                with self.assertRaises(ValueError):
+                    SnapshotSync(store)
+        self.assertFalse(SnapshotSync._safe_repo_filename("cp\x00.json"))
+
+        syncer = SnapshotSync(store)
+        syncer.restore_checkpoint_filename = "../escape.json"
+        with self.assertRaises(ValueError):
+            _ = syncer.restore_checkpoint_path
+        store.close()
+
+    def test_restore_checkpoint_lifecycle_and_resume_skip(self):
+        from service.server import SnapshotSync
+
+        store = Store(self.tmp.name)
+        syncer = SnapshotSync(store)
+        syncer.repo = "owner/private"
+        syncer.token = "test-token"
+        files = [
+            "funes-snapshot.jsonl.gz.enc",
+            "funes-delta-1.jsonl.gz.enc",
+            "funes-delta-2.jsonl.gz.enc",
+        ]
+        manifest = {
+            "version": 1,
+            "snapshot": "funes-snapshot.jsonl.gz.enc",
+            "deltas": ["funes-delta-1.jsonl.gz.enc", "funes-delta-2.jsonl.gz.enc"],
+            "controls": [],
+        }
+        revision = "sha-rev-1"
+        restored_files = []
+
+        def mock_restore_file(filename):
+            restored_files.append(filename)
+            return 1
+
+        checkpoint_path = syncer.restore_checkpoint_path
+        syncer._record_restore_checkpoint(
+            revision,
+            manifest,
+            files,
+            ["funes-snapshot.jsonl.gz.enc", "funes-delta-1.jsonl.gz.enc"],
+        )
+        self.assertTrue(checkpoint_path.is_file())
+
+        with mock.patch.object(
+            syncer, "_repo_files_metadata", return_value=(files, manifest, revision)
+        ), mock.patch.object(
+            syncer, "_prefetch_restore_files", return_value=None
+        ), mock.patch.object(
+            syncer, "_restore_file", side_effect=mock_restore_file
+        ):
+            result = syncer.restore()
+
+        self.assertEqual(result, 1)
+        self.assertEqual(restored_files, ["funes-delta-2.jsonl.gz.enc"])
+        self.assertFalse(checkpoint_path.exists())
+        self.assertFalse(syncer.restore_failed)
+        self.assertIsNone(syncer.restore_error)
+        store.close()
+
+    def test_restore_checkpoint_retained_on_failure_and_resumed(self):
+        from service.server import SnapshotSync
+
+        store = Store(self.tmp.name)
+        syncer = SnapshotSync(store)
+        syncer.repo = "owner/private"
+        syncer.token = "test-token"
+        files = [
+            "funes-snapshot.jsonl.gz.enc",
+            "funes-delta-fail.jsonl.gz.enc",
+            "funes-delta-last.jsonl.gz.enc",
+        ]
+        revision = "sha-fail-1"
+        restored_calls = []
+
+        def mock_restore_fail(filename):
+            restored_calls.append(filename)
+            if filename == "funes-delta-fail.jsonl.gz.enc":
+                raise RuntimeError("simulated download failure")
+            return 10
+
+        with mock.patch.object(
+            syncer, "_repo_files_metadata", return_value=(files, None, revision)
+        ), mock.patch.object(
+            syncer, "_prefetch_restore_files", return_value=None
+        ), mock.patch.object(
+            syncer, "_restore_file", side_effect=mock_restore_fail
+        ):
+            res1 = syncer.restore()
+
+        self.assertEqual(res1, -1)
+        self.assertTrue(syncer.restore_failed)
+        self.assertEqual(syncer.restore_error, "RuntimeError")
+        self.assertEqual(
+            restored_calls,
+            ["funes-snapshot.jsonl.gz.enc", "funes-delta-fail.jsonl.gz.enc"],
+        )
+
+        checkpoint_path = syncer.restore_checkpoint_path
+        self.assertTrue(checkpoint_path.is_file())
+        saved_checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+        self.assertEqual(saved_checkpoint["completed"], ["funes-snapshot.jsonl.gz.enc"])
+
+        restored_calls.clear()
+
+        def mock_restore_success(filename):
+            restored_calls.append(filename)
+            return 5
+
+        with mock.patch.object(
+            syncer, "_repo_files_metadata", return_value=(files, None, revision)
+        ), mock.patch.object(
+            syncer, "_prefetch_restore_files", return_value=None
+        ), mock.patch.object(
+            syncer, "_restore_file", side_effect=mock_restore_success
+        ):
+            res2 = syncer.restore()
+
+        self.assertEqual(res2, 10)
+        self.assertEqual(
+            restored_calls,
+            ["funes-delta-fail.jsonl.gz.enc", "funes-delta-last.jsonl.gz.enc"],
+        )
+        self.assertFalse(checkpoint_path.exists())
+        self.assertFalse(syncer.restore_failed)
+        self.assertIsNone(syncer.restore_error)
+        store.close()
+
+    def test_restore_checkpoint_strict_completed_prefix_validation(self):
+        from service.server import SnapshotSync
+
+        store = Store(self.tmp.name)
+        syncer = SnapshotSync(store)
+        files = ["snap.enc", "delta-1.enc", "delta-2.enc"]
+        revision = "rev-strict"
+        manifest = None
+        checkpoint_path = syncer.restore_checkpoint_path
+
+        def write_cp(completed):
+            syncer._record_restore_checkpoint(revision, manifest, files, completed)
+
+        # Exact prefix match: valid
+        write_cp(["snap.enc", "delta-1.enc"])
+        self.assertEqual(
+            syncer._load_restore_checkpoint(revision, manifest, files),
+            {"snap.enc", "delta-1.enc"},
+        )
+
+        # Gap in sequence (not a prefix)
+        write_cp(["snap.enc", "delta-2.enc"])
+        self.assertEqual(
+            syncer._load_restore_checkpoint(revision, manifest, files), set()
+        )
+
+        # Out of order
+        write_cp(["delta-1.enc", "snap.enc"])
+        self.assertEqual(
+            syncer._load_restore_checkpoint(revision, manifest, files), set()
+        )
+
+        # Missing first item
+        write_cp(["delta-1.enc"])
+        self.assertEqual(
+            syncer._load_restore_checkpoint(revision, manifest, files), set()
+        )
+
+        # Duplicate entries
+        data = {
+            "version": 1,
+            "revision": revision,
+            "manifest_digest": None,
+            "files_digest": syncer._canonical_digest(files),
+            "files": files,
+            "completed": ["snap.enc", "snap.enc"],
+        }
+        checkpoint_path.write_text(json.dumps(data), encoding="utf-8")
+        self.assertEqual(
+            syncer._load_restore_checkpoint(revision, manifest, files), set()
+        )
+
+        # Non-string entries
+        data["completed"] = ["snap.enc", 123]
+        checkpoint_path.write_text(json.dumps(data), encoding="utf-8")
+        self.assertEqual(
+            syncer._load_restore_checkpoint(revision, manifest, files), set()
+        )
+
+        # Completed longer than files
+        data["completed"] = ["snap.enc", "delta-1.enc", "delta-2.enc", "extra.enc"]
+        checkpoint_path.write_text(json.dumps(data), encoding="utf-8")
+        self.assertEqual(
+            syncer._load_restore_checkpoint(revision, manifest, files), set()
+        )
+        store.close()
+
+    def test_restore_checkpoint_metadata_invalidation(self):
+        from service.server import SnapshotSync
+
+        store = Store(self.tmp.name)
+        syncer = SnapshotSync(store)
+        files = ["snap.enc", "delta-1.enc"]
+        manifest = {
+            "version": 1,
+            "snapshot": "snap.enc",
+            "deltas": ["delta-1.enc"],
+            "controls": [],
+        }
+        revision = "rev-1"
+
+        syncer._record_restore_checkpoint(revision, manifest, files, ["snap.enc"])
+
+        # Matches initially
+        self.assertEqual(
+            syncer._load_restore_checkpoint(revision, manifest, files),
+            {"snap.enc"},
+        )
+
+        # Changed revision
+        self.assertEqual(
+            syncer._load_restore_checkpoint("rev-2", manifest, files),
+            set(),
+        )
+
+        # Changed manifest content
+        other_manifest = dict(manifest, deltas=["delta-2.enc"])
+        self.assertEqual(
+            syncer._load_restore_checkpoint(revision, other_manifest, files),
+            set(),
+        )
+
+        # None manifest vs dict manifest
+        self.assertEqual(
+            syncer._load_restore_checkpoint(revision, None, files),
+            set(),
+        )
+
+        # Changed files list
+        other_files = ["snap.enc", "delta-2.enc"]
+        self.assertEqual(
+            syncer._load_restore_checkpoint(revision, manifest, other_files),
+            set(),
+        )
+        store.close()
+
+    def test_restore_checkpoint_corrupted_json_or_invalid_schema(self):
+        from service.server import SnapshotSync
+
+        store = Store(self.tmp.name)
+        syncer = SnapshotSync(store)
+        checkpoint_path = syncer.restore_checkpoint_path
+        files = ["snap.enc"]
+        revision = "rev-1"
+
+        # Not a file
+        self.assertEqual(syncer._load_restore_checkpoint(revision, None, files), set())
+
+        # Corrupted JSON syntax
+        checkpoint_path.write_text("{malformed json: true", encoding="utf-8")
+        self.assertEqual(syncer._load_restore_checkpoint(revision, None, files), set())
+
+        # Non-dict JSON (e.g. list, string, number)
+        checkpoint_path.write_text("[1, 2, 3]", encoding="utf-8")
+        self.assertEqual(syncer._load_restore_checkpoint(revision, None, files), set())
+        checkpoint_path.write_text('"checkpoint"', encoding="utf-8")
+        self.assertEqual(syncer._load_restore_checkpoint(revision, None, files), set())
+
+        # Version mismatch
+        checkpoint_path.write_text(
+            json.dumps({"version": 2, "revision": revision}), encoding="utf-8"
+        )
+        self.assertEqual(syncer._load_restore_checkpoint(revision, None, files), set())
+
+        # Missing digests
+        checkpoint_path.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "revision": revision,
+                    "files": files,
+                    "completed": files,
+                }
+            ),
+            encoding="utf-8",
+        )
+        self.assertEqual(syncer._load_restore_checkpoint(revision, None, files), set())
+        store.close()
+
+    def test_restore_checkpoint_nested_delta(self):
+        from service.server import SnapshotSync
+
+        store = Store(self.tmp.name)
+        syncer = SnapshotSync(store)
+        syncer.repo = "owner/private"
+        syncer.token = "test-token"
+        nested_files = [
+            "funes-snapshot.jsonl.gz.enc",
+            "deltas/4a/funes-delta-4a1b2c3d.jsonl.gz.enc",
+            "deltas/8f/funes-delta-8f9e0a1b.jsonl.gz.enc",
+        ]
+        manifest = {
+            "version": 1,
+            "snapshot": nested_files[0],
+            "deltas": nested_files[1:],
+            "controls": [],
+        }
+        revision = "rev-nested"
+        restored_files = []
+
+        def mock_restore_file(filename):
+            restored_files.append(filename)
+            return 1
+
+        # Record checkpoint with first two (snapshot + 1st nested delta)
+        syncer._record_restore_checkpoint(
+            revision,
+            manifest,
+            nested_files,
+            nested_files[:2],
+        )
+        self.assertEqual(
+            syncer._load_restore_checkpoint(revision, manifest, nested_files),
+            set(nested_files[:2]),
+        )
+
+        with mock.patch.object(
+            syncer,
+            "_repo_files_metadata",
+            return_value=(nested_files, manifest, revision),
+        ), mock.patch.object(
+            syncer, "_prefetch_restore_files", return_value=None
+        ), mock.patch.object(
+            syncer, "_restore_file", side_effect=mock_restore_file
+        ):
+            result = syncer.restore()
+
+        self.assertEqual(result, 1)
+        self.assertEqual(restored_files, [nested_files[2]])
+        self.assertFalse(syncer.restore_checkpoint_path.exists())
+        store.close()
+
+    def test_sync_endpoint_rejects_during_restoring_and_restore_failed(self):
+        app = mock.Mock()
+        app.store = Store(self.tmp.name)
+        app.syncer = mock.Mock()
+        app.syncer.restoring = True
+        app.syncer.restore_failed = False
+        app.syncer.upload = mock.Mock(return_value={"uploaded": True, "durable": True})
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(app))
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            # While restoring: 503 restore_in_progress
+            status, body = self._request(server, "POST", "/sync", {})
+            self.assertEqual(status, 503)
+            self.assertEqual(body, {"error": "restore_in_progress", "durable": False})
+            self.assertEqual(app.syncer.upload.call_count, 0)
+
+            # When restore_failed: 503 restore_failed
+            app.syncer.restoring = False
+            app.syncer.restore_failed = True
+            status, body = self._request(server, "POST", "/sync", {})
+            self.assertEqual(status, 503)
+            self.assertEqual(body, {"error": "restore_failed", "durable": False})
+            self.assertEqual(app.syncer.upload.call_count, 0)
+
+            # When healthy: 200 upload called
+            app.syncer.restore_failed = False
+            status, body = self._request(server, "POST", "/sync", {})
+            self.assertEqual(status, 200)
+            self.assertEqual(body, {"uploaded": True, "durable": True})
+            self.assertEqual(app.syncer.upload.call_count, 1)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+            app.store.close()
+
+    def test_restore_holds_upload_lock_against_concurrent_upload(self):
+        import time
+        from service.server import SnapshotSync
+
+        store = Store(self.tmp.name)
+        syncer = SnapshotSync(store)
+        syncer.repo = "owner/private"
+        syncer.token = "test-token"
+
+        files = ["snap.enc", "delta-1.enc"]
+        restore_started = threading.Event()
+        proceed_restore = threading.Event()
+        upload_attempted = threading.Event()
+        upload_finished = threading.Event()
+
+        def slow_restore_file(filename):
+            restore_started.set()
+            upload_attempted.wait(timeout=2)
+            proceed_restore.wait(timeout=2)
+            return 1
+
+        api = mock.Mock()
+        api.repo_info.return_value = mock.Mock(sha="rev-lock")
+        api.list_repo_tree.return_value = []
+
+        with mock.patch.object(
+            syncer, "_repo_files_metadata", return_value=(files, None, "rev-lock")
+        ), mock.patch.object(
+            syncer, "_prefetch_restore_files", return_value=None
+        ), mock.patch.object(
+            syncer, "_restore_file", side_effect=slow_restore_file
+        ), mock.patch.object(
+            syncer, "_encryption_key", return_value=b"0" * 32
+        ), mock.patch(
+            "huggingface_hub.HfApi", return_value=api
+        ):
+            restore_thread = threading.Thread(target=syncer.restore)
+            restore_thread.start()
+
+            restore_started.wait(timeout=2)
+
+            lock_acquired_by_main = syncer.upload_lock.acquire(blocking=False)
+            self.assertFalse(
+                lock_acquired_by_main,
+                "Main thread should not acquire upload_lock while restore holds it",
+            )
+
+            def run_upload():
+                upload_attempted.set()
+                syncer.upload()
+                upload_finished.set()
+
+            upload_thread = threading.Thread(target=run_upload)
+            upload_thread.start()
+
+            upload_attempted.wait(timeout=2)
+            time.sleep(0.05)
+            self.assertFalse(
+                upload_finished.is_set(),
+                "Upload should be blocked while restore holds upload_lock",
+            )
+
+            proceed_restore.set()
+            restore_thread.join(timeout=2)
+            upload_thread.join(timeout=2)
+
+            self.assertTrue(
+                upload_finished.is_set(),
+                "Upload should finish after restore releases upload_lock",
+            )
+            self.assertFalse(syncer.restore_failed)
+        store.close()
+
+    def test_restore_progress_phases_and_counters(self):
+        from service.server import SnapshotSync
+
+        store = Store(self.tmp.name)
+        syncer = SnapshotSync(store)
+        syncer.repo = "owner/private"
+        syncer.token = "test-token"
+
+        # 1. Initial idle state
+        initial = syncer.progress
+        self.assertEqual(initial["phase"], "idle")
+        self.assertIsNone(initial["current"])
+        self.assertEqual(initial["completed"], 0)
+        self.assertEqual(initial["total"], 0)
+        self.assertEqual(initial["rows"], 0)
+        self.assertEqual(initial["bytes"], 0)
+
+        files = [
+            "funes-snapshot.jsonl.gz.enc",
+            "funes-delta-1.jsonl.gz.enc",
+        ]
+        manifest = {
+            "version": 1,
+            "snapshot": "funes-snapshot.jsonl.gz.enc",
+            "deltas": ["funes-delta-1.jsonl.gz.enc"],
+            "controls": [],
+        }
+        revision = "rev-progress-check"
+
+        history = []
+        original_update = syncer._update_restore_progress
+
+        def track_update(**kwargs):
+            original_update(**kwargs)
+            history.append(dict(syncer.progress))
+
+        def mock_restore_file(filename):
+            with syncer._progress_lock:
+                syncer._restore_progress["bytes"] += 512
+            return 3
+
+        syncer._update_restore_progress = track_update
+
+        with mock.patch.object(
+            syncer, "_repo_files_metadata", return_value=(files, manifest, revision)
+        ), mock.patch.object(
+            syncer, "_prefetch_restore_files", return_value=None
+        ), mock.patch.object(
+            syncer, "_restore_file", side_effect=mock_restore_file
+        ):
+            result = syncer.restore()
+
+        self.assertEqual(result, 6)
+        self.assertFalse(syncer.restore_failed)
+        self.assertTrue(syncer.restored)
+
+        # Verify phase progression and counters in recorded history
+        phases = [h["phase"] for h in history]
+        self.assertIn("listing", phases)
+        self.assertIn("prefetching", phases)
+        self.assertIn("restoring", phases)
+        self.assertIn("indexing", phases)
+        self.assertIn("completed", phases)
+
+        # Verify restoring phase records file names and increments
+        restoring_snapshots = [h for h in history if h["phase"] == "restoring"]
+        current_files = [h["current"] for h in restoring_snapshots if h["current"] is not None]
+        self.assertEqual(current_files, files)
+
+        # Final progress counters
+        final_progress = syncer.progress
+        self.assertEqual(final_progress["phase"], "completed")
+        self.assertIsNone(final_progress["current"])
+        self.assertEqual(final_progress["completed"], 2)
+        self.assertEqual(final_progress["total"], 2)
+        self.assertEqual(final_progress["rows"], 6)
+        self.assertEqual(final_progress["bytes"], 1024)
+
+        # Test failure transition
+        syncer_fail = SnapshotSync(store)
+        syncer_fail.repo = "owner/private"
+        syncer_fail.token = "test-token"
+
+        def mock_restore_raise(filename):
+            raise RuntimeError("simulated download failure")
+
+        with mock.patch.object(
+            syncer_fail, "_repo_files_metadata", return_value=(files, manifest, revision)
+        ), mock.patch.object(
+            syncer_fail, "_prefetch_restore_files", return_value=None
+        ), mock.patch.object(
+            syncer_fail, "_restore_file", side_effect=mock_restore_raise
+        ):
+            fail_res = syncer_fail.restore()
+
+        self.assertEqual(fail_res, -1)
+        self.assertTrue(syncer_fail.restore_failed)
+        fail_progress = syncer_fail.progress
+        self.assertEqual(fail_progress["phase"], "failed")
+        self.assertIsNone(fail_progress["current"])
+        self.assertEqual(fail_progress.get("error"), "RuntimeError")
+
+        store.close()
+
+    def test_restore_progress_endpoints(self):
+        app = mock.Mock()
+        app.store = Store(self.tmp.name)
+        app.syncer = mock.Mock()
+        app.syncer.restoring = True
+        app.syncer.restore_failed = False
+        app.syncer.progress = {
+            "phase": "restoring",
+            "current": "funes-delta-1.jsonl.gz.enc",
+            "completed": 1,
+            "total": 3,
+            "rows": 42,
+            "bytes": 2048,
+        }
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(app))
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            # During restore: /ready returns 503 with progress breakdown
+            status, body = self._request(server, "GET", "/ready")
+            self.assertEqual(status, 503)
+            self.assertEqual(body["status"], "restoring")
+            self.assertEqual(body["phase"], "restoring")
+            self.assertEqual(body["current"], "funes-delta-1.jsonl.gz.enc")
+            self.assertEqual(body["completed"], 1)
+            self.assertEqual(body["total"], 3)
+            self.assertEqual(body["rows"], 42)
+            self.assertEqual(body["bytes"], 2048)
+            self.assertEqual(body["progress"], app.syncer.progress)
+
+            # When restoring: /sync/status returns 503 with restore_progress
+            status, body = self._request(server, "GET", "/sync/status")
+            self.assertEqual(status, 503)
+            self.assertEqual(body.get("status"), "restoring")
+            self.assertEqual(body.get("restore_progress"), app.syncer.progress)
+
+            # POST must use the same non-blocking restore short-circuit.
+            status, body = self._request(server, "POST", "/sync/status", {})
+            self.assertEqual(status, 503)
+            self.assertEqual(body.get("status"), "restoring")
+            self.assertEqual(body.get("restore_progress"), app.syncer.progress)
+
+            # Once ready: /ready returns 200 with progress info
+            app.syncer.restoring = False
+            app.restore_result = 42
+            status, body = self._request(server, "GET", "/ready")
+            self.assertEqual(status, 200)
+            self.assertEqual(body["status"], "ready")
+            self.assertEqual(body["restored"], 42)
+            self.assertEqual(body["progress"], app.syncer.progress)
+
+            # Once ready: /sync/status returns 200 with restore_progress
+            status, body = self._request(server, "GET", "/sync/status")
+            self.assertEqual(status, 200)
+            self.assertEqual(body.get("restore_progress"), app.syncer.progress)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+            app.store.close()
+
+    def test_restore_checkpoint_resume_without_remaining_skips_bulk_rebuild(self):
+        from service.server import SnapshotSync
+
+        store = Store(self.tmp.name)
+        syncer = SnapshotSync(store)
+        syncer.repo = "owner/private"
+        syncer.token = "test-token"
+        files = [
+            "funes-snapshot.jsonl.gz.enc",
+            "funes-delta-1.jsonl.gz.enc",
+            "funes-delta-2.jsonl.gz.enc",
+        ]
+        manifest = {
+            "version": 1,
+            "snapshot": "funes-snapshot.jsonl.gz.enc",
+            "deltas": ["funes-delta-1.jsonl.gz.enc", "funes-delta-2.jsonl.gz.enc"],
+            "controls": [],
+        }
+        revision = "sha-resume-skip-1"
+
+        # Case 1: Checkpoint covers all manifest files AND derived_ready=True
+        # Must skip begin_bulk_restore and finish_bulk_restore
+        syncer._record_restore_checkpoint(
+            revision,
+            manifest,
+            files,
+            files,
+            derived_ready=True,
+        )
+        self.assertTrue(syncer.restore_checkpoint_path.is_file())
+
+        with mock.patch.object(
+            syncer, "_repo_files_metadata", return_value=(files, manifest, revision)
+        ), mock.patch.object(
+            syncer, "_prefetch_restore_files", return_value=None
+        ), mock.patch.object(
+            syncer, "_restore_file"
+        ) as mock_restore_file, mock.patch.object(
+            store, "begin_bulk_restore"
+        ) as mock_begin_bulk, mock.patch.object(
+            store, "finish_bulk_restore"
+        ) as mock_finish_bulk, mock.patch.object(
+            store, "compact_reindex_controls"
+        ) as mock_compact, mock.patch.object(
+            store, "drain_reindex_controls"
+        ) as mock_drain:
+            result = syncer.restore()
+
+        self.assertEqual(result, 0)
+        mock_restore_file.assert_not_called()
+        mock_begin_bulk.assert_not_called()
+        mock_finish_bulk.assert_not_called()
+        mock_compact.assert_called_once_with(replay=True)
+        mock_drain.assert_called_once_with(syncer.restore_batch)
+        self.assertFalse(syncer.restore_checkpoint_path.exists())
+        self.assertFalse(syncer.restore_failed)
+        self.assertTrue(syncer.restored)
+        self.assertEqual(syncer.covered_revision, revision)
+        self.assertEqual(syncer.progress["phase"], "completed")
+        self.assertEqual(syncer.progress["completed"], len(files))
+        self.assertEqual(syncer.progress["total"], len(files))
+
+        # Case 2: Checkpoint covers all files BUT derived_ready=False
+        # Must execute bulk rebuild (begin/finish_bulk_restore + controls drain) to ensure durability
+        syncer2 = SnapshotSync(store)
+        syncer2.repo = "owner/private"
+        syncer2.token = "test-token"
+        syncer2._record_restore_checkpoint(
+            revision,
+            manifest,
+            files,
+            files,
+            derived_ready=False,
+        )
+        self.assertTrue(syncer2.restore_checkpoint_path.is_file())
+
+        with mock.patch.object(
+            syncer2, "_repo_files_metadata", return_value=(files, manifest, revision)
+        ), mock.patch.object(
+            syncer2, "_prefetch_restore_files", return_value=None
+        ), mock.patch.object(
+            syncer2, "_restore_file"
+        ) as mock_restore_file2, mock.patch.object(
+            store, "begin_bulk_restore"
+        ) as mock_begin_bulk2, mock.patch.object(
+            store, "finish_bulk_restore"
+        ) as mock_finish_bulk2, mock.patch.object(
+            store, "compact_reindex_controls"
+        ) as mock_compact2, mock.patch.object(
+            store, "drain_reindex_controls"
+        ) as mock_drain2:
+            result2 = syncer2.restore()
+
+        self.assertEqual(result2, 0)
+        mock_restore_file2.assert_not_called()
+        mock_begin_bulk2.assert_called_once()
+        mock_finish_bulk2.assert_called_once()
+        mock_compact2.assert_called_once_with(replay=True)
+        mock_drain2.assert_called_once_with(syncer2.restore_batch)
+        self.assertFalse(syncer2.restore_checkpoint_path.exists())
+        self.assertFalse(syncer2.restore_failed)
+        self.assertTrue(syncer2.restored)
+
+        store.close()
 
 if __name__ == "__main__":
     unittest.main()

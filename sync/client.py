@@ -1,6 +1,6 @@
 from __future__ import annotations
 import gzip
-import json, os, subprocess, sys, time
+import json, math, os, subprocess, sys, time
 from email.utils import parsedate_to_datetime
 from urllib import error, parse, request
 from .config import Config
@@ -8,6 +8,10 @@ from .http import open_no_redirect
 
 
 class _PermanentIngestError(RuntimeError):
+    pass
+
+
+class _RetriesExceededError(RuntimeError):
     pass
 
 
@@ -81,16 +85,37 @@ class SyncClient:
         if timeout <= 0:
             raise RuntimeError("FUNES_REMOTE_TIMEOUT must be greater than zero")
         try:
+            raw_attempt = os.environ.get("FUNES_REMOTE_ATTEMPT_TIMEOUT")
+            if raw_attempt is None or not str(raw_attempt).strip():
+                raw_attempt = getattr(self.config, "remote_attempt_timeout", None)
+            if raw_attempt is not None and str(raw_attempt).strip():
+                attempt_val = float(raw_attempt)
+                if math.isnan(attempt_val) or math.isinf(attempt_val):
+                    attempt_timeout = 30.0
+                else:
+                    attempt_timeout = min(55.0, max(1.0, attempt_val))
+            else:
+                attempt_timeout = 30.0
+        except (TypeError, ValueError):
+            attempt_timeout = 30.0
+        try:
             max_response_bytes = max(
                 1, int(os.environ.get("FUNES_REMOTE_MAX_RESPONSE_BYTES", "1048576"))
             )
         except ValueError:
             max_response_bytes = 1048576
+        try:
+            max_transient_retries = max(
+                4, int(os.environ.get("FUNES_REMOTE_TRANSIENT_RETRIES", "60"))
+            )
+        except ValueError:
+            max_transient_retries = 60
         deadline = time.monotonic() + timeout
         poll_url = None
         operation_id = None
         backoff = 1.0
         consecutive_failures = 0
+        consecutive_transient_failures = 0
         last = None
 
         def remaining() -> float:
@@ -98,6 +123,9 @@ class SyncClient:
             if value <= 0:
                 raise RuntimeError("remote ingest timed out before durable confirmation") from last
             return value
+
+        def attempt_budget() -> float:
+            return min(attempt_timeout, remaining())
 
         def response_header(response, name: str) -> str:
             response_headers = getattr(response, "headers", None)
@@ -108,9 +136,11 @@ class SyncClient:
             getheader = getattr(response, "getheader", None)
             return str(getheader(name) or "") if getheader is not None else ""
 
-        def retry_delay(response) -> float:
+        def retry_delay(response, result: dict | None = None) -> float:
             nonlocal backoff
             value = response_header(response, "Retry-After").strip()
+            if not value and isinstance(result, dict) and "retry_after" in result:
+                value = str(result.get("retry_after") or "").strip()
             delay = None
             if value:
                 try:
@@ -126,16 +156,24 @@ class SyncClient:
             backoff = min(30.0, backoff * 2.0)
             return delay
 
-        def sleep_before_retry(response) -> None:
-            time.sleep(min(retry_delay(response), remaining()))
+        def sleep_before_retry(response, result: dict | None = None) -> None:
+            time.sleep(min(retry_delay(response, result), remaining()))
 
-        def note_failure(exc: Exception) -> None:
-            nonlocal consecutive_failures
-            consecutive_failures += 1
-            if consecutive_failures >= 4:
-                raise RuntimeError(
-                    f"remote ingest failed after retries: {type(exc).__name__}"
-                ) from exc
+        def note_failure(exc: Exception, *, transient: bool = False) -> None:
+            nonlocal consecutive_failures, consecutive_transient_failures
+            if transient:
+                consecutive_failures = 0
+                consecutive_transient_failures += 1
+                if consecutive_transient_failures >= max_transient_retries:
+                    raise _RetriesExceededError(
+                        f"remote ingest failed after retries: {type(exc).__name__}"
+                    ) from exc
+            else:
+                consecutive_failures += 1
+                if consecutive_failures >= 4:
+                    raise _RetriesExceededError(
+                        f"remote ingest failed after retries: {type(exc).__name__}"
+                    ) from exc
 
         def set_response_timeout(response, value: float) -> None:
             fp = getattr(response, "fp", None)
@@ -161,7 +199,7 @@ class SyncClient:
             chunks = bytearray()
             one_shot = False
             while True:
-                budget = remaining()
+                budget = attempt_budget()
                 set_response_timeout(response, budget)
                 read_size = min(65536, max_response_bytes + 1 - len(chunks))
                 try:
@@ -246,35 +284,47 @@ class SyncClient:
                 method="GET" if polling else "POST",
             )
             try:
-                with open_no_redirect(req,timeout=remaining()) as response:
+                with open_no_redirect(req, timeout=attempt_budget()) as response:
                     status = int(getattr(response, "status", 0))
-                    result = read_result(response)
+                    result = None
+                    if status in (200, 202):
+                        result = read_result(response)
+                    elif 400 <= status < 500 and status not in (408, 425, 429):
+                        raise _PermanentIngestError(f"remote ingest returned HTTP {status}")
+                    else:
+                        try:
+                            result = read_result(response)
+                        except Exception:
+                            pass
                     if polling:
-                        returned_id = str(result.get("operation_id") or "").strip()
+                        returned_id = str((result or {}).get("operation_id") or "").strip()
                         if returned_id != operation_id:
                             raise RuntimeError("remote async ingest operation_id changed")
                     if status == 200:
-                        return validate_durable(result)
+                        return validate_durable(result or {})
                     if status == 202:
                         if not polling:
-                            operation_id, poll_url = status_url(result, response)
+                            operation_id, poll_url = status_url(result or {}, response)
                         consecutive_failures = 0
+                        consecutive_transient_failures = 0
                         last = RuntimeError("remote ingest operation is still running")
-                    elif status == 429 or status >= 500:
+                    elif status in (408, 425, 429) or status >= 500:
                         last = RuntimeError(f"remote ingest returned retryable HTTP {status}")
                         if polling and status == 503:
                             poll_url = None
                             operation_id = None
-                        note_failure(last)
+                        note_failure(last, transient=True)
                     else:
                         raise RuntimeError(f"remote ingest returned unexpected HTTP {status}")
-                sleep_before_retry(response)
+                sleep_before_retry(response, result)
+            except (_PermanentIngestError, _RetriesExceededError):
+                raise
             except error.HTTPError as exc:
                 last = exc
                 if poll_url is not None and exc.code == 404:
                     poll_url = None
                     operation_id = None
-                    note_failure(exc)
+                    note_failure(exc, transient=True)
                     sleep_before_retry(exc)
                     continue
                 if exc.code not in (408, 425, 429) and exc.code < 500:
@@ -282,19 +332,17 @@ class SyncClient:
                 if poll_url is not None and exc.code == 503:
                     poll_url = None
                     operation_id = None
-                note_failure(exc)
+                note_failure(exc, transient=True)
                 sleep_before_retry(exc)
-            except _PermanentIngestError:
-                raise
             except RuntimeError as exc:
                 last = exc
                 poll_url = None
                 operation_id = None
-                note_failure(exc)
+                note_failure(exc, transient=False)
                 sleep_before_retry(exc)
             except (error.URLError, TimeoutError, OSError) as exc:
                 last = exc
-                note_failure(exc)
+                note_failure(exc, transient=False)
                 sleep_before_retry(exc)
 
     def health(self) -> bool:

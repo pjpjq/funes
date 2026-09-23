@@ -6,10 +6,11 @@
 
 use std::env;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Result};
 use reqwest::blocking::Client;
+use reqwest::header::HeaderMap;
 use reqwest::redirect::Policy;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
@@ -21,8 +22,12 @@ const RERANK_URL: &str = "https://api.voyageai.com/v1/rerank";
 const RERANK_MODEL: &str = "rerank-3-lite";
 const DOCUMENT_TIMEOUT: Duration = Duration::from_secs(30);
 const QUERY_TIMEOUT: Duration = Duration::from_secs(3);
-const DOCUMENT_ATTEMPTS: usize = 3;
+const DOCUMENT_ATTEMPTS: usize = 5;
 const DOCUMENT_RETRY_DELAY: Duration = Duration::from_millis(200);
+const DOCUMENT_RATE_LIMIT_DELAY: Duration = Duration::from_secs(60);
+// Four capped sleeps plus five 30-second requests stay below the Space's
+// 900-second canonical-ingest subprocess deadline.
+const DOCUMENT_MAX_RATE_LIMIT_DELAY: Duration = Duration::from_secs(120);
 
 #[derive(Serialize)]
 struct EmbeddingsRequest<'a> {
@@ -112,8 +117,8 @@ fn http_client() -> Result<Client> {
 }
 
 /// Keep reqwest's blocking runtime entirely outside a Tokio worker. The inference traits are
-/// synchronous, so each provider call waits for a scoped OS thread; that thread owns client
-/// construction, the request, response decoding, and client destruction.
+/// synchronous, so provider construction and each request run on a scoped OS thread. The retained
+/// client owns its connection pool across calls instead of rebuilding TLS state for every request.
 fn run_blocking_http<T: Send>(operation: &str, work: impl FnOnce() -> Result<T> + Send) -> Result<T> {
     thread::scope(|scope| {
         scope
@@ -141,6 +146,41 @@ fn retryable_request_error(error: &reqwest::Error) -> bool {
     error.is_timeout() || error.is_connect() || error.is_body()
 }
 
+fn retry_after_delay(value: &str, now: SystemTime) -> Option<Duration> {
+    if let Ok(seconds) = value.trim().parse::<u64>() {
+        return Some(Duration::from_secs(seconds));
+    }
+    let reset = chrono::DateTime::parse_from_rfc2822(value.trim()).ok()?.timestamp();
+    let now = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    Some(Duration::from_secs(reset.saturating_sub(now as i64).max(0) as u64))
+}
+
+fn epoch_reset_delay(value: &str, now: SystemTime) -> Option<Duration> {
+    let reset = value.trim().parse::<u64>().ok()?;
+    let now = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    Some(Duration::from_secs(reset.saturating_sub(now)))
+}
+
+fn exponential_rate_limit_delay(base: Duration, attempt: usize) -> Duration {
+    let multiplier = 1u32.checked_shl(attempt as u32).unwrap_or(u32::MAX);
+    base.saturating_mul(multiplier).min(DOCUMENT_MAX_RATE_LIMIT_DELAY)
+}
+
+fn rate_limit_delay_from_headers(headers: &HeaderMap, now: SystemTime, fallback: Duration) -> Duration {
+    headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| retry_after_delay(value, now))
+        .or_else(|| {
+            headers
+                .get("x-ratelimit-reset")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| epoch_reset_delay(value, now))
+        })
+        .unwrap_or(fallback)
+        .min(DOCUMENT_MAX_RATE_LIMIT_DELAY)
+}
+
 fn normalize(vector: &mut [f32]) -> Result<()> {
     if vector.iter().any(|value| !value.is_finite()) {
         bail!("Voyage embeddings returned a non-finite vector")
@@ -159,11 +199,7 @@ fn normalize(vector: &mut [f32]) -> Result<()> {
     Ok(())
 }
 
-fn decode_embeddings(
-    response: EmbeddingsResponse,
-    expected: usize,
-    dimensions: usize,
-) -> Result<Vec<Vec<f32>>> {
+fn decode_embeddings(response: EmbeddingsResponse, expected: usize, dimensions: usize) -> Result<Vec<Vec<f32>>> {
     if response.data.len() != expected {
         bail!(
             "Voyage embeddings returned {} vectors for {expected} inputs",
@@ -193,6 +229,7 @@ fn decode_embeddings(
 
 /// Voyage embeddings with explicit document/query modes.
 pub struct VoyageEmbedder {
+    client: Client,
     api_key: String,
     endpoint: String,
     model: String,
@@ -201,6 +238,7 @@ pub struct VoyageEmbedder {
     query_timeout: Duration,
     document_attempts: usize,
     document_retry_delay: Duration,
+    document_rate_limit_delay: Duration,
 }
 
 impl VoyageEmbedder {
@@ -214,6 +252,7 @@ impl VoyageEmbedder {
             QUERY_TIMEOUT,
             DOCUMENT_ATTEMPTS,
             DOCUMENT_RETRY_DELAY,
+            DOCUMENT_RATE_LIMIT_DELAY,
         )
     }
 
@@ -227,6 +266,7 @@ impl VoyageEmbedder {
         query_timeout: Duration,
         document_attempts: usize,
         document_retry_delay: Duration,
+        document_rate_limit_delay: Duration,
     ) -> Result<Self> {
         if model.trim().is_empty() {
             bail!("Voyage embedding model must not be empty")
@@ -237,7 +277,9 @@ impl VoyageEmbedder {
         if document_attempts == 0 {
             bail!("Voyage document attempts must be positive")
         }
+        let client = run_blocking_http("client setup", http_client)?;
         Ok(Self {
+            client,
             api_key,
             endpoint,
             model,
@@ -246,29 +288,32 @@ impl VoyageEmbedder {
             query_timeout,
             document_attempts,
             document_retry_delay,
+            document_rate_limit_delay,
         })
+    }
+
+    fn rate_limit_delay(&self, response: &reqwest::blocking::Response, attempt: usize) -> Duration {
+        rate_limit_delay_from_headers(
+            response.headers(),
+            SystemTime::now(),
+            exponential_rate_limit_delay(self.document_rate_limit_delay, attempt),
+        )
     }
 
     fn request(&self, texts: &[&str], input_type: &'static str, documents: bool) -> Result<Vec<Vec<f32>>> {
         run_blocking_http("embeddings", || self.request_blocking(texts, input_type, documents))
     }
 
-    fn request_blocking(
-        &self,
-        texts: &[&str],
-        input_type: &'static str,
-        documents: bool,
-    ) -> Result<Vec<Vec<f32>>> {
+    fn request_blocking(&self, texts: &[&str], input_type: &'static str, documents: bool) -> Result<Vec<Vec<f32>>> {
         if texts.is_empty() {
-            return Ok(Vec::new())
+            return Ok(Vec::new());
         }
-        let client = http_client()?;
         let request = EmbeddingsRequest {
             input: texts.to_vec(),
             model: &self.model,
             input_type,
             output_dimension: self.dimensions,
-            truncation: false,
+            truncation: true,
         };
         let attempts = if documents { self.document_attempts } else { 1 };
         let timeout = if documents {
@@ -278,7 +323,8 @@ impl VoyageEmbedder {
         };
 
         for attempt in 0..attempts {
-            let response = client
+            let response = self
+                .client
                 .post(&self.endpoint)
                 .timeout(timeout)
                 .bearer_auth(&self.api_key)
@@ -286,16 +332,9 @@ impl VoyageEmbedder {
                 .send();
             let response = match response {
                 Ok(response) => response,
-                Err(error)
-                    if documents
-                        && retryable_request_error(&error)
-                        && attempt + 1 < attempts =>
-                {
-                    thread::sleep(
-                        self.document_retry_delay
-                            .saturating_mul((attempt + 1) as u32),
-                    );
-                    continue
+                Err(error) if documents && retryable_request_error(&error) && attempt + 1 < attempts => {
+                    thread::sleep(self.document_retry_delay.saturating_mul((attempt + 1) as u32));
+                    continue;
                 }
                 Err(error) => return Err(request_error("embeddings", &error)),
             };
@@ -303,32 +342,25 @@ impl VoyageEmbedder {
             if status.is_success() {
                 let response = match response.json::<EmbeddingsResponse>() {
                     Ok(response) => response,
-                    Err(error)
-                        if documents
-                            && retryable_request_error(&error)
-                            && attempt + 1 < attempts =>
-                    {
-                        thread::sleep(
-                            self.document_retry_delay
-                                .saturating_mul((attempt + 1) as u32),
-                        );
-                        continue
+                    Err(error) if documents && retryable_request_error(&error) && attempt + 1 < attempts => {
+                        thread::sleep(self.document_retry_delay.saturating_mul((attempt + 1) as u32));
+                        continue;
                     }
-                    Err(error) if retryable_request_error(&error) => {
-                        return Err(request_error("embeddings", &error))
-                    }
+                    Err(error) if retryable_request_error(&error) => return Err(request_error("embeddings", &error)),
                     Err(_) => bail!("Voyage embeddings returned invalid JSON"),
                 };
-                return decode_embeddings(response, texts.len(), self.dimensions)
+                return decode_embeddings(response, texts.len(), self.dimensions);
             }
             if documents && retryable(status) && attempt + 1 < attempts {
-                thread::sleep(self.document_retry_delay.saturating_mul((attempt + 1) as u32));
-                continue
+                let delay = if status == StatusCode::TOO_MANY_REQUESTS {
+                    self.rate_limit_delay(&response, attempt)
+                } else {
+                    self.document_retry_delay.saturating_mul((attempt + 1) as u32)
+                };
+                thread::sleep(delay);
+                continue;
             }
-            bail!(
-                "Voyage embeddings request failed with HTTP {}",
-                status.as_u16()
-            )
+            bail!("Voyage embeddings request failed with HTTP {}", status.as_u16())
         }
         unreachable!("positive attempt count always returns")
     }
@@ -378,6 +410,7 @@ fn decode_rerank(response: RerankResponse, expected: usize) -> Result<Vec<f32>> 
 
 /// Voyage `rerank-3-lite`, bounded to one query-time request.
 pub struct VoyageReranker {
+    client: Client,
     api_key: String,
     endpoint: String,
     model: String,
@@ -386,24 +419,16 @@ pub struct VoyageReranker {
 
 impl VoyageReranker {
     pub fn new() -> Result<Self> {
-        Self::with_config(
-            api_key()?,
-            RERANK_URL.to_string(),
-            rerank_model()?,
-            QUERY_TIMEOUT,
-        )
+        Self::with_config(api_key()?, RERANK_URL.to_string(), rerank_model()?, QUERY_TIMEOUT)
     }
 
-    fn with_config(
-        api_key: String,
-        endpoint: String,
-        model: String,
-        query_timeout: Duration,
-    ) -> Result<Self> {
+    fn with_config(api_key: String, endpoint: String, model: String, query_timeout: Duration) -> Result<Self> {
         if model.trim().is_empty() {
             bail!("Voyage rerank model must not be empty")
         }
+        let client = run_blocking_http("client setup", http_client)?;
         Ok(Self {
+            client,
             api_key,
             endpoint,
             model,
@@ -425,17 +450,17 @@ impl Reranker for VoyageReranker {
 impl VoyageReranker {
     fn rerank_blocking(&self, query: &str, docs: &[&str]) -> Result<Vec<f32>> {
         if docs.is_empty() {
-            return Ok(Vec::new())
+            return Ok(Vec::new());
         }
-        let client = http_client()?;
         let request = RerankRequest {
             query,
             documents: docs.to_vec(),
             model: &self.model,
             return_documents: false,
-            truncation: false,
+            truncation: true,
         };
-        let response = client
+        let response = self
+            .client
             .post(&self.endpoint)
             .timeout(self.query_timeout)
             .bearer_auth(&self.api_key)
@@ -446,15 +471,13 @@ impl VoyageReranker {
         if !status.is_success() {
             bail!("Voyage rerank request failed with HTTP {}", status.as_u16())
         }
-        let response = response
-            .json::<RerankResponse>()
-            .map_err(|error| {
-                if retryable_request_error(&error) {
-                    request_error("rerank", &error)
-                } else {
-                    anyhow!("Voyage rerank returned invalid JSON")
-                }
-            })?;
+        let response = response.json::<RerankResponse>().map_err(|error| {
+            if retryable_request_error(&error) {
+                request_error("rerank", &error)
+            } else {
+                anyhow!("Voyage rerank returned invalid JSON")
+            }
+        })?;
         decode_rerank(response, docs.len())
     }
 }
@@ -477,6 +500,7 @@ mod tests {
         status: u16,
         body: String,
         delay: Duration,
+        headers: Vec<(&'static str, &'static str)>,
     }
 
     impl MockResponse {
@@ -485,6 +509,7 @@ mod tests {
                 status,
                 body: body.to_string(),
                 delay: Duration::ZERO,
+                headers: Vec::new(),
             }
         }
 
@@ -493,7 +518,13 @@ mod tests {
                 status,
                 body: body.to_string(),
                 delay,
+                headers: Vec::new(),
             }
+        }
+
+        fn with_header(mut self, name: &'static str, value: &'static str) -> Self {
+            self.headers.push((name, value));
+            self
         }
     }
 
@@ -525,10 +556,16 @@ mod tests {
                         captured.lock().unwrap().push(request);
                         std::thread::sleep(response.delay);
                         let reason = if response.status == 200 { "OK" } else { "Error" };
+                        let headers = response
+                            .headers
+                            .iter()
+                            .map(|(name, value)| format!("{name}: {value}\r\n"))
+                            .collect::<String>();
                         let wire = format!(
-                            "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
                             response.status,
                             reason,
+                            headers,
                             response.body.len(),
                             response.body
                         );
@@ -553,9 +590,7 @@ mod tests {
     }
 
     fn read_request(stream: &mut TcpStream) -> CapturedRequest {
-        stream
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
         let mut wire = Vec::new();
         let mut buffer = [0u8; 4096];
         let (header_end, content_length) = loop {
@@ -572,7 +607,7 @@ mod tests {
                             .then(|| value.trim().parse::<usize>().unwrap())
                     })
                     .unwrap();
-                break (header_end + 4, content_length)
+                break (header_end + 4, content_length);
             }
         };
         while wire.len() < header_end + content_length {
@@ -595,6 +630,7 @@ mod tests {
             Duration::from_millis(100),
             DOCUMENT_ATTEMPTS,
             Duration::ZERO,
+            Duration::ZERO,
         )
         .unwrap()
     }
@@ -614,8 +650,15 @@ mod tests {
         })
     }
 
+    #[test]
+    fn retained_clients_are_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<VoyageEmbedder>();
+        assert_send_sync::<VoyageReranker>();
+    }
+
     #[tokio::test]
-    async fn blocking_client_lifecycle_is_safe_inside_tokio() {
+    async fn retained_blocking_client_lifecycle_is_safe_inside_tokio() {
         let server = MockServer::start(vec![MockResponse::json(
             200,
             embedding_response(vec![(0, unit_vector(0))]),
@@ -631,10 +674,7 @@ mod tests {
     #[test]
     fn document_and_query_payloads_are_distinct_and_dimensioned() {
         let server = MockServer::start(vec![
-            MockResponse::json(
-                200,
-                embedding_response(vec![(1, unit_vector(1)), (0, unit_vector(0))]),
-            ),
+            MockResponse::json(200, embedding_response(vec![(1, unit_vector(1)), (0, unit_vector(0))])),
             MockResponse::json(200, embedding_response(vec![(0, unit_vector(2))])),
         ]);
         let mut embedder = test_embedder(&server, TEST_DIMENSIONS);
@@ -654,11 +694,11 @@ mod tests {
         assert_eq!(requests[0].body["model"], "test-embedding-model");
         assert_eq!(requests[0].body["input_type"], "document");
         assert_eq!(requests[0].body["output_dimension"], TEST_DIMENSIONS);
-        assert_eq!(requests[0].body["truncation"], false);
+        assert_eq!(requests[0].body["truncation"], true);
         assert_eq!(requests[1].body["input"], json!(["needle"]));
         assert_eq!(requests[1].body["input_type"], "query");
         assert_eq!(requests[1].body["output_dimension"], TEST_DIMENSIONS);
-        assert_eq!(requests[1].body["truncation"], false);
+        assert_eq!(requests[1].body["truncation"], true);
     }
 
     #[test]
@@ -684,15 +724,14 @@ mod tests {
             MockResponse::json(200, embedding_response(vec![(0, unit_vector(0))])),
         ]);
         let mut embedder = test_embedder(&server, TEST_DIMENSIONS);
-        assert_eq!(
-            embedder.embed_documents(&["document"]).unwrap(),
-            vec![unit_vector(0)]
-        );
+        assert_eq!(embedder.embed_documents(&["document"]).unwrap(), vec![unit_vector(0)]);
         assert_eq!(server.finish().len(), 3);
 
         let exhausted = MockServer::start(vec![
             MockResponse::json(500, json!({ "private": "first-body" })),
             MockResponse::json(502, json!({ "private": "second-body" })),
+            MockResponse::json(503, json!({ "private": "third-body" })),
+            MockResponse::json(504, json!({ "private": "fourth-body" })),
             MockResponse::json(599, json!({ "private": "last-body" })),
         ]);
         let mut embedder = test_embedder(&exhausted, TEST_DIMENSIONS);
@@ -700,6 +739,72 @@ mod tests {
         assert!(error.contains("HTTP 599"));
         assert!(!error.contains("last-body"));
         assert_eq!(exhausted.finish().len(), DOCUMENT_ATTEMPTS);
+    }
+
+    #[test]
+    fn retry_delay_accepts_http_date_and_rate_limit_reset() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_600_000_000);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            "Sun, 13 Sep 2020 12:27:00 GMT".parse().unwrap(),
+        );
+        assert_eq!(
+            rate_limit_delay_from_headers(&headers, now, Duration::from_secs(60)),
+            Duration::from_secs(20)
+        );
+
+        headers.remove(reqwest::header::RETRY_AFTER);
+        headers.insert("x-ratelimit-reset", "1600000060".parse().unwrap());
+        assert_eq!(
+            rate_limit_delay_from_headers(&headers, now, Duration::from_secs(120)),
+            Duration::from_secs(60)
+        );
+    }
+
+    #[test]
+    fn retry_delay_uses_capped_exponential_fallback() {
+        assert_eq!(
+            exponential_rate_limit_delay(Duration::from_secs(10), 0),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            exponential_rate_limit_delay(Duration::from_secs(10), 2),
+            Duration::from_secs(40)
+        );
+        assert_eq!(
+            exponential_rate_limit_delay(Duration::from_secs(60), 4),
+            DOCUMENT_MAX_RATE_LIMIT_DELAY
+        );
+    }
+
+    #[test]
+    fn document_429_honors_retry_after_without_using_the_fallback_delay() {
+        let server = MockServer::start(vec![
+            MockResponse::json(429, json!({ "private": "rate-limited" })).with_header("Retry-After", "0"),
+            MockResponse::json(200, embedding_response(vec![(0, unit_vector(0))])),
+        ]);
+        let mut embedder = test_embedder(&server, TEST_DIMENSIONS);
+        embedder.document_rate_limit_delay = Duration::from_millis(250);
+        let started = Instant::now();
+        assert_eq!(embedder.embed_documents(&["document"]).unwrap(), vec![unit_vector(0)]);
+        assert!(started.elapsed() < Duration::from_millis(200));
+        assert_eq!(server.finish().len(), 2);
+    }
+
+    #[test]
+    fn document_429_without_retry_after_uses_the_rate_limit_delay() {
+        let server = MockServer::start(vec![
+            MockResponse::json(429, json!({ "private": "rate-limited" })),
+            MockResponse::json(200, embedding_response(vec![(0, unit_vector(0))])),
+        ]);
+        let mut embedder = test_embedder(&server, TEST_DIMENSIONS);
+        embedder.document_rate_limit_delay = Duration::from_millis(40);
+        let started = Instant::now();
+        assert_eq!(embedder.embed_documents(&["document"]).unwrap(), vec![unit_vector(0)]);
+        assert!(started.elapsed() >= Duration::from_millis(35));
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert_eq!(server.finish().len(), 2);
     }
 
     #[test]
@@ -714,10 +819,7 @@ mod tests {
         ]);
         let mut embedder = test_embedder(&server, TEST_DIMENSIONS);
         embedder.document_timeout = Duration::from_millis(40);
-        assert_eq!(
-            embedder.embed_documents(&["document"]).unwrap(),
-            vec![unit_vector(1)]
-        );
+        assert_eq!(embedder.embed_documents(&["document"]).unwrap(), vec![unit_vector(1)]);
         assert_eq!(server.finish().len(), 2);
     }
 
@@ -734,6 +836,17 @@ mod tests {
         assert!(error.contains("HTTP 503"));
         assert!(!error.contains("do-not-return-this-body"));
         assert_eq!(failed.finish().len(), 1);
+
+        let rate_limited = MockServer::start(vec![MockResponse::json(
+            429,
+            json!({ "private": "do-not-return-this-body" }),
+        )]);
+        let mut embedder = test_embedder(&rate_limited, TEST_DIMENSIONS);
+        let started = Instant::now();
+        let error = embedder.embed_query("needle").unwrap_err().to_string();
+        assert!(error.contains("HTTP 429"));
+        assert!(started.elapsed() < Duration::from_millis(200));
+        assert_eq!(rate_limited.finish().len(), 1);
 
         let slow = MockServer::start(vec![MockResponse::delayed(
             200,
@@ -781,6 +894,6 @@ mod tests {
         assert_eq!(requests[0].body["documents"], json!(["first", "second"]));
         assert_eq!(requests[0].body["model"], "custom-rerank");
         assert_eq!(requests[0].body["return_documents"], false);
-        assert_eq!(requests[0].body["truncation"], false);
+        assert_eq!(requests[0].body["truncation"], true);
     }
 }

@@ -7,6 +7,21 @@ try:
 except ImportError:
     tomllib = None
 
+
+def _restrict_owned_permissions(path: Path, mode: int) -> None:
+    """Best-effort POSIX permissions without changing the process umask."""
+    if os.name == "nt":
+        return
+    try:
+        current = path.stat()
+        getuid = getattr(os, "getuid", None)
+        if getuid is not None and current.st_uid != getuid():
+            return
+        path.chmod(mode)
+    except (OSError, AttributeError, NotImplementedError):
+        pass
+
+
 @dataclass
 class Config:
     home: Path
@@ -69,4 +84,5 @@ class Config:
                    truth(os.environ.get("FUNES_MEMORY_ONLY", section.get("memory_only", False))),
                    int(os.environ.get("FUNES_SYNC_MAX_BATCH_BYTES", section.get("max_batch_bytes", 16 * 1024 * 1024))))
     def ensure(self):
-        self.state_dir.mkdir(parents=True, exist_ok=True)
+        self.state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        _restrict_owned_permissions(self.state_dir, 0o700)

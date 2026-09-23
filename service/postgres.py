@@ -727,11 +727,13 @@ class PostgresStore(Store):
                 raise
             old.close()
 
-    def _read_connection(self):
-        raw = self._connect()
+    def _read_connection(self, *, connect_timeout: int = 10, statement_timeout: int | None = None):
+        raw = self._connect(connect_timeout=connect_timeout)
         try:
-            _verify_marker(raw, require_ready=not self._migration_mode)
             raw.execute("SET default_transaction_read_only=on").close()
+            if statement_timeout is not None:
+                raw.execute(f"SET statement_timeout='{int(statement_timeout)}s'").close()
+            _verify_marker(raw, require_ready=not self._migration_mode)
             return Connection(raw, require_ready=not self._migration_mode)
         except BaseException:
             raw.close()
@@ -812,6 +814,81 @@ class PostgresStore(Store):
             if row is None:
                 raise PostgresNotReady("PostgreSQL source count marker is missing")
             return int(row[0])
+
+    def sync_status(self) -> dict[str, Any]:
+        """Return sync markers without waiting for the writer/advisory lock."""
+        with closing(self._read_connection(connect_timeout=3, statement_timeout=3)) as reader:
+            # One statement sees counters and the document total from the same
+            # committed snapshot, even while a writer advances both markers.
+            row = reader.execute(
+                "SELECT s.*,m.document_count AS documents FROM sync_state s "
+                "JOIN funes_schema_state m ON m.id=s.id WHERE s.id=1"
+            ).fetchone()
+            if row is None:
+                raise PostgresNotReady("PostgreSQL source status marker is missing")
+            return {**dict(row), "documents": int(row["documents"])}
+
+    def status_snapshot(
+        self, profile: dict[str, Any], memory: str, *, index_layout_version: int = 1
+    ) -> dict[str, Any]:
+        """O(1), read-only committed diagnostics; never initialize/rebuild state.
+
+        Counters belong to the stored profile, not necessarily the requested
+        build. A profile mismatch must not relabel an old index as complete.
+        Error categories require a source-table aggregation, so are explicitly
+        deferred rather than reported as zero or scanned on a status request.
+        """
+        state = self.sync_status()
+        stored_profile = str(state.get("native_checkpoint_profile") or "")
+        stored_memory = str(state.get("native_checkpoint_memory") or "")
+        current = (
+            stored_profile == str(profile.get("fingerprint") or "")
+            and stored_memory == str(memory or profile.get("memory") or "")
+            and int(state.get("native_checkpoint_state_version") or 0)
+            == NATIVE_CHECKPOINT_STATE_VERSION
+        )
+        checkpoint = {
+            **(profile if current else {}),
+            "fingerprint": stored_profile,
+            "memory": stored_memory,
+            "revision": int(state.get("native_index_revision") or 0),
+            "eligible": int(state.get("native_eligible_count") or 0),
+            "indexed": int(state.get("native_indexed_count") or 0),
+            "held": int(state.get("native_held_count") or 0),
+            "invalid": int(state.get("native_invalid_count") or 0),
+            "checkpoint_current": current,
+            "failures": None,
+            "failure_counts_status": "deferred",
+        }
+        checkpoint["pending"] = max(
+            0, checkpoint["eligible"] - checkpoint["indexed"] - checkpoint["held"]
+        )
+        checkpoint["complete"] = current and checkpoint["pending"] == 0
+        checkpoint["index_fingerprint"] = self._native_state_fingerprint(checkpoint)
+        optimize = {
+            "provider": state.get("native_optimize_provider"),
+            "model": state.get("native_optimize_model"),
+            "dimensions": state.get("native_optimize_dimensions"),
+            "schema_version": state.get("native_optimize_schema_version"),
+            "index_layout_version": int(state.get("native_optimize_layout_version") or 0),
+            "memory": state.get("native_optimize_memory"),
+            "fingerprint": state.get("native_optimize_fingerprint"),
+            "index_fingerprint": state.get("native_optimize_index_fingerprint"),
+            "status": state.get("native_optimize_status"),
+            "optimized_at": state.get("native_optimized_at"),
+            "revision": int(state.get("native_optimize_revision") or 0),
+        }
+        checkpoint["optimize"] = optimize
+        checkpoint["cutover_ready"] = bool(
+            checkpoint["complete"] and checkpoint["indexed"]
+            and optimize["status"] == "optimized"
+            and optimize["fingerprint"] == stored_profile
+            and optimize["memory"] == stored_memory
+            and optimize["index_fingerprint"] == checkpoint["index_fingerprint"]
+            and optimize["index_layout_version"] == index_layout_version
+        )
+        return {"documents": state["documents"], "sync": state,
+                "canonical_index": checkpoint}
 
     def fts_ready(self) -> bool:
         """Source readiness is independent of the deliberately disabled PG FTS."""

@@ -50,7 +50,18 @@ PORT = int(os.getenv("PORT", "7860"))
 TRANSLATION_THRESHOLD = float(os.getenv("TRANSLATE_CHINESE_THRESHOLD", "0.15"))
 INGEST_INDEX_TIMEOUT = int(os.getenv("FUNES_INGEST_INDEX_TIMEOUT", "900"))
 INGEST_PUSH_TIMEOUT = int(os.getenv("FUNES_INGEST_PUSH_TIMEOUT", "1800"))
-CANONICAL_INDEX_BATCH = max(1, int(os.getenv("FUNES_CANONICAL_INDEX_BATCH", "32")))
+def _canonical_index_batch(
+    environ: Mapping[str, str] | None = None,
+) -> int:
+    environ = os.environ if environ is None else environ
+    val = environ.get("FUNES_CANONICAL_INDEX_BATCH")
+    try:
+        return max(1, int(val)) if val is not None else 64
+    except (TypeError, ValueError):
+        return 64
+
+
+CANONICAL_INDEX_BATCH = _canonical_index_batch()
 
 
 def _canonical_index_request_limits(
@@ -186,6 +197,11 @@ INDEX_LOCK = threading.Lock()
 # Python-level serialization separate from reads so a background ingest/push
 # cannot make an HTTP recall wait for the full upload duration.
 WRITE_LOCK = threading.Lock()
+# The native Lance/HF index has a single-writer CAS head.  Keep that
+# serialization independent from raw-source durability so canonical indexing
+# does not block source ingest, readiness, or status reads for the duration of
+# a Voyage/native upload.
+NATIVE_WRITE_LOCK = threading.Lock()
 SOURCE_APP = None
 SOURCE_APP_LOCK = threading.Lock()
 INGEST_OPERATION_LOCK = threading.Lock()
@@ -1857,9 +1873,9 @@ def reconcile_canonical_index(app) -> dict[str, object]:
 
     profile = index_embedding_profile()
 
-    def select_and_ingest(directory: Path):
+    def select_candidates():
         if app.syncer.restoring or app.syncer.restore_failed:
-            return [], [], False
+            return []
         _canonical_reconcile_phase(app, "selecting")
         rows = app.store.canonical_index_candidates(
             CANONICAL_INDEX_BATCH,
@@ -1884,32 +1900,78 @@ def reconcile_canonical_index(app) -> dict[str, object]:
             max_rows=CANONICAL_INDEX_REQUEST_ROWS,
             max_chars=CANONICAL_INDEX_MAX_CHARS,
         )
+        return selected
+
+    def revalidate_candidates(selected):
+        """Re-read candidates immediately before native ingest.
+
+        Candidate selection intentionally happens without WRITE_LOCK.  A raw
+        ingest can therefore change a row while Voyage is being prepared; only
+        the exact durable revision observed here may enter the native writer.
+        """
         if not selected:
-            return selected, [], False
-        _canonical_reconcile_phase(app, "native_ingest")
-        updates, committed = _ingest_canonical_subset(
-            selected,
-            directory,
-            [0],
-            memory=memory,
-            profile=profile,
-        )
-        return selected, updates, committed
+            return []
+        identities = [str(item["source_identity"]) for item, _ in selected]
+        if hasattr(app.store, "get_many"):
+            current_rows = app.store.get_many(identities)
+            current_by_identity = {
+                str(item["source_identity"]): item
+                for item in current_rows
+                if isinstance(item, dict) and item.get("source_identity") is not None
+            }
+        else:
+            current_by_identity = {
+                identity: app.store.get(identity)
+                for identity in identities
+            }
+        stable = []
+        terminal = {"indexed", "held_secret", "held_invalid"}
+        for original, _ in selected:
+            identity = str(original["source_identity"])
+            current = current_by_identity.get(identity)
+            if not current or current.get("native_index_status") == "waiting_durability":
+                continue
+            if any(
+                str(current.get(field, "")) != str(original.get(field, ""))
+                for field in ("source_version", "content_hash")
+            ) or any(
+                int(current.get(field) or 0) != int(original.get(field) or 0)
+                for field in ("native_generation", "retrieval_generation")
+            ):
+                continue
+            document = canonical_document(current, profile)
+            if (
+                current.get("native_index_status") in terminal
+                and current.get("native_index_version") == document["source_version"]
+                and current.get("native_index_profile") == profile["fingerprint"]
+                and current.get("native_index_memory") == memory
+            ):
+                continue
+            stable.append((current, document))
+        return stable
 
     _canonical_reconcile_phase(app, "preparing")
     with tempfile.TemporaryDirectory(prefix="funes-canonical-") as temporary:
-        _canonical_reconcile_phase(app, "waiting_write_lock")
-        with WRITE_LOCK:
-            translation_lock = getattr(app, "translation_lock", None)
-            if translation_lock is None:
-                records, updates, committed = select_and_ingest(Path(temporary))
-            else:
-                _canonical_reconcile_phase(app, "waiting_translation_lock")
-                with translation_lock:
-                    records, updates, committed = select_and_ingest(Path(temporary))
+        selected = select_candidates()
+        candidate_seen = bool(selected)
+        records, updates, committed = [], [], False
+        if selected:
+            _canonical_reconcile_phase(app, "waiting_native_lock")
+            with NATIVE_WRITE_LOCK:
+                selected = revalidate_candidates(selected)
+                if selected:
+                    _canonical_reconcile_phase(app, "native_ingest")
+                    records = selected
+                    updates, committed = _ingest_canonical_subset(
+                        selected,
+                        Path(temporary),
+                        [0],
+                        memory=memory,
+                        profile=profile,
+                    )
     if not records:
         durable = not app.syncer.restoring and not app.syncer.restore_failed
-        if durable:
+        if durable and not candidate_seen:
             _canonical_reconcile_phase(app, "optimizing")
             optimize_canonical_index(app, profile, memory)
             _request_canonical_refresh(app, force=True, only_if_dirty=True)
@@ -1973,14 +2035,33 @@ def reconcile_canonical_index(app) -> dict[str, object]:
         status_documents.append(pending_marker)
     if valid_updates:
         status_documents.append(app.store.native_index_state_record(valid_updates))
-    _canonical_reconcile_phase(app, "persisting_source_status")
-    sync = app.syncer.upload(status_documents) if status_documents else {"durable": False}
-    durable = bool(sync.get("durable"))
-    if durable:
+    syncer_store = getattr(app.syncer, "store", None)
+    ack_fn = getattr(app.syncer, "ack_committed", None) or getattr(
+        app.syncer, "ack_persisted", None
+    )
+    use_postgres_ack = syncer_store is app.store and callable(ack_fn)
+    if use_postgres_ack:
+        # PostgreSQL is already the durable source store.  Re-uploading the
+        # hydrated rows through PostgresSync would perform a second upsert and
+        # needlessly serialize the whole batch under its upload lock.
         _canonical_reconcile_phase(app, "applying_checkpoint")
         app.store.update_native_index(valid_updates)
         if pending_marker is not None:
             app.store.set_native_optimize_checkpoint(pending_marker)
+        sync = ack_fn(status_documents) if status_documents else {"durable": False}
+    else:
+        _canonical_reconcile_phase(app, "persisting_source_status")
+        sync = (
+            app.syncer.upload(status_documents)
+            if status_documents
+            else {"durable": False}
+        )
+        if sync.get("durable"):
+            _canonical_reconcile_phase(app, "applying_checkpoint")
+            app.store.update_native_index(valid_updates)
+            if pending_marker is not None:
+                app.store.set_native_optimize_checkpoint(pending_marker)
+    durable = bool(sync.get("durable"))
     return {
         "attempted": len(records),
         "indexed": sum(item["native_index_status"] == "indexed" for item in updates) if durable else 0,

@@ -232,7 +232,9 @@ def test_reconcile_generations_match_accepted(monkeypatch):
 
     assert result["indexed"] == 1
     assert len(syncer.uploads) > 0
-    assert len(store.get_many_calls) == 1
+    # One batch read revalidates the candidate before native ingest; the
+    # second is the post-ingest CAS check before status persistence.
+    assert len(store.get_many_calls) == 2
     assert store.get_calls == []
 
 
@@ -387,4 +389,3 @@ def test_ingest_source_documents_holds_write_lock(monkeypatch):
     thread.join(timeout=2)
     assert not thread.is_alive()
     assert persisted.is_set()
-

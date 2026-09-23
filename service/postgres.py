@@ -500,7 +500,7 @@ class PostgresStore(Store):
             raw.close()
             raise
 
-    def _connect(self):
+    def _connect(self, *, connect_timeout: int = 10):
         try:
             import psycopg
         except ImportError:
@@ -508,7 +508,7 @@ class PostgresStore(Store):
         try:
             return psycopg.connect(
                 self._dsn, autocommit=True, row_factory=_row_factory,
-                connect_timeout=10, application_name="funes-source-store",
+                connect_timeout=connect_timeout, application_name="funes-source-store",
             )
         except Exception:
             raise PostgresNotReady("PostgreSQL source connection unavailable") from None
@@ -603,6 +603,19 @@ class PostgresStore(Store):
                     or int(state[2]) != NATIVE_CHECKPOINT_STATE_VERSION
                 )):
                     raise PostgresNotReady("PostgreSQL source checkpoint or disabled-FTS marker is invalid")
+
+    def probe_ready(self) -> None:
+        """Check the durable migration marker without waiting for the writer.
+
+        Full schema validation still runs at startup and writer reconnection.
+        HTTP liveness must not join the writer's transaction or wait behind a
+        batch. This short-lived, read-only connection never replays writes or
+        claims that uncommitted source/index work is durable.
+        """
+        with closing(self._connect(connect_timeout=3)) as raw:
+            raw.execute("SET default_transaction_read_only=on").close()
+            raw.execute("SET statement_timeout='3s'").close()
+            _verify_marker(raw, require_ready=not self._migration_mode)
 
     def prepare_bulk_migration(self, *, defer_secondary_indexes: bool = True) -> None:
         """Offline COPY preparation, strictly limited to an UNREADY database.

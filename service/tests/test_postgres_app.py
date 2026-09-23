@@ -94,8 +94,30 @@ class SourceStoreDouble:
         value = self.records.get(("memory", identity))
         return dict(value) if value else None
 
+    def probe_ready(self):
+        self.events.append("probe_ready")
+        if not self.available:
+            raise RuntimeError("postgres://private:password@host raw_text api-key")
+
     def get_many(self, identities):
-        return [self.get(identity) for identity in identities if self.get(identity)]
+        unique = list(dict.fromkeys(str(v) for v in identities if v))
+        results = []
+        for identity in unique:
+            value = self.records.get(("memory", identity))
+            if value:
+                results.append(dict(value))
+        return results
+
+    def latest_reindex_generation(self):
+        generations = [
+            int(record.get("generation") or 0)
+            for (kind, _), record in self.records.items()
+            if kind == "reindex_control"
+        ]
+        return max(generations, default=0)
+
+    def latest_embedding_generation(self):
+        return 0
 
     def translation_put(self, query, rewritten, **values):
         self._put({"_funes_record": "translation_cache", "query": query,
@@ -529,3 +551,173 @@ def test_sync_committed_documents_falls_back_to_upload():
     res2 = server._sync_committed_documents(app2, docs)
     assert res2["durable"] is True
     syncer2.upload.assert_called_once_with(docs)
+
+
+def test_source_store_double_get_many_does_not_call_get():
+    store = SourceStoreDouble()
+    store._put({"_funes_record": "memory", "source_identity": "m1", "raw_text": "text1"})
+    store.get = mock.Mock(side_effect=AssertionError("store.get called"))
+    rows = store.get_many(["m1", "m2"])
+    assert len(rows) == 1
+    assert rows[0]["source_identity"] == "m1"
+    store.get.assert_not_called()
+
+
+def test_ingest_documents_batch_precheck_avoids_per_document_get():
+    store = SourceStoreDouble()
+    syncer = PostgresSync(store)
+    app = SimpleNamespace(store=store, syncer=syncer)
+    store._put({
+        "_funes_record": "memory",
+        "source_identity": "doc-wait",
+        "source_version": "v1",
+        "native_index_status": "waiting_durability",
+        "native_index_version": "stale-v1",
+    })
+    docs = [
+        {"source_identity": "doc-wait", "source_version": "v2", "raw_text": "text-wait"},
+        {"source_identity": "doc-fresh", "source_version": "v1", "raw_text": "text-fresh"},
+        {"source_identity": "doc-fresh", "source_version": "v1", "raw_text": "text-fresh-dup"},
+    ]
+    store.get = mock.Mock(side_effect=AssertionError("per-document store.get called during ingest"))
+
+    with mock.patch.object(server, "prepare_ingest_documents", return_value=[dict(d) for d in docs]):
+        result = server.ingest_documents(app, docs)
+
+    assert result["durable"] is True
+    assert result["accepted"] == 3
+    store.get.assert_not_called()
+    ingested_waiting = store.records[("memory", "doc-wait")]
+    assert ingested_waiting["native_index_status"] == "retry"
+    assert ingested_waiting["native_index_version"] is None
+    assert len(result["items"]) == 3
+    assert [item["source_identity"] for item in result["items"]] == ["doc-wait", "doc-fresh", "doc-fresh"]
+
+
+def test_ingest_documents_batch_precheck_fails_closed_without_per_doc_get():
+    store = SourceStoreDouble()
+    syncer = PostgresSync(store)
+    app = SimpleNamespace(store=store, syncer=syncer)
+    docs = [
+        {"source_identity": "fail-1", "source_version": "v1", "content_hash": "hash-1", "raw_text": "raw-1"},
+        {"source_identity": "fail-2", "source_version": "v1", "content_hash": "hash-2", "raw_text": "raw-2"},
+    ]
+    store.get = mock.Mock(side_effect=AssertionError("per-document store.get called"))
+
+    with mock.patch.object(server, "prepare_ingest_documents", return_value=[dict(d) for d in docs]),          mock.patch.object(syncer, "ack_committed", return_value={"uploaded": False, "durable": False, "reason": "postgres_unavailable"}):
+        result = server.ingest_documents(app, docs)
+
+    assert result["durable"] is False
+    assert result["sync"]["reason"] == "postgres_unavailable"
+    assert result["error"] == "durability_pending"
+    assert "update_native_index" in store.events
+    store.get.assert_not_called()
+
+
+def test_service_ready_nonblocking_when_upload_lock_held():
+    store = SourceStoreDouble()
+    syncer = PostgresSync(store)
+    syncer.restored = True
+    app = SimpleNamespace(store=store, syncer=syncer, restore_result=0)
+    handler = object.__new__(server.make_handler(app))
+    handler.path = "/ready"
+    handler._json = lambda status, body: (status, body)
+
+    with syncer.upload_lock:
+        code, payload = handler.do_GET()
+
+    assert code == 200
+    assert payload["status"] == "ready"
+
+
+def test_service_ready_restoring_nonblocking_returns_503():
+    store = SourceStoreDouble()
+    syncer = PostgresSync(store)
+    syncer.restoring = True
+    app = SimpleNamespace(store=store, syncer=syncer, restore_result=0)
+    handler = object.__new__(server.make_handler(app))
+    handler.path = "/ready"
+    handler._json = lambda status, body: (status, body)
+
+    with syncer.upload_lock:
+        code, payload = handler.do_GET()
+
+    assert code == 503
+    assert payload["status"] == "restoring"
+
+
+def test_source_store_double_get_many_deduplicates_identities():
+    store = SourceStoreDouble()
+    store._put({"_funes_record": "memory", "source_identity": "m1", "raw_text": "text1"})
+    store._put({"_funes_record": "memory", "source_identity": "m2", "raw_text": "text2"})
+    rows = store.get_many(["m1", "m1", "m2", ""])
+    assert len(rows) == 2
+    assert [r["source_identity"] for r in rows] == ["m1", "m2"]
+
+
+def test_ingest_documents_without_mock_prepare_avoids_per_document_get():
+    store = SourceStoreDouble()
+    syncer = PostgresSync(store)
+    app = SimpleNamespace(
+        store=store,
+        syncer=syncer,
+        translator=SimpleNamespace(model="test-model"),
+    )
+    docs = [
+        {"source_identity": "doc1", "source_version": "v1", "raw_text": "hello"},
+        {"source_identity": "doc2", "source_version": "v1", "raw_text": "world"},
+    ]
+    store.get = mock.Mock(side_effect=AssertionError("per-document store.get called"))
+    result = server.ingest_documents(app, docs)
+    assert result["durable"] is True
+    assert result["accepted"] == 2
+    assert store.get.call_count == 0
+
+
+def test_prepare_ingest_documents_duplicate_identity_different_revisions_preserves_semantics():
+    store = SourceStoreDouble()
+    syncer = PostgresSync(store)
+    app = SimpleNamespace(
+        store=store,
+        syncer=syncer,
+        translator=SimpleNamespace(model="test-model"),
+    )
+    store.record_reindex_control({"generation": 5, "scope": "all"})
+    store.ingest([{
+        "source_identity": "doc-dup",
+        "source_version": "v1",
+        "content_hash": "1f64d67ab4462268ac11ef316ac654d0bfb8b0a7e2ead9b7f4468f06b95c5231",
+        "raw_text": "version 1 text",
+        "retrieval_text": "existing-shadow",
+        "retrieval_generation": 2,
+        "native_generation": 2,
+        "embedding_generation": 0,
+        "translation_status": "translated",
+        "translation_hash": "thash-1",
+        "translation_version": "tver-1",
+    }])
+
+    docs = [
+        {
+            "source_identity": "doc-dup",
+            "source_version": "v1",
+            "raw_text": "version 1 text",
+        },
+        {
+            "source_identity": "doc-dup",
+            "source_version": "v2",
+            "raw_text": "version 2 text - brand new content",
+        },
+    ]
+    prepared = server.prepare_ingest_documents(app, docs)
+    assert len(prepared) == 2
+
+    doc1 = prepared[0]
+    assert doc1["source_version"] == "v1"
+    assert "retrieval_generation" not in doc1
+
+    doc2 = prepared[1]
+    assert doc2["source_version"] == "v2"
+    assert doc2.get("retrieval_generation") == 5
+    assert doc2.get("native_generation") == 5
+    assert doc2.get("translation_status") in ("pending_provider", "skipped_native_session", "skipped_low_value")

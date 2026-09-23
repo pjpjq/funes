@@ -60,6 +60,26 @@ class PostgresSync:
             self._progress.pop("error", None)
             return True
 
+    def probe_ready(self) -> bool:
+        """Readiness probe isolated from upload_lock and the writer connection.
+
+        Only a startup-validated writer can be ready. A failed writer still
+        needs the existing explicit reconnect path; a successful read probe
+        cannot acknowledge a failed write or mark its queued records durable.
+        """
+        if self.restoring:
+            return False
+        if not self.restored or self.restore_failed:
+            return self.check_ready()
+        probe = getattr(self.store, "probe_ready", None)
+        if not callable(probe):
+            return self.check_ready()
+        try:
+            probe()
+        except Exception:
+            return False
+        return not self.restore_failed and not self.restoring
+
     def restore(self) -> int:
         """Validate the existing source database; there are no rows to replay."""
         with self.upload_lock:

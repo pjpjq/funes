@@ -25,6 +25,10 @@ const QUERY_TIMEOUT: Duration = Duration::from_secs(3);
 const DOCUMENT_ATTEMPTS: usize = 5;
 const DOCUMENT_RETRY_DELAY: Duration = Duration::from_millis(200);
 const DOCUMENT_RATE_LIMIT_DELAY: Duration = Duration::from_secs(60);
+// Voyage's embeddings endpoint accepts at most 128 input strings per request.
+// Keep this provider-specific guard here so callers may continue batching local
+// backends more aggressively without ever sending an invalid Voyage payload.
+const MAX_EMBEDDING_INPUTS: usize = 128;
 // Four capped sleeps plus five 30-second requests stay below the Space's
 // 900-second canonical-ingest subprocess deadline.
 const DOCUMENT_MAX_RATE_LIMIT_DELAY: Duration = Duration::from_secs(120);
@@ -373,7 +377,11 @@ impl Embedder for VoyageEmbedder {
     }
 
     fn embed_documents(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
-        self.request(texts, "document", true)
+        let mut vectors = Vec::with_capacity(texts.len());
+        for group in texts.chunks(MAX_EMBEDDING_INPUTS) {
+            vectors.extend(self.request(group, "document", true)?);
+        }
+        Ok(vectors)
     }
 
     fn embed_query(&mut self, text: &str) -> Result<Vec<f32>> {
@@ -699,6 +707,30 @@ mod tests {
         assert_eq!(requests[1].body["input_type"], "query");
         assert_eq!(requests[1].body["output_dimension"], TEST_DIMENSIONS);
         assert_eq!(requests[1].body["truncation"], true);
+    }
+
+    #[test]
+    fn document_batches_are_split_at_voyage_input_limit() {
+        let first = (0..MAX_EMBEDDING_INPUTS)
+            .map(|index| (index, unit_vector(index % TEST_DIMENSIONS)))
+            .collect();
+        let server = MockServer::start(vec![
+            MockResponse::json(200, embedding_response(first)),
+            MockResponse::json(200, embedding_response(vec![(0, unit_vector(0))])),
+        ]);
+        let mut embedder = test_embedder(&server, TEST_DIMENSIONS);
+        let texts: Vec<String> = (0..MAX_EMBEDDING_INPUTS + 1)
+            .map(|index| format!("document-{index}"))
+            .collect();
+        let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+
+        let vectors = embedder.embed_documents(&refs).unwrap();
+        assert_eq!(vectors.len(), MAX_EMBEDDING_INPUTS + 1);
+
+        let requests = server.finish();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].body["input"].as_array().unwrap().len(), MAX_EMBEDDING_INPUTS);
+        assert_eq!(requests[1].body["input"].as_array().unwrap().len(), 1);
     }
 
     #[test]

@@ -1889,6 +1889,9 @@ def reconcile_canonical_index(app) -> dict[str, object]:
         and memory == REMOTE
         and profile["fingerprint"] == embedding_profile()["fingerprint"]
     ):
+        # Keep the app-scoped cooldown: one active worker replacement can
+        # serve searches while the new worker warms, while trailing commits
+        # remain marked dirty for the next allowed refresh.
         _request_canonical_refresh(app)
     _canonical_reconcile_phase(app, "validating_status")
     status_documents = []

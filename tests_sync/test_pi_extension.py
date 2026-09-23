@@ -326,7 +326,7 @@ def test_pi_before_agent_start_fails_open_with_automatic_budget(tmp_path, failur
         assert result.returncode == 0, result.stderr
         assert result.stdout.strip() == "null"
         assert requests == ["/search"]
-        assert elapsed < (10.5 if failure == "hang" else 5)
+        assert elapsed < 5
     finally:
         server.shutdown()
         server.server_close()

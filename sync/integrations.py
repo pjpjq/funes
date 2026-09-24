@@ -123,6 +123,114 @@ def remove_legacy_pi_package(home: Path) -> bool:
             pass
 
 
+def _expand_path(p: Path | str, home: Path) -> Path:
+    s = str(p).strip()
+    if s == "~":
+        return home
+    if s.startswith("~/"):
+        return home / s[2:]
+    expanded = Path(s).expanduser()
+    if not expanded.is_absolute():
+        return home / expanded
+    return expanded
+
+
+def retire_legacy_claude_plugin(
+    home: Path,
+    claude_config_dir: Path | str | None = None,
+    timeout: float = 15.0,
+) -> str:
+    """Retire legacy Claude funes@huggingface plugin when currently enabled.
+
+    Uses official CLI ``claude plugin disable --scope user funes@huggingface``
+    with bounded timeout, targeting HOME/CLAUDE_CONFIG_DIR.
+    Idempotent: no-op if plugin is not installed or already disabled, avoiding
+    redundant writes to settings.json. Preserves all other settings and plugins;
+    never uninstalls or deletes files.
+    """
+    home_dir = Path(home).expanduser()
+    if claude_config_dir is not None:
+        config_dir = _expand_path(claude_config_dir, home_dir)
+    elif os.environ.get("CLAUDE_CONFIG_DIR", "").strip():
+        config_dir = _expand_path(os.environ["CLAUDE_CONFIG_DIR"].strip(), home_dir)
+    else:
+        config_dir = home_dir / ".claude"
+
+    settings_path = config_dir / "settings.json"
+    if not settings_path.exists():
+        return "noop"
+
+    try:
+        content = settings_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return "read_failed"
+
+    try:
+        data = json.loads(content)
+    except json.JSONDecodeError:
+        return "invalid_settings"
+
+    if not isinstance(data, dict):
+        return "invalid_settings"
+
+    enabled_plugins = data.get("enabledPlugins")
+    if enabled_plugins is not None and not isinstance(enabled_plugins, dict):
+        return "invalid_settings"
+
+    if not isinstance(enabled_plugins, dict) or not bool(enabled_plugins.get("funes@huggingface")):
+        return "noop"
+
+    if not shutil.which("claude"):
+        return "failed"
+
+    env = dict(os.environ)
+    env["HOME"] = str(home_dir)
+    env["CLAUDE_CONFIG_DIR"] = str(config_dir)
+
+    cmd = ["claude", "plugin", "disable", "--scope", "user", "funes@huggingface"]
+    try:
+        proc = subprocess.run(
+            cmd,
+            env=env,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return "timeout"
+    except OSError:
+        return "failed"
+
+    if proc.returncode != 0:
+        return "failed"
+
+    if not settings_path.exists():
+        return "failed"
+
+    try:
+        after_content = settings_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return "read_failed"
+
+    try:
+        after_data = json.loads(after_content)
+    except json.JSONDecodeError:
+        return "invalid_settings"
+
+    if not isinstance(after_data, dict):
+        return "invalid_settings"
+
+    after_enabled = after_data.get("enabledPlugins")
+    if after_enabled is not None and not isinstance(after_enabled, dict):
+        return "invalid_settings"
+
+    if isinstance(after_enabled, dict) and bool(after_enabled.get("funes@huggingface")):
+        return "failed"
+
+    return "disabled"
+
+
 def append_instruction(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     current = path.read_text(encoding="utf-8") if path.exists() else ""
@@ -143,9 +251,11 @@ def _run(args: list[str]) -> bool:
 def install_all(home: Path | None = None) -> dict[str, str | bool]:
     home = home or Path(os.environ.get("HOME", "~")).expanduser()
     bin_path = Path(os.environ.get("FUNES_SYNC_BIN", root() / "bin/funes-sync")).expanduser()
+    claude_outcome = retire_legacy_claude_plugin(home)
     result: dict[str, str | bool] = {
         "pi_extension": str(install_pi(home)),
         "pi_legacy_package_removed": remove_legacy_pi_package(home),
+        "claude_legacy_plugin_retired": claude_outcome,
     }
     append_instruction(home / ".codex" / "AGENTS.md")
     append_instruction(home / ".claude" / "CLAUDE.md")

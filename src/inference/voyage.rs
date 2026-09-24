@@ -949,6 +949,54 @@ mod tests {
             }
         }
 
+        fn start_handler<F>(count: usize, handler: F) -> Self
+        where
+            F: Fn(&CapturedRequest) -> MockResponse + Send + Sync + 'static,
+        {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let captured = Arc::clone(&requests);
+            let handler = Arc::new(handler);
+            let handle = std::thread::spawn(move || {
+                let mut handlers = Vec::new();
+                for _ in 0..count {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let captured = Arc::clone(&captured);
+                    let handler = Arc::clone(&handler);
+                    handlers.push(std::thread::spawn(move || {
+                        let request = read_request(&mut stream);
+                        let response = handler(&request);
+                        captured.lock().unwrap().push(request);
+                        std::thread::sleep(response.delay);
+                        let reason = if response.status == 200 { "OK" } else { "Error" };
+                        let headers = response
+                            .headers
+                            .iter()
+                            .map(|(name, value)| format!("{name}: {value}\r\n"))
+                            .collect::<String>();
+                        let wire = format!(
+                            "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            response.status,
+                            reason,
+                            headers,
+                            response.body.len(),
+                            response.body
+                        );
+                        let _ = stream.write_all(wire.as_bytes());
+                    }));
+                }
+                for handler in handlers {
+                    handler.join().unwrap();
+                }
+            });
+            Self {
+                url,
+                requests,
+                handle: Some(handle),
+            }
+        }
+
         fn finish(mut self) -> Vec<CapturedRequest> {
             self.handle.take().unwrap().join().unwrap();
             self.requests.lock().unwrap().clone()
@@ -1129,18 +1177,19 @@ mod tests {
 
     #[test]
     fn document_requests_use_bounded_concurrency_without_losing_batches() {
-        let server = MockServer::start(vec![
+        let server = MockServer::start_handler(2, |request| {
+            let input = request.body["input"][0].as_str().unwrap();
+            let vector = if input.starts_with('a') {
+                unit_vector(0)
+            } else {
+                unit_vector(1)
+            };
             MockResponse::delayed(
                 200,
-                embedding_response(vec![(0, unit_vector(0))]),
+                embedding_response(vec![(0, vector)]),
                 Duration::from_millis(300),
-            ),
-            MockResponse::delayed(
-                200,
-                embedding_response(vec![(0, unit_vector(0))]),
-                Duration::from_millis(300),
-            ),
-        ]);
+            )
+        });
         let mut embedder = test_embedder(&server, TEST_DIMENSIONS);
         embedder.document_max_tokens = 60;
         embedder.document_concurrency = 2;
@@ -1152,9 +1201,70 @@ mod tests {
             .embed_documents(&[first.as_str(), second.as_str()])
             .unwrap();
 
-        assert_eq!(vectors.len(), 2);
+        assert_eq!(vectors, vec![unit_vector(0), unit_vector(1)]);
         assert!(started.elapsed() < Duration::from_millis(650));
         assert_eq!(server.finish().len(), 2);
+    }
+
+    #[test]
+    fn document_requests_preserve_order_across_concurrency_waves() {
+        let server = MockServer::start_handler(3, |request| {
+            let input = request.body["input"][0].as_str().unwrap();
+            let (vector, delay) = if input.starts_with('a') {
+                // Batch 0 has a longer delay, so concurrent batch 1 finishes first.
+                (unit_vector(0), Duration::from_millis(50))
+            } else if input.starts_with('b') {
+                (unit_vector(1), Duration::ZERO)
+            } else {
+                (unit_vector(2), Duration::ZERO)
+            };
+            MockResponse::delayed(
+                200,
+                embedding_response(vec![(0, vector)]),
+                delay,
+            )
+        });
+        let mut embedder = test_embedder(&server, TEST_DIMENSIONS);
+        embedder.document_max_tokens = 60;
+        embedder.document_concurrency = 2;
+        let first = "a".repeat(20);
+        let second = "b".repeat(20);
+        let third = "c".repeat(20);
+
+        let vectors = embedder
+            .embed_documents(&[first.as_str(), second.as_str(), third.as_str()])
+            .unwrap();
+
+        assert_eq!(vectors, vec![unit_vector(0), unit_vector(1), unit_vector(2)]);
+        let requests = server.finish();
+        assert_eq!(requests.len(), 3);
+    }
+
+    #[test]
+    fn document_requests_propagate_worker_error_under_concurrency() {
+        let server = MockServer::start_handler(3, |request| {
+            let input = request.body["input"][0].as_str().unwrap();
+            if input.starts_with('a') {
+                MockResponse::json(200, embedding_response(vec![(0, unit_vector(0))]))
+            } else {
+                MockResponse::json(500, json!({ "error": "upstream batch failure" }))
+            }
+        });
+        let mut embedder = test_embedder(&server, TEST_DIMENSIONS);
+        embedder.document_max_tokens = 60;
+        embedder.document_concurrency = 2;
+        embedder.document_attempts = 2;
+        embedder.document_retry_delay = Duration::ZERO;
+        let first = "a".repeat(20);
+        let second = "b".repeat(20);
+
+        let error = embedder
+            .embed_documents(&[first.as_str(), second.as_str()])
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("HTTP 500"));
+        assert_eq!(server.finish().len(), 3);
     }
 
     #[test]

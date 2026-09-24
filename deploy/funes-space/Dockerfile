@@ -23,6 +23,12 @@ COPY server.py /app/server.py
 COPY service /app/service
 RUN pip install --no-cache-dir -r /app/service/requirements.txt
 ENV FUNES_HOME=/data/.funes \
+    HF_HOME=/data/huggingface \
+    HF_HUB_CACHE=/data/huggingface/hub \
+    FUNES_HUB_CACHE_BUCKET=bolikoto/funes-runtime-cache \
+    FUNES_HUB_CACHE_MOUNT=/mnt/funes-hub-cache \
+    FUNES_HUB_CACHE_INTERVAL=300 \
+    FUNES_HUB_CACHE_MAX_BYTES=34359738368 \
     PYTHONUNBUFFERED=1 \
     PORT=7860 \
     FUNES_EMBEDDING_PROVIDER=voyage \

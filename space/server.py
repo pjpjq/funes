@@ -29,6 +29,7 @@ from typing import Any
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from service.hub_cache import HubCache
 from service.server import App as SourceApp
 from service.server import expanded_candidate_limit
 from service.server import ingest_documents as persist_source_ingest
@@ -39,6 +40,33 @@ from service.server import queue_reindex as queue_source_reindex
 from service.server import stable_rrf
 from service.server import utc_now
 from service.server import validate_source_identity_batch
+
+
+# The optional Bucket only stores derived immutable Hub cache files. Locks and
+# snapshot symlinks stay on the local POSIX filesystem; originals/checkpoints
+# remain in the source store, and the canonical index remains in its Dataset.
+HUB_CACHE: HubCache | None = None
+HUB_CACHE_ERROR = ""
+
+
+def start_hub_cache() -> None:
+    global HUB_CACHE, HUB_CACHE_ERROR
+    try:
+        HUB_CACHE = HubCache.from_env()
+        if HUB_CACHE is not None:
+            HUB_CACHE.restore()
+            HUB_CACHE.start()
+            atexit.register(HUB_CACHE.stop)
+    except Exception as exc:
+        # Cache failure must never prevent the normal Hub read path or ingestion.
+        # Exception messages can contain private paths or provider credentials.
+        HUB_CACHE_ERROR = type(exc).__name__
+
+
+def hub_cache_status() -> dict[str, object]:
+    if HUB_CACHE is not None:
+        return HUB_CACHE.status()
+    return {"enabled": False, "error_class": HUB_CACHE_ERROR}
 
 
 FUNES_BIN = os.getenv("FUNES_BIN", "/usr/local/bin/funes")
@@ -3335,6 +3363,7 @@ class Handler(BaseHTTPRequestHandler):
                 code, payload = ready_payload()
             else:
                 code, payload = sync_status_payload()
+            payload["hub_cache"] = hub_cache_status()
             self.send_json(code, payload)
             return
         self.send_json(404, {"error": "not found"})
@@ -3347,6 +3376,7 @@ class Handler(BaseHTTPRequestHandler):
             obj = self.body()
             if self.path == "/sync/status":
                 code, payload = sync_status_payload()
+                payload["hub_cache"] = hub_cache_status()
                 self.send_json(code, payload)
                 return
             if self.path == "/sources/check":
@@ -4081,6 +4111,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def serve(host: str = "0.0.0.0", port: int = PORT) -> None:
     (HOME / "sources").mkdir(parents=True, exist_ok=True)
+    start_hub_cache()
     source_app()
     request_warm()
     ThreadingHTTPServer((host, port), Handler).serve_forever()

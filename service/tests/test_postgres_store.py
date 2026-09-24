@@ -466,6 +466,80 @@ class PostgresIntegrationTests(unittest.TestCase):
         self.assertEqual(sum(result["deduped"] for result in results), 1)
         self.assertEqual(self.store.count(), 1)
 
+    def test_source_version_only_change_preserves_native_index_state(self):
+        profile = {"fingerprint": "prof1"}
+        self.store.native_index_checkpoint(profile, "mem1")
+        self.store.ingest([
+            self.doc(
+                "source-preserve",
+                source_version="v1",
+                raw_text="preserved body",
+                native_index_status="indexed",
+                native_index_profile="prof1",
+                native_index_memory="mem1",
+                native_index_version="idx-v1",
+                native_indexed_at="2026-09-24T00:00:00Z",
+                native_generation=1,
+            ),
+            self.doc(
+                "source-held",
+                source_version="v1",
+                raw_text="secret body",
+                native_index_status="held_secret",
+                native_index_profile="prof1",
+                native_index_memory="mem1",
+            ),
+        ])
+        state_before = self.store.native_index_checkpoint(profile, "mem1")
+        self.assertEqual(state_before["indexed"], 1)
+        self.assertEqual(state_before["held"], 1)
+
+        # Ingest v2 with identical raw_text: native index state must be preserved
+        self.store.ingest([
+            self.doc("source-preserve", source_version="v2", raw_text="preserved body"),
+            self.doc("source-held", source_version="v2", raw_text="secret body"),
+        ])
+        preserved = self.store.get("source-preserve")
+        self.assertEqual(preserved["source_version"], "v2")
+        self.assertEqual(preserved["native_index_status"], "indexed")
+        self.assertEqual(preserved["native_index_profile"], "prof1")
+        self.assertEqual(preserved["native_index_memory"], "mem1")
+        self.assertEqual(preserved["native_index_version"], "idx-v1")
+        self.assertEqual(preserved["native_indexed_at"], "2026-09-24T00:00:00Z")
+        self.assertEqual(preserved["native_generation"], 1)
+
+        held = self.store.get("source-held")
+        self.assertEqual(held["source_version"], "v2")
+        self.assertEqual(held["native_index_status"], "held_secret")
+
+        # Postgres native_index_pending trigger check
+        pending_rows = self.store.conn.execute(
+            "SELECT source_identity, native_index_pending FROM memories WHERE source_identity IN (?, ?)",
+            ("source-preserve", "source-held"),
+        ).fetchall()
+        for row in pending_rows:
+            self.assertEqual(row["native_index_pending"], 0)
+
+        # Checkpoints remain consistent
+        state_after = self.store.native_index_checkpoint(profile, "mem1")
+        self.assertEqual(state_after["indexed"], 1)
+        self.assertEqual(state_after["held"], 1)
+
+        # Ingest v3 with modified raw_text: resets native index state to pending
+        self.store.ingest([
+            self.doc("source-preserve", source_version="v3", raw_text="modified body"),
+        ])
+        modified = self.store.get("source-preserve")
+        self.assertEqual(modified["source_version"], "v3")
+        self.assertIsNone(modified["native_index_status"])
+        pending_row = self.store.conn.execute(
+            "SELECT native_index_pending FROM memories WHERE source_identity=?",
+            ("source-preserve",),
+        ).fetchone()
+        self.assertEqual(pending_row["native_index_pending"], 1)
+        state_modified = self.store.native_index_checkpoint(profile, "mem1")
+        self.assertEqual(state_modified["indexed"], 0)
+
 
 @unittest.skipUnless(os.getenv("FUNES_TEST_POSTGRES_DSN"), "FUNES_TEST_POSTGRES_DSN not configured")
 class InheritedStoreContractTests(unittest.TestCase):
@@ -504,6 +578,11 @@ class InheritedStoreContractTests(unittest.TestCase):
             "native_optimize_old_marker_cannot_regress_layout_version",
             "reindex_generations_reset_only_derived_state",
             "reindex_row_cursor_is_bounded_and_survives_restart",
+            "source_version_change_preserves_valid_indexed_native_state",
+            "source_version_change_preserves_valid_held_native_state",
+            "source_version_change_with_new_raw_resets_native_state",
+            "source_version_change_with_pending_state_remains_pending",
+            "source_version_change_with_profile_or_memory_mismatch_resets_to_pending",
         )
         base = os.environ["FUNES_TEST_POSTGRES_DSN"]
         paths, stores = {}, []

@@ -24,6 +24,15 @@ def test_dockerfiles_copy_canonical_space_server():
         ), f"{path.relative_to(REPO_ROOT)} should not COPY root server.py directly"
 
 
+def test_production_space_enables_bounded_voyage_concurrency():
+    """Keep the measured Voyage A/B settings in the production image."""
+    path = REPO_ROOT / "deploy" / "funes-space" / "Dockerfile"
+    text = path.read_text(encoding="utf-8")
+    assert "FUNES_VOYAGE_CONCURRENCY=2" in text
+    assert "FUNES_VOYAGE_MIN_REQUEST_INTERVAL=0" in text
+    assert "FUNES_CANONICAL_INDEX_MIN_REQUEST_INTERVAL=0" in text
+
+
 def test_root_server_synced_with_space_server():
     """Verify root server.py matches space/server.py byte-for-byte to prevent drift."""
     space_server = (REPO_ROOT / "space" / "server.py").read_bytes()

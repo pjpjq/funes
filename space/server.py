@@ -1438,6 +1438,10 @@ NATIVE_HELD_SOURCE_IDS_RE = re.compile(
     r"(?m)[ \t]held_source_ids=(\[[^\r\n]*\])[ \t]*$"
 )
 NATIVE_HELD_SOURCE_ID_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
+NATIVE_STALE_SOURCE_IDS_RE = re.compile(
+    r"(?m)[ \t]stale_source_ids=(\[[^\r\n]*\])[ \t]*$"
+)
+NATIVE_STALE_SOURCE_ID_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
 NATIVE_RECORD_ERROR_RE = re.compile(
     r"invalid canonical JSONL record|must not be empty|must not contain NUL|invalid timestamp",
     re.IGNORECASE,
@@ -1650,6 +1654,35 @@ def _reported_held_source_ids(
     return set(source_ids)
 
 
+def _reported_stale_source_ids(
+    output: str,
+    records: list[tuple[dict, dict]],
+    stale: int,
+) -> set[str] | None:
+    """Validate the opaque stale mapping before trusting a non-bisecting report."""
+    matches = NATIVE_STALE_SOURCE_IDS_RE.findall(output)
+    if len(matches) != 1:
+        return None
+    try:
+        source_ids = json.loads(matches[0])
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(source_ids, list) or len(source_ids) != stale:
+        return None
+    if any(
+        not isinstance(source_id, str)
+        or NATIVE_STALE_SOURCE_ID_RE.fullmatch(source_id) is None
+        for source_id in source_ids
+    ) or len(set(source_ids)) != stale:
+        return None
+    record_source_ids = {
+        _opaque_source_id(str(item["source_identity"])) for item, _ in records
+    }
+    if len(record_source_ids) != len(records) or not set(source_ids) <= record_source_ids:
+        return None
+    return set(source_ids)
+
+
 def _ingest_canonical_subset(
     records: list[tuple[dict, dict]],
     directory: Path,
@@ -1742,7 +1775,44 @@ def _ingest_canonical_subset(
                 memory=memory,
             )
             for item, document in records
-        ], committed
+            ], committed
+    stale_source_ids = _reported_stale_source_ids(output, records, stale)
+    held_source_ids = _reported_held_source_ids(output, records, held) if held else set()
+    # Newer native binaries identify stale rows, so mixed batches can be handled in one
+    # invocation. This preserves stale->retry and never advances a stale checkpoint.
+    if stale_source_ids is not None and (held == 0 or held_source_ids is not None):
+        if sources == 0 or committed:
+            held_source_ids = held_source_ids or set()
+            updates = []
+            for item, document in records:
+                opaque_id = _opaque_source_id(str(item["source_identity"]))
+                if opaque_id in stale_source_ids:
+                    updates.append(
+                        _native_update(
+                            item, "retry", None, "native_stale", profile=profile, memory=memory
+                        )
+                    )
+                elif opaque_id in held_source_ids:
+                    updates.append(
+                        _native_update(
+                            item,
+                            "held_secret",
+                            document["source_version"],
+                            profile=profile,
+                            memory=memory,
+                        )
+                    )
+                else:
+                    updates.append(
+                        _native_update(
+                            item,
+                            "indexed",
+                            document["source_version"],
+                            profile=profile,
+                            memory=memory,
+                        )
+                    )
+            return updates, committed
     # The extension identifies held rows only.  A stale row has no identity mapping, so preserve
     # the legacy bisection fallback unless every non-held row is safe to mark indexed.
     if stale == 0:
@@ -1779,6 +1849,13 @@ def _ingest_canonical_subset(
             _native_update(
                 item, "retry", None, "native_stale", profile=profile, memory=memory
             )
+        ], committed
+    # A legacy native binary may not emit stale identities. Avoid a full binary tree when the
+    # whole batch is stale; one retry is safe and the next reconciliation can observe a new head.
+    if stale == len(records):
+        return [
+            _native_update(item, "retry", None, "native_stale", profile=profile, memory=memory)
+            for item, _ in records
         ], committed
     middle = len(records) // 2
     left, left_commit = _ingest_canonical_subset(

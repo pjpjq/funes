@@ -115,6 +115,7 @@ struct Selection<'a> {
     changed: Vec<&'a Document>,
     unchanged: usize,
     stale: usize,
+    stale_source_ids: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -132,6 +133,7 @@ struct Report {
     unchanged: usize,
     stale: usize,
     held_source_ids: Vec<String>,
+    stale_source_ids: Vec<String>,
     commit: Option<String>,
 }
 
@@ -166,15 +168,23 @@ impl Report {
                 serde_json::to_string(&self.held_source_ids).expect("serializing source-id digests cannot fail");
             format!(" held_source_ids={encoded}")
         };
+        let stale_source_ids = if self.stale_source_ids.is_empty() {
+            String::new()
+        } else {
+            let encoded = serde_json::to_string(&self.stale_source_ids)
+                .expect("serializing stale source-id digests cannot fail");
+            format!(" stale_source_ids={encoded}")
+        };
         format!(
-            "ingested sources={} chunks={} unchanged={} stale={} held={}{}{}\n",
+            "ingested sources={} chunks={} unchanged={} stale={} held={}{}{}{}\n",
             self.sources,
             self.chunks,
             self.unchanged,
             self.stale,
             self.held_source_ids.len(),
             commit,
-            held_source_ids
+            held_source_ids,
+            stale_source_ids,
         )
     }
 }
@@ -439,7 +449,12 @@ fn select_documents<'a>(docs: &'a [Document], stored: &HashMap<String, StoredRev
     for doc in docs {
         match stored.get(&doc.source_identity) {
             Some(current) if current.source_version == doc.source_version => selection.unchanged += 1,
-            Some(current) if revision_order(doc) <= stored_revision_order(current) => selection.stale += 1,
+            Some(current) if revision_order(doc) <= stored_revision_order(current) => {
+                selection.stale += 1;
+                selection
+                    .stale_source_ids
+                    .push(opaque_source_id(&doc.source_identity));
+            }
             _ => selection.changed.push(doc),
         }
     }
@@ -735,6 +750,7 @@ async fn ingest_local(
             unchanged: selection.unchanged,
             stale: selection.stale,
             held_source_ids: held_source_ids.to_vec(),
+            stale_source_ids: selection.stale_source_ids.clone(),
             ..Report::default()
         });
     }
@@ -775,6 +791,7 @@ async fn ingest_local(
         unchanged: selection.unchanged,
         stale: selection.stale,
         held_source_ids: held_source_ids.to_vec(),
+        stale_source_ids: selection.stale_source_ids.clone(),
         commit: None,
     })
 }
@@ -830,6 +847,7 @@ async fn ingest_remote(
                 unchanged: selection.unchanged,
                 stale: selection.stale,
                 held_source_ids: held_source_ids.to_vec(),
+                stale_source_ids: selection.stale_source_ids.clone(),
                 ..Report::default()
             });
         }
@@ -885,6 +903,7 @@ async fn ingest_remote(
                     unchanged: selection.unchanged,
                     stale: selection.stale,
                     held_source_ids: held_source_ids.to_vec(),
+                    stale_source_ids: selection.stale_source_ids.clone(),
                     commit: Some(oid),
                 })
             }

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import concurrent.futures
 import json
+import multiprocessing as mp
 import os
 import sqlite3
 import stat
@@ -658,5 +660,405 @@ def test_ack_session_records_preserves_all_source_kinds_and_checkpoint(tmp_path)
         assert store.ack_session_records(all_ids) == 0
         assert store.pending_count() == 10
         assert store.db.total_changes == previous_changes
+    finally:
+        store.close()
+def _concurrent_open_store(db_path_str: str, config_tuple: tuple) -> int:
+    cfg = Config(Path(config_tuple[0]), Path(config_tuple[1]), Path(config_tuple[2]))
+    store = Store(path=Path(db_path_str), config=cfg)
+    try:
+        return store.stats()["records"]
+    finally:
+        store.close()
+
+
+def _concurrent_write_store(db_path_str: str, config_tuple: tuple, source_key: str) -> bool:
+    cfg = Config(Path(config_tuple[0]), Path(config_tuple[1]), Path(config_tuple[2]))
+    store = Store(path=Path(db_path_str), config=cfg)
+    try:
+        source = Source(source_key, "codex", Path(config_tuple[0]) / f"{source_key}.jsonl", "dev")
+        store.register_source(source)
+        chunks = [
+            Chunk(
+                f"{source_key}_{i}",
+                source_key,
+                "codex",
+                str(source.path),
+                "sess",
+                i,
+                "user",
+                f"msg_{i}",
+                f"msg_{i}",
+            )
+            for i in range(5)
+        ]
+        store.upsert_chunks(chunks)
+        store.ack([f"{source_key}_0", f"{source_key}_1"])
+        return True
+    finally:
+        store.close()
+
+
+def test_source_record_counts_bootstrap_reentry(tmp_path):
+    state = tmp_path / ".state"
+    state.mkdir()
+    db_file = state / "sync.db"
+    conn = sqlite3.connect(db_file)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.executescript(
+        """
+        CREATE TABLE sources(source_key TEXT PRIMARY KEY,kind TEXT NOT NULL,path TEXT NOT NULL,device_id TEXT,project TEXT,active INTEGER DEFAULT 1,retired INTEGER NOT NULL DEFAULT 0,size INTEGER,mtime REAL,inode INTEGER,updated_at REAL);
+        CREATE TABLE records(record_id TEXT PRIMARY KEY,source_key TEXT NOT NULL,content_hash TEXT NOT NULL,version INTEGER DEFAULT 1,payload TEXT NOT NULL,updated_at REAL);
+        CREATE TABLE queue(record_id TEXT PRIMARY KEY,attempts INTEGER DEFAULT 0,next_at REAL DEFAULT 0,last_error TEXT,queued_at REAL);
+        CREATE TABLE cursors(source_key TEXT PRIMARY KEY,offset INTEGER DEFAULT 0,inode INTEGER,size INTEGER,updated_at REAL);
+        CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT NOT NULL,updated_at REAL NOT NULL);
+
+        INSERT INTO sources(source_key, kind, path, device_id, project, active, retired)
+        VALUES ('s1', 'codex', '/path/s1.jsonl', 'dev', '', 1, 0),
+               ('s2', 'codex', '/path/s2.jsonl', 'dev', '', 1, 0),
+               ('s3', 'codex', '/path/s3.jsonl', 'dev', '', 1, 0);
+
+        INSERT INTO records(record_id, source_key, content_hash, version, payload, updated_at)
+        VALUES ('s1_1', 's1', 'h', 1, '{}', 1.0),
+               ('s1_2', 's1', 'h', 1, '{}', 1.0),
+               ('s1_3', 's1', 'h', 1, '{}', 1.0),
+               ('s2_1', 's2', 'h', 1, '{}', 1.0),
+               ('s2_2', 's2', 'h', 1, '{}', 1.0),
+               ('s3_1', 's3', 'h', 1, '{}', 1.0);
+
+        INSERT INTO queue(record_id, attempts, next_at, last_error, queued_at)
+        VALUES ('s1_1', 0, 0, NULL, 1.0),
+               ('s1_2', 0, 0, NULL, 1.0),
+               ('s3_1', 0, 0, NULL, 1.0);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    cfg = Config(tmp_path, state, tmp_path / "config.toml")
+    store = Store(config=cfg)
+    try:
+        assert store.meta_value("stats_cache_v1") == "completed"
+        counts = {
+            r[0]: (r[1], r[2])
+            for r in store.db.execute(
+                "SELECT source_key, record_count, pending_count FROM source_record_counts"
+            ).fetchall()
+        }
+        assert counts["s1"] == (3, 2)
+        assert counts["s2"] == (2, 0)
+        assert counts["s3"] == (1, 1)
+        stats = store.stats()
+        assert stats["records"] == 6
+        assert stats["pending"] == 3
+    finally:
+        store.close()
+
+    for _ in range(3):
+        reopened = Store(config=cfg)
+        try:
+            assert reopened.stats()["records"] == 6
+            assert reopened.stats()["pending"] == 3
+        finally:
+            reopened.close()
+
+    reopened = Store(config=cfg)
+    try:
+        reopened.ack(["s1_1"])
+        assert reopened.stats()["records"] == 6
+        assert reopened.stats()["pending"] == 2
+        chunk = Chunk(
+            "s3_2",
+            "s3",
+            "codex",
+            "/path/s3.jsonl",
+            "sess",
+            1,
+            "user",
+            "text",
+            "text",
+        )
+        reopened.upsert_chunks([chunk])
+        assert reopened.stats()["records"] == 7
+        assert reopened.stats()["pending"] == 3
+    finally:
+        reopened.close()
+
+
+def test_source_record_counts_cross_process_migration_and_writes(tmp_path):
+    state = tmp_path / ".state"
+    state.mkdir()
+    db_file = state / "sync.db"
+
+    conn = sqlite3.connect(db_file)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.executescript(
+        """
+        CREATE TABLE sources(source_key TEXT PRIMARY KEY,kind TEXT NOT NULL,path TEXT NOT NULL,device_id TEXT,project TEXT,active INTEGER DEFAULT 1,retired INTEGER NOT NULL DEFAULT 0,size INTEGER,mtime REAL,inode INTEGER,updated_at REAL);
+        CREATE TABLE records(record_id TEXT PRIMARY KEY,source_key TEXT NOT NULL,content_hash TEXT NOT NULL,version INTEGER DEFAULT 1,payload TEXT NOT NULL,updated_at REAL);
+        CREATE TABLE queue(record_id TEXT PRIMARY KEY,attempts INTEGER DEFAULT 0,next_at REAL DEFAULT 0,last_error TEXT,queued_at REAL);
+        CREATE TABLE cursors(source_key TEXT PRIMARY KEY,offset INTEGER DEFAULT 0,inode INTEGER,size INTEGER,updated_at REAL);
+        CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT NOT NULL,updated_at REAL NOT NULL);
+        INSERT INTO records VALUES('r0', 's0', 'h0', 1, '{}', 1.0);
+        INSERT INTO queue VALUES('r0', 0, 0, NULL, 1.0);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    cfg_tuple = (str(tmp_path), str(state), str(tmp_path / "config.toml"))
+
+    ctx = mp.get_context("fork")
+    with concurrent.futures.ProcessPoolExecutor(max_workers=4, mp_context=ctx) as pool:
+        futures = []
+        for i in range(3):
+            futures.append(pool.submit(_concurrent_open_store, str(db_file), cfg_tuple))
+        for i in range(3):
+            futures.append(pool.submit(_concurrent_write_store, str(db_file), cfg_tuple, f"worker_src_{i}"))
+        for f in concurrent.futures.as_completed(futures):
+            res = f.result()
+            assert res is not None
+
+    cfg = Config(Path(cfg_tuple[0]), Path(cfg_tuple[1]), Path(cfg_tuple[2]))
+    final_store = Store(path=db_file, config=cfg)
+    try:
+        stats = final_store.stats()
+        assert stats["records"] == 16
+        assert stats["pending"] == 10
+        actual_records = final_store.db.execute("SELECT count(*) FROM records").fetchone()[0]
+        actual_pending = final_store.db.execute("SELECT count(*) FROM queue").fetchone()[0]
+        assert stats["records"] == actual_records
+        assert stats["pending"] == actual_pending
+
+        rows = final_store.db.execute(
+            "SELECT source_key, record_count, pending_count FROM source_record_counts"
+        ).fetchall()
+        for r in rows:
+            sk, rc, pc = r[0], r[1], r[2]
+            real_rc = final_store.db.execute(
+                "SELECT count(*) FROM records WHERE source_key=?", (sk,)
+            ).fetchone()[0]
+            real_pc = final_store.db.execute(
+                "SELECT count(*) FROM records r JOIN queue q ON q.record_id=r.record_id WHERE r.source_key=?",
+                (sk,),
+            ).fetchone()[0]
+            assert rc == real_rc
+            assert pc == real_pc
+        assert final_store.meta_value("stats_cache_v1") == "completed"
+    finally:
+        final_store.close()
+
+
+def test_source_record_counts_legacy_daemon_writes(tmp_path):
+    cfg = Config(tmp_path, tmp_path / ".state", tmp_path / "config.toml")
+    store = Store(config=cfg)
+    try:
+        source = Source("legacy_src", "codex", tmp_path / "legacy.jsonl", "dev")
+        store.register_source(source)
+
+        store.db.execute(
+            "INSERT INTO records(record_id, source_key, content_hash, version, payload, updated_at) VALUES ('r1', 'legacy_src', 'h1', 1, '{}', 1.0)"
+        )
+        store.db.commit()
+        row = store.db.execute(
+            "SELECT record_count, pending_count FROM source_record_counts WHERE source_key='legacy_src'"
+        ).fetchone()
+        assert (row[0], row[1]) == (1, 0)
+
+        store.db.execute(
+            "INSERT INTO queue(record_id, attempts, next_at, last_error, queued_at) VALUES ('r1', 0, 0, NULL, 1.0)"
+        )
+        store.db.commit()
+        row = store.db.execute(
+            "SELECT record_count, pending_count FROM source_record_counts WHERE source_key='legacy_src'"
+        ).fetchone()
+        assert (row[0], row[1]) == (1, 1)
+
+        store.db.execute(
+            "INSERT INTO records(record_id, source_key, content_hash, version, payload, updated_at) VALUES ('r2', 'legacy_src', 'h2', 1, '{}', 1.0)"
+        )
+        store.db.execute(
+            "INSERT INTO queue(record_id, attempts, next_at, last_error, queued_at) VALUES ('r2', 0, 0, NULL, 1.0)"
+        )
+        store.db.commit()
+        row = store.db.execute(
+            "SELECT record_count, pending_count FROM source_record_counts WHERE source_key='legacy_src'"
+        ).fetchone()
+        assert (row[0], row[1]) == (2, 2)
+
+        store.db.execute("DELETE FROM queue WHERE record_id = 'r1'")
+        store.db.commit()
+        row = store.db.execute(
+            "SELECT record_count, pending_count FROM source_record_counts WHERE source_key='legacy_src'"
+        ).fetchone()
+        assert (row[0], row[1]) == (2, 1)
+
+        store.db.execute("DELETE FROM records WHERE record_id = 'r2'")
+        store.db.commit()
+        row = store.db.execute(
+            "SELECT record_count, pending_count FROM source_record_counts WHERE source_key='legacy_src'"
+        ).fetchone()
+        assert (row[0], row[1]) == (1, 0)
+
+        store.db.execute("DELETE FROM queue WHERE record_id = 'r2'")
+        store.db.commit()
+        row = store.db.execute(
+            "SELECT record_count, pending_count FROM source_record_counts WHERE source_key='legacy_src'"
+        ).fetchone()
+        assert (row[0], row[1]) == (1, 0)
+
+        store.db.execute("DELETE FROM records WHERE record_id = 'r1'")
+        store.db.commit()
+        row = store.db.execute(
+            "SELECT record_count, pending_count FROM source_record_counts WHERE source_key='legacy_src'"
+        ).fetchone()
+        assert (row[0], row[1]) == (0, 0)
+
+        stats = store.stats()
+        assert stats["records"] == 0
+        assert stats["pending"] == 0
+    finally:
+        store.close()
+
+
+def test_source_record_counts_record_source_migration(tmp_path):
+    cfg = Config(tmp_path, tmp_path / ".state", tmp_path / "config.toml")
+    store = Store(config=cfg)
+    try:
+        store.register_source(Source("src_alpha", "codex", tmp_path / "alpha.jsonl", "dev"))
+        store.register_source(Source("src_beta", "codex", tmp_path / "beta.jsonl", "dev"))
+        store.register_source(Source("src_gamma", "codex", tmp_path / "gamma.jsonl", "dev"))
+
+        store.upsert_chunks([
+            Chunk("rec_acked", "src_alpha", "codex", str(tmp_path / "alpha.jsonl"), "s", 0, "user", "a", "a"),
+            Chunk("rec_pending", "src_alpha", "codex", str(tmp_path / "alpha.jsonl"), "s", 1, "user", "b", "b"),
+        ])
+        store.ack(["rec_acked"])
+
+        alpha = store.db.execute(
+            "SELECT record_count, pending_count FROM source_record_counts WHERE source_key='src_alpha'"
+        ).fetchone()
+        assert (alpha[0], alpha[1]) == (2, 1)
+
+        store.db.execute("UPDATE records SET source_key='src_beta' WHERE record_id='rec_acked'")
+        store.db.commit()
+        alpha = store.db.execute(
+            "SELECT record_count, pending_count FROM source_record_counts WHERE source_key='src_alpha'"
+        ).fetchone()
+        beta = store.db.execute(
+            "SELECT record_count, pending_count FROM source_record_counts WHERE source_key='src_beta'"
+        ).fetchone()
+        assert (alpha[0], alpha[1]) == (1, 1)
+        assert (beta[0], beta[1]) == (1, 0)
+
+        store.db.execute("UPDATE records SET source_key='src_beta' WHERE record_id='rec_pending'")
+        store.db.commit()
+        alpha = store.db.execute(
+            "SELECT record_count, pending_count FROM source_record_counts WHERE source_key='src_alpha'"
+        ).fetchone()
+        beta = store.db.execute(
+            "SELECT record_count, pending_count FROM source_record_counts WHERE source_key='src_beta'"
+        ).fetchone()
+        assert (alpha[0], alpha[1]) == (0, 0)
+        assert (beta[0], beta[1]) == (2, 1)
+
+        store.upsert_chunks([
+            Chunk("rec_pending", "src_gamma", "codex", str(tmp_path / "gamma.jsonl"), "s", 1, "user", "b_updated", "b_updated"),
+        ])
+        beta = store.db.execute(
+            "SELECT record_count, pending_count FROM source_record_counts WHERE source_key='src_beta'"
+        ).fetchone()
+        gamma = store.db.execute(
+            "SELECT record_count, pending_count FROM source_record_counts WHERE source_key='src_gamma'"
+        ).fetchone()
+        assert (beta[0], beta[1]) == (1, 0)
+        assert (gamma[0], gamma[1]) == (1, 1)
+
+        stats = store.stats()
+        assert stats["records"] == 2
+        assert stats["pending"] == 1
+    finally:
+        store.close()
+
+
+def test_source_record_counts_duplicate_queue_ack_idempotence(tmp_path):
+    cfg = Config(tmp_path, tmp_path / ".state", tmp_path / "config.toml")
+    store = Store(config=cfg)
+    try:
+        store.register_source(Source("src_idem", "codex", tmp_path / "idem.jsonl", "dev"))
+        store.upsert_chunks([
+            Chunk("c1", "src_idem", "codex", str(tmp_path / "idem.jsonl"), "s", 0, "user", "t1", "t1"),
+            Chunk("c2", "src_idem", "codex", str(tmp_path / "idem.jsonl"), "s", 1, "user", "t2", "t2"),
+        ])
+        row = store.db.execute(
+            "SELECT record_count, pending_count FROM source_record_counts WHERE source_key='src_idem'"
+        ).fetchone()
+        assert (row[0], row[1]) == (2, 2)
+
+        store.ack(["c1"])
+        row = store.db.execute(
+            "SELECT record_count, pending_count FROM source_record_counts WHERE source_key='src_idem'"
+        ).fetchone()
+        assert (row[0], row[1]) == (2, 1)
+
+        store.ack(["c1"])
+        row = store.db.execute(
+            "SELECT record_count, pending_count FROM source_record_counts WHERE source_key='src_idem'"
+        ).fetchone()
+        assert (row[0], row[1]) == (2, 1)
+
+        store.ack(["non_existent_1", "non_existent_2"])
+        store.ack([])
+        row = store.db.execute(
+            "SELECT record_count, pending_count FROM source_record_counts WHERE source_key='src_idem'"
+        ).fetchone()
+        assert (row[0], row[1]) == (2, 1)
+
+        added = store.enqueue_records(["c1", "c1", "ghost"])
+        assert added == 1
+        row = store.db.execute(
+            "SELECT record_count, pending_count FROM source_record_counts WHERE source_key='src_idem'"
+        ).fetchone()
+        assert (row[0], row[1]) == (2, 2)
+
+        added = store.enqueue_records(["c1", "c2"])
+        assert added == 0
+        row = store.db.execute(
+            "SELECT record_count, pending_count FROM source_record_counts WHERE source_key='src_idem'"
+        ).fetchone()
+        assert (row[0], row[1]) == (2, 2)
+
+        store.db.execute("DELETE FROM queue WHERE record_id='c1'")
+        store.db.commit()
+        row = store.db.execute(
+            "SELECT record_count, pending_count FROM source_record_counts WHERE source_key='src_idem'"
+        ).fetchone()
+        assert (row[0], row[1]) == (2, 1)
+
+        store.db.execute("DELETE FROM queue WHERE record_id='c1'")
+        store.db.commit()
+        row = store.db.execute(
+            "SELECT record_count, pending_count FROM source_record_counts WHERE source_key='src_idem'"
+        ).fetchone()
+        assert (row[0], row[1]) == (2, 1)
+
+        store.db.execute("DELETE FROM queue WHERE record_id='c2'")
+        store.db.commit()
+        row = store.db.execute(
+            "SELECT record_count, pending_count FROM source_record_counts WHERE source_key='src_idem'"
+        ).fetchone()
+        assert (row[0], row[1]) == (2, 0)
+
+        store.db.execute(
+            "INSERT INTO records(record_id, source_key, content_hash, version, payload, updated_at) VALUES ('ghost', 'src_idem', 'h', 1, '{}', 1.0)"
+        )
+        store.db.execute("UPDATE source_record_counts SET pending_count=0 WHERE source_key='src_idem'")
+        store.db.execute("INSERT INTO queue(record_id, queued_at) VALUES('ghost', 1.0)")
+        store.db.execute("UPDATE source_record_counts SET pending_count=0 WHERE source_key='src_idem'")
+        store.db.execute("DELETE FROM queue WHERE record_id='ghost'")
+        store.db.commit()
+        row = store.db.execute(
+            "SELECT pending_count FROM source_record_counts WHERE source_key='src_idem'"
+        ).fetchone()
+        assert row[0] >= 0
     finally:
         store.close()

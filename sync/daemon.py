@@ -103,7 +103,8 @@ class SyncDaemon:
         for s in sources:
             try: st=s.path.stat()
             except OSError: continue
-            old=self.store.db.execute("SELECT size,mtime,inode FROM sources WHERE source_key=?", (s.source_key,)).fetchone()
+            old=self.store.db.execute("SELECT size,mtime,inode,project FROM sources WHERE source_key=?", (s.source_key,)).fetchone()
+            source_context_changed = bool(old and (old[3] or "") != s.project)
             self.store.register_source(s,st)
             cur=self.store.cursor(s.source_key); start=0
             has_records=bool(self.store.db.execute(
@@ -114,12 +115,12 @@ class SyncDaemon:
             repair_zero_record=zero_record_repair_missing and not seeded_without_backfill and not has_records
             repair_automation=automation_identity_missing and not seeded_without_backfill and s.kind=="codex_memory" and "/automations/" in s.source_key.replace("\\","/")
             # No full reparse for unchanged files; append-only growth resumes at the byte cursor.
-            if not refresh_source_schema and not repair_zero_record and not repair_automation and old and old[0] == st.st_size and old[1] == st.st_mtime and old[2] == st.st_ino:
+            if not source_context_changed and not refresh_source_schema and not repair_zero_record and not repair_automation and old and old[0] == st.st_size and old[1] == st.st_mtime and old[2] == st.st_ino:
                 continue
             appendable = _is_appendable_source(s)
             try:
                 offset = _cursor_offset(s, st.st_size)
-                can_append = not refresh_source_schema and not repair_zero_record and not repair_automation and (has_records or seeded_without_backfill) and appendable and cur and cur.get("inode")==st.st_ino and st.st_size>=cur.get("size",0)
+                can_append = not source_context_changed and not refresh_source_schema and not repair_zero_record and not repair_automation and (has_records or seeded_without_backfill) and appendable and cur and cur.get("inode")==st.st_ino and st.st_size>=cur.get("size",0)
                 if can_append:
                     candidate = int(cur.get("offset", 0))
                     # Legacy versions advanced cursors past an unterminated

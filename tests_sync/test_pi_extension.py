@@ -129,8 +129,8 @@ def test_pi_rejects_public_env_file(tmp_path):
         "const tools = {};\n"
         "const pi = {registerTool(tool) { tools[tool.name] = tool; }, on() {}};\n"
         "extension(pi);\n"
-        "const result = await tools.funes_recall.execute('test', {query: 'history'});\n"
-        "console.log(result.content[0].text);\n"
+        "try { await tools.funes_recall.execute('test', {query: 'history'}); }\n"
+        "catch (error) { console.log(JSON.stringify({text: error.message, isError: true})); }\n"
     )
     result = run_harness(
         tmp_path,
@@ -144,7 +144,10 @@ def test_pi_rejects_public_env_file(tmp_path):
         },
     )
     assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == "null"
+    assert json.loads(result.stdout) == {
+        "text": "funes_recall error: Funes remote API token is not configured",
+        "isError": True,
+    }
 
 
 @pytest.mark.skipif(NODE is None, reason="node is unavailable")
@@ -192,8 +195,8 @@ def test_pi_does_not_follow_or_retry_redirect(tmp_path):
             "const tools = {};\n"
             "const pi = {registerTool(tool) { tools[tool.name] = tool; }, on() {}};\n"
             "extension(pi);\n"
-            "const result = await tools.funes_recall.execute('test', {query: 'history'});\n"
-            "console.log(result.content[0].text);\n"
+            "try { await tools.funes_recall.execute('test', {query: 'history'}); }\n"
+            "catch (error) { console.log(JSON.stringify({text: error.message, isError: true})); }\n"
         )
         started = time.monotonic()
         result = run_harness(
@@ -203,7 +206,9 @@ def test_pi_does_not_follow_or_retry_redirect(tmp_path):
         )
         elapsed = time.monotonic() - started
         assert result.returncode == 0, result.stderr
-        assert result.stdout.strip() == "null"
+        parsed = json.loads(result.stdout)
+        assert parsed["isError"] is True
+        assert parsed["text"].startswith("funes_recall error:")
         assert source_requests == ["/search"]
         assert sink_requests == []
         assert elapsed < 3
@@ -378,7 +383,7 @@ def test_pi_funes_recall_uses_short_503_backoff_and_recovers(tmp_path):
         assert parsed["results"][0]["raw_text"] == "recovered decision"
         assert len(requests) == 2
         delay = requests[1][1] - requests[0][1]
-        assert 0.4 <= delay < 1.5, f"expected ~0.5s backoff, got {delay}"
+        assert 2.5 <= delay < 4.5, f"expected ~3s backoff, got {delay}"
     finally:
         server.shutdown()
         server.server_close()
@@ -406,8 +411,8 @@ def test_pi_funes_recall_ignores_long_remote_env_and_defaults_to_two_attempts(tm
             "const tools = {};\n"
             "const pi = {registerTool(tool) { tools[tool.name] = tool; }, on() {}};\n"
             "extension(pi);\n"
-            "const result = await tools.funes_recall.execute('test', {query: 'decision'});\n"
-            "console.log(result.content[0].text);\n"
+            "try { await tools.funes_recall.execute('test', {query: 'decision'}); }\n"
+            "catch (error) { console.log(JSON.stringify({text: error.message, isError: true})); }\n"
         )
         started = time.monotonic()
         result = run_harness(
@@ -422,9 +427,11 @@ def test_pi_funes_recall_ignores_long_remote_env_and_defaults_to_two_attempts(tm
         )
         elapsed = time.monotonic() - started
         assert result.returncode == 0, result.stderr
-        assert result.stdout.strip() == "null"
+        parsed = json.loads(result.stdout)
+        assert parsed["isError"] is True
+        assert "HTTP 503" in parsed["text"]
         assert len(requests) == 2
-        assert elapsed < 4.0
+        assert elapsed < 6.0
     finally:
         server.shutdown()
         server.server_close()
@@ -452,8 +459,8 @@ def test_pi_funes_recall_reads_dedicated_recall_attempts_env(tmp_path):
             "const tools = {};\n"
             "const pi = {registerTool(tool) { tools[tool.name] = tool; }, on() {}};\n"
             "extension(pi);\n"
-            "const result = await tools.funes_recall.execute('test', {query: 'decision'});\n"
-            "console.log(result.content[0].text);\n"
+            "try { await tools.funes_recall.execute('test', {query: 'decision'}); }\n"
+            "catch (error) { console.log(JSON.stringify({text: error.message, isError: true})); }\n"
         )
         result = run_harness(
             tmp_path,
@@ -464,7 +471,9 @@ def test_pi_funes_recall_reads_dedicated_recall_attempts_env(tmp_path):
             },
         )
         assert result.returncode == 0, result.stderr
-        assert result.stdout.strip() == "null"
+        parsed = json.loads(result.stdout)
+        assert parsed["isError"] is True
+        assert "HTTP 503" in parsed["text"]
         assert len(requests) == 3
     finally:
         server.shutdown()
@@ -562,6 +571,240 @@ def test_pi_funes_recall_allows_slow_search_matching_large_index_latency(tmp_pat
         assert parsed["results"][0]["raw_text"] == "large index raw text"
         assert len(requests) == 1
         assert 5.8 < elapsed < 8.0
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+@pytest.mark.skipif(NODE is None, reason="node is unavailable")
+def test_pi_before_agent_start_reads_auto_recall_timeout_from_config(tmp_path):
+    requests = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            requests.append(self.path)
+            time.sleep(6.1)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(
+                b'{"ok":true,"results":[{"raw_text":"remembered decision"}]}'
+            )
+
+        def log_message(self, format, *args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server.daemon_threads = True
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        body = (
+            "let beforeAgentStart;\n"
+            "const pi = {registerTool() {}, on(name, handler) { "
+            "if (name === 'before_agent_start') beforeAgentStart = handler; }};\n"
+            "extension(pi);\n"
+            "const result = await beforeAgentStart({"
+            "prompt: 'What did we decide previously about the remote memory?', "
+            "systemPrompt: 'base'});\n"
+            "console.log(JSON.stringify(result ?? null));\n"
+        )
+        started = time.monotonic()
+        result = run_harness(
+            tmp_path,
+            f'[remote]\nurl = "http://127.0.0.1:{server.server_port}"\nauto_recall_timeout_ms = 8000\n',
+            body,
+        )
+        elapsed = time.monotonic() - started
+
+        assert result.returncode == 0, result.stderr
+        assert json.loads(result.stdout) == {
+            "systemPrompt": "base\n\n## Funes unified memory\n1. remembered decision"
+        }
+        assert requests == ["/search"]
+        assert 5.8 < elapsed < 8.0
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+@pytest.mark.skipif(NODE is None, reason="node is unavailable")
+def test_pi_before_agent_start_can_disable_auto_recall(tmp_path):
+    requests = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            requests.append(self.path)
+            self.send_response(500)
+            self.end_headers()
+
+        def log_message(self, format, *args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        body = (
+            "let beforeAgentStart;\n"
+            "const pi = {registerTool() {}, on(name, handler) { "
+            "if (name === 'before_agent_start') beforeAgentStart = handler; }};\n"
+            "extension(pi);\n"
+            "const result = await beforeAgentStart({"
+            "prompt: 'What did we decide previously about the remote memory?', "
+            "systemPrompt: 'base'});\n"
+            "console.log(JSON.stringify(result ?? null));\n"
+        )
+        result = run_harness(
+            tmp_path,
+            f'[remote]\nurl = "http://127.0.0.1:{server.server_port}"\n',
+            body,
+            {"FUNES_REMOTE_AUTO_RECALL_TIMEOUT_MS": "0"},
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "null"
+        assert requests == []
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+@pytest.mark.skipif(NODE is None, reason="node is unavailable")
+def test_pi_funes_recall_exposes_and_forwards_filters(tmp_path):
+    requests = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            requests.append(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"ok":true,"results":[]}')
+
+        def log_message(self, format, *args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        body = (
+            "const tools = {};\n"
+            "const pi = {registerTool(tool) { tools[tool.name] = tool; }, on() {}};\n"
+            "extension(pi);\n"
+            "const result = await tools.funes_recall.execute('test', {"
+            "query: 'context', limit: 3, source_agent: 'pi', source_type: 'session', "
+            "project: 'funes', repo: 'owner/funes', device_id: 'macminim2', role: 'user', "
+            "content_type: 'user_message', source_missing: false, since: '2026-01-01', until: '2026-09-24', "
+            "facets: {source_agent: 'pi'} });\n"
+            "console.log(JSON.stringify({result, schema: tools.funes_recall.parameters}));\n"
+        )
+        result = run_harness(
+            tmp_path,
+            f'[remote]\nurl = "http://127.0.0.1:{server.server_port}"\n',
+            body,
+        )
+        assert result.returncode == 0, result.stderr
+        output = json.loads(result.stdout)
+        assert output["result"].get("isError") is not True
+        assert json.loads(output["result"]["content"][0]["text"])["ok"] is True
+        assert output["schema"]["properties"]["source_agent"]["type"] == "string"
+        assert output["schema"]["properties"]["source_missing"]["type"] == "boolean"
+        assert requests == [{
+            "query": "context",
+            "limit": 3,
+            "source_agent": "pi",
+            "source_type": "session",
+            "project": "funes",
+            "repo": "owner/funes",
+            "device_id": "macminim2",
+            "role": "user",
+            "content_type": "user_message",
+            "source_missing": False,
+            "since": "2026-01-01",
+            "until": "2026-09-24",
+            "facets": {"source_agent": "pi"},
+        }]
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+@pytest.mark.skipif(NODE is None, reason="node is unavailable")
+def test_pi_funes_recall_marks_429_as_tool_error(tmp_path):
+    requests = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            requests.append(self.path)
+            self.send_response(429)
+            self.send_header("Retry-After", "0")
+            self.end_headers()
+
+        def log_message(self, format, *args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        body = (
+            "const tools = {};\n"
+            "const pi = {registerTool(tool) { tools[tool.name] = tool; }, on() {}};\n"
+            "extension(pi);\n"
+            "try { await tools.funes_recall.execute('test', {query: 'rate'}); }\n"
+            "catch (error) { console.log(JSON.stringify({text: error.message, isError: true})); }\n"
+        )
+        result = run_harness(
+            tmp_path,
+            f'[remote]\nurl = "http://127.0.0.1:{server.server_port}"\n',
+            body,
+            {"FUNES_REMOTE_RECALL_ATTEMPTS": "1"},
+        )
+        assert result.returncode == 0, result.stderr
+        parsed = json.loads(result.stdout)
+        assert parsed["isError"] is True
+        assert "HTTP 429" in parsed["text"]
+        assert requests == ["/search"]
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+@pytest.mark.skipif(NODE is None, reason="node is unavailable")
+def test_pi_funes_recall_marks_timeout_as_tool_error(tmp_path):
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            time.sleep(0.3)
+
+        def log_message(self, format, *args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        body = (
+            "const tools = {};\n"
+            "const pi = {registerTool(tool) { tools[tool.name] = tool; }, on() {}};\n"
+            "extension(pi);\n"
+            "try { await tools.funes_recall.execute('test', {query: 'timeout'}); }\n"
+            "catch (error) { console.log(JSON.stringify({text: error.message, isError: true})); }\n"
+        )
+        result = run_harness(
+            tmp_path,
+            f'[remote]\nurl = "http://127.0.0.1:{server.server_port}"\n',
+            body,
+            {
+                "FUNES_REMOTE_RECALL_ATTEMPTS": "1",
+                "FUNES_REMOTE_RECALL_TIMEOUT_MS": "200",
+                "FUNES_REMOTE_RECALL_ATTEMPT_TIMEOUT_MS": "100",
+            },
+        )
+        assert result.returncode == 0, result.stderr
+        parsed = json.loads(result.stdout)
+        assert parsed["isError"] is True
+        assert "timed out" in parsed["text"]
     finally:
         server.shutdown()
         server.server_close()

@@ -31,6 +31,30 @@ export function configuredRemoteUrl(): string {
   return "";
 }
 
+function configuredRemoteNumber(keys: string[]): number | undefined {
+  const path = process.env.FUNES_CONFIG || `${process.env.HOME || homedir()}/.config/funes/config.toml`;
+  try {
+    let section = "";
+    for (const sourceLine of readFileSync(path, "utf8").split(/\r?\n/)) {
+      const line = sourceLine.trim();
+      const sectionLine = line.match(/^\[([^\]]+)\]$/);
+      if (sectionLine) {
+        section = sectionLine[1];
+        continue;
+      }
+      if (section !== "remote" && section !== "sync") continue;
+      const match = line.match(/^([A-Za-z0-9_.-]+)\s*=\s*(?:["']([^"']+)["']|([0-9]+(?:\.[0-9]+)?))/);
+      if (!match) continue;
+      const [, key, quotedVal, numVal] = match;
+      if (keys.includes(key)) {
+        const val = Number(quotedVal ?? numVal);
+        if (!Number.isNaN(val)) return val;
+      }
+    }
+  } catch {}
+  return undefined;
+}
+
 const base = configuredRemoteUrl().replace(/\/+$/, "");
 
 function keychain(service: string): string {
@@ -153,6 +177,10 @@ const recallTimeoutMs = (() => {
   if (ms !== undefined) return bounded(ms, 18_000, 100, 60_000);
   const sec = firstEnvNumber(["FUNES_REMOTE_RECALL_TIMEOUT", "FUNES_REMOTE_SEARCH_TIMEOUT"]);
   if (sec !== undefined) return bounded(sec * 1_000, 18_000, 100, 60_000);
+  const cfgMs = configuredRemoteNumber(["recall_timeout_ms", "search_timeout_ms"]);
+  if (cfgMs !== undefined) return bounded(cfgMs, 18_000, 100, 60_000);
+  const cfgSec = configuredRemoteNumber(["recall_timeout", "search_timeout"]);
+  if (cfgSec !== undefined) return bounded(cfgSec * 1_000, 18_000, 100, 60_000);
   return 18_000;
 })();
 
@@ -190,31 +218,76 @@ const manualRecallBudget: CallBudget = {
   readyPolls: 1,
 };
 
+const recall503DelayMs = (() => {
+  const ms = firstEnvNumber([
+    "FUNES_REMOTE_RECALL_503_DELAY_MS",
+    "FUNES_REMOTE_SEARCH_503_DELAY_MS",
+  ]);
+  if (ms !== undefined) return bounded(ms, 3_000, 100, 15_000);
+  const sec = firstEnvNumber([
+    "FUNES_REMOTE_RECALL_503_DELAY",
+    "FUNES_REMOTE_SEARCH_503_DELAY",
+  ]);
+  if (sec !== undefined) return bounded(sec * 1_000, 3_000, 100, 15_000);
+  const cfgMs = configuredRemoteNumber([
+    "recall_503_delay_ms",
+    "search_503_delay_ms",
+  ]);
+  if (cfgMs !== undefined) return bounded(cfgMs, 3_000, 100, 15_000);
+  const cfgSec = configuredRemoteNumber([
+    "recall_503_delay",
+    "search_503_delay",
+  ]);
+  if (cfgSec !== undefined) return bounded(cfgSec * 1_000, 3_000, 100, 15_000);
+  return 3_000;
+})();
+
 const autoRecallTimeoutMs = (() => {
   const ms = firstEnvNumber([
     "FUNES_REMOTE_AUTO_RECALL_TIMEOUT_MS",
     "FUNES_REMOTE_AUTO_SEARCH_TIMEOUT_MS",
   ]);
-  if (ms !== undefined) return bounded(ms, 2_500, 100, 10_000);
+  if (ms !== undefined) return ms <= 0 ? 0 : bounded(ms, 2_500, 100, 10_000);
   const sec = firstEnvNumber([
     "FUNES_REMOTE_AUTO_RECALL_TIMEOUT",
     "FUNES_REMOTE_AUTO_SEARCH_TIMEOUT",
   ]);
-  if (sec !== undefined) return bounded(sec * 1_000, 2_500, 100, 10_000);
+  if (sec !== undefined) return sec <= 0 ? 0 : bounded(sec * 1_000, 2_500, 100, 10_000);
+  const cfgMs = configuredRemoteNumber([
+    "auto_recall_timeout_ms",
+    "auto_search_timeout_ms",
+  ]);
+  if (cfgMs !== undefined) return cfgMs <= 0 ? 0 : bounded(cfgMs, 2_500, 100, 10_000);
+  const cfgSec = configuredRemoteNumber([
+    "auto_recall_timeout",
+    "auto_search_timeout",
+  ]);
+  if (cfgSec !== undefined) return cfgSec <= 0 ? 0 : bounded(cfgSec * 1_000, 2_500, 100, 10_000);
   return 2_500;
 })();
 
 const autoRecallAttemptTimeoutMs = (() => {
+  if (autoRecallTimeoutMs <= 0) return 0;
   const ms = firstEnvNumber([
     "FUNES_REMOTE_AUTO_RECALL_ATTEMPT_TIMEOUT_MS",
     "FUNES_REMOTE_AUTO_SEARCH_ATTEMPT_TIMEOUT_MS",
   ]);
-  if (ms !== undefined) return bounded(ms, autoRecallTimeoutMs, 100, 10_000);
+  if (ms !== undefined) return ms <= 0 ? 0 : bounded(ms, autoRecallTimeoutMs, 100, 10_000);
   const sec = firstEnvNumber([
     "FUNES_REMOTE_AUTO_RECALL_ATTEMPT_TIMEOUT",
     "FUNES_REMOTE_AUTO_SEARCH_ATTEMPT_TIMEOUT",
   ]);
-  if (sec !== undefined) return bounded(sec * 1_000, autoRecallTimeoutMs, 100, 10_000);
+  if (sec !== undefined) return sec <= 0 ? 0 : bounded(sec * 1_000, autoRecallTimeoutMs, 100, 10_000);
+  const cfgMs = configuredRemoteNumber([
+    "auto_recall_attempt_timeout_ms",
+    "auto_search_attempt_timeout_ms",
+  ]);
+  if (cfgMs !== undefined) return cfgMs <= 0 ? 0 : bounded(cfgMs, autoRecallTimeoutMs, 100, 10_000);
+  const cfgSec = configuredRemoteNumber([
+    "auto_recall_attempt_timeout",
+    "auto_search_attempt_timeout",
+  ]);
+  if (cfgSec !== undefined) return cfgSec <= 0 ? 0 : bounded(cfgSec * 1_000, autoRecallTimeoutMs, 100, 10_000);
   return autoRecallTimeoutMs;
 })();
 
@@ -303,7 +376,7 @@ function retryDelay(response: FetchResult | undefined, attempt: number, recall: 
     }
   }
   if (recall && status === 503) {
-    return 500;
+    return recall503DelayMs;
   }
   return exponential;
 }
@@ -318,6 +391,10 @@ async function sleepUntil(ms: number, deadline: number): Promise<boolean> {
 }
 
 type ReadyState = "ready" | "warming" | "transient" | "unknown" | "permanent";
+
+type RemoteCall =
+  | { ok: true; value: unknown }
+  | { ok: false; message: string; status?: number };
 
 async function probeReady(headers: Record<string, string>, timeoutMs: number): Promise<ReadyState> {
   try {
@@ -364,15 +441,27 @@ function shouldRecall(prompt: string): boolean {
   return /(之前|上次|历史|做过|决定|决策|测试结果|偏好|已有实现|为什么放弃|以前|回忆|prior|previous|history|earlier|last time|we decided|decision|past work|preference|already implemented|old bug|regression)/i.test(prompt);
 }
 
-async function call(path: string, body: Record<string, unknown>, budget?: CallBudget) {
+function remoteFailure(message: string, status?: number): RemoteCall {
+  return { ok: false, message, ...(status === undefined ? {} : { status }) };
+}
+
+function failureForStatus(status: number): string {
+  if (status === 401 || status === 403) return `Funes remote authentication failed (HTTP ${status})`;
+  if (status === 429) return "Funes remote rate limited the request (HTTP 429)";
+  if (status >= 500) return `Funes remote unavailable (HTTP ${status})`;
+  return `Funes remote request failed (HTTP ${status})`;
+}
+
+async function call(path: string, body: Record<string, unknown>, budget?: CallBudget): Promise<RemoteCall> {
   const isRecall = path === "/search" || path === "/recall";
   const activeBudget = budget ?? (isRecall ? manualRecallBudget : manualBudget);
-  if (!base || !token) return null;
+  if (!base) return remoteFailure("Funes remote URL is not configured");
+  if (!token) return remoteFailure("Funes remote API token is not configured");
   let encodedBody: string;
   try {
     encodedBody = JSON.stringify(body);
   } catch {
-    return null;
+    return remoteFailure("Funes remote request could not be encoded");
   }
 
   const headers: Record<string, string> = { "Content-Type": "application/json" };
@@ -392,10 +481,12 @@ async function call(path: string, body: Record<string, unknown>, budget?: CallBu
     // A permanent readiness response (most commonly 401/403) must not be
     // followed by a duplicate POST. A still-warming service can be queried if
     // the bounded poll count was reached before the overall deadline.
-    if (ready === "permanent" || (ready === "warming" && now() >= deadline)) return null;
+    if (ready === "permanent") return remoteFailure("Funes remote readiness check failed");
+    if (ready === "warming" && now() >= deadline) return remoteFailure("Funes remote is still warming");
   }
 
   let lastResponse: FetchResult | undefined;
+  let lastError: string | undefined;
   for (let attempt = 0; attempt < activeBudget.attempts; attempt += 1) {
     const remaining = deadline - now();
     if (remaining <= 0) break;
@@ -412,18 +503,23 @@ async function call(path: string, body: Record<string, unknown>, budget?: CallBu
       );
       const status = statusOf(response);
       if (isSuccess(response)) {
-        if (response.validJson) return response.value;
+        if (response.validJson) return { ok: true, value: response.value };
         // A truncated/invalid JSON body is transient; let the bounded retry
         // loop recover without changing the response shape for valid calls.
+        lastError = "Funes remote returned invalid JSON";
       } else {
         // Never retry authentication or other caller errors.  Only provider /
         // gateway failures and explicit rate limits are transient here.
-        if (!isRetryableStatus(status)) return null;
+        if (!isRetryableStatus(status)) return remoteFailure(failureForStatus(status), status);
         lastResponse = response;
+        lastError = failureForStatus(status);
       }
-    } catch {
+    } catch (error) {
       // Fetch failures include connection resets and per-attempt timeouts; all
       // are bounded by the shared deadline and safe to retry.
+      lastError = error instanceof RequestTimeoutError
+        ? "Funes remote request timed out"
+        : "Funes remote request failed before receiving a response";
     }
 
     if (attempt + 1 >= activeBudget.attempts) break;
@@ -431,7 +527,17 @@ async function call(path: string, body: Record<string, unknown>, budget?: CallBu
     if (remainingAfterAttempt <= 0) break;
     if (!(await sleepUntil(retryDelay(lastResponse, attempt, isRecall), deadline))) break;
   }
-  return null;
+  const status = lastResponse ? statusOf(lastResponse) : undefined;
+  return remoteFailure(lastError || "Funes remote request failed", status);
+}
+
+function toolResult(outcome: RemoteCall, name: string) {
+  if (outcome.ok) {
+    return { content: [{ type: "text", text: JSON.stringify(outcome.value, null, 2) }], details: {} };
+  }
+  const err = new Error(`${name} error: ${outcome.message}`);
+  if (outcome.status !== undefined) (err as any).status = outcome.status;
+  throw err;
 }
 
 export default function funesRemote(pi: ExtensionAPI) {
@@ -439,26 +545,47 @@ export default function funesRemote(pi: ExtensionAPI) {
     name: "funes_recall",
     label: "funes recall",
     description: "Search unified Codex, Pi and Claude memory and return original raw context.",
-    parameters: { type: "object", properties: { query: { type: "string" }, limit: { type: "integer" } }, required: ["query"] },
-    execute: async (_id: string, args: Record<string, unknown>) => ({ content: [{ type: "text", text: JSON.stringify(await call("/search", args, manualRecallBudget), null, 2) }], details: {} }),
+    parameters: {
+      type: "object",
+      properties: {
+        query: { type: "string" },
+        limit: { type: "integer" },
+        source_agent: { type: "string" },
+        source_type: { type: "string" },
+        project: { type: "string" },
+        repo: { type: "string" },
+        device_id: { type: "string" },
+        role: { type: "string" },
+        content_type: { type: "string" },
+        source_missing: { type: "boolean" },
+        since: { type: "string" },
+        until: { type: "string" },
+        facets: { type: "object" },
+      },
+      required: ["query"],
+    },
+    execute: async (_id: string, args: Record<string, unknown>) => toolResult(await call("/search", args, manualRecallBudget), "funes_recall"),
   });
   pi.registerTool({
     name: "funes_get",
     label: "funes get",
     description: "Read one original unified memory record.",
     parameters: { type: "object", properties: { record_id: { type: "string" } }, required: ["record_id"] },
-    execute: async (_id: string, args: Record<string, unknown>) => ({ content: [{ type: "text", text: JSON.stringify(await call("/get", { id: args.record_id }, manualBudget), null, 2) }], details: {} }),
+    execute: async (_id: string, args: Record<string, unknown>) => toolResult(await call("/get", { id: args.record_id }, manualBudget), "funes_get"),
   });
   pi.on("before_agent_start", async (event) => {
+    if (autoRecallTimeoutMs <= 0) return;
     const prompt = String(event.prompt || "").trim();
     if (!shouldRecall(prompt)) return;
     let result: any;
     try {
-      result = await call(
+      const outcome = await call(
         "/search",
         { query: prompt, limit: 5 },
         automaticRecallBudget,
       );
+      if (!outcome.ok) return;
+      result = outcome.value;
     } catch {
       return;
     }

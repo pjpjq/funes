@@ -48,6 +48,44 @@ class Store:
         CREATE TABLE IF NOT EXISTS cursors(source_key TEXT PRIMARY KEY,offset INTEGER DEFAULT 0,inode INTEGER,size INTEGER,updated_at REAL);
         CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL,updated_at REAL NOT NULL);
         CREATE INDEX IF NOT EXISTS sources_active_kind ON sources(active,kind);
+        CREATE TABLE IF NOT EXISTS source_record_counts(source_key TEXT PRIMARY KEY,record_count INTEGER NOT NULL DEFAULT 0,pending_count INTEGER NOT NULL DEFAULT 0);
+        CREATE TRIGGER IF NOT EXISTS records_ai AFTER INSERT ON records BEGIN
+            INSERT INTO source_record_counts(source_key,record_count,pending_count)
+            VALUES(NEW.source_key,1,CASE WHEN EXISTS(SELECT 1 FROM queue WHERE record_id=NEW.record_id) THEN 1 ELSE 0 END)
+            ON CONFLICT(source_key) DO UPDATE SET
+                record_count=record_count+1,
+                pending_count=pending_count+CASE WHEN EXISTS(SELECT 1 FROM queue WHERE record_id=NEW.record_id) THEN 1 ELSE 0 END;
+        END;
+        CREATE TRIGGER IF NOT EXISTS records_ad AFTER DELETE ON records BEGIN
+            UPDATE source_record_counts
+            SET record_count=MAX(0,record_count-1),
+                pending_count=CASE WHEN EXISTS(SELECT 1 FROM queue WHERE record_id=OLD.record_id)
+                                   THEN MAX(0,pending_count-1)
+                                   ELSE pending_count END
+            WHERE source_key=OLD.source_key;
+        END;
+        CREATE TRIGGER IF NOT EXISTS records_au_source_key AFTER UPDATE OF source_key ON records
+        WHEN OLD.source_key!=NEW.source_key
+        BEGIN
+            UPDATE source_record_counts SET record_count=MAX(0,record_count-1) WHERE source_key=OLD.source_key;
+            UPDATE source_record_counts SET pending_count=MAX(0,pending_count-1)
+                WHERE source_key=OLD.source_key AND EXISTS(SELECT 1 FROM queue WHERE record_id=OLD.record_id);
+            INSERT INTO source_record_counts(source_key,record_count,pending_count)
+            VALUES(NEW.source_key,1,CASE WHEN EXISTS(SELECT 1 FROM queue WHERE record_id=NEW.record_id) THEN 1 ELSE 0 END)
+            ON CONFLICT(source_key) DO UPDATE SET
+                record_count=record_count+1,
+                pending_count=pending_count+CASE WHEN EXISTS(SELECT 1 FROM queue WHERE record_id=NEW.record_id) THEN 1 ELSE 0 END;
+        END;
+        CREATE TRIGGER IF NOT EXISTS queue_ai AFTER INSERT ON queue BEGIN
+            UPDATE source_record_counts
+            SET pending_count=pending_count+1
+            WHERE source_key=(SELECT source_key FROM records WHERE record_id=NEW.record_id);
+        END;
+        CREATE TRIGGER IF NOT EXISTS queue_ad AFTER DELETE ON queue BEGIN
+            UPDATE source_record_counts
+            SET pending_count=MAX(0,pending_count-1)
+            WHERE source_key=(SELECT source_key FROM records WHERE record_id=OLD.record_id);
+        END;
         ''')
         source_columns={row[1] for row in self.db.execute("PRAGMA table_info(sources)")}
         if "retired" not in source_columns:
@@ -59,26 +97,66 @@ class Store:
         if not self.db.execute(
             "SELECT 1 FROM meta WHERE key=?",(retirement_migration,)
         ).fetchone():
-            now=time.time()
-            with self.db:
-                self.db.execute('''
-                    UPDATE sources SET retired=1,active=0,updated_at=?
-                    WHERE kind='codex_memory'
-                      AND replace(lower(path),char(92),'/') LIKE '%/.codex/automations/%'
-                      AND lower(path) NOT LIKE '%.md'
-                      AND lower(path) NOT LIKE '%.toml'
-                ''',(now,))
-                self.db.execute('''
-                    DELETE FROM queue WHERE record_id IN (
-                        SELECT r.record_id FROM records r
-                        JOIN sources s ON s.source_key=r.source_key
-                        WHERE s.retired=1
+            self.db.commit()
+            self.db.execute("BEGIN IMMEDIATE")
+            try:
+                if not self.db.execute(
+                    "SELECT 1 FROM meta WHERE key=?",(retirement_migration,)
+                ).fetchone():
+                    now=time.time()
+                    self.db.execute('''
+                        UPDATE sources SET retired=1,active=0,updated_at=?
+                        WHERE kind='codex_memory'
+                          AND replace(lower(path),char(92),'/') LIKE '%/.codex/automations/%'
+                          AND lower(path) NOT LIKE '%.md'
+                          AND lower(path) NOT LIKE '%.toml'
+                    ''',(now,))
+                    self.db.execute('''
+                        DELETE FROM queue WHERE record_id IN (
+                            SELECT r.record_id FROM records r
+                            JOIN sources s ON s.source_key=r.source_key
+                            WHERE s.retired=1
+                        )
+                    ''')
+                    self.db.execute(
+                        "INSERT INTO meta(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO NOTHING",
+                        (retirement_migration,"completed",now),
                     )
-                ''')
-                self.db.execute(
-                    "INSERT INTO meta(key,value,updated_at) VALUES(?,?,?)",
-                    (retirement_migration,"completed",now),
-                )
+                self.db.commit()
+            except Exception:
+                self.db.rollback()
+                raise
+        cache_migration="stats_cache_v1"
+        if not self.db.execute(
+            "SELECT 1 FROM meta WHERE key=?",(cache_migration,)
+        ).fetchone():
+            self.db.commit()
+            self.db.execute("BEGIN IMMEDIATE")
+            try:
+                if not self.db.execute(
+                    "SELECT 1 FROM meta WHERE key=?",(cache_migration,)
+                ).fetchone():
+                    now=time.time()
+                    self.db.execute('''
+                        INSERT INTO source_record_counts(source_key,record_count,pending_count)
+                        SELECT r.source_key,
+                               count(r.record_id) AS record_count,
+                               count(q.record_id) AS pending_count
+                        FROM records r
+                        LEFT JOIN queue q ON q.record_id=r.record_id
+                        GROUP BY r.source_key
+                        ON CONFLICT(source_key) DO UPDATE SET
+                            record_count=excluded.record_count,
+                            pending_count=excluded.pending_count
+                    ''')
+                    self.db.execute(
+                        "INSERT INTO meta(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO NOTHING",
+                        (cache_migration,"completed",now),
+                    )
+                self.db.commit()
+            except Exception:
+                self.db.rollback()
+                raise
     def close(self): self.db.close()
     def register_source(self,s:Source,stat=None):
         now=time.time(); st=stat
@@ -157,10 +235,9 @@ class Store:
     def enqueue_records(self, record_ids: list[str]) -> int:
         if not record_ids:
             return 0
-        before=self.db.total_changes
         now=time.time()
         with self.db:
-            self.db.executemany(
+            cursor=self.db.executemany(
                 """INSERT OR IGNORE INTO queue(
                 record_id,attempts,next_at,last_error,queued_at)
                 SELECT r.record_id,0,0,NULL,? FROM records r
@@ -168,7 +245,7 @@ class Store:
                 WHERE r.record_id=? AND COALESCE(s.retired,0)=0""",
                 ((now,record_id) for record_id in dict.fromkeys(record_ids)),
             )
-        return self.db.total_changes-before
+        return max(0, cursor.rowcount)
     def ack(self,ids:list[str]):
         if ids:
             now=time.time()
@@ -204,16 +281,10 @@ class Store:
         synced=dict(discovered)
         rows=self.db.execute('''
             SELECT s.kind,count(*) AS discovered,
-                   sum(CASE WHEN EXISTS (
-                       SELECT 1 FROM records r WHERE r.source_key=s.source_key LIMIT 1
-                   ) THEN 1 ELSE 0 END) AS parsed,
-                   sum(CASE WHEN EXISTS (
-                       SELECT 1 FROM records r WHERE r.source_key=s.source_key LIMIT 1
-                   ) AND NOT EXISTS (
-                       SELECT 1 FROM records r JOIN queue q ON q.record_id=r.record_id
-                       WHERE r.source_key=s.source_key LIMIT 1
-                   ) THEN 1 ELSE 0 END) AS synced
+                   sum(CASE WHEN coalesce(c.record_count, 0) > 0 THEN 1 ELSE 0 END) AS parsed,
+                   sum(CASE WHEN coalesce(c.record_count, 0) > 0 AND coalesce(c.pending_count, 0) = 0 THEN 1 ELSE 0 END) AS synced
             FROM sources s
+            LEFT JOIN source_record_counts c ON c.source_key=s.source_key
             WHERE s.active=1
             GROUP BY s.kind
         ''')
@@ -236,11 +307,6 @@ class Store:
             )
     def record_counts_by_agent(self):
         rows=self.db.execute('''
-            WITH record_counts AS (
-                SELECT source_key,count(*) AS n
-                FROM records INDEXED BY records_source
-                GROUP BY source_key
-            )
             SELECT CASE
                        WHEN substr(s.kind,1,5)='codex' THEN 'codex'
                        WHEN substr(s.kind,1,2)='pi' THEN 'pi'
@@ -250,9 +316,10 @@ class Store:
                        WHEN s.kind='persistent' THEN 'shared'
                        ELSE 'unknown'
                    END AS agent,
-                   sum(record_counts.n) AS n
-            FROM record_counts
-            LEFT JOIN sources s ON s.source_key=record_counts.source_key
+                   sum(c.record_count) AS n
+            FROM source_record_counts c
+            LEFT JOIN sources s ON s.source_key=c.source_key
+            WHERE c.record_count > 0
             GROUP BY agent
         ''')
         return {row["agent"]:int(row["n"]) for row in rows}
@@ -260,7 +327,8 @@ class Store:
         by_agent=self.record_counts_by_agent()
         pending=self.pending_count()
         counts=self.source_counts()
-        return {"sources":self.db.execute("SELECT count(*) FROM sources").fetchone()[0],"active_sources":self.db.execute("SELECT count(*) FROM sources WHERE active=1").fetchone()[0],"records":self.db.execute("SELECT count(*) FROM records").fetchone()[0],"pending":pending,"pending_uploads":pending,"failed_uploads":self.db.execute("SELECT count(*) FROM queue WHERE last_error IS NOT NULL").fetchone()[0],"last_successful_sync":self.meta_value("last_successful_sync"),"discovered":counts["discovered"],"parsed":counts["parsed"],"synced":counts["synced"],"by_agent":by_agent}
+        total_records=int(self.db.execute("SELECT coalesce(sum(record_count),0) FROM source_record_counts").fetchone()[0])
+        return {"sources":self.db.execute("SELECT count(*) FROM sources").fetchone()[0],"active_sources":self.db.execute("SELECT count(*) FROM sources WHERE active=1").fetchone()[0],"records":total_records,"pending":pending,"pending_uploads":pending,"failed_uploads":self.db.execute("SELECT count(*) FROM queue WHERE last_error IS NOT NULL").fetchone()[0],"last_successful_sync":self.meta_value("last_successful_sync"),"discovered":counts["discovered"],"parsed":counts["parsed"],"synced":counts["synced"],"by_agent":by_agent}
     def search(self,query,limit=20):
         q=f"%{query}%"; rows=self.db.execute("SELECT payload FROM records WHERE payload LIKE ? ORDER BY updated_at DESC LIMIT ?",(q,limit)).fetchall(); return [json.loads(r[0]) for r in rows]
     def get(self,record_id):

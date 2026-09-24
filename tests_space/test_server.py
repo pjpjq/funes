@@ -2308,6 +2308,76 @@ def test_canonical_source_version_keeps_epoch_prefix_across_shadow_changes():
     assert right.startswith("~funes-eg-v1:00000000000000000007:")
 
 
+def test_source_version_only_change_skips_native_reconcile(monkeypatch, tmp_path):
+    """A source metadata revision must not re-embed unchanged raw content."""
+    app = _source_app(tmp_path)
+    profile = {
+        "provider": "voyage",
+        "model": "voyage-4-lite",
+        "dimensions": 1024,
+        "schema_version": 2,
+        "fingerprint": "fixed-profile",
+    }
+    memory = "owner/voyage-build"
+    monkeypatch.setattr(bridge, "index_embedding_profile", lambda: profile)
+    monkeypatch.setattr(bridge, "index_memory", lambda: memory)
+    monkeypatch.setattr(bridge, "optimize_canonical_index", lambda *_args: True)
+    monkeypatch.setattr(bridge, "_request_canonical_refresh", lambda *_args, **_kwargs: None)
+    app.store.conn.execute(
+        "UPDATE sync_state SET native_checkpoint_profile=?, native_checkpoint_memory=? WHERE id=1",
+        (profile["fingerprint"], memory),
+    )
+    app.store.ingest(
+        [{
+            "source_identity": "source-version-only",
+            "source_version": "v1",
+            "source_agent": "pi",
+            "source_type": "memory",
+            "raw_text": "原始内容不变",
+            "retrieval_text": "unchanged raw content",
+            "translation_status": "skipped_raw_mode",
+            "native_index_version": "legacy-native-v1",
+            "native_index_status": "indexed",
+            "native_index_profile": profile["fingerprint"],
+            "native_index_memory": memory,
+            "native_indexed_at": "2026-09-24T00:00:00Z",
+        }]
+    )
+    before = app.store.get("source-version-only")
+    assert before["native_index_pending"] == 0
+
+    app.store.ingest(
+        [{
+            "source_identity": "source-version-only",
+            "source_version": "v2",
+            "source_agent": "pi",
+            "source_type": "memory",
+            "raw_text": "原始内容不变",
+        }]
+    )
+    after = app.store.get("source-version-only")
+    assert after["source_version"] == "v2"
+    assert after["content_hash"] == before["content_hash"]
+    assert after["native_index_status"] == "indexed"
+    assert after["native_index_profile"] == profile["fingerprint"]
+    assert after["native_index_memory"] == memory
+    assert after["native_index_version"] == "legacy-native-v1"
+    assert after["native_index_pending"] == 0
+
+    monkeypatch.setattr(
+        bridge,
+        "run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("source_version-only update must not call Voyage")
+        ),
+    )
+    try:
+        result = bridge.reconcile_canonical_index(app)
+    finally:
+        app.store.close()
+    assert result["attempted"] == 0
+
+
 def test_canonical_document_carries_embedding_generation():
     item = {
         "source_identity": "memory-section",

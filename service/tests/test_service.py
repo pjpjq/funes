@@ -966,6 +966,231 @@ class ServiceTests(unittest.TestCase):
         finally:
             store.close()
 
+    def test_source_version_change_preserves_valid_indexed_native_state(self):
+        store = Store(self.tmp.name)
+        store.conn.execute(
+            "UPDATE sync_state SET native_checkpoint_profile='prof1', native_checkpoint_memory='mem1' WHERE id=1"
+        )
+        store.ingest([{
+            "source_identity": "doc-preserve",
+            "source_version": "v1",
+            "raw_text": "hello world",
+            "native_index_status": "indexed",
+            "native_index_profile": "prof1",
+            "native_index_memory": "mem1",
+            "native_index_version": "idx-v1",
+            "native_indexed_at": "2026-09-24T00:00:00Z",
+            "native_generation": 1,
+        }])
+        st = store.conn.execute("SELECT native_indexed_count FROM sync_state WHERE id=1").fetchone()
+        self.assertEqual(st[0], 1)
+
+        store.ingest([{
+            "source_identity": "doc-preserve",
+            "source_version": "v2",
+            "raw_text": "hello world",
+        }])
+        item = store.get("doc-preserve")
+        row = store.conn.execute("SELECT native_index_pending FROM memories WHERE source_identity='doc-preserve'").fetchone()
+        st = store.conn.execute("SELECT native_indexed_count FROM sync_state WHERE id=1").fetchone()
+        self.assertEqual(item["native_index_status"], "indexed")
+        self.assertEqual(item["native_index_profile"], "prof1")
+        self.assertEqual(item["native_index_memory"], "mem1")
+        self.assertEqual(item["native_index_version"], "idx-v1")
+        self.assertEqual(item["native_indexed_at"], "2026-09-24T00:00:00Z")
+        self.assertEqual(item["native_generation"], 1)
+        self.assertEqual(row["native_index_pending"], 0)
+        self.assertEqual(st[0], 1)
+        store.close()
+
+    def test_source_version_change_preserves_valid_held_native_state(self):
+        store = Store(self.tmp.name)
+        store.conn.execute(
+            "UPDATE sync_state SET native_checkpoint_profile='prof1', native_checkpoint_memory='mem1' WHERE id=1"
+        )
+        store.ingest([{
+            "source_identity": "doc-held",
+            "source_version": "v1",
+            "raw_text": "secret text",
+            "native_index_status": "held_secret",
+            "native_index_profile": "prof1",
+            "native_index_memory": "mem1",
+        }])
+        st = store.conn.execute("SELECT native_held_count FROM sync_state WHERE id=1").fetchone()
+        self.assertEqual(st[0], 1)
+
+        store.ingest([{
+            "source_identity": "doc-held",
+            "source_version": "v2",
+            "raw_text": "secret text",
+        }])
+        item = store.get("doc-held")
+        row = store.conn.execute("SELECT native_index_pending FROM memories WHERE source_identity='doc-held'").fetchone()
+        st = store.conn.execute("SELECT native_held_count FROM sync_state WHERE id=1").fetchone()
+        self.assertEqual(item["native_index_status"], "held_secret")
+        self.assertEqual(row["native_index_pending"], 0)
+        self.assertEqual(st[0], 1)
+        store.close()
+
+    def test_source_version_change_with_new_raw_resets_native_state(self):
+        store = Store(self.tmp.name)
+        store.conn.execute(
+            "UPDATE sync_state SET native_checkpoint_profile='prof1', native_checkpoint_memory='mem1' WHERE id=1"
+        )
+        store.ingest([{
+            "source_identity": "doc-changed-raw",
+            "source_version": "v1",
+            "raw_text": "original raw",
+            "native_index_status": "indexed",
+            "native_index_profile": "prof1",
+            "native_index_memory": "mem1",
+        }])
+        st = store.conn.execute("SELECT native_indexed_count FROM sync_state WHERE id=1").fetchone()
+        self.assertEqual(st[0], 1)
+
+        store.ingest([{
+            "source_identity": "doc-changed-raw",
+            "source_version": "v2",
+            "raw_text": "new modified raw",
+        }])
+        item = store.get("doc-changed-raw")
+        row = store.conn.execute("SELECT native_index_pending FROM memories WHERE source_identity='doc-changed-raw'").fetchone()
+        st = store.conn.execute("SELECT native_indexed_count FROM sync_state WHERE id=1").fetchone()
+        self.assertIsNone(item["native_index_status"])
+        self.assertEqual(row["native_index_pending"], 1)
+        self.assertEqual(st[0], 0)
+        store.close()
+
+    def test_source_version_change_with_pending_state_remains_pending(self):
+        store = Store(self.tmp.name)
+        store.conn.execute(
+            "UPDATE sync_state SET native_checkpoint_profile='prof1', native_checkpoint_memory='mem1' WHERE id=1"
+        )
+        store.ingest([{
+            "source_identity": "doc-pending",
+            "source_version": "v1",
+            "raw_text": "pending raw",
+            "native_index_status": "retry",
+            "native_index_profile": "prof1",
+            "native_index_memory": "mem1",
+        }])
+        row = store.conn.execute("SELECT native_index_pending FROM memories WHERE source_identity='doc-pending'").fetchone()
+        self.assertEqual(row["native_index_pending"], 1)
+
+        store.ingest([{
+            "source_identity": "doc-pending",
+            "source_version": "v2",
+            "raw_text": "pending raw",
+        }])
+        row = store.conn.execute("SELECT native_index_pending FROM memories WHERE source_identity='doc-pending'").fetchone()
+        st = store.conn.execute("SELECT native_indexed_count FROM sync_state WHERE id=1").fetchone()
+        self.assertEqual(row["native_index_pending"], 1)
+        self.assertEqual(st[0], 0)
+        store.close()
+
+    def test_source_version_change_with_profile_or_memory_mismatch_resets_to_pending(self):
+        store = Store(self.tmp.name)
+        store.conn.execute(
+            "UPDATE sync_state SET native_checkpoint_profile='prof1', native_checkpoint_memory='mem1' WHERE id=1"
+        )
+        # Case A: Supplied mismatch on profile
+        store.ingest([{
+            "source_identity": "doc-mismatch-prof",
+            "source_version": "v1",
+            "raw_text": "mismatch text",
+            "native_index_status": "indexed",
+            "native_index_profile": "prof1",
+            "native_index_memory": "mem1",
+            "native_index_version": "idx-v1",
+            "native_indexed_at": "2026-09-24T00:00:00Z",
+        }])
+        store.ingest([{
+            "source_identity": "doc-mismatch-prof",
+            "source_version": "v2",
+            "raw_text": "mismatch text",
+            "native_index_profile": "prof2",
+        }])
+        row = store.conn.execute("SELECT native_index_pending FROM memories WHERE source_identity='doc-mismatch-prof'").fetchone()
+        self.assertEqual(row["native_index_pending"], 1)
+
+        # Case B: Supplied mismatch on memory
+        store.ingest([{
+            "source_identity": "doc-mismatch-mem",
+            "source_version": "v1",
+            "raw_text": "mismatch memory text",
+            "native_index_status": "indexed",
+            "native_index_profile": "prof1",
+            "native_index_memory": "mem1",
+            "native_index_version": "idx-v1",
+            "native_indexed_at": "2026-09-24T00:00:00Z",
+        }])
+        store.ingest([{
+            "source_identity": "doc-mismatch-mem",
+            "source_version": "v2",
+            "raw_text": "mismatch memory text",
+            "native_index_memory": "mem2",
+        }])
+        row = store.conn.execute("SELECT native_index_pending FROM memories WHERE source_identity='doc-mismatch-mem'").fetchone()
+        self.assertEqual(row["native_index_pending"], 1)
+
+        # Case C: Checkpoint mismatch in store
+        store.ingest([{
+            "source_identity": "doc-mismatch-checkpoint",
+            "source_version": "v1",
+            "raw_text": "checkpoint mismatch text",
+            "native_index_status": "indexed",
+            "native_index_profile": "prof1",
+            "native_index_memory": "mem1",
+            "native_index_version": "idx-v1",
+            "native_indexed_at": "2026-09-24T00:00:00Z",
+        }])
+        store._rebuild_native_checkpoint_state_locked("prof2", "mem2")
+        row = store.conn.execute("SELECT native_index_pending FROM memories WHERE source_identity='doc-mismatch-checkpoint'").fetchone()
+        self.assertEqual(row["native_index_pending"], 1)
+
+        store.ingest([{
+            "source_identity": "doc-mismatch-checkpoint",
+            "source_version": "v2",
+            "raw_text": "checkpoint mismatch text",
+        }])
+        row = store.conn.execute("SELECT native_index_pending FROM memories WHERE source_identity='doc-mismatch-checkpoint'").fetchone()
+        self.assertEqual(row["native_index_pending"], 1)
+        store.close()
+
+    def test_prepare_ingest_documents_source_version_change_preserves_translation_state(self):
+        app = App()
+        try:
+            app.store.ingest([{
+                "source_identity": "doc-trans",
+                "source_version": "v1",
+                "raw_text": "你好世界，这是一个测试",
+                "retrieval_text": "hello world, this is a test",
+                "translation_status": "ok",
+                "translation_hash": "h1",
+                "translation_version": "t1",
+            }])
+            prepared = prepare_ingest_documents(app, [{
+                "source_identity": "doc-trans",
+                "source_version": "v2",
+                "raw_text": "你好世界，这是一个测试",
+            }])
+            self.assertEqual(len(prepared), 1)
+            item = prepared[0]
+            self.assertEqual(item["retrieval_text"], "hello world, this is a test")
+            self.assertEqual(item["translation_status"], "ok")
+            self.assertEqual(item["translation_hash"], "h1")
+            self.assertEqual(item["translation_version"], "t1")
+
+            app.store.ingest(prepared)
+            stored = app.store.get("doc-trans")
+            self.assertEqual(stored["source_version"], "v2")
+            self.assertEqual(stored["retrieval_text"], "hello world, this is a test")
+            self.assertEqual(stored["translation_status"], "ok")
+            self.assertEqual(stored["translation_hash"], "h1")
+            self.assertEqual(stored["translation_version"], "t1")
+        finally:
+            app.close()
+
     def test_multiple_chunks_same_source_path(self):
         store = Store(self.tmp.name)
         result = store.ingest([

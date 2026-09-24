@@ -29,6 +29,7 @@ from typing import Any
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from service.hub_cache import HubCache
 from service.server import App as SourceApp
 from service.server import expanded_candidate_limit
 from service.server import ingest_documents as persist_source_ingest
@@ -39,6 +40,33 @@ from service.server import queue_reindex as queue_source_reindex
 from service.server import stable_rrf
 from service.server import utc_now
 from service.server import validate_source_identity_batch
+
+
+# The optional Bucket only stores derived immutable Hub cache files. Locks and
+# snapshot symlinks stay on the local POSIX filesystem; originals/checkpoints
+# remain in the source store, and the canonical index remains in its Dataset.
+HUB_CACHE: HubCache | None = None
+HUB_CACHE_ERROR = ""
+
+
+def start_hub_cache() -> None:
+    global HUB_CACHE, HUB_CACHE_ERROR
+    try:
+        HUB_CACHE = HubCache.from_env()
+        if HUB_CACHE is not None:
+            HUB_CACHE.restore()
+            HUB_CACHE.start()
+            atexit.register(HUB_CACHE.stop)
+    except Exception as exc:
+        # Cache failure must never prevent the normal Hub read path or ingestion.
+        # Exception messages can contain private paths or provider credentials.
+        HUB_CACHE_ERROR = type(exc).__name__
+
+
+def hub_cache_status() -> dict[str, object]:
+    if HUB_CACHE is not None:
+        return HUB_CACHE.status()
+    return {"enabled": False, "error_class": HUB_CACHE_ERROR}
 
 
 FUNES_BIN = os.getenv("FUNES_BIN", "/usr/local/bin/funes")
@@ -1410,6 +1438,10 @@ NATIVE_HELD_SOURCE_IDS_RE = re.compile(
     r"(?m)[ \t]held_source_ids=(\[[^\r\n]*\])[ \t]*$"
 )
 NATIVE_HELD_SOURCE_ID_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
+NATIVE_STALE_SOURCE_IDS_RE = re.compile(
+    r"(?m)[ \t]stale_source_ids=(\[[^\r\n]*\])[ \t]*$"
+)
+NATIVE_STALE_SOURCE_ID_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
 NATIVE_RECORD_ERROR_RE = re.compile(
     r"invalid canonical JSONL record|must not be empty|must not contain NUL|invalid timestamp",
     re.IGNORECASE,
@@ -1622,6 +1654,35 @@ def _reported_held_source_ids(
     return set(source_ids)
 
 
+def _reported_stale_source_ids(
+    output: str,
+    records: list[tuple[dict, dict]],
+    stale: int,
+) -> set[str] | None:
+    """Validate the opaque stale mapping before trusting a non-bisecting report."""
+    matches = NATIVE_STALE_SOURCE_IDS_RE.findall(output)
+    if len(matches) != 1:
+        return None
+    try:
+        source_ids = json.loads(matches[0])
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(source_ids, list) or len(source_ids) != stale:
+        return None
+    if any(
+        not isinstance(source_id, str)
+        or NATIVE_STALE_SOURCE_ID_RE.fullmatch(source_id) is None
+        for source_id in source_ids
+    ) or len(set(source_ids)) != stale:
+        return None
+    record_source_ids = {
+        _opaque_source_id(str(item["source_identity"])) for item, _ in records
+    }
+    if len(record_source_ids) != len(records) or not set(source_ids) <= record_source_ids:
+        return None
+    return set(source_ids)
+
+
 def _ingest_canonical_subset(
     records: list[tuple[dict, dict]],
     directory: Path,
@@ -1714,7 +1775,44 @@ def _ingest_canonical_subset(
                 memory=memory,
             )
             for item, document in records
-        ], committed
+            ], committed
+    stale_source_ids = _reported_stale_source_ids(output, records, stale)
+    held_source_ids = _reported_held_source_ids(output, records, held) if held else set()
+    # Newer native binaries identify stale rows, so mixed batches can be handled in one
+    # invocation. This preserves stale->retry and never advances a stale checkpoint.
+    if stale_source_ids is not None and (held == 0 or held_source_ids is not None):
+        if sources == 0 or committed:
+            held_source_ids = held_source_ids or set()
+            updates = []
+            for item, document in records:
+                opaque_id = _opaque_source_id(str(item["source_identity"]))
+                if opaque_id in stale_source_ids:
+                    updates.append(
+                        _native_update(
+                            item, "retry", None, "native_stale", profile=profile, memory=memory
+                        )
+                    )
+                elif opaque_id in held_source_ids:
+                    updates.append(
+                        _native_update(
+                            item,
+                            "held_secret",
+                            document["source_version"],
+                            profile=profile,
+                            memory=memory,
+                        )
+                    )
+                else:
+                    updates.append(
+                        _native_update(
+                            item,
+                            "indexed",
+                            document["source_version"],
+                            profile=profile,
+                            memory=memory,
+                        )
+                    )
+            return updates, committed
     # The extension identifies held rows only.  A stale row has no identity mapping, so preserve
     # the legacy bisection fallback unless every non-held row is safe to mark indexed.
     if stale == 0:
@@ -1751,6 +1849,13 @@ def _ingest_canonical_subset(
             _native_update(
                 item, "retry", None, "native_stale", profile=profile, memory=memory
             )
+        ], committed
+    # A legacy native binary may not emit stale identities. Avoid a full binary tree when the
+    # whole batch is stale; one retry is safe and the next reconciliation can observe a new head.
+    if stale == len(records):
+        return [
+            _native_update(item, "retry", None, "native_stale", profile=profile, memory=memory)
+            for item, _ in records
         ], committed
     middle = len(records) // 2
     left, left_commit = _ingest_canonical_subset(
@@ -3335,6 +3440,7 @@ class Handler(BaseHTTPRequestHandler):
                 code, payload = ready_payload()
             else:
                 code, payload = sync_status_payload()
+            payload["hub_cache"] = hub_cache_status()
             self.send_json(code, payload)
             return
         self.send_json(404, {"error": "not found"})
@@ -3347,6 +3453,7 @@ class Handler(BaseHTTPRequestHandler):
             obj = self.body()
             if self.path == "/sync/status":
                 code, payload = sync_status_payload()
+                payload["hub_cache"] = hub_cache_status()
                 self.send_json(code, payload)
                 return
             if self.path == "/sources/check":
@@ -4081,6 +4188,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def serve(host: str = "0.0.0.0", port: int = PORT) -> None:
     (HOME / "sources").mkdir(parents=True, exist_ok=True)
+    start_hub_cache()
     source_app()
     request_warm()
     ThreadingHTTPServer((host, port), Handler).serve_forever()

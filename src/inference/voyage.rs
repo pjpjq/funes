@@ -33,6 +33,8 @@ const DOCUMENT_RATE_LIMIT_DELAY: Duration = Duration::from_secs(60);
 const DOCUMENT_MAX_TOKENS: usize = 9_000;
 const DOCUMENT_TOKENS_PER_MINUTE: usize = 0;
 const DOCUMENT_MIN_REQUEST_INTERVAL: Duration = Duration::ZERO;
+const DOCUMENT_CONCURRENCY: usize = 1;
+const MAX_DOCUMENT_CONCURRENCY: usize = 8;
 const TPM_WINDOW: Duration = Duration::from_secs(60);
 // Voyage's embeddings endpoint accepts at most 128 input strings per request.
 // Keep this provider-specific guard here so callers may continue batching local
@@ -444,13 +446,14 @@ pub struct VoyageEmbedder {
     document_retry_delay: Duration,
     document_rate_limit_delay: Duration,
     document_max_tokens: usize,
+    document_concurrency: usize,
     pacer: Mutex<DocumentPacer>,
     clock: Arc<dyn Clock>,
 }
 
 impl VoyageEmbedder {
     pub fn new(model: String, dimensions: usize) -> Result<Self> {
-        Self::with_config(
+        let mut embedder = Self::with_config(
             api_key()?,
             EMBEDDINGS_URL.to_string(),
             model,
@@ -466,7 +469,13 @@ impl VoyageEmbedder {
                 "FUNES_VOYAGE_MIN_REQUEST_INTERVAL",
                 DOCUMENT_MIN_REQUEST_INTERVAL,
             ),
+        )?;
+        embedder.document_concurrency = positive_usize_env(
+            "FUNES_VOYAGE_CONCURRENCY",
+            DOCUMENT_CONCURRENCY,
         )
+        .min(MAX_DOCUMENT_CONCURRENCY);
+        Ok(embedder)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -546,6 +555,7 @@ impl VoyageEmbedder {
             document_retry_delay,
             document_rate_limit_delay,
             document_max_tokens,
+            document_concurrency: DOCUMENT_CONCURRENCY,
             pacer,
             clock,
         })
@@ -556,6 +566,11 @@ impl VoyageEmbedder {
         // controls. A low account TPM must not reject an otherwise valid document;
         // the pacer delays the request instead.
         self.document_max_tokens
+    }
+
+    fn effective_document_concurrency(&self) -> usize {
+        self.document_concurrency
+            .clamp(1, MAX_DOCUMENT_CONCURRENCY)
     }
 
     fn pace_document_attempt(&self, tokens: usize) {
@@ -696,8 +711,33 @@ impl Embedder for VoyageEmbedder {
         let budget = self.effective_document_token_budget();
         let batches = document_batches(texts, MAX_EMBEDDING_INPUTS, budget)?;
         let mut vectors = Vec::with_capacity(texts.len());
-        for group in batches {
-            vectors.extend(self.request(&group, "document", true)?);
+        let concurrency = self.effective_document_concurrency().min(batches.len().max(1));
+        let this = &*self;
+        let mut next = 0;
+        while next < batches.len() {
+            let end = (next + concurrency).min(batches.len());
+            let results: Vec<Result<Vec<Vec<f32>>>> = thread::scope(|scope| {
+                let handles: Vec<_> = batches[next..end]
+                    .iter()
+                    .map(|group| {
+                        let group = group.clone();
+                        scope.spawn(move || this.request(&group, "document", true))
+                    })
+                    .collect();
+                let joined: Result<Vec<Result<Vec<Vec<f32>>>>, anyhow::Error> = handles
+                    .into_iter()
+                    .map(|handle| {
+                        handle
+                            .join()
+                            .map_err(|_| anyhow!("Voyage document worker panicked"))
+                    })
+                    .collect();
+                joined
+            })?;
+            for result in results {
+                vectors.extend(result?);
+            }
+            next = end;
         }
         Ok(vectors)
     }
@@ -1085,6 +1125,36 @@ mod tests {
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0].body["input"].as_array().unwrap().len(), MAX_EMBEDDING_INPUTS);
         assert_eq!(requests[1].body["input"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn document_requests_use_bounded_concurrency_without_losing_batches() {
+        let server = MockServer::start(vec![
+            MockResponse::delayed(
+                200,
+                embedding_response(vec![(0, unit_vector(0))]),
+                Duration::from_millis(300),
+            ),
+            MockResponse::delayed(
+                200,
+                embedding_response(vec![(0, unit_vector(0))]),
+                Duration::from_millis(300),
+            ),
+        ]);
+        let mut embedder = test_embedder(&server, TEST_DIMENSIONS);
+        embedder.document_max_tokens = 60;
+        embedder.document_concurrency = 2;
+        let first = "a".repeat(20);
+        let second = "b".repeat(20);
+        let started = Instant::now();
+
+        let vectors = embedder
+            .embed_documents(&[first.as_str(), second.as_str()])
+            .unwrap();
+
+        assert_eq!(vectors.len(), 2);
+        assert!(started.elapsed() < Duration::from_millis(650));
+        assert_eq!(server.finish().len(), 2);
     }
 
     #[test]

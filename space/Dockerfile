@@ -29,6 +29,8 @@ COPY space/server.py /app/server.py
 COPY service /app/service
 RUN pip install --no-cache-dir -r /app/service/requirements.txt
 ENV FUNES_HOME=/data/.funes \
+    HF_HOME=/data/huggingface \
+    HF_HUB_CACHE=/data/huggingface/hub \
     PYTHONUNBUFFERED=1 \
     PORT=7860 \
     FUNES_EMBEDDING_PROVIDER=voyage \

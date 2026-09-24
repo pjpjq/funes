@@ -1,8 +1,9 @@
 FROM python:3.12-slim-trixie
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
-ARG FUNES_SOURCE_REV=7a9d234fa575411a2c4d481cc6f70ee207557166
+ARG FUNES_SOURCE_REV=e061d7b3c61c3fd0dba2452716e666c8d6b9b83c
 ARG FUNES_BINARY_SHA256=78c06203d3e1273a3190cec9035719514f34746a19afdbaf07e1e225987352f4
 ARG FUNES_ARCHIVE_SHA256=19931d887ff8650a8fa7a2b1d564bf04521c768001688cff25d8718090574cce
+ARG FUNES_BINARY_URL=https://raw.githubusercontent.com/pjpjq/funes/${FUNES_SOURCE_REV}/space/bin/funes-x86_64-linux.bin.zst
 LABEL org.opencontainers.image.source="https://github.com/pjpjq/funes" \
       org.opencontainers.image.revision="${FUNES_SOURCE_REV}"
 RUN apt-get update \
@@ -12,8 +13,9 @@ RUN apt-get update \
         | bash -s -- -b /usr/local/bin v3.95.5 \
     && test -x /usr/local/bin/trufflehog \
     && rm -rf /var/lib/apt/lists/*
-COPY space/bin/funes-x86_64-linux.bin.zst /tmp/funes.bin.zst
-RUN printf '%s  %s\n' "${FUNES_ARCHIVE_SHA256}" /tmp/funes.bin.zst | sha256sum -c - \
+RUN curl --fail --show-error --location --retry 5 --retry-all-errors --connect-timeout 15 --max-time 300 \
+        "${FUNES_BINARY_URL}" -o /tmp/funes.bin.zst \
+    && printf '%s  %s\n' "${FUNES_ARCHIVE_SHA256}" /tmp/funes.bin.zst | sha256sum -c - \
     && zstd -q -d /tmp/funes.bin.zst -o /usr/local/bin/funes \
     && printf '%s  %s\n' "${FUNES_BINARY_SHA256}" /usr/local/bin/funes | sha256sum -c - \
     && chmod 0755 /usr/local/bin/funes \

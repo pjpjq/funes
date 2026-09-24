@@ -958,7 +958,7 @@ class Store:
                     translation_hash, translation_version, translation_status,
                     retrieval_updated_at, native_index_version, native_index_status,
                     native_index_profile, native_index_memory, native_indexed_at,
-                    native_index_error, source_missing,
+                    native_index_error, native_index_pending, source_missing,
                     retrieval_generation, native_generation, embedding_generation
                     FROM memories WHERE source_identity=?""",
                     (source_identity,),
@@ -1323,6 +1323,31 @@ class Store:
                     results.append({"id": row["id"], "status": "stale", "source_identity": source_identity})
                     continue
                 if row:
+                    if row["content_hash"] == content_hash:
+                        existing_native_valid = (
+                            row["native_index_status"] in NATIVE_TERMINAL_STATUSES
+                            and int(row["native_index_pending"] or 0) == 0
+                        )
+                        native_supplied = any(
+                            supplied(name)
+                            for name in (
+                                "native_index_version",
+                                "native_index_status",
+                                "native_index_profile",
+                                "native_index_memory",
+                                "native_indexed_at",
+                                "native_index_error",
+                            )
+                        )
+                        if existing_native_valid and not native_supplied:
+                            values["native_index_version"] = row["native_index_version"]
+                            values["native_index_status"] = row["native_index_status"]
+                            values["native_index_profile"] = row["native_index_profile"]
+                            values["native_index_memory"] = row["native_index_memory"]
+                            values["native_indexed_at"] = row["native_indexed_at"]
+                            values["native_index_error"] = row["native_index_error"]
+                            if not supplied("native_generation"):
+                                values["native_generation"] = int(row["native_generation"] or 0)
                     self.conn.execute(
                         """UPDATE memories SET source_version=?, raw_text=?, retrieval_text=?,
                         search_identifiers=?, metadata_json=?, source_metadata_clock_json=?,
@@ -1491,7 +1516,7 @@ class Store:
     def _row(self, row: sqlite3.Row) -> dict[str, Any]:
         out = dict(row)
         out.pop("search_identifiers", None)
-        out.pop("native_index_pending", None)
+        out["native_index_pending"] = int(out.get("native_index_pending") or 0)
         out[SOURCE_METADATA_CLOCK_KEY] = self._source_metadata_clocks(
             out.pop("source_metadata_clock_json", "{}"), out.get("updated_at")
         )
@@ -4163,6 +4188,12 @@ def prepare_ingest_documents(app: Any, docs: list[dict[str, Any]]) -> list[dict[
             # checkpoint instead of stamping the latest global reindex epoch.
             prepared.append(item)
             continue
+        existing_native_valid = bool(
+            existing
+            and existing.get("content_hash") == content_hash
+            and existing.get("native_index_status") in NATIVE_TERMINAL_STATUSES
+            and int(existing.get("native_index_pending") or 0) == 0
+        )
         if same_revision:
             for name in (
                 "retrieval_generation",
@@ -4173,16 +4204,20 @@ def prepare_ingest_documents(app: Any, docs: list[dict[str, Any]]) -> list[dict[
                     item[name] = int(existing.get(name) or 0)
         else:
             item["retrieval_generation"] = generation
-            item["native_generation"] = generation
+            if existing_native_valid and not supplied("native_generation"):
+                item["native_generation"] = int(existing.get("native_generation") or 0)
+            else:
+                item["native_generation"] = generation
             item["embedding_generation"] = embedding_generation
-        same_final_revision = bool(
-            same_revision
+        same_content = bool(
+            existing
+            and existing.get("content_hash") == content_hash
             and existing.get("translation_status") in FINAL_TRANSLATION_STATUSES
         )
         supplied_retrieval = (
             incoming("retrieval_text") if supplied("retrieval_text") else None
         )
-        if same_final_revision and not supplied_retrieval:
+        if same_content and not supplied_retrieval:
             item["retrieval_text"] = existing.get("retrieval_text") or normalize_text(raw)
             for name in ("translation_hash", "translation_version", "translation_status"):
                 if not supplied(name) and existing.get(name) is not None:

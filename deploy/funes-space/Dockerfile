@@ -21,7 +21,7 @@ RUN curl --fail --show-error --location --retry 5 --retry-all-errors --connect-t
     && chmod 0755 /usr/local/bin/funes \
     && /usr/local/bin/funes --version \
     && rm /tmp/funes.bin.zst
-COPY server.py /app/server.py
+COPY space/server.py /app/server.py
 COPY service /app/service
 RUN pip install --no-cache-dir -r /app/service/requirements.txt
 ENV FUNES_HOME=/data/.funes \

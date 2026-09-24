@@ -4,9 +4,11 @@
 //! classes, never the response body. Document embeddings retry a small bounded set of transient
 //! responses; query-time operations use one request with a short total timeout.
 
+use std::collections::VecDeque;
 use std::env;
+use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Result};
 use reqwest::blocking::Client;
@@ -25,6 +27,13 @@ const QUERY_TIMEOUT: Duration = Duration::from_secs(3);
 const DOCUMENT_ATTEMPTS: usize = 5;
 const DOCUMENT_RETRY_DELAY: Duration = Duration::from_millis(200);
 const DOCUMENT_RATE_LIMIT_DELAY: Duration = Duration::from_secs(60);
+// Keep document requests below the observed free-tier 10K TPM/request ceiling. The
+// estimate is deliberately conservative because Voyage does not expose a tokenizer
+// endpoint and token density varies substantially across code, CJK, and base64 text.
+const DOCUMENT_MAX_TOKENS: usize = 9_000;
+const DOCUMENT_TOKENS_PER_MINUTE: usize = 0;
+const DOCUMENT_MIN_REQUEST_INTERVAL: Duration = Duration::ZERO;
+const TPM_WINDOW: Duration = Duration::from_secs(60);
 // Voyage's embeddings endpoint accepts at most 128 input strings per request.
 // Keep this provider-specific guard here so callers may continue batching local
 // backends more aggressively without ever sending an invalid Voyage payload.
@@ -91,6 +100,30 @@ fn api_key() -> Result<String> {
         }
     };
     api_key_from(value)
+}
+
+fn positive_usize_env(name: &str, default: usize) -> usize {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+fn usize_env(name: &str, default: usize) -> usize {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(default)
+}
+
+fn duration_seconds_env(name: &str, default: Duration) -> Duration {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .and_then(|value| Duration::try_from_secs_f64(value).ok())
+        .unwrap_or(default)
 }
 
 fn rerank_model_from(value: Option<String>) -> Result<String> {
@@ -231,6 +264,173 @@ fn decode_embeddings(response: EmbeddingsResponse, expected: usize, dimensions: 
         .collect()
 }
 
+pub(crate) trait Clock: Send + Sync {
+    fn now(&self) -> Instant;
+    fn sleep(&self, duration: Duration);
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+
+    fn sleep(&self, duration: Duration) {
+        if !duration.is_zero() {
+            thread::sleep(duration);
+        }
+    }
+}
+
+#[derive(Debug)]
+struct DocumentPacer {
+    min_interval: Duration,
+    tokens_per_minute: usize,
+    last_request_start: Option<Instant>,
+    window_history: VecDeque<(Instant, usize)>,
+    not_before: Option<Instant>,
+}
+
+impl DocumentPacer {
+    fn new(min_interval: Duration, tokens_per_minute: usize) -> Self {
+        Self {
+            min_interval,
+            tokens_per_minute,
+            last_request_start: None,
+            window_history: VecDeque::new(),
+            not_before: None,
+        }
+    }
+
+    fn prune_history(&mut self, now: Instant) {
+        while let Some(&(start, _)) = self.window_history.front() {
+            if now.saturating_duration_since(start) >= TPM_WINDOW {
+                self.window_history.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn delay_at(&self, now: Instant, tokens: usize) -> Duration {
+        let interval_delay = match self.last_request_start {
+            Some(last_start) => {
+                let elapsed = now.saturating_duration_since(last_start);
+                self.min_interval.saturating_sub(elapsed)
+            }
+            None => Duration::ZERO,
+        };
+        let retry_delay = self
+            .not_before
+            .map(|deadline| deadline.saturating_duration_since(now))
+            .unwrap_or(Duration::ZERO);
+        let interval_delay = interval_delay.max(retry_delay);
+
+        if self.tokens_per_minute == 0 || tokens == 0 {
+            return interval_delay;
+        }
+
+        let mut active_tokens: usize = self
+            .window_history
+            .iter()
+            .filter(|(start, _)| now.saturating_duration_since(*start) < TPM_WINDOW)
+            .map(|(_, count)| *count)
+            .sum();
+
+        if active_tokens.saturating_add(tokens) <= self.tokens_per_minute {
+            return interval_delay;
+        }
+
+        let mut tpm_delay = Duration::ZERO;
+        for &(start, count) in self.window_history.iter() {
+            if now.saturating_duration_since(start) >= TPM_WINDOW {
+                continue;
+            }
+            active_tokens = active_tokens.saturating_sub(count);
+            let expiration = start + TPM_WINDOW;
+            let needed = expiration.saturating_duration_since(now);
+            tpm_delay = tpm_delay.max(needed);
+            if active_tokens.saturating_add(tokens) <= self.tokens_per_minute {
+                break;
+            }
+        }
+
+        interval_delay.max(tpm_delay)
+    }
+
+    fn record_attempt(&mut self, now: Instant, tokens: usize) {
+        self.last_request_start = Some(now);
+        if self
+            .not_before
+            .is_some_and(|deadline| now >= deadline)
+        {
+            self.not_before = None;
+        }
+        if self.tokens_per_minute > 0 && tokens > 0 {
+            self.prune_history(now);
+            self.window_history.push_back((now, tokens));
+        }
+    }
+
+    fn defer_until(&mut self, now: Instant, delay: Duration) {
+        if delay.is_zero() {
+            return;
+        }
+        let deadline = now + delay;
+        self.not_before = Some(self.not_before.map_or(deadline, |current| current.max(deadline)));
+    }
+}
+
+/// Estimate provider tokens without shipping a tokenizer into the binary.
+///
+/// The byte-based branch protects dense ASCII/code/base64; the character-based
+/// branch protects CJK, where a character is commonly close to one token. A small
+/// per-input overhead covers JSON/tokenizer boundary effects observed in live A/B.
+fn estimated_document_tokens(text: &str) -> usize {
+    let chars = text.chars().count();
+    let ascii_bytes = text.bytes().filter(u8::is_ascii).count();
+    let non_ascii_chars = chars.saturating_sub(ascii_bytes);
+    ascii_bytes
+        .saturating_mul(9)
+        .saturating_div(10)
+        .saturating_add(non_ascii_chars.saturating_mul(2))
+        .saturating_add(32)
+}
+
+fn document_batches<'a>(
+    texts: &'a [&'a str],
+    max_inputs: usize,
+    max_tokens: usize,
+) -> Result<Vec<Vec<&'a str>>> {
+    let mut batches = Vec::new();
+    let mut current = Vec::new();
+    let mut current_tokens = 0usize;
+    for (index, text) in texts.iter().enumerate() {
+        let estimate = estimated_document_tokens(text);
+        if estimate > max_tokens {
+            bail!(
+                "Voyage document at index {index} exceeds conservative token budget: estimated {estimate} tokens > max {max_tokens} tokens (heuristic estimate; provider has no tokenizer endpoint)"
+            );
+        }
+        let would_overflow = !current.is_empty()
+            && (current.len() >= max_inputs
+                || current_tokens.saturating_add(estimate) > max_tokens);
+        if would_overflow {
+            batches.push(current);
+            current = Vec::new();
+            current_tokens = 0;
+        }
+        current.push(*text);
+        current_tokens = current_tokens.saturating_add(estimate);
+    }
+    if !current.is_empty() {
+        batches.push(current);
+    }
+    Ok(batches)
+}
+
 /// Voyage embeddings with explicit document/query modes.
 pub struct VoyageEmbedder {
     client: Client,
@@ -243,6 +443,9 @@ pub struct VoyageEmbedder {
     document_attempts: usize,
     document_retry_delay: Duration,
     document_rate_limit_delay: Duration,
+    document_max_tokens: usize,
+    pacer: Mutex<DocumentPacer>,
+    clock: Arc<dyn Clock>,
 }
 
 impl VoyageEmbedder {
@@ -257,6 +460,12 @@ impl VoyageEmbedder {
             DOCUMENT_ATTEMPTS,
             DOCUMENT_RETRY_DELAY,
             DOCUMENT_RATE_LIMIT_DELAY,
+            positive_usize_env("FUNES_VOYAGE_MAX_REQUEST_TOKENS", DOCUMENT_MAX_TOKENS),
+            usize_env("FUNES_VOYAGE_TOKENS_PER_MINUTE", DOCUMENT_TOKENS_PER_MINUTE),
+            duration_seconds_env(
+                "FUNES_VOYAGE_MIN_REQUEST_INTERVAL",
+                DOCUMENT_MIN_REQUEST_INTERVAL,
+            ),
         )
     }
 
@@ -271,6 +480,42 @@ impl VoyageEmbedder {
         document_attempts: usize,
         document_retry_delay: Duration,
         document_rate_limit_delay: Duration,
+        document_max_tokens: usize,
+        document_tokens_per_minute: usize,
+        document_min_request_interval: Duration,
+    ) -> Result<Self> {
+        Self::with_config_and_clock(
+            api_key,
+            endpoint,
+            model,
+            dimensions,
+            document_timeout,
+            query_timeout,
+            document_attempts,
+            document_retry_delay,
+            document_rate_limit_delay,
+            document_max_tokens,
+            document_tokens_per_minute,
+            document_min_request_interval,
+            Arc::new(SystemClock),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn with_config_and_clock(
+        api_key: String,
+        endpoint: String,
+        model: String,
+        dimensions: usize,
+        document_timeout: Duration,
+        query_timeout: Duration,
+        document_attempts: usize,
+        document_retry_delay: Duration,
+        document_rate_limit_delay: Duration,
+        document_max_tokens: usize,
+        document_tokens_per_minute: usize,
+        document_min_request_interval: Duration,
+        clock: Arc<dyn Clock>,
     ) -> Result<Self> {
         if model.trim().is_empty() {
             bail!("Voyage embedding model must not be empty")
@@ -281,7 +526,14 @@ impl VoyageEmbedder {
         if document_attempts == 0 {
             bail!("Voyage document attempts must be positive")
         }
+        if document_max_tokens == 0 {
+            bail!("Voyage document max tokens must be positive")
+        }
         let client = run_blocking_http("client setup", http_client)?;
+        let pacer = Mutex::new(DocumentPacer::new(
+            document_min_request_interval,
+            document_tokens_per_minute,
+        ));
         Ok(Self {
             client,
             api_key,
@@ -293,7 +545,56 @@ impl VoyageEmbedder {
             document_attempts,
             document_retry_delay,
             document_rate_limit_delay,
+            document_max_tokens,
+            pacer,
+            clock,
         })
+    }
+
+    fn effective_document_token_budget(&self) -> usize {
+        // The per-request input ceiling and the rolling TPM limiter are separate
+        // controls. A low account TPM must not reject an otherwise valid document;
+        // the pacer delays the request instead.
+        self.document_max_tokens
+    }
+
+    fn pace_document_attempt(&self, tokens: usize) {
+        loop {
+            let delay = {
+                let pacer = self
+                    .pacer
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                pacer.delay_at(self.clock.now(), tokens)
+            };
+            if !delay.is_zero() {
+                // Never sleep while holding the mutex: another batch must be able
+                // to inspect the pacing state and wait independently.
+                self.clock.sleep(delay);
+                continue;
+            }
+
+            let mut pacer = self
+                .pacer
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let now = self.clock.now();
+            let delay = pacer.delay_at(now, tokens);
+            if delay.is_zero() {
+                pacer.record_attempt(now, tokens);
+                return;
+            }
+            drop(pacer);
+            self.clock.sleep(delay);
+        }
+    }
+
+    fn defer_document_attempt(&self, delay: Duration) {
+        let mut pacer = self
+            .pacer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        pacer.defer_until(self.clock.now(), delay);
     }
 
     fn rate_limit_delay(&self, response: &reqwest::blocking::Response, attempt: usize) -> Duration {
@@ -325,8 +626,19 @@ impl VoyageEmbedder {
         } else {
             self.query_timeout
         };
+        let estimated_tokens = if documents {
+            texts.iter().map(|text| estimated_document_tokens(text)).sum()
+        } else {
+            0
+        };
 
         for attempt in 0..attempts {
+            if documents {
+                // Count a batch once. Retries still honor interval/retry-after
+                // pacing, but do not consume the same TPM budget repeatedly.
+                self.pace_document_attempt(if attempt == 0 { estimated_tokens } else { 0 });
+            }
+
             let response = self
                 .client
                 .post(&self.endpoint)
@@ -337,7 +649,9 @@ impl VoyageEmbedder {
             let response = match response {
                 Ok(response) => response,
                 Err(error) if documents && retryable_request_error(&error) && attempt + 1 < attempts => {
-                    thread::sleep(self.document_retry_delay.saturating_mul((attempt + 1) as u32));
+                    self.defer_document_attempt(
+                        self.document_retry_delay.saturating_mul((attempt + 1) as u32),
+                    );
                     continue;
                 }
                 Err(error) => return Err(request_error("embeddings", &error)),
@@ -347,7 +661,9 @@ impl VoyageEmbedder {
                 let response = match response.json::<EmbeddingsResponse>() {
                     Ok(response) => response,
                     Err(error) if documents && retryable_request_error(&error) && attempt + 1 < attempts => {
-                        thread::sleep(self.document_retry_delay.saturating_mul((attempt + 1) as u32));
+                        self.defer_document_attempt(
+                            self.document_retry_delay.saturating_mul((attempt + 1) as u32),
+                        );
                         continue;
                     }
                     Err(error) if retryable_request_error(&error) => return Err(request_error("embeddings", &error)),
@@ -361,7 +677,7 @@ impl VoyageEmbedder {
                 } else {
                     self.document_retry_delay.saturating_mul((attempt + 1) as u32)
                 };
-                thread::sleep(delay);
+                self.defer_document_attempt(delay);
                 continue;
             }
             bail!("Voyage embeddings request failed with HTTP {}", status.as_u16())
@@ -377,9 +693,11 @@ impl Embedder for VoyageEmbedder {
     }
 
     fn embed_documents(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        let budget = self.effective_document_token_budget();
+        let batches = document_batches(texts, MAX_EMBEDDING_INPUTS, budget)?;
         let mut vectors = Vec::with_capacity(texts.len());
-        for group in texts.chunks(MAX_EMBEDDING_INPUTS) {
-            vectors.extend(self.request(group, "document", true)?);
+        for group in batches {
+            vectors.extend(self.request(&group, "document", true)?);
         }
         Ok(vectors)
     }
@@ -628,6 +946,39 @@ mod tests {
         CapturedRequest { headers, body }
     }
 
+    #[derive(Debug)]
+    struct MockClock {
+        now: Mutex<Instant>,
+        sleeps: Mutex<Vec<Duration>>,
+    }
+
+    impl MockClock {
+        fn new(start: Instant) -> Self {
+            Self {
+                now: Mutex::new(start),
+                sleeps: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn total_slept(&self) -> Duration {
+            self.sleeps.lock().unwrap().iter().copied().sum()
+        }
+    }
+
+    impl Clock for MockClock {
+        fn now(&self) -> Instant {
+            *self.now.lock().unwrap()
+        }
+
+        fn sleep(&self, duration: Duration) {
+            if !duration.is_zero() {
+                self.sleeps.lock().unwrap().push(duration);
+                let mut now = self.now.lock().unwrap();
+                *now += duration;
+            }
+        }
+    }
+
     fn test_embedder(server: &MockServer, dimensions: usize) -> VoyageEmbedder {
         VoyageEmbedder::with_config(
             "test-api-key".to_string(),
@@ -639,6 +990,9 @@ mod tests {
             DOCUMENT_ATTEMPTS,
             Duration::ZERO,
             Duration::ZERO,
+            DOCUMENT_MAX_TOKENS,
+            DOCUMENT_TOKENS_PER_MINUTE,
+            DOCUMENT_MIN_REQUEST_INTERVAL,
         )
         .unwrap()
     }
@@ -731,6 +1085,276 @@ mod tests {
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0].body["input"].as_array().unwrap().len(), MAX_EMBEDDING_INPUTS);
         assert_eq!(requests[1].body["input"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn document_batches_respect_conservative_token_budget_and_preserve_order() {
+        let first = "a".repeat(6_000);
+        let second = "b".repeat(6_000);
+        let third = "中文".repeat(2_000);
+        let texts = vec![first.as_str(), second.as_str(), third.as_str()];
+        let batches = document_batches(&texts, MAX_EMBEDDING_INPUTS, 9_000).unwrap();
+
+        assert_eq!(batches.len(), 3);
+        assert_eq!(batches[0], vec![first.as_str()]);
+        assert_eq!(batches[1], vec![second.as_str()]);
+        assert_eq!(batches[2], vec![third.as_str()]);
+        assert!(batches.iter().all(|batch| {
+            batch
+                .iter()
+                .map(|text| estimated_document_tokens(text))
+                .sum::<usize>()
+                <= 9_000
+                || batch.len() == 1
+        }));
+    }
+
+    #[test]
+    fn document_batches_pack_short_inputs_until_token_budget() {
+        let texts = vec!["one", "two", "three"];
+        let batches = document_batches(&texts, MAX_EMBEDDING_INPUTS, 120).unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0], texts);
+    }
+
+    #[test]
+    fn document_batches_fail_closed_when_single_input_exceeds_budget() {
+        let long_text = "a".repeat(12_000);
+        let texts = vec!["short", long_text.as_str()];
+        let err = document_batches(&texts, MAX_EMBEDDING_INPUTS, 9_000)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("index 1"));
+        assert!(err.contains("budget"));
+        assert!(err.contains("heuristic"));
+    }
+
+    #[test]
+    fn low_tpm_does_not_reduce_per_request_document_budget() {
+        let server = MockServer::start(vec![MockResponse::json(
+            200,
+            embedding_response(vec![(0, unit_vector(0))]),
+        )]);
+        let mut embedder = VoyageEmbedder::with_config(
+            "test-api-key".to_string(),
+            server.url.clone(),
+            "test-embedding-model".to_string(),
+            TEST_DIMENSIONS,
+            Duration::from_secs(1),
+            Duration::from_millis(100),
+            DOCUMENT_ATTEMPTS,
+            Duration::ZERO,
+            Duration::ZERO,
+            9_000,
+            1_000,
+            Duration::ZERO,
+        )
+        .unwrap();
+
+        let document = "a".repeat(6_000);
+        assert_eq!(
+            embedder.embed_documents(&[document.as_str()]).unwrap(),
+            vec![unit_vector(0)]
+        );
+        assert_eq!(server.finish().len(), 1);
+    }
+
+    #[test]
+    fn pure_document_pacer_enforces_interval_and_sliding_window_tpm() {
+        let min_interval = Duration::from_secs(10);
+        let tpm = 10_000;
+        let mut pacer = DocumentPacer::new(min_interval, tpm);
+        let t0 = Instant::now();
+
+        // 1. Initial request has no prior history, so zero delay.
+        assert_eq!(pacer.delay_at(t0, 6_000), Duration::ZERO);
+        pacer.record_attempt(t0, 6_000);
+
+        // 2. Request at t0 + 5s with 3_000 tokens:
+        //    Interval remaining = 10s - 5s = 5s.
+        //    TPM tokens = 6_000 + 3_000 = 9_000 <= 10_000.
+        //    delay_at should be max(5s, 0s) = 5s.
+        let t1 = t0 + Duration::from_secs(5);
+        assert_eq!(pacer.delay_at(t1, 3_000), Duration::from_secs(5));
+
+        // 3. Request at t0 + 5s with 5_000 tokens:
+        //    TPM tokens = 6_000 + 5_000 = 11_000 > 10_000.
+        //    To fit 5_000 tokens, the 6_000 token request at t0 must expire (at t0 + 60s).
+        //    tpm_delay = 60s - 5s = 55s.
+        //    max(5s, 55s) = 55s.
+        assert_eq!(pacer.delay_at(t1, 5_000), Duration::from_secs(55));
+
+        // 4. Advance to t0 + 10s (interval satisfied), send 3_000 tokens.
+        let t2 = t0 + Duration::from_secs(10);
+        assert_eq!(pacer.delay_at(t2, 3_000), Duration::ZERO);
+        pacer.record_attempt(t2, 3_000);
+
+        // 5. At t0 + 20s, try sending 2_000 tokens:
+        //    Active = 9_000. 9_000 + 2_000 = 11_000 > 10_000.
+        //    First entry (t0, 6_000) expires at t0 + 60s.
+        //    Remaining active after expiration = 3_000.
+        //    3_000 + 2_000 = 5_000 <= 10_000.
+        //    tpm_delay = (t0 + 60s) - (t0 + 20s) = 40s.
+        let t3 = t0 + Duration::from_secs(20);
+        assert_eq!(pacer.delay_at(t3, 2_000), Duration::from_secs(40));
+
+        // 6. At t0 + 60s, first entry has expired:
+        //    Remaining active = 3_000.
+        //    3_000 + 2_000 = 5_000 <= 10_000.
+        //    Interval since t2 (t0 + 10s) = 50s >= 10s.
+        //    delay should be ZERO.
+        let t4 = t0 + Duration::from_secs(60);
+        assert_eq!(pacer.delay_at(t4, 2_000), Duration::ZERO);
+        pacer.record_attempt(t4, 2_000);
+    }
+
+    #[test]
+    fn mock_clock_embed_documents_continuous_tpm_pacing_across_calls() {
+        let server = MockServer::start(vec![
+            MockResponse::json(200, embedding_response(vec![(0, unit_vector(0))])),
+            MockResponse::json(200, embedding_response(vec![(0, unit_vector(1))])),
+        ]);
+
+        let clock = Arc::new(MockClock::new(Instant::now()));
+        let mut embedder = VoyageEmbedder::with_config_and_clock(
+            "test-api-key".to_string(),
+            server.url.clone(),
+            "test-embedding-model".to_string(),
+            TEST_DIMENSIONS,
+            Duration::from_secs(1),
+            Duration::from_millis(100),
+            DOCUMENT_ATTEMPTS,
+            Duration::ZERO,
+            Duration::ZERO,
+            9_000,
+            10_000,
+            Duration::ZERO,
+            clock.clone(),
+        )
+        .unwrap();
+
+        let text1 = "a".repeat(6_000);
+        let text2 = "b".repeat(6_000);
+
+        let res1 = embedder.embed_documents(&[text1.as_str()]).unwrap();
+        assert_eq!(res1, vec![unit_vector(0)]);
+        assert_eq!(clock.total_slept(), Duration::ZERO);
+
+        let res2 = embedder.embed_documents(&[text2.as_str()]).unwrap();
+        assert_eq!(res2, vec![unit_vector(1)]);
+        assert_eq!(clock.total_slept(), Duration::from_secs(60));
+        assert_eq!(server.finish().len(), 2);
+    }
+
+    #[test]
+    fn mock_clock_query_bypasses_document_pacing() {
+        let server = MockServer::start(vec![
+            MockResponse::json(200, embedding_response(vec![(0, unit_vector(0))])),
+            MockResponse::json(200, embedding_response(vec![(0, unit_vector(1))])),
+        ]);
+
+        let clock = Arc::new(MockClock::new(Instant::now()));
+        let mut embedder = VoyageEmbedder::with_config_and_clock(
+            "test-api-key".to_string(),
+            server.url.clone(),
+            "test-embedding-model".to_string(),
+            TEST_DIMENSIONS,
+            Duration::from_secs(1),
+            Duration::from_millis(100),
+            DOCUMENT_ATTEMPTS,
+            Duration::ZERO,
+            Duration::ZERO,
+            9_000,
+            10_000,
+            Duration::from_secs(30),
+            clock.clone(),
+        )
+        .unwrap();
+
+        let doc = "a".repeat(6_000);
+        let res_doc = embedder.embed_documents(&[doc.as_str()]).unwrap();
+        assert_eq!(res_doc, vec![unit_vector(0)]);
+        assert_eq!(clock.total_slept(), Duration::ZERO);
+
+        let res_query = embedder.embed_query("needle").unwrap();
+        assert_eq!(res_query, unit_vector(1));
+        assert_eq!(clock.total_slept(), Duration::ZERO);
+
+        let requests = server.finish();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].body["input_type"], "document");
+        assert_eq!(requests[1].body["input_type"], "query");
+    }
+
+    #[test]
+    fn mock_clock_retries_do_not_double_count_tpm() {
+        let server = MockServer::start(vec![
+            MockResponse::json(503, json!({ "private": "retryable-error" })),
+            MockResponse::json(200, embedding_response(vec![(0, unit_vector(0))])),
+        ]);
+
+        let clock = Arc::new(MockClock::new(Instant::now()));
+        let mut embedder = VoyageEmbedder::with_config_and_clock(
+            "test-api-key".to_string(),
+            server.url.clone(),
+            "test-embedding-model".to_string(),
+            TEST_DIMENSIONS,
+            Duration::from_secs(1),
+            Duration::from_millis(100),
+            DOCUMENT_ATTEMPTS,
+            Duration::from_millis(500),
+            Duration::ZERO,
+            9_000,
+            10_000,
+            Duration::from_secs(5),
+            clock.clone(),
+        )
+        .unwrap();
+
+        let doc = "a".repeat(6_000);
+        let res = embedder.embed_documents(&[doc.as_str()]).unwrap();
+        assert_eq!(res, vec![unit_vector(0)]);
+
+        // The retry honors the configured 5s minimum interval and 500ms
+        // backoff, but does not charge the same 6K-token batch a second time
+        // against the 10K TPM window.
+        assert_eq!(clock.total_slept(), Duration::from_secs(5));
+        assert_eq!(server.finish().len(), 2);
+    }
+
+    #[test]
+    fn mock_clock_retry_after_updates_shared_pacer_deadline() {
+        let server = MockServer::start(vec![
+            MockResponse::json(429, json!({ "private": "retryable-error" }))
+                .with_header("Retry-After", "7"),
+            MockResponse::json(200, embedding_response(vec![(0, unit_vector(0))])),
+        ]);
+
+        let clock = Arc::new(MockClock::new(Instant::now()));
+        let mut embedder = VoyageEmbedder::with_config_and_clock(
+            "test-api-key".to_string(),
+            server.url.clone(),
+            "test-embedding-model".to_string(),
+            TEST_DIMENSIONS,
+            Duration::from_secs(1),
+            Duration::from_millis(100),
+            DOCUMENT_ATTEMPTS,
+            Duration::ZERO,
+            Duration::from_secs(60),
+            9_000,
+            10_000,
+            Duration::ZERO,
+            clock.clone(),
+        )
+        .unwrap();
+
+        let document = "a".repeat(6_000);
+        assert_eq!(
+            embedder.embed_documents(&[document.as_str()]).unwrap(),
+            vec![unit_vector(0)]
+        );
+        assert_eq!(clock.total_slept(), Duration::from_secs(7));
+        assert_eq!(server.finish().len(), 2);
     }
 
     #[test]

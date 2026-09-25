@@ -27,14 +27,14 @@ def test_dockerfiles_copy_canonical_space_server():
 def test_production_space_enables_safe_voyage_batching_and_pacing():
     """Keep production batching larger while respecting the observed free tier."""
     required = (
-        "FUNES_CANONICAL_INDEX_BATCH=128",
-        "FUNES_CANONICAL_INDEX_REQUEST_ROWS=128",
-        "FUNES_CANONICAL_INDEX_MAX_CHARS=192000",
+        "FUNES_CANONICAL_INDEX_BATCH=64",
+        "FUNES_CANONICAL_INDEX_REQUEST_ROWS=32",
+        "FUNES_CANONICAL_INDEX_MAX_CHARS=24000",
         "FUNES_VOYAGE_CONCURRENCY=1",
         "FUNES_VOYAGE_MAX_REQUEST_TOKENS=9000",
         "FUNES_VOYAGE_TOKENS_PER_MINUTE=9000",
-        "FUNES_VOYAGE_MIN_REQUEST_INTERVAL=0",
-        "FUNES_CANONICAL_INDEX_MIN_REQUEST_INTERVAL=0",
+        "FUNES_VOYAGE_MIN_REQUEST_INTERVAL=20",
+        "FUNES_CANONICAL_INDEX_MIN_REQUEST_INTERVAL=20",
     )
     for path in (
         REPO_ROOT / "deploy" / "funes-space" / "Dockerfile",

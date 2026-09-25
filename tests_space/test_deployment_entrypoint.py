@@ -26,16 +26,23 @@ def test_dockerfiles_copy_canonical_space_server():
 
 def test_production_space_enables_safe_voyage_batching_and_pacing():
     """Keep production batching larger while respecting the observed free tier."""
-    path = REPO_ROOT / "deploy" / "funes-space" / "Dockerfile"
-    text = path.read_text(encoding="utf-8")
-    assert "FUNES_CANONICAL_INDEX_BATCH=128" in text
-    assert "FUNES_CANONICAL_INDEX_REQUEST_ROWS=128" in text
-    assert "FUNES_CANONICAL_INDEX_MAX_CHARS=192000" in text
-    assert "FUNES_VOYAGE_CONCURRENCY=1" in text
-    assert "FUNES_VOYAGE_MAX_REQUEST_TOKENS=9000" in text
-    assert "FUNES_VOYAGE_TOKENS_PER_MINUTE=9000" in text
-    assert "FUNES_VOYAGE_MIN_REQUEST_INTERVAL=0" in text
-    assert "FUNES_CANONICAL_INDEX_MIN_REQUEST_INTERVAL=0" in text
+    required = (
+        "FUNES_CANONICAL_INDEX_BATCH=128",
+        "FUNES_CANONICAL_INDEX_REQUEST_ROWS=128",
+        "FUNES_CANONICAL_INDEX_MAX_CHARS=192000",
+        "FUNES_VOYAGE_CONCURRENCY=1",
+        "FUNES_VOYAGE_MAX_REQUEST_TOKENS=9000",
+        "FUNES_VOYAGE_TOKENS_PER_MINUTE=9000",
+        "FUNES_VOYAGE_MIN_REQUEST_INTERVAL=0",
+        "FUNES_CANONICAL_INDEX_MIN_REQUEST_INTERVAL=0",
+    )
+    for path in (
+        REPO_ROOT / "deploy" / "funes-space" / "Dockerfile",
+        REPO_ROOT / "space" / "Dockerfile",
+    ):
+        text = path.read_text(encoding="utf-8")
+        for value in required:
+            assert value in text, f"{value} missing from {path.relative_to(REPO_ROOT)}"
 
 
 def test_root_server_synced_with_space_server():

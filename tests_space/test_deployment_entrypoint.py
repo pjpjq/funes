@@ -24,11 +24,16 @@ def test_dockerfiles_copy_canonical_space_server():
         ), f"{path.relative_to(REPO_ROOT)} should not COPY root server.py directly"
 
 
-def test_production_space_enables_bounded_voyage_concurrency():
-    """Keep the measured Voyage A/B settings in the production image."""
+def test_production_space_enables_safe_voyage_batching_and_pacing():
+    """Keep production batching larger while respecting the observed free tier."""
     path = REPO_ROOT / "deploy" / "funes-space" / "Dockerfile"
     text = path.read_text(encoding="utf-8")
-    assert "FUNES_VOYAGE_CONCURRENCY=2" in text
+    assert "FUNES_CANONICAL_INDEX_BATCH=128" in text
+    assert "FUNES_CANONICAL_INDEX_REQUEST_ROWS=128" in text
+    assert "FUNES_CANONICAL_INDEX_MAX_CHARS=192000" in text
+    assert "FUNES_VOYAGE_CONCURRENCY=1" in text
+    assert "FUNES_VOYAGE_MAX_REQUEST_TOKENS=9000" in text
+    assert "FUNES_VOYAGE_TOKENS_PER_MINUTE=9000" in text
     assert "FUNES_VOYAGE_MIN_REQUEST_INTERVAL=0" in text
     assert "FUNES_CANONICAL_INDEX_MIN_REQUEST_INTERVAL=0" in text
 

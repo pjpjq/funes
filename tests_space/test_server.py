@@ -2431,6 +2431,8 @@ def test_native_environment_uses_safe_production_defaults(monkeypatch, tmp_path)
         "FUNES_RERANK_PROVIDER",
         "FUNES_NATIVE_FALLBACK",
         "FUNES_RETRIEVAL_LANGUAGE_MODE",
+        "FUNES_INGEST_METRICS",
+        "FUNES_VOYAGE_CONCURRENCY",
     ):
         monkeypatch.delenv(name, raising=False)
     env = bridge.native_environment(tmp_path)
@@ -2441,8 +2443,23 @@ def test_native_environment_uses_safe_production_defaults(monkeypatch, tmp_path)
     assert env["FUNES_EMBEDDING_SCHEMA_VERSION"] == "2"
     assert env["FUNES_RERANK_PROVIDER"] == "none"
     assert env["FUNES_NATIVE_FALLBACK"] == "false"
+    assert env["FUNES_INGEST_METRICS"] == "1"
     assert env["FUNES_MCP_PIN_MEMORY"] == "true"
     assert env["FUNES_RETRIEVAL_LANGUAGE_MODE"] == "raw"
+
+
+def test_native_environment_profile_overrides_voyage_concurrency(monkeypatch, tmp_path):
+    monkeypatch.delenv("FUNES_VOYAGE_CONCURRENCY", raising=False)
+    profile = {
+        **bridge.embedding_profile(),
+        "concurrency": 4,
+    }
+    env = bridge.native_environment(tmp_path, profile)
+    assert env["FUNES_VOYAGE_CONCURRENCY"] == "4"
+
+    profile["concurrency"] = "not-an-int"
+    fallback = bridge.native_environment(tmp_path, profile)
+    assert "FUNES_VOYAGE_CONCURRENCY" not in fallback
 
 
 def test_blue_green_build_profile_isolated_from_active_query_profile(
@@ -3148,10 +3165,139 @@ def test_canonical_reconcile_state_exposes_safe_values():
     assert status["max_chars"] == bridge.CANONICAL_INDEX_MAX_CHARS
     assert status["min_request_interval_seconds"] == bridge.CANONICAL_INDEX_MIN_REQUEST_INTERVAL
     assert status["timeout_seconds"] == bridge.CANONICAL_INDEX_TIMEOUT
+    assert status["last_metrics"] is None
 
     dumped = json.dumps(status)
     assert "raw_text" not in dumped
     assert "token" not in dumped.lower()
+
+
+def test_native_metrics_parsing_and_bounded_sanitization():
+    metrics = bridge._native_metrics()
+    assert metrics["phase_ms"] == {}
+    assert metrics["voyage_requests"] == 0
+    assert metrics["voyage_input_count"] == 0
+    assert metrics["voyage_token_usage"] == 0
+    assert metrics["voyage_token_usage_known"] == 0
+    assert metrics["voyage_status_counts"] == {}
+    assert metrics["voyage_pacer_wait_ms"] == 0.0
+    assert metrics["voyage_backoff_ms"] == 0.0
+
+    lines = [
+        "random log line from native ingest",
+        'funes_metric {"stage": "secret_scan", "duration_ms": 12.34}',
+        'funes_metric {"stage": "embedding", "duration_ms": 100.56}',
+        'funes_metric {"stage": "unknown_phase", "duration_ms": 55.0}',
+        'funes_metric {"invalid": "json"',
+        'funes_metric {"stage": "secret_scan", "duration_ms": -5.0}',
+        'funes_metric {"stage": "voyage_request", "duration_ms": 80.0, "input_count": 5, "status_code": 200, "token_usage": 1234, "pacer_wait_ms": 2.5, "backoff_ms": 1.25}',
+        'funes_metric {"stage": "voyage_request", "duration_ms": 90.0, "input_count": 3, "status_code": 429, "token_usage": null, "pacer_wait_ms": 0.0, "backoff_ms": 50.0}',
+    ]
+    stderr = chr(10).join(lines)
+    bridge._record_native_metrics(metrics, stderr)
+
+    assert metrics["phase_ms"] == {"secret_scan": 12.34, "embedding": 100.56}
+    assert metrics["voyage_requests"] == 2
+    assert metrics["voyage_input_count"] == 8
+    assert metrics["voyage_token_usage"] == 1234
+    assert metrics["voyage_token_usage_known"] == 1
+    assert metrics["voyage_status_counts"] == {"200": 1, "429": 1}
+    assert metrics["voyage_pacer_wait_ms"] == 2.5
+    assert metrics["voyage_backoff_ms"] == 51.25
+
+    untrusted = {
+        **metrics,
+        "phase_ms": {**metrics["phase_ms"], "untrusted_phase": 42.0},
+        "voyage_status_counts": {**metrics["voyage_status_counts"], "invalid_status": 99},
+        "secret_token": "sk-secret-12345",
+        "raw_text": "sensitive source document",
+        "voyage_requests": -10,
+    }
+    bounded = bridge._bounded_native_metrics(untrusted)
+    assert bounded is not None
+    assert "secret_token" not in bounded
+    assert "raw_text" not in bounded
+    assert "untrusted_phase" not in bounded["phase_ms"]
+    assert "invalid_status" not in bounded["voyage_status_counts"]
+    assert bounded["voyage_requests"] == 0
+    assert bounded["phase_ms"] == {"embedding": 100.56, "secret_scan": 12.34}
+    assert bridge._bounded_native_metrics(None) is None
+    assert bridge._bounded_native_metrics("invalid") is None
+
+
+def test_reconcile_canonical_index_captures_and_persists_metrics(monkeypatch, tmp_path):
+    app = _source_app(tmp_path)
+    _canonical_source(app.store, "doc-with-metrics")
+    bridge._initialize_canonical_reconcile_state(app)
+
+    monkeypatch.setattr(bridge, "REMOTE", "owner/memory")
+    monkeypatch.setattr(bridge, "INDEX_REMOTE", "")
+    monkeypatch.setattr(
+        bridge,
+        "run",
+        lambda *_args, **_kwargs: (
+            0,
+            "ingested sources=1 chunks=1 unchanged=0 stale=0 held=0 commit=rev" + chr(10),
+            'funes_metric {"stage": "lance_write_commit", "duration_ms": 45.67}' + chr(10)
+            + 'funes_metric {"stage": "voyage_request", "duration_ms": 120.0, "input_count": 1, "status_code": 200, "token_usage": 50}' + chr(10),
+        ),
+    )
+    try:
+        result = bridge.reconcile_canonical_index(app)
+        assert result["indexed"] == 1
+        state = bridge.canonical_reconcile_state(app)
+        last_metrics = state["last_metrics"]
+        assert last_metrics is not None
+        assert last_metrics["voyage_requests"] == 1
+        assert last_metrics["phase_ms"] == {"lance_write_commit": 45.67}
+        assert last_metrics["voyage_status_counts"] == {"200": 1}
+    finally:
+        app.store.close()
+
+
+def test_sync_status_reports_bounded_last_metrics_without_leaks(monkeypatch):
+    monkeypatch.setattr(bridge, "REMOTE", "owner/private")
+    sample_metrics = {
+        "phase_ms": {"secret_scan": 1.23, "embedding": 45.6},
+        "voyage_requests": 2,
+        "voyage_input_count": 4,
+        "voyage_token_usage": 100,
+        "voyage_token_usage_known": 2,
+        "voyage_status_counts": {"200": 2},
+        "voyage_pacer_wait_ms": 1.0,
+        "voyage_backoff_ms": 0.0,
+        "private_token": "sk-should-not-leak",
+    }
+    app = SimpleNamespace()
+    bridge._initialize_canonical_reconcile_state(app)
+    bridge._set_canonical_reconcile_state(app, last_metrics=sample_metrics)
+
+    state = bridge.canonical_reconcile_state(app)
+    assert state["last_metrics"] is not None
+    assert "private_token" not in state["last_metrics"]
+    assert state["last_metrics"]["voyage_requests"] == 2
+
+    monkeypatch.setattr(
+        bridge,
+        "source_state",
+        lambda: {
+            "configured": True,
+            "ready": True,
+            "documents": 1,
+            "canonical_reconciler": state,
+        },
+    )
+    monkeypatch.setattr(bridge, "warm_state", lambda: {"state": "ready"})
+    monkeypatch.setattr(bridge, "run", lambda *_args, **_kwargs: (0, "ok", ""))
+
+    code, payload = bridge.sync_status_payload()
+    assert code == 200
+    reconciler = payload["source_store"]["canonical_reconciler"]
+    assert reconciler["last_metrics"]["voyage_requests"] == 2
+    assert reconciler["last_metrics"]["phase_ms"] == {"embedding": 45.6, "secret_scan": 1.23}
+    dumped = json.dumps(payload)
+    assert "sk-should-not-leak" not in dumped
+    assert "private_token" not in dumped
 
 
 def test_canonical_background_enforces_min_request_interval_after_progress(monkeypatch):

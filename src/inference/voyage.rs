@@ -53,9 +53,53 @@ struct EmbeddingsRequest<'a> {
     truncation: bool,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+struct VoyageUsage {
+    #[serde(default)]
+    total_tokens: Option<u64>,
+}
+
 #[derive(Deserialize)]
 struct EmbeddingsResponse {
     data: Vec<EmbeddingData>,
+    #[serde(default)]
+    usage: Option<VoyageUsage>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct VoyageRequestMetric {
+    stage: &'static str,
+    attempt: usize,
+    duration_ms: f64,
+    status_code: u16,
+    input_count: usize,
+    token_usage: Option<u64>,
+    pacer_wait_ms: f64,
+    backoff_ms: f64,
+}
+
+fn ingest_metrics_enabled_from(value: Option<&str>) -> bool {
+    matches!(
+        value.map(|val| val.trim().to_ascii_lowercase()).as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
+}
+
+fn ingest_metrics_enabled() -> bool {
+    ingest_metrics_enabled_from(env::var("FUNES_INGEST_METRICS").ok().as_deref())
+}
+
+fn round_ms(duration: Duration) -> f64 {
+    ((duration.as_secs_f64() * 1000.0) * 100.0).round() / 100.0
+}
+
+fn emit_voyage_metric(metric: &VoyageRequestMetric) {
+    if !ingest_metrics_enabled() {
+        return;
+    }
+    if let Ok(json) = serde_json::to_string(metric) {
+        eprintln!("funes_metric {json}");
+    }
 }
 
 #[derive(Deserialize)]
@@ -648,12 +692,16 @@ impl VoyageEmbedder {
         };
 
         for attempt in 0..attempts {
+            let pacer_start = self.clock.now();
             if documents {
                 // Count a batch once. Retries still honor interval/retry-after
                 // pacing, but do not consume the same TPM budget repeatedly.
                 self.pace_document_attempt(if attempt == 0 { estimated_tokens } else { 0 });
             }
+            let pacer_wait = self.clock.now().saturating_duration_since(pacer_start);
+            let pacer_wait_ms = round_ms(pacer_wait);
 
+            let req_start = Instant::now();
             let response = self
                 .client
                 .post(&self.endpoint)
@@ -664,37 +712,129 @@ impl VoyageEmbedder {
             let response = match response {
                 Ok(response) => response,
                 Err(error) if documents && retryable_request_error(&error) && attempt + 1 < attempts => {
-                    self.defer_document_attempt(
-                        self.document_retry_delay.saturating_mul((attempt + 1) as u32),
-                    );
+                    let req_duration = req_start.elapsed();
+                    let delay = self.document_retry_delay.saturating_mul((attempt + 1) as u32);
+                    emit_voyage_metric(&VoyageRequestMetric {
+                        stage: "voyage_request",
+                        attempt: attempt + 1,
+                        duration_ms: round_ms(req_duration),
+                        status_code: 0,
+                        input_count: texts.len(),
+                        token_usage: None,
+                        pacer_wait_ms,
+                        backoff_ms: round_ms(delay),
+                    });
+                    self.defer_document_attempt(delay);
                     continue;
                 }
-                Err(error) => return Err(request_error("embeddings", &error)),
+                Err(error) => {
+                    let req_duration = req_start.elapsed();
+                    emit_voyage_metric(&VoyageRequestMetric {
+                        stage: "voyage_request",
+                        attempt: attempt + 1,
+                        duration_ms: round_ms(req_duration),
+                        status_code: 0,
+                        input_count: texts.len(),
+                        token_usage: None,
+                        pacer_wait_ms,
+                        backoff_ms: 0.0,
+                    });
+                    return Err(request_error("embeddings", &error));
+                }
             };
             let status = response.status();
+            let status_code = status.as_u16();
             if status.is_success() {
+                let req_duration = req_start.elapsed();
                 let response = match response.json::<EmbeddingsResponse>() {
-                    Ok(response) => response,
+                    Ok(response) => {
+                        let token_usage = response.usage.as_ref().and_then(|u| u.total_tokens);
+                        emit_voyage_metric(&VoyageRequestMetric {
+                            stage: "voyage_request",
+                            attempt: attempt + 1,
+                            duration_ms: round_ms(req_duration),
+                            status_code,
+                            input_count: texts.len(),
+                            token_usage,
+                            pacer_wait_ms,
+                            backoff_ms: 0.0,
+                        });
+                        response
+                    }
                     Err(error) if documents && retryable_request_error(&error) && attempt + 1 < attempts => {
-                        self.defer_document_attempt(
-                            self.document_retry_delay.saturating_mul((attempt + 1) as u32),
-                        );
+                        let delay = self.document_retry_delay.saturating_mul((attempt + 1) as u32);
+                        emit_voyage_metric(&VoyageRequestMetric {
+                            stage: "voyage_request",
+                            attempt: attempt + 1,
+                            duration_ms: round_ms(req_duration),
+                            status_code,
+                            input_count: texts.len(),
+                            token_usage: None,
+                            pacer_wait_ms,
+                            backoff_ms: round_ms(delay),
+                        });
+                        self.defer_document_attempt(delay);
                         continue;
                     }
-                    Err(error) if retryable_request_error(&error) => return Err(request_error("embeddings", &error)),
-                    Err(_) => bail!("Voyage embeddings returned invalid JSON"),
+                    Err(error) if retryable_request_error(&error) => {
+                        emit_voyage_metric(&VoyageRequestMetric {
+                            stage: "voyage_request",
+                            attempt: attempt + 1,
+                            duration_ms: round_ms(req_duration),
+                            status_code,
+                            input_count: texts.len(),
+                            token_usage: None,
+                            pacer_wait_ms,
+                            backoff_ms: 0.0,
+                        });
+                        return Err(request_error("embeddings", &error));
+                    }
+                    Err(_) => {
+                        emit_voyage_metric(&VoyageRequestMetric {
+                            stage: "voyage_request",
+                            attempt: attempt + 1,
+                            duration_ms: round_ms(req_duration),
+                            status_code,
+                            input_count: texts.len(),
+                            token_usage: None,
+                            pacer_wait_ms,
+                            backoff_ms: 0.0,
+                        });
+                        bail!("Voyage embeddings returned invalid JSON");
+                    }
                 };
                 return decode_embeddings(response, texts.len(), self.dimensions);
             }
+            let req_duration = req_start.elapsed();
             if documents && retryable(status) && attempt + 1 < attempts {
                 let delay = if status == StatusCode::TOO_MANY_REQUESTS {
                     self.rate_limit_delay(&response, attempt)
                 } else {
                     self.document_retry_delay.saturating_mul((attempt + 1) as u32)
                 };
+                emit_voyage_metric(&VoyageRequestMetric {
+                    stage: "voyage_request",
+                    attempt: attempt + 1,
+                    duration_ms: round_ms(req_duration),
+                    status_code,
+                    input_count: texts.len(),
+                    token_usage: None,
+                    pacer_wait_ms,
+                    backoff_ms: round_ms(delay),
+                });
                 self.defer_document_attempt(delay);
                 continue;
             }
+            emit_voyage_metric(&VoyageRequestMetric {
+                stage: "voyage_request",
+                attempt: attempt + 1,
+                duration_ms: round_ms(req_duration),
+                status_code,
+                input_count: texts.len(),
+                token_usage: None,
+                pacer_wait_ms,
+                backoff_ms: 0.0,
+            });
             bail!("Voyage embeddings request failed with HTTP {}", status.as_u16())
         }
         unreachable!("positive attempt count always returns")
@@ -1732,4 +1872,51 @@ mod tests {
         assert_eq!(requests[0].body["return_documents"], false);
         assert_eq!(requests[0].body["truncation"], true);
     }
+
+    #[test]
+    fn voyage_metrics_schema_and_usage_deserialization_are_strict() {
+        assert!(ingest_metrics_enabled_from(Some("1")));
+        assert!(ingest_metrics_enabled_from(Some("true")));
+        assert!(!ingest_metrics_enabled_from(Some("0")));
+        assert!(!ingest_metrics_enabled_from(None));
+
+        let res: EmbeddingsResponse = serde_json::from_value(json!({
+            "data": [],
+            "usage": { "total_tokens": 128 }
+        })).unwrap();
+        assert_eq!(res.usage.unwrap().total_tokens, Some(128));
+
+        let res_no_usage: EmbeddingsResponse = serde_json::from_value(json!({
+            "data": []
+        })).unwrap();
+        assert!(res_no_usage.usage.is_none());
+
+        let metric = VoyageRequestMetric {
+            stage: "voyage_request",
+            attempt: 1,
+            duration_ms: 142.5,
+            status_code: 200,
+            input_count: 8,
+            token_usage: Some(128),
+            pacer_wait_ms: 0.0,
+            backoff_ms: 0.0,
+        };
+        let serialized = serde_json::to_string(&metric).unwrap();
+        assert_eq!(
+            serialized,
+            r#"{"stage":"voyage_request","attempt":1,"duration_ms":142.5,"status_code":200,"input_count":8,"token_usage":128,"pacer_wait_ms":0.0,"backoff_ms":0.0}"#
+        );
+        let parsed: Value = serde_json::from_str(&serialized).unwrap();
+        let obj = parsed.as_object().unwrap();
+        assert_eq!(obj.len(), 8);
+        assert_eq!(obj.get("stage").unwrap(), "voyage_request");
+        assert_eq!(obj.get("attempt").unwrap(), 1);
+        assert_eq!(obj.get("duration_ms").unwrap(), 142.5);
+        assert_eq!(obj.get("status_code").unwrap(), 200);
+        assert_eq!(obj.get("input_count").unwrap(), 8);
+        assert_eq!(obj.get("token_usage").unwrap(), 128);
+        assert_eq!(obj.get("pacer_wait_ms").unwrap(), 0.0);
+        assert_eq!(obj.get("backoff_ms").unwrap(), 0.0);
+    }
+
 }

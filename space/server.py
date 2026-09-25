@@ -330,6 +330,19 @@ def native_environment(
     env["FUNES_EMBEDDING_SCHEMA_VERSION"] = str(profile["schema_version"])
     env["FUNES_RERANK_PROVIDER"] = os.getenv("FUNES_RERANK_PROVIDER", "none") or "none"
     env["FUNES_NATIVE_FALLBACK"] = os.getenv("FUNES_NATIVE_FALLBACK", "false") or "false"
+    # Keep native diagnostics on for the bounded backfill controller.  The
+    # emitted records are allowlisted numeric aggregates; no source text or
+    # credentials are included.
+    env["FUNES_INGEST_METRICS"] = os.getenv("FUNES_INGEST_METRICS", "1") or "1"
+    # A/B profiles may override the Rust document concurrency for an isolated
+    # cycle.  Production calls without this field retain the process setting.
+    if isinstance(profile, dict) and profile.get("concurrency") is not None:
+        try:
+            concurrency = max(1, min(32, int(profile["concurrency"])))
+        except (TypeError, ValueError):
+            concurrency = None
+        if concurrency is not None:
+            env["FUNES_VOYAGE_CONCURRENCY"] = str(concurrency)
     # A Space refreshes the complete MCP child after committed index revisions.
     # Pin that child's immutable Dataset handle so recalls do not resolve/open the
     # same Hub revision again on every request. Ordinary MCP/CLI processes remain
@@ -1446,6 +1459,153 @@ NATIVE_RECORD_ERROR_RE = re.compile(
     r"invalid canonical JSONL record|must not be empty|must not contain NUL|invalid timestamp",
     re.IGNORECASE,
 )
+NATIVE_METRIC_RE = re.compile(r"^funes_metric (\{.*\})\s*$")
+NATIVE_METRIC_PHASES = frozenset(
+    {
+        "secret_scan",
+        "remote_open",
+        "revision_lookup",
+        "vector_reuse",
+        "embedding",
+        "lance_write_commit",
+    }
+)
+
+
+def _native_metrics() -> dict[str, object]:
+    """Return a bounded aggregate for native ingest timing diagnostics."""
+    return {
+        "phase_ms": {},
+        "voyage_requests": 0,
+        "voyage_input_count": 0,
+        "voyage_token_usage": 0,
+        "voyage_token_usage_known": 0,
+        "voyage_status_counts": {},
+        "voyage_pacer_wait_ms": 0.0,
+        "voyage_backoff_ms": 0.0,
+    }
+
+
+def _record_native_metrics(metrics: dict[str, object], stderr: str | None) -> None:
+    """Parse only allowlisted numeric metrics; never retain native stderr."""
+    if not stderr:
+        return
+    phase_ms = metrics["phase_ms"]
+    status_counts = metrics["voyage_status_counts"]
+    if not isinstance(phase_ms, dict) or not isinstance(status_counts, dict):
+        return
+    for line in stderr.splitlines():
+        match = NATIVE_METRIC_RE.fullmatch(line.strip())
+        if match is None:
+            continue
+        try:
+            item = json.loads(match.group(1))
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(item, dict):
+            continue
+        stage = item.get("stage")
+        try:
+            duration_ms = float(item.get("duration_ms"))
+        except (TypeError, ValueError):
+            duration_ms = -1.0
+        if (
+            not isinstance(stage, str)
+            or duration_ms < 0.0
+            or duration_ms >= 86_400_000
+        ):
+            continue
+        if stage in NATIVE_METRIC_PHASES:
+            phase_ms[stage] = round(float(phase_ms.get(stage, 0.0)) + duration_ms, 2)
+            continue
+        if stage != "voyage_request":
+            continue
+        metrics["voyage_requests"] = int(metrics["voyage_requests"]) + 1
+        try:
+            input_count = int(item.get("input_count", 0))
+        except (TypeError, ValueError):
+            input_count = 0
+        if 0 <= input_count <= 128:
+            metrics["voyage_input_count"] = int(metrics["voyage_input_count"]) + input_count
+        try:
+            status = int(item.get("status_code", 0))
+        except (TypeError, ValueError):
+            status = 0
+        if 0 <= status <= 999:
+            key = str(status)
+            status_counts[key] = int(status_counts.get(key, 0)) + 1
+        token_usage = item.get("token_usage")
+        if token_usage is not None:
+            try:
+                token_usage = int(token_usage)
+            except (TypeError, ValueError):
+                token_usage = -1
+            if 0 <= token_usage <= 10_000_000:
+                metrics["voyage_token_usage"] = int(metrics["voyage_token_usage"]) + token_usage
+                metrics["voyage_token_usage_known"] = int(metrics["voyage_token_usage_known"]) + 1
+        for field in ("pacer_wait_ms", "backoff_ms"):
+            try:
+                value = float(item.get(field, 0.0))
+            except (TypeError, ValueError):
+                value = -1.0
+            if 0.0 <= value < 86_400_000:
+                key = "voyage_pacer_wait_ms" if field == "pacer_wait_ms" else "voyage_backoff_ms"
+                metrics[key] = round(float(metrics[key]) + value, 2)
+
+
+def _bounded_native_metrics(metrics: object) -> dict[str, object] | None:
+    """Sanitize native ingest metrics to safe numeric aggregates and allowlisted phases."""
+    if not isinstance(metrics, dict):
+        return None
+    phase_ms: dict[str, float] = {}
+    raw_phase = metrics.get("phase_ms")
+    if isinstance(raw_phase, dict):
+        for stage in sorted(NATIVE_METRIC_PHASES):
+            if stage in raw_phase:
+                try:
+                    val = float(raw_phase[stage])
+                except (TypeError, ValueError):
+                    continue
+                if 0.0 <= val < 86_400_000:
+                    phase_ms[stage] = round(val, 2)
+
+    status_counts: dict[str, int] = {}
+    raw_status = metrics.get("voyage_status_counts")
+    if isinstance(raw_status, dict):
+        for raw_k, raw_v in raw_status.items():
+            try:
+                code = int(raw_k)
+                count = int(raw_v)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= code <= 999 and count >= 0:
+                status_counts[str(code)] = count
+
+    def _safe_int(key: str, min_val: int = 0, max_val: int = 1_000_000_000) -> int:
+        try:
+            val = int(metrics.get(key, 0))  # type: ignore[union-attr]
+        except (TypeError, ValueError):
+            return 0
+        return val if min_val <= val <= max_val else 0
+
+    def _safe_float(key: str, min_val: float = 0.0, max_val: float = 86_400_000.0) -> float:
+        try:
+            val = float(metrics.get(key, 0.0))  # type: ignore[union-attr]
+        except (TypeError, ValueError):
+            return 0.0
+        return round(val, 2) if min_val <= val < max_val else 0.0
+
+    return {
+        "phase_ms": phase_ms,
+        "voyage_requests": _safe_int("voyage_requests"),
+        "voyage_input_count": _safe_int("voyage_input_count"),
+        "voyage_token_usage": _safe_int("voyage_token_usage"),
+        "voyage_token_usage_known": _safe_int("voyage_token_usage_known"),
+        "voyage_status_counts": status_counts,
+        "voyage_pacer_wait_ms": _safe_float("voyage_pacer_wait_ms"),
+        "voyage_backoff_ms": _safe_float("voyage_backoff_ms"),
+    }
+
 CANONICAL_REF_PREFIX = "funes-doc:"
 HELD_SOURCE_ID_DOMAIN = b"funes-held-source-v1\0"
 
@@ -1690,6 +1850,7 @@ def _ingest_canonical_subset(
     *,
     memory: str,
     profile: dict[str, object],
+    metrics: dict[str, object] | None = None,
 ) -> tuple[list[dict], bool]:
     sequence[0] += 1
     path = directory / f"batch-{sequence[0]:06d}.jsonl"
@@ -1703,7 +1864,15 @@ def _ingest_canonical_subset(
             timeout=CANONICAL_INDEX_TIMEOUT,
             profile=profile,
         )
-    except subprocess.TimeoutExpired:
+        if metrics is not None:
+            _record_native_metrics(metrics, error_output)
+    except subprocess.TimeoutExpired as exc:
+        if metrics is not None:
+            partial_stderr = getattr(exc, "stderr", None)
+            if isinstance(partial_stderr, bytes):
+                partial_stderr = partial_stderr.decode("utf-8", "replace")
+            if isinstance(partial_stderr, str):
+                _record_native_metrics(metrics, partial_stderr)
         return [
             _native_update(
                 item, "retry", None, "TimeoutExpired", profile=profile, memory=memory
@@ -1733,10 +1902,10 @@ def _ingest_canonical_subset(
                 ], False
             middle = len(records) // 2
             left, left_commit = _ingest_canonical_subset(
-                records[:middle], directory, sequence, memory=memory, profile=profile
+                records[:middle], directory, sequence, memory=memory, profile=profile, metrics=metrics
             )
             right, right_commit = _ingest_canonical_subset(
-                records[middle:], directory, sequence, memory=memory, profile=profile
+                records[middle:], directory, sequence, memory=memory, profile=profile, metrics=metrics
             )
             return left + right, left_commit or right_commit
         return [
@@ -1859,10 +2028,10 @@ def _ingest_canonical_subset(
         ], committed
     middle = len(records) // 2
     left, left_commit = _ingest_canonical_subset(
-        records[:middle], directory, sequence, memory=memory, profile=profile
+        records[:middle], directory, sequence, memory=memory, profile=profile, metrics=metrics
     )
     right, right_commit = _ingest_canonical_subset(
-        records[middle:], directory, sequence, memory=memory, profile=profile
+        records[middle:], directory, sequence, memory=memory, profile=profile, metrics=metrics
     )
     return left + right, committed or left_commit or right_commit
 
@@ -1879,6 +2048,7 @@ def _initialize_canonical_reconcile_state(app) -> None:
         "last_result": None,
         "last_error": None,
         "last_progress_at": None,
+        "last_metrics": None,
         "consecutive_failures": 0,
         "wait_seconds": CANONICAL_INDEX_INTERVAL,
     }
@@ -1943,6 +2113,7 @@ def canonical_reconcile_state(app) -> dict[str, object]:
             "last_result": None,
             "last_error": None,
             "last_progress_at": None,
+            "last_metrics": None,
             "consecutive_failures": 0,
             "wait_seconds": CANONICAL_INDEX_INTERVAL,
         }
@@ -1951,6 +2122,7 @@ def canonical_reconcile_state(app) -> dict[str, object]:
             public = {
                 key: value for key, value in state.items() if not key.startswith("_")
             }
+    public["last_metrics"] = _bounded_native_metrics(public.get("last_metrics"))
     thread = getattr(app, "canonical_index_thread", None)
     public.update(
         thread_alive=bool(thread is not None and thread.is_alive()),
@@ -1972,6 +2144,7 @@ def _canonical_reconcile_phase(app, phase: str) -> None:
 
 def reconcile_canonical_index(app) -> dict[str, object]:
     """Index one restart-safe batch and persist only derived status in the sidecar."""
+    metrics = _native_metrics()
     memory = index_memory()
     if not memory or app.syncer.restoring or app.syncer.restore_failed:
         return {"attempted": 0, "indexed": 0, "held": 0, "durable": False}
@@ -2073,6 +2246,7 @@ def reconcile_canonical_index(app) -> dict[str, object]:
                         [0],
                         memory=memory,
                         profile=profile,
+                        metrics=metrics,
                     )
     if not records:
         durable = not app.syncer.restoring and not app.syncer.restore_failed
@@ -2167,6 +2341,7 @@ def reconcile_canonical_index(app) -> dict[str, object]:
             if pending_marker is not None:
                 app.store.set_native_optimize_checkpoint(pending_marker)
     durable = bool(sync.get("durable"))
+    _set_canonical_reconcile_state(app, last_metrics=metrics)
     return {
         "attempted": len(records),
         "indexed": sum(item["native_index_status"] == "indexed" for item in updates) if durable else 0,

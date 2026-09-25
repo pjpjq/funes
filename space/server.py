@@ -1983,7 +1983,7 @@ def reconcile_canonical_index(app) -> dict[str, object]:
             return []
         _canonical_reconcile_phase(app, "selecting")
         rows = app.store.canonical_index_candidates(
-            CANONICAL_INDEX_BATCH,
+            max(CANONICAL_INDEX_BATCH, CANONICAL_INDEX_REQUEST_ROWS),
             str(profile["fingerprint"]),
             memory,
         )

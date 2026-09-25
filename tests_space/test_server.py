@@ -2691,7 +2691,7 @@ def test_blue_green_reconcile_writes_only_build_target_and_does_not_warm_active(
     build = bridge.index_embedding_profile()
     assert result == {"attempted": 1, "indexed": 1, "held": 0, "durable": True}
     assert store.candidate_args == (
-        bridge.CANONICAL_INDEX_BATCH,
+        max(bridge.CANONICAL_INDEX_BATCH, bridge.CANONICAL_INDEX_REQUEST_ROWS),
         build["fingerprint"],
         "owner/voyage-build",
     )
@@ -2838,6 +2838,7 @@ def test_canonical_commit_refresh_uses_app_scoped_cooldown(monkeypatch, tmp_path
     monkeypatch.setattr(bridge, "REMOTE", "owner/memory")
     monkeypatch.setattr(bridge, "INDEX_REMOTE", "")
     monkeypatch.setattr(bridge, "CANONICAL_INDEX_BATCH", 1)
+    monkeypatch.setattr(bridge, "CANONICAL_INDEX_REQUEST_ROWS", 1)
     monkeypatch.setattr(bridge, "CANONICAL_REFRESH_COOLDOWN", 300.0)
     monkeypatch.setattr(bridge.time, "monotonic", lambda: clock[0])
     monkeypatch.setattr(bridge, "request_warm", lambda **kwargs: warm.append(kwargs))
@@ -2871,6 +2872,7 @@ def test_canonical_final_backlog_flushes_dirty_refresh_once(monkeypatch, tmp_pat
     monkeypatch.setattr(bridge, "REMOTE", "owner/memory")
     monkeypatch.setattr(bridge, "INDEX_REMOTE", "")
     monkeypatch.setattr(bridge, "CANONICAL_INDEX_BATCH", 1)
+    monkeypatch.setattr(bridge, "CANONICAL_INDEX_REQUEST_ROWS", 1)
     monkeypatch.setattr(bridge, "CANONICAL_REFRESH_COOLDOWN", 300.0)
     monkeypatch.setattr(bridge.time, "monotonic", lambda: 100.0)
     monkeypatch.setattr(bridge, "request_warm", lambda **kwargs: warm.append(kwargs))

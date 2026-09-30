@@ -205,7 +205,7 @@ async fn append_at(
             text_indexed,
         }),
         Err(e) if head_moved(&e) => Ok(Appended::Conflict),
-        Err(e) => Err(anyhow::Error::new(e).context("data commit failed")),
+        Err(e) => Err(commit_error("data commit failed", &e)),
     }
 }
 
@@ -373,7 +373,7 @@ pub(crate) async fn first_document_publish(
     match send_commit(repo, ops, Some(expected_parent.to_string()), rev, message).await {
         Ok(info) => Ok(Replaced::Committed(info.commit_oid.unwrap_or_else(|| "?".to_string()))),
         Err(e) if head_moved(&e) => Ok(Replaced::Conflict),
-        Err(e) => Err(anyhow::Error::new(e).context("canonical data commit failed")),
+        Err(e) => Err(commit_error("canonical data commit failed", &e)),
     }
 }
 
@@ -682,7 +682,7 @@ pub(crate) async fn reindex(
     match send_commit(repo, ops, Some(parent), rev, message).await {
         Ok(info) => Ok(Reindexed::Committed(info.commit_oid.unwrap_or_else(|| "?".into()))),
         Err(error) if head_moved(&error) => Ok(Reindexed::Conflict),
-        Err(error) => Err(anyhow::Error::new(error).context("reindex commit failed")),
+        Err(error) => Err(commit_error("reindex commit failed", &error)),
     }
 }
 
@@ -737,7 +737,7 @@ pub async fn add_column(
     let (ops, _dir) = write_ops(&files)?;
     let info = send_commit(repo, ops, Some(parent), rev, message)
         .await
-        .map_err(|e| anyhow::Error::new(e).context("add_column commit failed"))?;
+        .map_err(|e| commit_error("add_column commit failed", &e))?;
     Ok(info.commit_oid.unwrap_or_else(|| "?".to_string()))
 }
 
@@ -790,7 +790,7 @@ pub(crate) async fn replace_documents(
     match send_commit(repo, ops, Some(expected_parent.to_string()), rev, message).await {
         Ok(info) => Ok(Replaced::Committed(info.commit_oid.unwrap_or_else(|| "?".to_string()))),
         Err(e) if head_moved(&e) => Ok(Replaced::Conflict),
-        Err(e) => Err(anyhow::Error::new(e).context("canonical data commit failed")),
+        Err(e) => Err(commit_error("canonical data commit failed", &e)),
     }
 }
 
@@ -969,6 +969,66 @@ async fn send_commit(
 /// Whether the Hub refused a commit because another is in progress on the repo, in its own words.
 fn repo_busy(e: &HFError) -> bool {
     matches!(e, HFError::Conflict { context } if context.body.contains("Another commit operation is in progress"))
+}
+
+/// Convert an HF commit failure into a bounded diagnostic that is safe to persist in the
+/// reconciler state. `HFError`'s Display implementation intentionally includes response URLs and,
+/// for conflicts, the full response body; neither belongs in logs or API responses.
+fn commit_error(label: &str, error: &HFError) -> anyhow::Error {
+    fn safe_atom(value: &str) -> Option<String> {
+        let value = value.trim();
+        if value.is_empty()
+            || value.contains("://")
+            || value.contains('/')
+            || value.contains('\\')
+            || value.to_ascii_lowercase().contains("bearer")
+            || value.to_ascii_lowercase().contains("token")
+        {
+            return None;
+        }
+        let sanitized: String = value
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '.' | ',' | ':' | ';' | '-' | '_'))
+            .take(160)
+            .collect();
+        let sanitized = sanitized.split_whitespace().collect::<Vec<_>>().join(" ");
+        (!sanitized.is_empty()).then_some(sanitized)
+    }
+
+    macro_rules! http_detail {
+        ($variant:expr, $context:expr) => {{
+            let context = $context;
+            let mut detail = format!(
+                "{label}: hf_error={} http_status={}",
+                $variant,
+                context.status.as_u16()
+            );
+            if let Some(code) = context.error_code.as_deref().and_then(safe_atom) {
+                detail.push_str(&format!(" error_code={code}"));
+            }
+            if let Some(message) = context.server_message.as_deref().and_then(safe_atom) {
+                detail.push_str(&format!(" server_message={message}"));
+            }
+            anyhow::anyhow!(detail)
+        }};
+    }
+
+    match error {
+        HFError::Http { context } => http_detail!("http", context),
+        HFError::AuthRequired { context } => http_detail!("auth_required", context),
+        HFError::Forbidden { context } => http_detail!("forbidden", context),
+        HFError::RateLimited { context, .. } => http_detail!("rate_limited", context),
+        HFError::Conflict { context } => http_detail!("conflict", context),
+        HFError::Xet { operation, .. } => anyhow::anyhow!(
+            "{label}: hf_error=xet operation={operation}"
+        ),
+        HFError::Request { .. } => anyhow::anyhow!("{label}: hf_error=request_transport"),
+        HFError::RepoNotFound { .. } => anyhow::anyhow!("{label}: hf_error=repo_not_found"),
+        HFError::RevisionNotFound { .. } => anyhow::anyhow!("{label}: hf_error=revision_not_found"),
+        HFError::EntryNotFound { .. } => anyhow::anyhow!("{label}: hf_error=entry_not_found"),
+        HFError::BucketNotFound { .. } => anyhow::anyhow!("{label}: hf_error=bucket_not_found"),
+        _ => anyhow::anyhow!("{label}: hf_error=other"),
+    }
 }
 
 /// Whether a [`send_commit`] failure is the Hub rejecting a stale `parent_commit`: the commit API

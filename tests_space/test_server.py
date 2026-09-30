@@ -3225,6 +3225,14 @@ def test_native_metrics_parsing_and_bounded_sanitization():
     assert bridge._bounded_native_metrics("invalid") is None
 
 
+def test_native_failure_code_exposes_only_allowlisted_categories():
+    assert bridge._native_failure_code("ManifestOversizedError: private path") == "manifest_oversized"
+    assert bridge._native_failure_code("HTTP error: 503; provider payload omitted") == "hf_http_5xx"
+    assert bridge._native_failure_code("Voyage embeddings request failed with HTTP 429") == "hf_http_429"
+    assert bridge._native_failure_code("VOYAGE_API_KEY is required for Voyage inference") == "voyage_api_key_missing"
+    assert bridge._native_failure_code("private raw and credentials") == "native_exit"
+
+
 def test_reconcile_canonical_index_captures_and_persists_metrics(monkeypatch, tmp_path):
     app = _source_app(tmp_path)
     _canonical_source(app.store, "doc-with-metrics")
@@ -3497,6 +3505,7 @@ def test_canonical_background_uses_idle_wait_when_attempt_makes_no_progress(
     assert stop.waits == [9.0]
     assert status["wait_seconds"] == 9.0
     assert status["consecutive_failures"] == 0
+    assert status["last_error"] is None
 
 
 def test_canonical_background_marks_non_durable_result_as_failure(monkeypatch):

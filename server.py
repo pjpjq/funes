@@ -1464,7 +1464,16 @@ NATIVE_RECORD_ERROR_RE = re.compile(
 # leaking provider payloads, paths, or credentials.
 NATIVE_FAILURE_PATTERNS = (
     ("manifest_oversized", re.compile(r"ManifestOversizedError|manifest.{0,32}(?:too large|oversized)", re.IGNORECASE)),
-    ("hf_commit_conflict_exhausted", re.compile(r"canonical dataset commit conflicted 10 times", re.IGNORECASE)),
+    (
+        "hf_commit_conflict_exhausted",
+        re.compile(r"canonical (?:dataset commit conflicted 10 times|data commit kept conflicting)", re.IGNORECASE),
+    ),
+    ("hf_request_transport", re.compile(r"hf_error=request_transport\b", re.IGNORECASE)),
+    ("hf_repo_not_found", re.compile(r"hf_error=repo_not_found\b", re.IGNORECASE)),
+    ("hf_revision_not_found", re.compile(r"hf_error=revision_not_found\b", re.IGNORECASE)),
+    ("hf_entry_not_found", re.compile(r"hf_error=entry_not_found\b", re.IGNORECASE)),
+    ("hf_bucket_not_found", re.compile(r"hf_error=bucket_not_found\b", re.IGNORECASE)),
+    ("hf_http_400", re.compile(r"(?:HTTP error:\s*|http_status=)400\b", re.IGNORECASE)),
     ("hf_http_401", re.compile(r"(?:HTTP error:\s*|http_status=)401\b", re.IGNORECASE)),
     ("hf_http_403", re.compile(r"(?:HTTP error:\s*|http_status=)403\b|hf_error=forbidden", re.IGNORECASE)),
     ("hf_http_409", re.compile(r"(?:HTTP error:\s*|http_status=)409\b|hf_error=conflict", re.IGNORECASE)),
@@ -1475,6 +1484,7 @@ NATIVE_FAILURE_PATTERNS = (
         re.compile(r"(?:HTTP error:\s*|http_status=|failed with HTTP\s*)429\b|hf_error=rate_limited", re.IGNORECASE),
     ),
     ("hf_http_5xx", re.compile(r"(?:HTTP error:\s*|http_status=)5(?:00|02|03|04)\b", re.IGNORECASE)),
+    ("hf_http_other", re.compile(r"(?:HTTP error:\s*|http_status=|failed with HTTP\s*)\d{3}\b", re.IGNORECASE)),
     ("hf_xet_failed", re.compile(r"hf_error=xet\b|Xet .* failed", re.IGNORECASE)),
     ("hf_local_entry_not_found", re.compile(r"hf_error=local_entry_not_found\b", re.IGNORECASE)),
     ("hf_cache_not_enabled", re.compile(r"hf_error=cache_not_enabled\b", re.IGNORECASE)),

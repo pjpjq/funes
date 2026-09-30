@@ -408,10 +408,7 @@ impl DocumentPacer {
 
     fn record_attempt(&mut self, now: Instant, tokens: usize) {
         self.last_request_start = Some(now);
-        if self
-            .not_before
-            .is_some_and(|deadline| now >= deadline)
-        {
+        if self.not_before.is_some_and(|deadline| now >= deadline) {
             self.not_before = None;
         }
         if self.tokens_per_minute > 0 && tokens > 0 {
@@ -445,11 +442,7 @@ fn estimated_document_tokens(text: &str) -> usize {
         .saturating_add(32)
 }
 
-fn document_batches<'a>(
-    texts: &'a [&'a str],
-    max_inputs: usize,
-    max_tokens: usize,
-) -> Result<Vec<Vec<&'a str>>> {
+fn document_batches<'a>(texts: &'a [&'a str], max_inputs: usize, max_tokens: usize) -> Result<Vec<Vec<&'a str>>> {
     let mut batches = Vec::new();
     let mut current = Vec::new();
     let mut current_tokens = 0usize;
@@ -461,8 +454,7 @@ fn document_batches<'a>(
             );
         }
         let would_overflow = !current.is_empty()
-            && (current.len() >= max_inputs
-                || current_tokens.saturating_add(estimate) > max_tokens);
+            && (current.len() >= max_inputs || current_tokens.saturating_add(estimate) > max_tokens);
         if would_overflow {
             batches.push(current);
             current = Vec::new();
@@ -509,16 +501,10 @@ impl VoyageEmbedder {
             DOCUMENT_RATE_LIMIT_DELAY,
             positive_usize_env("FUNES_VOYAGE_MAX_REQUEST_TOKENS", DOCUMENT_MAX_TOKENS),
             usize_env("FUNES_VOYAGE_TOKENS_PER_MINUTE", DOCUMENT_TOKENS_PER_MINUTE),
-            duration_seconds_env(
-                "FUNES_VOYAGE_MIN_REQUEST_INTERVAL",
-                DOCUMENT_MIN_REQUEST_INTERVAL,
-            ),
+            duration_seconds_env("FUNES_VOYAGE_MIN_REQUEST_INTERVAL", DOCUMENT_MIN_REQUEST_INTERVAL),
         )?;
-        embedder.document_concurrency = positive_usize_env(
-            "FUNES_VOYAGE_CONCURRENCY",
-            DOCUMENT_CONCURRENCY,
-        )
-        .min(MAX_DOCUMENT_CONCURRENCY);
+        embedder.document_concurrency =
+            positive_usize_env("FUNES_VOYAGE_CONCURRENCY", DOCUMENT_CONCURRENCY).min(MAX_DOCUMENT_CONCURRENCY);
         Ok(embedder)
     }
 
@@ -613,17 +599,13 @@ impl VoyageEmbedder {
     }
 
     fn effective_document_concurrency(&self) -> usize {
-        self.document_concurrency
-            .clamp(1, MAX_DOCUMENT_CONCURRENCY)
+        self.document_concurrency.clamp(1, MAX_DOCUMENT_CONCURRENCY)
     }
 
     fn pace_document_attempt(&self, tokens: usize) {
         loop {
             let delay = {
-                let pacer = self
-                    .pacer
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let pacer = self.pacer.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                 pacer.delay_at(self.clock.now(), tokens)
             };
             if !delay.is_zero() {
@@ -633,10 +615,7 @@ impl VoyageEmbedder {
                 continue;
             }
 
-            let mut pacer = self
-                .pacer
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut pacer = self.pacer.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             let now = self.clock.now();
             let delay = pacer.delay_at(now, tokens);
             if delay.is_zero() {
@@ -649,10 +628,7 @@ impl VoyageEmbedder {
     }
 
     fn defer_document_attempt(&self, delay: Duration) {
-        let mut pacer = self
-            .pacer
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut pacer = self.pacer.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         pacer.defer_until(self.clock.now(), delay);
     }
 
@@ -866,11 +842,7 @@ impl Embedder for VoyageEmbedder {
                     .collect();
                 let joined: Result<Vec<Result<Vec<Vec<f32>>>>, anyhow::Error> = handles
                     .into_iter()
-                    .map(|handle| {
-                        handle
-                            .join()
-                            .map_err(|_| anyhow!("Voyage document worker panicked"))
-                    })
+                    .map(|handle| handle.join().map_err(|_| anyhow!("Voyage document worker panicked")))
                     .collect();
                 joined
             })?;
@@ -1311,7 +1283,10 @@ mod tests {
 
         let requests = server.finish();
         assert_eq!(requests.len(), 2);
-        assert_eq!(requests[0].body["input"].as_array().unwrap().len(), MAX_EMBEDDING_INPUTS);
+        assert_eq!(
+            requests[0].body["input"].as_array().unwrap().len(),
+            MAX_EMBEDDING_INPUTS
+        );
         assert_eq!(requests[1].body["input"].as_array().unwrap().len(), 1);
     }
 
@@ -1324,11 +1299,7 @@ mod tests {
             } else {
                 unit_vector(1)
             };
-            MockResponse::delayed(
-                200,
-                embedding_response(vec![(0, vector)]),
-                Duration::from_millis(300),
-            )
+            MockResponse::delayed(200, embedding_response(vec![(0, vector)]), Duration::from_millis(300))
         });
         let mut embedder = test_embedder(&server, TEST_DIMENSIONS);
         embedder.document_max_tokens = 60;
@@ -1337,9 +1308,7 @@ mod tests {
         let second = "b".repeat(20);
         let started = Instant::now();
 
-        let vectors = embedder
-            .embed_documents(&[first.as_str(), second.as_str()])
-            .unwrap();
+        let vectors = embedder.embed_documents(&[first.as_str(), second.as_str()]).unwrap();
 
         assert_eq!(vectors, vec![unit_vector(0), unit_vector(1)]);
         assert!(started.elapsed() < Duration::from_millis(650));
@@ -1358,11 +1327,7 @@ mod tests {
             } else {
                 (unit_vector(2), Duration::ZERO)
             };
-            MockResponse::delayed(
-                200,
-                embedding_response(vec![(0, vector)]),
-                delay,
-            )
+            MockResponse::delayed(200, embedding_response(vec![(0, vector)]), delay)
         });
         let mut embedder = test_embedder(&server, TEST_DIMENSIONS);
         embedder.document_max_tokens = 60;
@@ -1420,12 +1385,7 @@ mod tests {
         assert_eq!(batches[1], vec![second.as_str()]);
         assert_eq!(batches[2], vec![third.as_str()]);
         assert!(batches.iter().all(|batch| {
-            batch
-                .iter()
-                .map(|text| estimated_document_tokens(text))
-                .sum::<usize>()
-                <= 9_000
-                || batch.len() == 1
+            batch.iter().map(|text| estimated_document_tokens(text)).sum::<usize>() <= 9_000 || batch.len() == 1
         }));
     }
 
@@ -1645,8 +1605,7 @@ mod tests {
     #[test]
     fn mock_clock_retry_after_updates_shared_pacer_deadline() {
         let server = MockServer::start(vec![
-            MockResponse::json(429, json!({ "private": "retryable-error" }))
-                .with_header("Retry-After", "7"),
+            MockResponse::json(429, json!({ "private": "retryable-error" })).with_header("Retry-After", "7"),
             MockResponse::json(200, embedding_response(vec![(0, unit_vector(0))])),
         ]);
 
@@ -1883,12 +1842,14 @@ mod tests {
         let res: EmbeddingsResponse = serde_json::from_value(json!({
             "data": [],
             "usage": { "total_tokens": 128 }
-        })).unwrap();
+        }))
+        .unwrap();
         assert_eq!(res.usage.unwrap().total_tokens, Some(128));
 
         let res_no_usage: EmbeddingsResponse = serde_json::from_value(json!({
             "data": []
-        })).unwrap();
+        }))
+        .unwrap();
         assert!(res_no_usage.usage.is_none());
 
         let metric = VoyageRequestMetric {
@@ -1918,5 +1879,4 @@ mod tests {
         assert_eq!(obj.get("pacer_wait_ms").unwrap(), 0.0);
         assert_eq!(obj.get("backoff_ms").unwrap(), 0.0);
     }
-
 }

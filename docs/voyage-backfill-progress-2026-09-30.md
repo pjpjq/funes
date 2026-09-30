@@ -56,8 +56,25 @@ git diff --check HEAD~2..HEAD
 exit 0
 ```
 
-以上仅证明定向 Python 回归。未在当前代码上重新完成 Rust `fmt` / `clippy` /
-`test`、ONNX clippy 或真实 provider 吞吐验收。旧报告中的 Rust 通过记录不能替代这些验证。
+以上两组仅证明定向 Python 回归；推送后的完整 Python CI 与格式检查结果见下文。
+仍未在当前代码上重新完成 Rust `clippy` / `test`、ONNX clippy 或真实 provider
+吞吐验收。旧报告中的 Rust 通过记录不能替代这些验证。
+
+### 推送后的 CI 与格式修正
+
+PR #11 的 head `a034abe` 触发 CI run `36738163687`：
+
+- `Python Sync & Space Tests`（job `109965233250`）实际通过：
+  **1022 passed, 59 skipped, 24 subtests passed in 108.77s**。
+  这是完整 Python CI 的结果，不与前面的定向测试数量相加。
+- `Lint & Unit Tests`（job `109965232907`）在 `cargo fmt --check` 失败；
+  Clippy 和 Rust 单测因此没有执行，不能称为逻辑验证通过。
+- 仅格式化 `src/commands/ingest_docs.rs` 与 `src/inference/voyage.rs`，没有改动业务逻辑。
+  使用官方 Rust **1.95.0** 组件并验证 SHA256，随后本地
+  `cargo fmt --all -- --check`、`git diff --check` 均以 **exit 0** 结束。
+
+格式补丁需要新的 CI run 继续验证；上述 Python CI 结果对应 `a034abe`，
+不是后续 head 的预先通过声明。本轮没有因此部署或重启 HF。
 
 ## Alice 与持久化边界
 

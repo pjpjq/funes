@@ -15,7 +15,6 @@ use chrono::DateTime;
 use futures::TryStreamExt;
 use lance::dataset::{Dataset, MergeInsertBuilder, WhenMatched, WhenNotMatched, WhenNotMatchedBySource, WriteParams};
 use serde::{Deserialize, Serialize};
-use std::time::{Duration, Instant};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::borrow::Cow;
@@ -24,6 +23,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 const MAX_COMMIT_RETRIES: u32 = 10;
 const HELD_SOURCE_ID_DOMAIN: &[u8] = b"funes-held-source-v1\0";
@@ -69,7 +69,6 @@ fn emit_phase_metric(stage: &'static str, duration: Duration) {
         eprintln!("funes_metric {json}");
     }
 }
-
 
 #[derive(Clone, Debug, Deserialize)]
 struct InputDocument {
@@ -207,8 +206,8 @@ impl Report {
         let stale_source_ids = if self.stale_source_ids.is_empty() {
             String::new()
         } else {
-            let encoded = serde_json::to_string(&self.stale_source_ids)
-                .expect("serializing stale source-id digests cannot fail");
+            let encoded =
+                serde_json::to_string(&self.stale_source_ids).expect("serializing stale source-id digests cannot fail");
             format!(" stale_source_ids={encoded}")
         };
         format!(
@@ -489,9 +488,7 @@ fn select_documents<'a>(docs: &'a [Document], stored: &HashMap<String, StoredRev
             Some(current) if current.source_version == doc.source_version => selection.unchanged += 1,
             Some(current) if revision_order(doc) <= stored_revision_order(current) => {
                 selection.stale += 1;
-                selection
-                    .stale_source_ids
-                    .push(opaque_source_id(&doc.source_identity));
+                selection.stale_source_ids.push(opaque_source_id(&doc.source_identity));
             }
             _ => selection.changed.push(doc),
         }
@@ -1739,5 +1736,4 @@ mod tests {
         assert_eq!(obj.get("stage").unwrap(), "secret_scan");
         assert_eq!(obj.get("duration_ms").unwrap(), 12.34);
     }
-
 }

@@ -1459,6 +1459,33 @@ NATIVE_RECORD_ERROR_RE = re.compile(
     r"invalid canonical JSONL record|must not be empty|must not contain NUL|invalid timestamp",
     re.IGNORECASE,
 )
+# Native stderr is never returned or persisted. These patterns only select a
+# bounded diagnostic label so failed ingest can be distinguished without
+# leaking provider payloads, paths, or credentials.
+NATIVE_FAILURE_PATTERNS = (
+    ("manifest_oversized", re.compile(r"ManifestOversizedError|manifest.{0,32}(?:too large|oversized)", re.IGNORECASE)),
+    ("hf_commit_conflict_exhausted", re.compile(r"canonical dataset commit conflicted 10 times", re.IGNORECASE)),
+    ("hf_http_401", re.compile(r"HTTP error:\s*401\b", re.IGNORECASE)),
+    ("hf_http_403", re.compile(r"HTTP error:\s*403\b", re.IGNORECASE)),
+    ("hf_http_413", re.compile(r"HTTP error:\s*413\b", re.IGNORECASE)),
+    (
+        "hf_http_429",
+        re.compile(r"(?:HTTP error:\s*|failed with HTTP\s*)429\b", re.IGNORECASE),
+    ),
+    ("hf_http_5xx", re.compile(r"HTTP error:\s*5(?:00|02|03|04)\b", re.IGNORECASE)),
+    (
+        "voyage_api_key_missing",
+        re.compile(r"VOYAGE_API_KEY\s+is\s+required", re.IGNORECASE),
+    ),
+    ("hf_auth_required", re.compile(r"Authentication required|unauthori[sz]ed|invalid api key", re.IGNORECASE)),
+    ("hf_rate_limited", re.compile(r"Rate limited|rate[ -]?limit|too many requests", re.IGNORECASE)),
+    ("lance_remote_open_failed", re.compile(r"opening the remote dataset", re.IGNORECASE)),
+    ("hf_commit_failed", re.compile(r"canonical data commit failed|data commit failed", re.IGNORECASE)),
+    ("lance_schema_migration_failed", re.compile(r"adding canonical document columns", re.IGNORECASE)),
+    ("lance_delete_failed", re.compile(r"deleting stale canonical document rows", re.IGNORECASE)),
+    ("lance_append_failed", re.compile(r"appending replacement canonical document rows", re.IGNORECASE)),
+    ("disk_full", re.compile(r"No space left on device", re.IGNORECASE)),
+)
 NATIVE_METRIC_RE = re.compile(r"^funes_metric (\{.*\})\s*$")
 NATIVE_METRIC_PHASES = frozenset(
     {
@@ -1484,6 +1511,15 @@ def _native_metrics() -> dict[str, object]:
         "voyage_pacer_wait_ms": 0.0,
         "voyage_backoff_ms": 0.0,
     }
+
+
+def _native_failure_code(stderr: str | None) -> str:
+    """Map untrusted native stderr to one safe, bounded diagnostic label."""
+    text = stderr if isinstance(stderr, str) else ""
+    for code, pattern in NATIVE_FAILURE_PATTERNS:
+        if pattern.search(text):
+            return code
+    return "native_exit"
 
 
 def _record_native_metrics(metrics: dict[str, object], stderr: str | None) -> None:
@@ -1908,9 +1944,10 @@ def _ingest_canonical_subset(
                 records[middle:], directory, sequence, memory=memory, profile=profile, metrics=metrics
             )
             return left + right, left_commit or right_commit
+        failure_code = _native_failure_code(error_output)
         return [
             _native_update(
-                item, "retry", None, "native_exit", profile=profile, memory=memory
+                item, "retry", None, failure_code, profile=profile, memory=memory
             )
             for item, _ in records
         ], False
@@ -2250,6 +2287,9 @@ def reconcile_canonical_index(app) -> dict[str, object]:
                     )
     if not records:
         durable = not app.syncer.restoring and not app.syncer.restore_failed
+        _set_canonical_reconcile_state(
+            app, last_metrics=metrics, failure_counts={}
+        )
         if durable and not candidate_seen:
             _canonical_reconcile_phase(app, "optimizing")
             optimize_canonical_index(app, profile, memory)
@@ -2341,8 +2381,15 @@ def reconcile_canonical_index(app) -> dict[str, object]:
             if pending_marker is not None:
                 app.store.set_native_optimize_checkpoint(pending_marker)
     durable = bool(sync.get("durable"))
-    _set_canonical_reconcile_state(app, last_metrics=metrics)
-    return {
+    failure_counts: dict[str, int] = {}
+    for update in updates:
+        error = str(update.get("native_index_error") or "")
+        if error and update.get("native_index_status") == "retry":
+            failure_counts[error] = failure_counts.get(error, 0) + 1
+    _set_canonical_reconcile_state(
+        app, last_metrics=metrics, failure_counts=failure_counts
+    )
+    result = {
         "attempted": len(records),
         "indexed": sum(item["native_index_status"] == "indexed" for item in updates) if durable else 0,
         "held": (
@@ -2355,6 +2402,7 @@ def reconcile_canonical_index(app) -> dict[str, object]:
         ),
         "durable": durable,
     }
+    return result
 
 
 def optimize_native_index(
@@ -2498,11 +2546,21 @@ def _canonical_reconcile_background(app) -> None:
                 )
             else:
                 wait_seconds = CANONICAL_INDEX_INTERVAL
-            failures = (
-                0
-                if durable
-                else int(state.get("consecutive_failures") or 0) + 1
-            )
+            raw_failure_counts = state.get("failure_counts")
+            failure_counts = {}
+            if isinstance(raw_failure_counts, dict):
+                for key, value in raw_failure_counts.items():
+                    if isinstance(key, str) and isinstance(value, int) and value > 0:
+                        failure_counts[key] = value
+            if durable and failure_counts:
+                last_error = next(iter(sorted(failure_counts)), "native_failure")
+                failures = int(state.get("consecutive_failures") or 0) + 1
+            elif durable:
+                last_error = None
+                failures = 0
+            else:
+                last_error = "status_not_durable"
+                failures = int(state.get("consecutive_failures") or 0) + 1
             changes: dict[str, object] = {
                 "active": False,
                 "phase": "sleeping",
@@ -2512,10 +2570,16 @@ def _canonical_reconcile_background(app) -> None:
                     0, round((time.monotonic() - started) * 1000)
                 ),
                 "last_result": safe_result,
-                "last_error": None if durable else "status_not_durable",
+                "last_error": last_error,
                 "consecutive_failures": failures,
                 "wait_seconds": wait_seconds,
             }
+            if failure_counts:
+                changes["failure_counts"] = failure_counts
+            else:
+                # Do not retain a stale category after a later successful
+                # cycle; the field is intentionally absent when there is none.
+                changes["failure_counts"] = {}
             if durable and (
                 int(result.get("indexed") or 0) > 0
                 or int(result.get("held") or 0) > 0

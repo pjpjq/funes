@@ -3234,6 +3234,14 @@ def test_native_failure_code_exposes_only_allowlisted_categories():
     assert bridge._native_failure_code("canonical data commit failed: hf_error=forbidden http_status=403") == "hf_http_403"
     assert bridge._native_failure_code("canonical data commit failed: hf_error=rate_limited http_status=429") == "hf_http_429"
     assert bridge._native_failure_code("canonical data commit failed: hf_error=xet operation=upload") == "hf_xet_failed"
+    assert bridge._native_failure_code("canonical data commit failed: hf_error=request_transport") == "hf_request_transport"
+    assert bridge._native_failure_code("canonical data commit failed: hf_error=repo_not_found") == "hf_repo_not_found"
+    assert bridge._native_failure_code("canonical data commit failed: hf_error=revision_not_found") == "hf_revision_not_found"
+    assert bridge._native_failure_code("canonical data commit failed: hf_error=entry_not_found") == "hf_entry_not_found"
+    assert bridge._native_failure_code("canonical data commit failed: hf_error=bucket_not_found") == "hf_bucket_not_found"
+    assert bridge._native_failure_code("canonical data commit failed: http_status=400") == "hf_http_400"
+    assert bridge._native_failure_code("canonical data commit failed: http_status=404") == "hf_http_other"
+    assert bridge._native_failure_code("canonical data commit kept conflicting after 10 retries") == "hf_commit_conflict_exhausted"
     for hf_error, expected in (
         ("local_entry_not_found", "hf_local_entry_not_found"),
         ("cache_not_enabled", "hf_cache_not_enabled"),

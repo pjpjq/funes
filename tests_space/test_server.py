@@ -3234,7 +3234,23 @@ def test_native_failure_code_exposes_only_allowlisted_categories():
     assert bridge._native_failure_code("canonical data commit failed: hf_error=forbidden http_status=403") == "hf_http_403"
     assert bridge._native_failure_code("canonical data commit failed: hf_error=rate_limited http_status=429") == "hf_http_429"
     assert bridge._native_failure_code("canonical data commit failed: hf_error=xet operation=upload") == "hf_xet_failed"
-    assert bridge._native_failure_code("canonical data commit failed: hf_error=other") == "hf_commit_failed"
+    for hf_error, expected in (
+        ("local_entry_not_found", "hf_local_entry_not_found"),
+        ("cache_not_enabled", "hf_cache_not_enabled"),
+        ("cache_lock_timeout", "hf_cache_lock_timeout"),
+        ("io", "hf_io"),
+        ("json", "hf_json"),
+        ("url", "hf_url"),
+        ("invalid_parameter", "hf_invalid_parameter"),
+        ("diff_parse", "hf_diff_parse"),
+        ("malformed_response", "hf_malformed_response"),
+        ("other", "hf_other"),
+        ("unknown", "hf_unknown"),
+    ):
+        assert (
+            bridge._native_failure_code(f"canonical data commit failed: hf_error={hf_error} private raw")
+            == expected
+        )
 
 
 def test_reconcile_canonical_index_captures_and_persists_metrics(monkeypatch, tmp_path):

@@ -3231,6 +3231,10 @@ def test_native_failure_code_exposes_only_allowlisted_categories():
     assert bridge._native_failure_code("Voyage embeddings request failed with HTTP 429") == "hf_http_429"
     assert bridge._native_failure_code("VOYAGE_API_KEY is required for Voyage inference") == "voyage_api_key_missing"
     assert bridge._native_failure_code("private raw and credentials") == "native_exit"
+    assert bridge._native_failure_code("canonical data commit failed: hf_error=forbidden http_status=403") == "hf_http_403"
+    assert bridge._native_failure_code("canonical data commit failed: hf_error=rate_limited http_status=429") == "hf_http_429"
+    assert bridge._native_failure_code("canonical data commit failed: hf_error=xet operation=upload") == "hf_xet_failed"
+    assert bridge._native_failure_code("canonical data commit failed: hf_error=other") == "hf_commit_failed"
 
 
 def test_reconcile_canonical_index_captures_and_persists_metrics(monkeypatch, tmp_path):

@@ -628,7 +628,23 @@ fn commit_error(label: &str, error: &HFError) -> anyhow::Error {
         HFError::RevisionNotFound { .. } => anyhow::anyhow!("{label}: hf_error=revision_not_found"),
         HFError::EntryNotFound { .. } => anyhow::anyhow!("{label}: hf_error=entry_not_found"),
         HFError::BucketNotFound { .. } => anyhow::anyhow!("{label}: hf_error=bucket_not_found"),
-        _ => anyhow::anyhow!("{label}: hf_error=other"),
+        HFError::LocalEntryNotFound { .. } => {
+            anyhow::anyhow!("{label}: hf_error=local_entry_not_found")
+        }
+        HFError::CacheNotEnabled => anyhow::anyhow!("{label}: hf_error=cache_not_enabled"),
+        HFError::CacheLockTimeout { .. } => {
+            anyhow::anyhow!("{label}: hf_error=cache_lock_timeout")
+        }
+        HFError::Io(_) => anyhow::anyhow!("{label}: hf_error=io"),
+        HFError::Json(_) => anyhow::anyhow!("{label}: hf_error=json"),
+        HFError::Url(_) => anyhow::anyhow!("{label}: hf_error=url"),
+        HFError::InvalidParameter(_) => anyhow::anyhow!("{label}: hf_error=invalid_parameter"),
+        HFError::DiffParse(_) => anyhow::anyhow!("{label}: hf_error=diff_parse"),
+        HFError::MalformedResponse { .. } => {
+            anyhow::anyhow!("{label}: hf_error=malformed_response")
+        }
+        HFError::Other(_) => anyhow::anyhow!("{label}: hf_error=other"),
+        _ => anyhow::anyhow!("{label}: hf_error=unknown"),
     }
 }
 

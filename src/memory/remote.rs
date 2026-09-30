@@ -599,11 +599,7 @@ fn commit_error(label: &str, error: &HFError) -> anyhow::Error {
     macro_rules! http_detail {
         ($variant:expr, $context:expr) => {{
             let context = $context;
-            let mut detail = format!(
-                "{label}: hf_error={} http_status={}",
-                $variant,
-                context.status.as_u16()
-            );
+            let mut detail = format!("{label}: hf_error={} http_status={}", $variant, context.status.as_u16());
             if let Some(code) = context.error_code.as_deref().and_then(safe_atom) {
                 detail.push_str(&format!(" error_code={code}"));
             }
@@ -620,9 +616,7 @@ fn commit_error(label: &str, error: &HFError) -> anyhow::Error {
         HFError::Forbidden { context } => http_detail!("forbidden", context),
         HFError::RateLimited { context, .. } => http_detail!("rate_limited", context),
         HFError::Conflict { context } => http_detail!("conflict", context),
-        HFError::Xet { operation, .. } => anyhow::anyhow!(
-            "{label}: hf_error=xet operation={operation}"
-        ),
+        HFError::Xet { operation, .. } => anyhow::anyhow!("{label}: hf_error=xet operation={operation}"),
         HFError::Request { .. } => anyhow::anyhow!("{label}: hf_error=request_transport"),
         HFError::RepoNotFound { .. } => anyhow::anyhow!("{label}: hf_error=repo_not_found"),
         HFError::RevisionNotFound { .. } => anyhow::anyhow!("{label}: hf_error=revision_not_found"),

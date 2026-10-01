@@ -1466,7 +1466,12 @@ NATIVE_HF_ERROR_CODE_RE = re.compile(
     r"\berror_code=([A-Za-z0-9][A-Za-z0-9_.-]{0,63})(?=\s|$|[,;])", re.IGNORECASE
 )
 NATIVE_HF_PHASE_RE = re.compile(r"\bhf_phase=(preupload|commit)\b", re.IGNORECASE)
-NATIVE_HF_SERVER_MESSAGE_RE = re.compile(r"\bserver_message=([^\r\n]+)", re.IGNORECASE)
+# Rust emits a bounded `server_reason` classification; accept the older
+# `server_message` spelling too so deployed binaries and bridge revisions can
+# be rolled independently without hiding the Hub rejection class.
+NATIVE_HF_SERVER_MESSAGE_RE = re.compile(
+    r"\b(?:server_reason|server_message)=([^\r\n]+)", re.IGNORECASE
+)
 NATIVE_HF_400_HINTS = (
     (
         "commit_file_limit",

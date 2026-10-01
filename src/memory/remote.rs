@@ -58,6 +58,7 @@ use object_store::ObjectStore as OSObjectStore;
 use super::capture_store::{CaptureStore, Captured};
 use super::dataset;
 use super::fetch_store::{FetchStore, FileFetcher};
+use super::shard_store::{physical_path, ShardStore};
 use crate::hub;
 
 /// Outcome of an [`append`] commit.
@@ -465,14 +466,18 @@ async fn open_capturing(
     Ok((ds, wrapper))
 }
 
-/// The captured writes as repo-path → bytes — the files Lance wrote, ready to commit.
+/// The captured writes as physical repo-path → bytes, ready to commit. Existing flat files are
+/// unchanged; new Lance files live in deterministic buckets so no directory hits Hub's file cap.
 fn captured_files(wrapper: &CaptureWrapper) -> BTreeMap<String, Bytes> {
     wrapper
         .captured
         .lock()
         .unwrap()
         .iter()
-        .map(|(p, b)| (p.to_string(), b.clone()))
+        .map(|(p, b)| {
+            let logical = p.to_string();
+            (physical_path(&logical).unwrap_or(logical), b.clone())
+        })
         .collect()
 }
 
@@ -924,7 +929,8 @@ struct CaptureWrapper {
 impl WrappingObjectStore for CaptureWrapper {
     fn wrap(&self, _prefix: &str, original: Arc<dyn OSObjectStore>) -> Arc<dyn OSObjectStore> {
         let cached = Arc::new(FetchStore::new(original, self.fetcher.clone()));
-        Arc::new(CaptureStore::new(cached, self.captured.clone()))
+        let logical = Arc::new(ShardStore::new(cached));
+        Arc::new(CaptureStore::new(logical, self.captured.clone()))
     }
 }
 
@@ -984,7 +990,8 @@ impl FetchWrapper {
 
 impl WrappingObjectStore for FetchWrapper {
     fn wrap(&self, _prefix: &str, original: Arc<dyn OSObjectStore>) -> Arc<dyn OSObjectStore> {
-        Arc::new(FetchStore::new(original, self.fetcher.clone()))
+        let cached = Arc::new(FetchStore::new(original, self.fetcher.clone()));
+        Arc::new(ShardStore::new(cached))
     }
 }
 
@@ -1022,6 +1029,48 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
     use lance_index::scalar::{InvertedIndexParams, ScalarIndexParams};
     use lance_index::IndexType;
+    use object_store::ObjectStoreExt;
+
+    #[derive(Debug)]
+    struct UnusedFetcher;
+
+    #[async_trait]
+    impl FileFetcher for UnusedFetcher {
+        async fn fetch(&self, _filename: &str) -> Result<PathBuf> {
+            anyhow::bail!("test reads use the in-memory backend")
+        }
+
+        async fn discard(&self, _path: &Path) -> Result<()> {
+            anyhow::bail!("test reads use the in-memory backend")
+        }
+    }
+
+    /// Use the real production decorators over a deterministic backend, without Hub or Voyage.
+    #[derive(Debug)]
+    struct TestStoreWrapper {
+        store: Arc<dyn OSObjectStore>,
+        sharded: bool,
+        captured: Option<Captured>,
+    }
+
+    impl WrappingObjectStore for TestStoreWrapper {
+        fn wrap(&self, prefix: &str, _original: Arc<dyn OSObjectStore>) -> Arc<dyn OSObjectStore> {
+            if let Some(captured) = &self.captured {
+                CaptureWrapper {
+                    captured: captured.clone(),
+                    fetcher: Arc::new(UnusedFetcher),
+                }
+                .wrap(prefix, self.store.clone())
+            } else if self.sharded {
+                FetchWrapper {
+                    fetcher: Arc::new(UnusedFetcher),
+                }
+                .wrap(prefix, self.store.clone())
+            } else {
+                self.store.clone()
+            }
+        }
+    }
 
     #[test]
     fn hf_http_phase_is_bounded_and_does_not_expose_urls() {
@@ -1239,5 +1288,190 @@ mod tests {
             .collect::<Vec<_>>();
         let error = split_commit_operations(ops).unwrap_err();
         assert!(matches!(error, HFError::InvalidParameter(message) if message.contains("activation metadata")));
+    }
+
+    #[test]
+    fn captured_lance_files_are_sharded_but_repo_metadata_stays_flat() {
+        let wrapper = CaptureWrapper {
+            captured: Captured::default(),
+            fetcher: Arc::new(UnusedFetcher),
+        };
+        for logical in [
+            "chunks.lance/data/new.lance",
+            "chunks.lance/_versions/10001.manifest",
+            "chunks.lance/_transactions/10001.txn",
+            "README.md",
+        ] {
+            wrapper.captured.lock().unwrap().insert(
+                object_store::path::Path::from(logical),
+                Bytes::from_static(b"unchanged"),
+            );
+        }
+        let files = captured_files(&wrapper);
+        assert_eq!(files.len(), 4);
+        assert!(files.contains_key("README.md"));
+        for logical in [
+            "chunks.lance/data/new.lance",
+            "chunks.lance/_versions/10001.manifest",
+            "chunks.lance/_transactions/10001.txn",
+        ] {
+            assert!(!files.contains_key(logical));
+            assert_eq!(
+                files.get(&physical_path(logical).unwrap()),
+                Some(&Bytes::from_static(b"unchanged"))
+            );
+        }
+    }
+
+    #[test]
+    fn sharded_manifest_transaction_and_hint_activate_in_the_final_commit() {
+        let mut ops = (0..(MAX_COMMIT_OPERATIONS + 3))
+            .map(|i| {
+                let logical = format!("chunks.lance/data/{i}.lance");
+                CommitOperation::add_bytes(physical_path(&logical).unwrap(), Bytes::from_static(b"data"))
+            })
+            .collect::<Vec<_>>();
+        let activation = [
+            "chunks.lance/_transactions/10001.txn",
+            "chunks.lance/_versions/10001.manifest",
+            "chunks.lance/_versions/_latest.manifest",
+        ]
+        .map(|logical| physical_path(logical).unwrap());
+        for path in &activation {
+            ops.insert(
+                0,
+                CommitOperation::add_bytes(path.clone(), Bytes::from_static(b"metadata")),
+            );
+        }
+        let chunks = split_commit_operations(ops).unwrap();
+        assert_eq!(chunks.len(), 2);
+        assert!(chunks[0].iter().all(|op| !is_activation_path(operation_path(op))));
+        let last = chunks.last().unwrap();
+        assert!(activation
+            .iter()
+            .all(|path| last.iter().any(|op| operation_path(op) == path)));
+        assert!(last[last.len() - activation.len()..]
+            .iter()
+            .all(|op| is_activation_path(operation_path(op))));
+    }
+
+    #[tokio::test]
+    async fn real_lance_reopens_and_appends_sharded_files_without_changing_flat_history() {
+        use futures::TryStreamExt;
+        use lance::dataset::builder::DatasetBuilder;
+        use lance_io::object_store::ObjectStoreParams;
+        use object_store::memory::InMemory;
+        use object_store::path::Path as OPath;
+        use object_store::{GetOptions, PutOptions, PutPayload};
+
+        let store = Arc::new(InMemory::new());
+        let uri = "memory://shard-regression/chunks.lance";
+        let batch = |texts: Vec<String>| {
+            let schema = Arc::new(Schema::new(vec![Field::new("text", DataType::Utf8, false)]));
+            let rows = RecordBatch::try_new(schema.clone(), vec![Arc::new(StringArray::from(texts))]);
+            RecordBatchIterator::new([rows], schema)
+        };
+        let initial = Dataset::write(
+            batch(vec!["original raw memory".to_string()]),
+            uri,
+            Some(WriteParams {
+                store_params: Some(ObjectStoreParams {
+                    object_store_wrapper: Some(Arc::new(TestStoreWrapper {
+                        store: store.clone(),
+                        sharded: false,
+                        captured: None,
+                    })),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let initial_version = initial.version().version;
+        let flat_objects = store.list(None).try_collect::<Vec<_>>().await.unwrap();
+        let mut flat_bytes = BTreeMap::new();
+        for meta in &flat_objects {
+            flat_bytes.insert(
+                meta.location.clone(),
+                store.get(&meta.location).await.unwrap().bytes().await.unwrap(),
+            );
+        }
+
+        for expected_rows in 2..=3 {
+            let captured = Captured::default();
+            let mut ds = dataset::open_wrapped(
+                uri,
+                HashMap::new(),
+                Arc::new(TestStoreWrapper {
+                    store: store.clone(),
+                    sharded: true,
+                    captured: Some(captured.clone()),
+                }),
+            )
+            .await
+            .unwrap();
+            ds.append(batch(vec![format!("new raw memory {expected_rows}")]), None)
+                .await
+                .unwrap();
+            let files = captured_files(&CaptureWrapper {
+                captured,
+                fetcher: Arc::new(UnusedFetcher),
+            });
+            assert!(!files.is_empty());
+            assert!(files.keys().all(|path| path.starts_with("__funes_shards__/v1/")));
+            for (path, bytes) in &files {
+                store
+                    .put_opts(
+                        &OPath::from(path.as_str()),
+                        PutPayload::from(bytes.clone()),
+                        PutOptions::default(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            let read_wrapper = Arc::new(TestStoreWrapper {
+                store: store.clone(),
+                sharded: true,
+                captured: None,
+            });
+            let reopened = dataset::open_wrapped(uri, HashMap::new(), read_wrapper.clone())
+                .await
+                .unwrap();
+            assert_eq!(reopened.count_rows(None).await.unwrap(), expected_rows);
+            let rows = dataset::scan_rows(&reopened, &["text"], None, None).await.unwrap();
+            let actual = rows
+                .iter()
+                .flat_map(|row| {
+                    let text = row.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+                    (0..row.num_rows()).map(|i| text.value(i).to_string())
+                })
+                .collect::<Vec<_>>();
+            assert!(actual.contains(&"original raw memory".to_string()));
+            assert!(actual.contains(&format!("new raw memory {expected_rows}")));
+
+            let old = DatasetBuilder::from_uri(uri)
+                .with_store_params(ObjectStoreParams {
+                    object_store_wrapper: Some(read_wrapper),
+                    ..Default::default()
+                })
+                .with_version(initial_version)
+                .load()
+                .await
+                .unwrap();
+            assert_eq!(old.count_rows(None).await.unwrap(), 1);
+            for (path, bytes) in &flat_bytes {
+                assert_eq!(
+                    &store
+                        .get_opts(path, GetOptions::default())
+                        .await
+                        .unwrap()
+                        .bytes()
+                        .await
+                        .unwrap(),
+                    bytes
+                );
+            }
+        }
     }
 }

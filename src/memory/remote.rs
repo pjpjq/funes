@@ -673,7 +673,12 @@ fn commit_error(label: &str, error: &HFError) -> anyhow::Error {
             if let Some(code) = context.error_code.as_deref().and_then(safe_atom) {
                 detail.push_str(&format!(" error_code={code}"));
             }
-            if let Some(message) = context.server_message.as_deref().and_then(safe_server_reason) {
+            let server_reason = context
+                .server_message
+                .as_deref()
+                .and_then(safe_server_reason)
+                .or_else(|| safe_server_reason(&context.body));
+            if let Some(message) = server_reason {
                 detail.push_str(&format!(" server_reason={message}"));
             }
             anyhow::anyhow!(detail)

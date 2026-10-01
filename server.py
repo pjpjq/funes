@@ -1586,8 +1586,15 @@ def _native_failure_code(stderr: str | None) -> str:
                 return f"hf_http_400:{normalized[:48]}"
         server_message = NATIVE_HF_SERVER_MESSAGE_RE.search(text)
         if server_message is not None:
+            raw_reason = server_message.group(1).strip()
+            # The Rust bridge emits bounded snake_case classifications (for
+            # example ``file_count_limit``) rather than the provider's raw
+            # response. Preserve those atoms so production diagnostics do not
+            # collapse back to the generic phase-only ``:commit`` label.
+            if re.fullmatch(r"[a-z0-9_]{3,48}", raw_reason):
+                return f"hf_http_400:{raw_reason}"
             for label, pattern in NATIVE_HF_400_HINTS:
-                if pattern.search(server_message.group(1)):
+                if pattern.search(raw_reason):
                     return f"hf_http_400:{label}"
         phase = NATIVE_HF_PHASE_RE.search(text)
         if phase is not None:

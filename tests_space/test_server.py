@@ -3263,6 +3263,13 @@ def test_native_failure_code_exposes_only_allowlisted_categories():
     assert (
         bridge._native_failure_code(
             "canonical data commit failed: http_status=400 hf_phase=commit "
+            "server_reason=You can't create a commit with more than 1000 files"
+        )
+        == "hf_http_400:commit_file_limit"
+    )
+    assert (
+        bridge._native_failure_code(
+            "canonical data commit failed: http_status=400 hf_phase=commit "
             "server_message=You can't create a commit with more than 1000 files"
         )
         == "hf_http_400:commit_file_limit"

@@ -1,14 +1,15 @@
 //! The remote side of a memory: how its Lance dataset is read from and written to a Hub repo.
 //!
 //! [`append`] adds rows; [`reindex`] folds the unindexed backlog into the FTS/IVF indexes. Each
-//! runs a native Lance op and lands the result in one `create_commit` on the branch, guarded by a
-//! `parent_commit` against the head it read — atomic. Each is a single attempt: if the head moved
-//! first it reports a conflict ([`Appended::Conflict`] / [`Reindexed::Conflict`]) and the caller
-//! retries against the new head.
+//! runs a native Lance op and lands the result in one or more bounded `create_commit` calls on the
+//! branch, guarded by a chained `parent_commit` against the head it read. Activation metadata is
+//! always uploaded last, so readers keep seeing the previous manifest until the final chunk. Each
+//! operation is a single attempt: if the head moved first it reports a conflict
+//! ([`Appended::Conflict`] / [`Reindexed::Conflict`]) and the caller retries against the new head.
 //!
-//! The result goes up as a *single* `create_commit` because Lance, left to write straight to
-//! `hf://`, would commit each file on its own: that store is OpenDAL's HuggingFace service, where
-//! every `put` is its own git commit.
+//! The result goes up as bounded `create_commit` calls because the Hub rejects a commit with more
+//! than 1000 files. Lance, left to write straight to `hf://`, would commit each file on its own:
+//! that store is OpenDAL's HuggingFace service, where every `put` is its own git commit.
 //!
 //! ```text
 //!   Lance Dataset → object_store → OpenDAL hf service → HF Hub
@@ -18,7 +19,7 @@
 //! A multi-file write would then be several commits — non-atomic, no CAS. So the op runs through a
 //! [`CaptureStore`](super::capture_store::CaptureStore) installed via Lance's
 //! [`WrappingObjectStore`] seam: Lance's writes are captured in memory instead of hitting the Hub,
-//! and we ship the whole set as one guarded `create_commit`.
+//! and we ship the whole set as a bounded sequence of guarded `create_commit` calls.
 //!
 //! # Why this shape
 //!
@@ -221,9 +222,9 @@ fn align_batch(batch: RecordBatch, target: SchemaRef) -> Result<RecordBatch> {
     Ok(RecordBatch::try_new(target, columns)?)
 }
 
-/// Build the whole dataset locally (data + indexes) and upload it in one `create_commit` — unlike
-/// [`append`]/[`reindex`], no head to guard against, since the dataset doesn't exist yet. `None` if
-/// the build produced no files.
+/// Build the whole dataset locally (data + indexes) and upload it in bounded chained commits —
+/// unlike [`append`]/[`reindex`], the first commit has no head to guard against since the dataset
+/// does not exist yet. `None` if the build produced no files.
 #[allow(clippy::too_many_arguments)] // internal orchestration, one call site (`push`)
 pub(crate) async fn first_publish(
     repo: &HFRepository<RepoTypeDataset>,
@@ -267,13 +268,7 @@ pub(crate) async fn first_publish(
     let (extra_ops, _extra_dir) = write_ops(extra_files)?;
     ops.extend(extra_ops);
 
-    let info = repo
-        .create_commit()
-        .operations(ops)
-        .commit_message(message)
-        .revision(rev.to_string())
-        .progress(upload_progress())
-        .send()
+    let info = send_commit_chunks(repo, ops, None, rev, message)
         .await
         .map_err(|e| anyhow::Error::new(e).context("create_commit failed"))?;
     Ok(Some(info.commit_oid.unwrap_or_else(|| "?".to_string())))
@@ -524,7 +519,7 @@ pub(crate) async fn head_oid(repo: &HFRepository<RepoTypeDataset>, rev: &str) ->
 }
 
 /// Write captured files (path → bytes) to a scratch dir and turn them into add-file commit
-/// operations — hf-hub uploads from local paths. The returned `TempDir` must outlive the commit.
+/// operations — hf-hub uploads from local paths. The returned `TempDir` must outlive all chunks.
 fn write_ops(files: &BTreeMap<String, Bytes>) -> Result<(Vec<CommitOperation>, tempfile::TempDir)> {
     let dir = tempfile::tempdir()?;
     let mut ops = Vec::with_capacity(files.len());
@@ -553,8 +548,9 @@ pub(crate) async fn fetch_readme(repo: &HFRepository<RepoTypeDataset>, rev: &str
     }
 }
 
-/// One `create_commit` of `ops` on branch `rev`, guarded by `parent`. Returns the raw hf-hub
-/// result so callers can tell a head-moved [`HFError::Conflict`] from other failures.
+/// Upload `ops` in bounded chained `create_commit` calls on branch `rev`, guarded by `parent`.
+/// The returned result is the final Hub response so callers can tell a head-moved
+/// [`HFError::Conflict`] from other failures. Activation metadata is forced into the last chunk.
 async fn send_commit(
     repo: &HFRepository<RepoTypeDataset>,
     ops: Vec<CommitOperation>,
@@ -562,14 +558,124 @@ async fn send_commit(
     rev: &str,
     message: String,
 ) -> std::result::Result<CommitInfo, HFError> {
-    repo.create_commit()
-        .operations(ops)
-        .commit_message(message)
-        .parent_commit(parent)
-        .revision(rev.to_string())
-        .progress(upload_progress())
-        .send()
-        .await
+    send_commit_chunks(repo, ops, Some(parent), rev, message).await
+}
+
+/// Hub currently rejects a single commit containing more than 1000 files. Keep headroom for
+/// retries and future metadata by using a lower bound, and make activation metadata the final
+/// chunk so an interrupted upload cannot expose a manifest that references missing files.
+const MAX_COMMIT_OPERATIONS: usize = 900;
+
+/// Paths that activate a new Lance snapshot. The final chunk may also contain `README.md`, which
+/// is updated with the same dataset snapshot and should not precede the manifest activation.
+fn is_activation_path(path: &str) -> bool {
+    let path = path.trim_start_matches("./");
+    path == "README.md"
+        || path.starts_with("_versions/")
+        || path.starts_with("_transactions/")
+        || path.ends_with(".manifest")
+        || path.ends_with("latest_version_hint.json")
+}
+
+fn operation_path(operation: &CommitOperation) -> &str {
+    match operation {
+        CommitOperation::Add { path_in_repo, .. } | CommitOperation::Delete { path_in_repo } => path_in_repo,
+    }
+}
+
+/// Split a commit before any network upload. Activation metadata is deliberately rejected when it
+/// cannot fit in one final chunk; uploading part of it would make the ordering guarantee false.
+fn split_commit_operations(ops: Vec<CommitOperation>) -> std::result::Result<Vec<Vec<CommitOperation>>, HFError> {
+    let mut regular = Vec::with_capacity(ops.len());
+    let mut activation = Vec::new();
+    for operation in ops {
+        if is_activation_path(operation_path(&operation)) {
+            activation.push(operation);
+        } else {
+            regular.push(operation);
+        }
+    }
+    if activation.len() > MAX_COMMIT_OPERATIONS {
+        return Err(HFError::InvalidParameter(format!(
+            "activation metadata exceeds one commit chunk: {} operations (limit {})",
+            activation.len(),
+            MAX_COMMIT_OPERATIONS
+        )));
+    }
+
+    let mut chunks = regular
+        .chunks(MAX_COMMIT_OPERATIONS)
+        .map(|chunk| chunk.to_vec())
+        .collect::<Vec<_>>();
+    if !activation.is_empty() {
+        if let Some(last) = chunks.last_mut() {
+            if last.len() + activation.len() <= MAX_COMMIT_OPERATIONS {
+                last.extend(activation);
+            } else {
+                chunks.push(activation);
+            }
+        } else {
+            chunks.push(activation);
+        }
+    }
+    Ok(chunks)
+}
+
+/// Upload chunks serially. The first chunk uses the caller's expected parent (if any); every
+/// later chunk uses the successful preceding commit SHA. A missing SHA is handled by reading the
+/// branch head rather than passing an empty parent to the next request.
+async fn send_commit_chunks(
+    repo: &HFRepository<RepoTypeDataset>,
+    ops: Vec<CommitOperation>,
+    parent: Option<String>,
+    rev: &str,
+    message: String,
+) -> std::result::Result<CommitInfo, HFError> {
+    let chunks = split_commit_operations(ops)?;
+    let mut parent = parent;
+    let mut final_info = None;
+    for (index, chunk) in chunks.into_iter().enumerate() {
+        let chunk_message = if index == 0 {
+            message.clone()
+        } else {
+            format!("{message} (chunk {index})")
+        };
+        let info = if let Some(expected_parent) = parent.take() {
+            repo.create_commit()
+                .operations(chunk)
+                .commit_message(chunk_message)
+                .parent_commit(expected_parent)
+                .revision(rev.to_string())
+                .progress(upload_progress())
+                .send()
+                .await?
+        } else {
+            repo.create_commit()
+                .operations(chunk)
+                .commit_message(chunk_message)
+                .revision(rev.to_string())
+                .progress(upload_progress())
+                .send()
+                .await?
+        };
+        parent = match info.commit_oid.as_deref().filter(|oid| !oid.is_empty()) {
+            Some(oid) => Some(oid.to_string()),
+            None => Some(head_oid_for_commit(repo, rev).await?),
+        };
+        final_info = Some(info);
+    }
+    final_info.ok_or_else(|| HFError::InvalidParameter("cannot commit an empty operation list".to_string()))
+}
+
+/// Same branch-head lookup as [`head_oid`], retaining the HF error type used by chunk uploads and
+/// never copying an arbitrary response body into a persisted diagnostic.
+async fn head_oid_for_commit(repo: &HFRepository<RepoTypeDataset>, rev: &str) -> std::result::Result<String, HFError> {
+    let refs = repo.list_refs().send().await?;
+    refs.branches
+        .iter()
+        .find(|branch| branch.name == rev)
+        .map(|branch| branch.target_commit.clone())
+        .ok_or_else(|| HFError::InvalidParameter("target branch not found on the remote".to_string()))
 }
 
 /// Keep enough of a Hub rejection to identify its class without persisting URLs,
@@ -1072,5 +1178,45 @@ mod tests {
         assert!(!redacted.contains("/private/data"));
         assert!(!redacted.contains("https://example.invalid"));
         assert!(!redacted.contains("secret"));
+    }
+
+    #[test]
+    fn commit_chunks_bound_operations_and_activate_metadata_last() {
+        let mut ops = (0..(MAX_COMMIT_OPERATIONS * 2 + 7))
+            .map(|i| CommitOperation::add_bytes(format!("data/{i}.bin"), Bytes::from_static(b"x")))
+            .collect::<Vec<_>>();
+        ops.push(CommitOperation::add_bytes(
+            "_versions/7.manifest",
+            Bytes::from_static(b"manifest"),
+        ));
+        ops.push(CommitOperation::add_bytes(
+            "_transactions/7.json",
+            Bytes::from_static(b"txn"),
+        ));
+        ops.push(CommitOperation::add_bytes("README.md", Bytes::from_static(b"readme")));
+
+        let chunks = split_commit_operations(ops).unwrap();
+        assert!(chunks.iter().all(|chunk| chunk.len() <= MAX_COMMIT_OPERATIONS));
+        let last = chunks.last().unwrap();
+        let first_activation = last
+            .iter()
+            .position(|op| is_activation_path(operation_path(op)))
+            .expect("activation metadata must be present in the last chunk");
+        assert!(last[first_activation..]
+            .iter()
+            .all(|op| is_activation_path(operation_path(op))));
+        assert!(chunks[..chunks.len() - 1]
+            .iter()
+            .flatten()
+            .all(|op| !is_activation_path(operation_path(op))));
+    }
+
+    #[test]
+    fn commit_chunks_reject_oversized_activation_metadata_before_upload() {
+        let ops = (0..=MAX_COMMIT_OPERATIONS)
+            .map(|i| CommitOperation::add_bytes(format!("_versions/{i}.manifest"), Bytes::from_static(b"x")))
+            .collect::<Vec<_>>();
+        let error = split_commit_operations(ops).unwrap_err();
+        assert!(matches!(error, HFError::InvalidParameter(message) if message.contains("activation metadata")));
     }
 }

@@ -572,6 +572,71 @@ async fn send_commit(
         .await
 }
 
+/// Keep enough of a Hub rejection to identify its class without persisting URLs,
+/// repository paths, credentials, or an unbounded response body.
+fn safe_server_reason(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    let classified = if lower.contains("larger than 10 mib")
+        || lower.contains("larger than 10 mb")
+        || lower.contains("file size")
+        || lower.contains("git-lfs")
+        || lower.contains("git lfs")
+    {
+        Some("file_size_or_lfs")
+    } else if lower.contains("more than 1000 files") || lower.contains("too many files") || lower.contains("file limit")
+    {
+        Some("file_count_limit")
+    } else if lower.contains("lfs pointer") || lower.contains("lfs object") {
+        Some("missing_lfs_object")
+    } else if lower.contains("parent commit") || lower.contains("parentcommit") {
+        Some("invalid_parent")
+    } else if lower.contains("empty commit") || lower.contains("no operations") || lower.contains("commit content") {
+        Some("empty_commit")
+    } else if lower.contains("invalid path") || lower.contains("path is invalid") {
+        Some("invalid_path")
+    } else if lower.contains("rate limit") || lower.contains("too many requests") {
+        Some("rate_limit")
+    } else if lower.contains("unauthorized") || lower.contains("forbidden") || lower.contains("permission") {
+        Some("auth_or_permission")
+    } else if lower.contains("conflict") || lower.contains("head moved") {
+        Some("stale_parent")
+    } else {
+        None
+    };
+    if let Some(reason) = classified {
+        return Some(reason.to_string());
+    }
+
+    let sanitized = trimmed
+        .split_whitespace()
+        .map(|word| {
+            let lower_word = word.to_ascii_lowercase();
+            if word.contains("://") {
+                "<url>".to_string()
+            } else if word.starts_with('/') || word.contains('\\') {
+                "<path>".to_string()
+            } else if lower_word.contains("bearer")
+                || lower_word.starts_with("token=")
+                || lower_word.starts_with("api_key=")
+            {
+                "<redacted>".to_string()
+            } else {
+                word.chars()
+                    .filter(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '.' | ',' | ':' | ';' | '-' | '_'))
+                    .collect::<String>()
+            }
+        })
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let bounded = sanitized.chars().take(160).collect::<String>();
+    (!bounded.is_empty()).then_some(bounded)
+}
+
 /// Convert an HF commit failure into a bounded diagnostic that is safe to persist in the
 /// reconciler state. `HFError`'s Display implementation intentionally includes response URLs and,
 /// for conflicts, the full response body; neither belongs in logs or API responses.
@@ -608,8 +673,8 @@ fn commit_error(label: &str, error: &HFError) -> anyhow::Error {
             if let Some(code) = context.error_code.as_deref().and_then(safe_atom) {
                 detail.push_str(&format!(" error_code={code}"));
             }
-            if let Some(message) = context.server_message.as_deref().and_then(safe_atom) {
-                detail.push_str(&format!(" server_message={message}"));
+            if let Some(message) = context.server_message.as_deref().and_then(safe_server_reason) {
+                detail.push_str(&format!(" server_reason={message}"));
             }
             anyhow::anyhow!(detail)
         }};
@@ -984,5 +1049,23 @@ mod tests {
         assert_eq!(human_bytes(1536), "1.5 KiB");
         assert_eq!(human_bytes(5 * 1024 * 1024), "5.0 MiB");
         assert_eq!(human_bytes(3 * 1024 * 1024 * 1024), "3.0 GiB");
+    }
+
+    #[test]
+    fn server_reason_classifies_and_redacts_hub_messages() {
+        assert_eq!(
+            safe_server_reason("Your push was rejected because it contains files larger than 10 MiB; see https://huggingface.co/docs/hub"),
+            Some("file_size_or_lfs".to_string())
+        );
+        assert_eq!(
+            safe_server_reason("You can't create a commit with more than 1000 files"),
+            Some("file_count_limit".to_string())
+        );
+        let redacted =
+            safe_server_reason("unexpected failure at /private/data with https://example.invalid and token=secret")
+                .unwrap();
+        assert!(!redacted.contains("/private/data"));
+        assert!(!redacted.contains("https://example.invalid"));
+        assert!(!redacted.contains("secret"));
     }
 }

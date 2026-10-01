@@ -1379,7 +1379,7 @@ def run(
         )
         try:
             stdout, stderr = process.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired:
+        except subprocess.TimeoutExpired as exc:
             if os.name == "posix":
                 try:
                     os.killpg(process.pid, signal.SIGKILL)
@@ -1389,10 +1389,22 @@ def run(
                     process.kill()
             else:
                 process.kill()
-            process.communicate()
-            # Never retain stdout/stderr or caller arguments in the exception:
+            try:
+                _, killed_stderr = process.communicate()
+            except Exception:
+                killed_stderr = None
+            raw_stderr = (
+                killed_stderr
+                if killed_stderr is not None
+                else getattr(exc, "stderr", None)
+            )
+            safe_stderr = _safe_timeout_stderr(raw_stderr)
+            # Never retain stdout or caller arguments in the exception:
             # a descendant may have emitted payloads, paths, or raw memory.
-            raise subprocess.TimeoutExpired([FUNES_BIN], timeout) from None
+            # stderr contains only allowlisted, re-serialized diagnostic metrics.
+            raise subprocess.TimeoutExpired(
+                [FUNES_BIN], timeout, output=None, stderr=safe_stderr
+            ) from None
         return process.returncode, stdout, stderr
 
 
@@ -1548,6 +1560,89 @@ NATIVE_METRIC_PHASES = frozenset(
         "lance_write_commit",
     }
 )
+
+
+def _safe_timeout_stderr(stderr: str | bytes | None) -> str | None:
+    """Extract and re-serialize only allowlisted numeric metrics on timeout."""
+    if stderr is None:
+        return None
+    if isinstance(stderr, bytes):
+        text = stderr.decode("utf-8", "replace")
+    elif isinstance(stderr, str):
+        text = stderr
+    else:
+        return None
+
+    safe_lines: list[str] = []
+    for line in text.splitlines():
+        match = NATIVE_METRIC_RE.fullmatch(line.strip())
+        if match is None:
+            continue
+        try:
+            item = json.loads(match.group(1))
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(item, dict):
+            continue
+        stage = item.get("stage")
+        try:
+            duration_ms = float(item.get("duration_ms"))
+        except (TypeError, ValueError):
+            continue
+        if (
+            not isinstance(stage, str)
+            or duration_ms < 0.0
+            or duration_ms >= 86_400_000
+        ):
+            continue
+
+        if stage in NATIVE_METRIC_PHASES:
+            clean_item: dict[str, object] = {
+                "stage": stage,
+                "duration_ms": round(duration_ms, 2),
+            }
+        elif stage == "voyage_request":
+            clean_item = {
+                "stage": stage,
+                "duration_ms": round(duration_ms, 2),
+            }
+            if "input_count" in item:
+                try:
+                    value = int(item["input_count"])
+                    if 0 <= value <= 128:
+                        clean_item["input_count"] = value
+                except (TypeError, ValueError):
+                    pass
+            if "status_code" in item:
+                try:
+                    value = int(item["status_code"])
+                    if 0 <= value <= 999:
+                        clean_item["status_code"] = value
+                except (TypeError, ValueError):
+                    pass
+            if "token_usage" in item and item["token_usage"] is not None:
+                try:
+                    value = int(item["token_usage"])
+                    if 0 <= value <= 10_000_000:
+                        clean_item["token_usage"] = value
+                except (TypeError, ValueError):
+                    pass
+            for field in ("pacer_wait_ms", "backoff_ms"):
+                if field not in item or item[field] is None:
+                    continue
+                try:
+                    value = float(item[field])
+                    if 0.0 <= value < 86_400_000:
+                        clean_item[field] = round(value, 2)
+                except (TypeError, ValueError):
+                    pass
+        else:
+            continue
+
+        clean_json = json.dumps(clean_item, separators=(",", ":"), sort_keys=True)
+        safe_lines.append(f"funes_metric {clean_json}")
+
+    return "\n".join(safe_lines) + "\n" if safe_lines else None
 
 
 def _native_metrics() -> dict[str, object]:

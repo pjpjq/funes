@@ -572,7 +572,9 @@ fn is_activation_path(path: &str) -> bool {
     let path = path.trim_start_matches("./");
     path == "README.md"
         || path.starts_with("_versions/")
+        || path.contains("/_versions/")
         || path.starts_with("_transactions/")
+        || path.contains("/_transactions/")
         || path.ends_with(".manifest")
         || path.ends_with("latest_version_hint.json")
 }
@@ -1183,15 +1185,21 @@ mod tests {
     #[test]
     fn commit_chunks_bound_operations_and_activate_metadata_last() {
         let mut ops = (0..(MAX_COMMIT_OPERATIONS * 2 + 7))
-            .map(|i| CommitOperation::add_bytes(format!("data/{i}.bin"), Bytes::from_static(b"x")))
+            .map(|i| CommitOperation::add_bytes(format!("chunks.lance/data/{i}.bin"), Bytes::from_static(b"x")))
             .collect::<Vec<_>>();
+        // Transactions sort before data in real Hub table paths. Place this first so an
+        // unrecognized table prefix cannot accidentally pass by landing in the final chunk.
+        ops.insert(
+            0,
+            CommitOperation::add_bytes("chunks.lance/_transactions/7.txn", Bytes::from_static(b"txn")),
+        );
         ops.push(CommitOperation::add_bytes(
-            "_versions/7.manifest",
+            "chunks.lance/_versions/7.manifest",
             Bytes::from_static(b"manifest"),
         ));
         ops.push(CommitOperation::add_bytes(
-            "_transactions/7.json",
-            Bytes::from_static(b"txn"),
+            "chunks.lance/_versions/latest_version_hint.json",
+            Bytes::from_static(b"hint"),
         ));
         ops.push(CommitOperation::add_bytes("README.md", Bytes::from_static(b"readme")));
 
@@ -1209,12 +1217,25 @@ mod tests {
             .iter()
             .flatten()
             .all(|op| !is_activation_path(operation_path(op))));
+        for path in [
+            "chunks.lance/_transactions/7.txn",
+            "chunks.lance/_versions/7.manifest",
+            "chunks.lance/_versions/latest_version_hint.json",
+            "README.md",
+        ] {
+            assert!(
+                last.iter().any(|op| operation_path(op) == path),
+                "activation path missing from final chunk: {path}"
+            );
+        }
     }
 
     #[test]
     fn commit_chunks_reject_oversized_activation_metadata_before_upload() {
         let ops = (0..=MAX_COMMIT_OPERATIONS)
-            .map(|i| CommitOperation::add_bytes(format!("_versions/{i}.manifest"), Bytes::from_static(b"x")))
+            .map(|i| {
+                CommitOperation::add_bytes(format!("chunks.lance/_transactions/{i}.txn"), Bytes::from_static(b"x"))
+            })
             .collect::<Vec<_>>();
         let error = split_commit_operations(ops).unwrap_err();
         assert!(matches!(error, HFError::InvalidParameter(message) if message.contains("activation metadata")));

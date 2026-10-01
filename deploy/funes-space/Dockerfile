@@ -1,8 +1,8 @@
 FROM python:3.12-slim-trixie
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
-ARG FUNES_SOURCE_REV=24aac4f2d464b33fe5b1719ff0b1628651a0f35a
-ARG FUNES_BINARY_SHA256=5b54af46b73fa1220ab156c5e50d49b76a1d0775d66c5662833358276a6fc070
-ARG FUNES_ARCHIVE_SHA256=7e9ac04ebf16317c0e7e0eab12dbfda2ce690cb40e0c51a3021194cb6018785d
+ARG FUNES_SOURCE_REV=0ae561c5655f18b5e5db81bf8ca21d6678da2c59
+ARG FUNES_BINARY_SHA256=c5b9bb898d9969b31b9d29065b87d21584edf1854135756eae05e5be0a76ece5
+ARG FUNES_ARCHIVE_SHA256=77ac8df45f2959f3cd4bafaf7af3ea4b30abab81ac9f7e1a5d383e1d611fbd6b
 ARG FUNES_BINARY_URL=https://raw.githubusercontent.com/pjpjq/funes/${FUNES_SOURCE_REV}/space/bin/funes-x86_64-linux.bin.zst
 LABEL org.opencontainers.image.source="https://github.com/pjpjq/funes" \
       org.opencontainers.image.revision="${FUNES_SOURCE_REV}"

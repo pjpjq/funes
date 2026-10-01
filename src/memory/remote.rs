@@ -599,7 +599,12 @@ fn commit_error(label: &str, error: &HFError) -> anyhow::Error {
     macro_rules! http_detail {
         ($variant:expr, $context:expr) => {{
             let context = $context;
-            let mut detail = format!("{label}: hf_error={} http_status={}", $variant, context.status.as_u16());
+            let phase = hf_http_phase(&context.url);
+            let mut detail = format!(
+                "{label}: hf_error={} http_status={} hf_phase={phase}",
+                $variant,
+                context.status.as_u16()
+            );
             if let Some(code) = context.error_code.as_deref().and_then(safe_atom) {
                 detail.push_str(&format!(" error_code={code}"));
             }
@@ -639,6 +644,17 @@ fn commit_error(label: &str, error: &HFError) -> anyhow::Error {
         }
         HFError::Other(_) => anyhow::anyhow!("{label}: hf_error=other"),
         _ => anyhow::anyhow!("{label}: hf_error=unknown"),
+    }
+}
+
+/// Bounded phase label derived from the Hub endpoint only; never persist the URL itself.
+fn hf_http_phase(url: &str) -> &'static str {
+    if url.contains("/preupload/") {
+        "preupload"
+    } else if url.contains("/commit/") {
+        "commit"
+    } else {
+        "unknown"
     }
 }
 
@@ -828,6 +844,22 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
     use lance_index::scalar::{InvertedIndexParams, ScalarIndexParams};
     use lance_index::IndexType;
+
+    #[test]
+    fn hf_http_phase_is_bounded_and_does_not_expose_urls() {
+        assert_eq!(
+            hf_http_phase("https://huggingface.co/api/datasets/a/b/preupload/main"),
+            "preupload"
+        );
+        assert_eq!(
+            hf_http_phase("https://huggingface.co/api/datasets/a/b/commit/main"),
+            "commit"
+        );
+        assert_eq!(
+            hf_http_phase("https://huggingface.co/api/datasets/a/b/tree/main"),
+            "unknown"
+        );
+    }
 
     /// Pins the Lance behavior [`reindex`] relies on: `append()` adds one delta sub-index per
     /// backlog, and `merge(deltas)` folds the deltas back into one without touching the base.

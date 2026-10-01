@@ -1465,6 +1465,7 @@ NATIVE_RECORD_ERROR_RE = re.compile(
 NATIVE_HF_ERROR_CODE_RE = re.compile(
     r"\berror_code=([A-Za-z0-9][A-Za-z0-9_.-]{0,63})(?=\s|$|[,;])", re.IGNORECASE
 )
+NATIVE_HF_PHASE_RE = re.compile(r"\bhf_phase=(preupload|commit)\b", re.IGNORECASE)
 NATIVE_HF_SERVER_MESSAGE_RE = re.compile(r"\bserver_message=([^\r\n]+)", re.IGNORECASE)
 NATIVE_HF_400_HINTS = (
     ("preupload", re.compile(r"\bpreupload\b", re.IGNORECASE)),
@@ -1569,6 +1570,9 @@ def _native_failure_code(stderr: str | None) -> str:
             normalized = re.sub(r"[^a-zA-Z0-9]+", "_", normalized).strip("_").lower()
             if normalized:
                 return f"hf_http_400:{normalized[:48]}"
+        phase = NATIVE_HF_PHASE_RE.search(text)
+        if phase is not None:
+            return f"hf_http_400:{phase.group(1).lower()}"
         server_message = NATIVE_HF_SERVER_MESSAGE_RE.search(text)
         if server_message is not None:
             for label, pattern in NATIVE_HF_400_HINTS:

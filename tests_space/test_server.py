@@ -3240,6 +3240,24 @@ def test_native_failure_code_exposes_only_allowlisted_categories():
     assert bridge._native_failure_code("canonical data commit failed: hf_error=entry_not_found") == "hf_entry_not_found"
     assert bridge._native_failure_code("canonical data commit failed: hf_error=bucket_not_found") == "hf_bucket_not_found"
     assert bridge._native_failure_code("canonical data commit failed: http_status=400") == "hf_http_400"
+    assert (
+        bridge._native_failure_code(
+            "canonical data commit failed: http_status=400 error_code=InvalidParentCommit"
+        )
+        == "hf_http_400:invalid_parent_commit"
+    )
+    assert (
+        bridge._native_failure_code(
+            "canonical data commit failed: http_status=400 server_message=preupload rejected"
+        )
+        == "hf_http_400:preupload"
+    )
+    assert (
+        bridge._native_failure_code(
+            "canonical data commit failed: http_status=400 error_code=bad/secret"
+        )
+        == "hf_http_400"
+    )
     assert bridge._native_failure_code("canonical data commit failed: http_status=404") == "hf_http_other"
     assert bridge._native_failure_code("canonical data commit kept conflicting after 10 retries") == "hf_commit_conflict_exhausted"
     for hf_error, expected in (

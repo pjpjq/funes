@@ -1468,6 +1468,15 @@ NATIVE_HF_ERROR_CODE_RE = re.compile(
 NATIVE_HF_PHASE_RE = re.compile(r"\bhf_phase=(preupload|commit)\b", re.IGNORECASE)
 NATIVE_HF_SERVER_MESSAGE_RE = re.compile(r"\bserver_message=([^\r\n]+)", re.IGNORECASE)
 NATIVE_HF_400_HINTS = (
+    (
+        "commit_file_limit",
+        re.compile(
+            r"\b(?:more than|over|maximum of)\s+\d+\s+files\b"
+            r"|\b(?:file|operation)s?\s+(?:limit|maximum)\b"
+            r"|\bmax(?:imum)?[_ -]?files\b",
+            re.IGNORECASE,
+        ),
+    ),
     ("preupload", re.compile(r"\bpreupload\b", re.IGNORECASE)),
     ("parent_commit", re.compile(r"\bparent(?:[_ -]?commit)?\b", re.IGNORECASE)),
     ("payload", re.compile(r"\b(?:payload|ndjson|invalid[_ -]?json)\b", re.IGNORECASE)),
@@ -1570,14 +1579,14 @@ def _native_failure_code(stderr: str | None) -> str:
             normalized = re.sub(r"[^a-zA-Z0-9]+", "_", normalized).strip("_").lower()
             if normalized:
                 return f"hf_http_400:{normalized[:48]}"
-        phase = NATIVE_HF_PHASE_RE.search(text)
-        if phase is not None:
-            return f"hf_http_400:{phase.group(1).lower()}"
         server_message = NATIVE_HF_SERVER_MESSAGE_RE.search(text)
         if server_message is not None:
             for label, pattern in NATIVE_HF_400_HINTS:
                 if pattern.search(server_message.group(1)):
                     return f"hf_http_400:{label}"
+        phase = NATIVE_HF_PHASE_RE.search(text)
+        if phase is not None:
+            return f"hf_http_400:{phase.group(1).lower()}"
         return "hf_http_400"
     return "native_exit"
 

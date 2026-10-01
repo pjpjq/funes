@@ -1459,6 +1459,18 @@ NATIVE_RECORD_ERROR_RE = re.compile(
     r"invalid canonical JSONL record|must not be empty|must not contain NUL|invalid timestamp",
     re.IGNORECASE,
 )
+# HF's generic HTTP error does not preserve the useful response discriminator.
+# Rust emits only bounded `error_code`/`server_message` atoms; normalize those
+# into a short category and never persist the provider message itself.
+NATIVE_HF_ERROR_CODE_RE = re.compile(
+    r"\berror_code=([A-Za-z0-9][A-Za-z0-9_.-]{0,63})(?=\s|$|[,;])", re.IGNORECASE
+)
+NATIVE_HF_SERVER_MESSAGE_RE = re.compile(r"\bserver_message=([^\r\n]+)", re.IGNORECASE)
+NATIVE_HF_400_HINTS = (
+    ("preupload", re.compile(r"\bpreupload\b", re.IGNORECASE)),
+    ("parent_commit", re.compile(r"\bparent(?:[_ -]?commit)?\b", re.IGNORECASE)),
+    ("payload", re.compile(r"\b(?:payload|ndjson|invalid[_ -]?json)\b", re.IGNORECASE)),
+)
 # Native stderr is never returned or persisted. These patterns only select a
 # bounded diagnostic label so failed ingest can be distinguished without
 # leaking provider payloads, paths, or credentials.
@@ -1540,9 +1552,29 @@ def _native_metrics() -> dict[str, object]:
 def _native_failure_code(stderr: str | None) -> str:
     """Map untrusted native stderr to one safe, bounded diagnostic label."""
     text = stderr if isinstance(stderr, str) else ""
+    http_400 = bool(re.search(r"(?:HTTP error:\s*|http_status=)400\b", text, re.IGNORECASE))
     for code, pattern in NATIVE_FAILURE_PATTERNS:
+        if code in {"hf_http_400", "hf_http_other", "hf_commit_failed"} and http_400:
+            # A bare HTTP 400 is a fallback.  Prefer a bounded child category
+            # when the native error contains a safe Hub discriminator.
+            continue
         if pattern.search(text):
             return code
+    if http_400:
+        error_code = NATIVE_HF_ERROR_CODE_RE.search(text)
+        if error_code is not None:
+            normalized = re.sub(
+                r"(?<=[a-z0-9])(?=[A-Z])", "_", error_code.group(1)
+            )
+            normalized = re.sub(r"[^a-zA-Z0-9]+", "_", normalized).strip("_").lower()
+            if normalized:
+                return f"hf_http_400:{normalized[:48]}"
+        server_message = NATIVE_HF_SERVER_MESSAGE_RE.search(text)
+        if server_message is not None:
+            for label, pattern in NATIVE_HF_400_HINTS:
+                if pattern.search(server_message.group(1)):
+                    return f"hf_http_400:{label}"
+        return "hf_http_400"
     return "native_exit"
 
 

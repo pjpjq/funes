@@ -5835,3 +5835,169 @@ def test_missing_canonical_reference_never_falls_back_to_native_get(monkeypatch,
         app.store.close()
     assert status == 404
     assert body["error"] == "not_found"
+
+
+def test_safe_timeout_stderr_keeps_allowlisted_numeric_metrics_and_strips_secrets():
+    assert bridge._safe_timeout_stderr(None) is None
+    assert bridge._safe_timeout_stderr("") is None
+    assert bridge._safe_timeout_stderr(b"") is None
+    assert bridge._safe_timeout_stderr(12345) is None
+    assert bridge._safe_timeout_stderr(["unexpected"]) is None
+
+    raw_stderr = (
+        "Authorization: Bearer secret_key_12345\n"
+        "Traceback (most recent call last):\n"
+        "  File 'server.py', line 1, in <module>\n"
+    )
+    assert bridge._safe_timeout_stderr(raw_stderr) is None
+
+    mixed_stderr = (
+        "[INFO] Starting ingestion...\n"
+        "Authorization: Bearer secret_top_secret_token\n"
+        'funes_metric {"stage": "remote_open", "duration_ms": 14.234, "secret_header": "Bearer secret"}\n'
+        'funes_metric {"stage": "voyage_request", "duration_ms": 120.456, "input_count": 16, "status_code": 200, "token_usage": 450, "pacer_wait_ms": 1.25, "backoff_ms": 0.0, "auth": "Bearer secret"}\n'
+        'funes_metric {"stage": "unknown_phase", "duration_ms": 10.0}\n'
+        'funes_metric {"stage": "embedding", "duration_ms": -5.0}\n'
+        'funes_metric {"stage": "embedding", "duration_ms": 99999999.0}\n'
+        'funes_metric {"stage": "embedding", "duration_ms": "fast"}\n'
+        "funes_metric not valid json\n"
+        "funes_metric [1, 2, 3]\n"
+        'funes_metric {"stage": "voyage_request", "duration_ms": 50.0, "input_count": 999, "status_code": 10000, "token_usage": 20000000, "pacer_wait_ms": -1.0}\n'
+    )
+    safe = bridge._safe_timeout_stderr(mixed_stderr)
+    assert safe is not None
+    assert "Bearer" not in safe
+    assert "secret" not in safe
+    assert "unknown_phase" not in safe
+    assert "Starting ingestion" not in safe
+    lines = safe.strip().splitlines()
+    assert len(lines) == 3
+    assert lines[0] == 'funes_metric {"duration_ms":14.23,"stage":"remote_open"}'
+    assert lines[1] == 'funes_metric {"backoff_ms":0.0,"duration_ms":120.46,"input_count":16,"pacer_wait_ms":1.25,"stage":"voyage_request","status_code":200,"token_usage":450}'
+    assert lines[2] == 'funes_metric {"duration_ms":50.0,"stage":"voyage_request"}'
+
+    assert bridge._safe_timeout_stderr(mixed_stderr.encode("utf-8")) == safe
+
+
+def test_ingest_canonical_subset_catches_timeout_and_accumulates_partial_metrics(
+    monkeypatch, tmp_path
+):
+    item = {
+        "source_identity": "session-1",
+        "source_version": "v1",
+        "content_hash": "hash-abc",
+        "native_generation": 1,
+        "retrieval_generation": 1,
+    }
+    document = {
+        "source_identity": "session-1",
+        "source_version": "v1",
+        "content": "sample content",
+        "session_id": "session-1",
+    }
+    records = [(item, document)]
+    sequence = [0]
+    profile = bridge.index_embedding_profile()
+    metrics = bridge._native_metrics()
+
+    safe_stderr = (
+        'funes_metric {"stage": "remote_open", "duration_ms": 10.5}\n'
+        'funes_metric {"stage": "voyage_request", "duration_ms": 150.0, "input_count": 8, "status_code": 200, "token_usage": 320, "pacer_wait_ms": 2.0, "backoff_ms": 0.0}\n'
+    )
+
+    def fake_run_timeout(*_args, **_kwargs):
+        raise subprocess.TimeoutExpired(
+            [bridge.FUNES_BIN],
+            bridge.CANONICAL_INDEX_TIMEOUT,
+            output=None,
+            stderr=safe_stderr,
+        )
+
+    monkeypatch.setattr(bridge, "run", fake_run_timeout)
+
+    updates, committed = bridge._ingest_canonical_subset(
+        records,
+        tmp_path,
+        sequence,
+        memory="test-memory",
+        profile=profile,
+        metrics=metrics,
+    )
+    assert committed is False
+    assert len(updates) == 1
+    assert updates[0]["native_index_status"] == "retry"
+    assert updates[0]["native_index_error"] == "TimeoutExpired"
+    assert updates[0]["source_identity"] == "session-1"
+    assert updates[0]["native_index_memory"] == "test-memory"
+    assert updates[0]["native_index_profile"] == profile["fingerprint"]
+    assert (tmp_path / "batch-000001.jsonl").is_file()
+
+    assert metrics["phase_ms"]["remote_open"] == 10.5
+    assert metrics["voyage_requests"] == 1
+    assert metrics["voyage_input_count"] == 8
+    assert metrics["voyage_status_counts"]["200"] == 1
+    assert metrics["voyage_token_usage"] == 320
+    assert metrics["voyage_token_usage_known"] == 1
+    assert metrics["voyage_pacer_wait_ms"] == 2.0
+    assert metrics["voyage_backoff_ms"] == 0.0
+
+    # Handles bytes stderr
+    monkeypatch.setattr(
+        bridge,
+        "run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            subprocess.TimeoutExpired(
+                [bridge.FUNES_BIN],
+                bridge.CANONICAL_INDEX_TIMEOUT,
+                output=None,
+                stderr=b'funes_metric {"stage": "embedding", "duration_ms": 25.0}\n',
+            )
+        ),
+    )
+    updates_bytes, committed_bytes = bridge._ingest_canonical_subset(
+        records,
+        tmp_path,
+        sequence,
+        memory="test-memory",
+        profile=profile,
+        metrics=metrics,
+    )
+    assert committed_bytes is False
+    assert updates_bytes[0]["native_index_status"] == "retry"
+    assert metrics["phase_ms"]["embedding"] == 25.0
+
+    # Handles metrics=None without error
+    updates_no_metrics, committed_no_metrics = bridge._ingest_canonical_subset(
+        records,
+        tmp_path,
+        sequence,
+        memory="test-memory",
+        profile=profile,
+        metrics=None,
+    )
+    assert committed_no_metrics is False
+    assert updates_no_metrics[0]["native_index_status"] == "retry"
+
+    # Handles stderr=None
+    monkeypatch.setattr(
+        bridge,
+        "run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            subprocess.TimeoutExpired(
+                [bridge.FUNES_BIN],
+                bridge.CANONICAL_INDEX_TIMEOUT,
+                output=None,
+                stderr=None,
+            )
+        ),
+    )
+    updates_no_stderr, committed_no_stderr = bridge._ingest_canonical_subset(
+        records,
+        tmp_path,
+        sequence,
+        memory="test-memory",
+        profile=profile,
+        metrics=metrics,
+    )
+    assert committed_no_stderr is False
+    assert updates_no_stderr[0]["native_index_status"] == "retry"

@@ -77,6 +77,25 @@ min(FUNES_VOYAGE_CONCURRENCY, batches.len())
 
 因此本次生产数据只能支持：并发 `4` 可运行、无状态错误、没有明显高于并发 `2` 的已证实收益。若要继续优化，应先在不切生产的测试路径加入分阶段计时（Voyage 请求、过滤、Lance 写入、状态回写）和真实请求批次数统计，再改变 `REQUEST_ROWS` 或 `MAX_CHARS`。
 
+## 2026-10-03 生产诊断后的最小吞吐调整
+
+部署诊断版本后，生产连续成功完成两轮原生回填：
+
+- `17/17`、约 `66.7s`
+- `19/19`、约 `66.4s`
+- Voyage 请求均为 HTTP `200`，无 `429`、`5xx`、退避或失败。
+
+瓶颈在固定的远端 Lance/HF 提交开销，而不是 Voyage：最近一轮约为 `remote_open=33.1s`、`lance_write_commit=19.6s`，单轮仅选择到 19 条是因为 `MAX_CHARS=96000` 先达到字符上限。为摊薄固定提交开销，下一版镜像只扩大单轮候选窗口，不改变 profile、checkpoint 或数据格式：
+
+| 变量 | 旧值 | 新值 |
+| --- | ---: | ---: |
+| `FUNES_CANONICAL_INDEX_BATCH` | `128` | `512` |
+| `FUNES_CANONICAL_INDEX_REQUEST_ROWS` | `64` | `128` |
+| `FUNES_CANONICAL_INDEX_MAX_CHARS` | `96000` | `192000` |
+| `FUNES_VOYAGE_CONCURRENCY` | `2` | `4` |
+
+这不会重嵌已 indexed 记录；仍由现有 source identity、profile、version/hash 和 checkpoint 判定增量。部署后先观察一个完整 cycle，再决定是否继续放大窗口。
+
 ## 稳定性边界
 
 - `/health`（无鉴权）：`200`

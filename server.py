@@ -142,7 +142,20 @@ def _canonical_index_min_request_interval(
 
 
 CANONICAL_INDEX_MIN_REQUEST_INTERVAL = _canonical_index_min_request_interval()
-CANONICAL_INDEX_TIMEOUT = max(1, int(os.getenv("FUNES_CANONICAL_INDEX_TIMEOUT", "900")))
+
+
+def _canonical_index_timeout(
+    environ: Mapping[str, str] | None = None,
+) -> int:
+    environ = os.environ if environ is None else environ
+    val = environ.get("FUNES_CANONICAL_INDEX_TIMEOUT")
+    try:
+        return max(1, int(val)) if val is not None else 1800
+    except (TypeError, ValueError):
+        return 1800
+
+
+CANONICAL_INDEX_TIMEOUT = _canonical_index_timeout()
 CANONICAL_OPTIMIZE_TIMEOUT = max(1, int(os.getenv("FUNES_CANONICAL_OPTIMIZE_TIMEOUT", "900")))
 # Bump when a deployed native index needs one-time structural maintenance even
 # though its source/profile checkpoint is already complete.

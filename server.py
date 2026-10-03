@@ -1089,7 +1089,7 @@ def request_warm(*, force: bool = False) -> dict[str, object]:
 
 def request_native_recovery() -> None:
     """Rebuild a failed active MCP child outside the current HTTP request."""
-    if isinstance(MCP_WORKER, NativeMcpWorker):
+    if MCP_WORKER is None or isinstance(MCP_WORKER, NativeMcpWorker):
         request_warm(force=True)
 
 
@@ -2995,6 +2995,10 @@ class NativeMcpError(subprocess.SubprocessError):
     """A native MCP failure without carrying process output into logs or HTTP responses."""
 
 
+class NativeMcpProtocolError(NativeMcpError):
+    """A JSON-RPC/MCP error returned by an otherwise live child process."""
+
+
 class NativeMcpBusyError(NativeMcpError):
     """The single native read worker is occupied; callers should retry shortly."""
 
@@ -3014,6 +3018,8 @@ def _native_failure_category(error: BaseException) -> str:
     """Map native failures to a safe, stable category without exposing details."""
     if isinstance(error, NativeMcpTimeoutError):
         return "timeout"
+    if isinstance(error, NativeMcpProtocolError):
+        return "protocol_error"
     message = str(error).lower()
     if "process exited" in message or "closed stdout" in message:
         return "process_exit"
@@ -3265,7 +3271,7 @@ class NativeMcpWorker:
             if not isinstance(message, dict) or message.get("id") != request_id:
                 continue
             if message.get("error") is not None:
-                raise NativeMcpError("native MCP request failed")
+                raise NativeMcpProtocolError("native MCP request failed")
             return message.get("result")
 
     def _call(self, method: str, params: dict, *, timeout: float | None = None) -> object:
@@ -3285,6 +3291,12 @@ class NativeMcpWorker:
                 except NativeMcpTimeoutError as exc:
                     _record_native_failure(exc)
                     self._stop_locked(deadline)
+                    raise
+                except NativeMcpProtocolError as exc:
+                    # JSON-RPC errors are application-level failures. Keep
+                    # the child alive instead of converting a valid tool
+                    # error into a worker outage and restart churn.
+                    _record_native_failure(exc)
                     raise
                 except NativeMcpError as exc:
                     _record_native_failure(exc)
@@ -3708,10 +3720,18 @@ def _ready_payload(
     sources = source_readiness_state()
     warm = warm_state()
     source_ok = not sources.get("configured") or bool(sources.get("ready"))
+    needs_recovery = (
+        warm.get("state") in {"error", "not_started"}
+        or (
+            allow_active_search
+            and warm.get("state") == "ready"
+            and not _native_search_serviceable(warm)
+        )
+    )
     if (
         REMOTE
         and (source_ok or not require_source)
-        and warm.get("state") in {"error", "not_started"}
+        and needs_recovery
     ):
         # A failed initial warm must not leave Codex/Pi polling a permanent
         # 503. `request_warm` atomically reserves `warming`, so concurrent
@@ -3836,13 +3856,24 @@ def sync_status_payload() -> tuple[int, dict[str, object]]:
         code, out, err = 1, "", "native_status_unavailable"
     sources = source_state()
     source_ok = not sources.get("configured") or bool(sources.get("ready"))
+    ok = code == 0 and source_ok
+    if not source_ok:
+        error = (
+            "restore_in_progress"
+            if sources.get("restoring")
+            else str(sources.get("error") or "source_store_unavailable")
+        )
+    elif code != 0:
+        error = err[-500:] or f"native_status_failed_{code}"
+    else:
+        error = ""
     return (
-        200 if code == 0 and source_ok else 503,
+        200 if ok else 503,
         {
-            "ok": code == 0 and source_ok,
+            "ok": ok,
             "remote": REMOTE,
             "status": out[-2000:],
-            "error": err[-500:],
+            "error": error,
             "native_warm": warm_state(),
             "native_worker": native_worker_status(),
             "source_store": sources,
@@ -4150,6 +4181,7 @@ class Handler(BaseHTTPRequestHandler):
                         )
                         return
                     if not _native_search_serviceable(warm_state()):
+                        request_native_recovery()
                         self.send_json(
                             503,
                             {

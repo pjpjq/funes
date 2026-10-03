@@ -1071,14 +1071,46 @@ def test_search_ready_rejects_false_ready_without_live_worker(monkeypatch):
     monkeypatch.setattr(bridge, "SOURCE_APP", None)
     monkeypatch.setattr(bridge, "MCP_WORKER", None)
     monkeypatch.setattr(bridge, "warm_state", lambda: {"state": "ready"})
+    recovery_calls = []
+    monkeypatch.setattr(
+        bridge,
+        "request_warm",
+        lambda *, force: recovery_calls.append(force) or {"state": "warming"},
+    )
 
     code, payload = bridge.search_ready_payload()
 
     assert code == 503
     assert payload["ok"] is False
-    assert payload["error"] == "native_mcp_unavailable"
+    assert payload["error"] == "native_warm_warming"
     assert payload["native_worker"]["configured"] is False
     assert payload["native_worker"]["alive"] is False
+    assert recovery_calls == [True]
+
+
+def test_sync_status_non_postgres_reports_safe_error(monkeypatch):
+    monkeypatch.setattr(bridge, "REMOTE", "owner/memory")
+    monkeypatch.setattr(bridge, "SOURCE_APP", None)
+    monkeypatch.setattr(bridge, "run", lambda *args, **kwargs: (0, "ok", "warning"))
+    monkeypatch.setattr(bridge, "source_state", lambda: {"configured": True, "ready": True})
+    code, payload = bridge.sync_status_payload()
+    assert code == 200
+    assert payload["error"] == ""
+
+    monkeypatch.setattr(bridge, "run", lambda *args, **kwargs: (1, "", ""))
+    code, payload = bridge.sync_status_payload()
+    assert code == 503
+    assert payload["error"] == "native_status_failed_1"
+
+    monkeypatch.setattr(bridge, "run", lambda *args, **kwargs: (0, "ok", ""))
+    monkeypatch.setattr(
+        bridge,
+        "source_state",
+        lambda: {"configured": True, "ready": False, "error": "db_corrupted"},
+    )
+    code, payload = bridge.sync_status_payload()
+    assert code == 503
+    assert payload["error"] == "db_corrupted"
 
 
 def test_search_ready_requires_source_for_legacy_local_provider(monkeypatch):
@@ -5579,7 +5611,7 @@ def test_request_native_recovery_triggers_warm_only_for_native_mcp_worker(monkey
 
     monkeypatch.setattr(bridge, "MCP_WORKER", None)
     bridge.request_native_recovery()
-    assert warm_calls == []
+    assert warm_calls == [True]
 
     class DummyNativeWorker(bridge.NativeMcpWorker):
         def __init__(self):
@@ -5587,7 +5619,34 @@ def test_request_native_recovery_triggers_warm_only_for_native_mcp_worker(monkey
 
     monkeypatch.setattr(bridge, "MCP_WORKER", DummyNativeWorker())
     bridge.request_native_recovery()
-    assert warm_calls == [True]
+    assert warm_calls == [True, True]
+
+
+def test_native_mcp_protocol_error_keeps_child_alive(monkeypatch, tmp_path):
+    process = _FakeProcess(
+        lambda message, stdout: (
+            stdout.push(
+                {
+                    "jsonrpc": "2.0",
+                    "id": message["id"],
+                    "error": {"code": -32000, "message": "tool failed"},
+                }
+            )
+            if message.get("method") == "tools/call"
+            else _mcp_responder(message, stdout)
+        )
+    )
+    monkeypatch.setattr(bridge.subprocess, "Popen", lambda *_args, **_kwargs: process)
+    worker = bridge.NativeMcpWorker(
+        "fake-funes", "owner/memory", tmp_path, timeout=1, handshake_timeout=1
+    )
+    try:
+        with pytest.raises(bridge.NativeMcpProtocolError):
+            worker.call_tool("recall", {"query": "q"})
+        assert process.terminated is False
+        assert process.poll() is None
+    finally:
+        worker.close()
 
 
 def test_concurrent_voyage_native_request_returns_busy_without_foreign_result(

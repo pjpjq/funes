@@ -40,6 +40,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{ensure, Context, Result};
 use arrow_array::{new_null_array, RecordBatch, RecordBatchIterator};
@@ -54,12 +55,47 @@ use lance::index::DatasetIndexExt;
 use lance_index::optimize::OptimizeOptions;
 use lance_io::object_store::WrappingObjectStore;
 use object_store::ObjectStore as OSObjectStore;
+use serde::Serialize;
 
 use super::capture_store::{CaptureStore, Captured};
 use super::dataset;
 use super::fetch_store::{FetchStore, FileFetcher};
 use super::shard_store::{physical_path, ShardStore};
 use crate::hub;
+
+#[derive(Clone, Debug, Serialize)]
+struct IngestPhaseMetric {
+    stage: &'static str,
+    duration_ms: f64,
+}
+
+fn ingest_metrics_enabled_from(value: Option<&str>) -> bool {
+    matches!(
+        value.map(|val| val.trim().to_ascii_lowercase()).as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
+}
+
+fn ingest_metrics_enabled() -> bool {
+    ingest_metrics_enabled_from(std::env::var("FUNES_INGEST_METRICS").ok().as_deref())
+}
+
+fn round_ms(duration: Duration) -> f64 {
+    ((duration.as_secs_f64() * 1000.0) * 100.0).round() / 100.0
+}
+
+fn emit_phase_metric(stage: &'static str, duration: Duration) {
+    if !ingest_metrics_enabled() {
+        return;
+    }
+    let metric = IngestPhaseMetric {
+        stage,
+        duration_ms: round_ms(duration),
+    };
+    if let Ok(json) = serde_json::to_string(&metric) {
+        eprintln!("funes_metric {json}");
+    }
+}
 
 /// Outcome of an [`append`] commit.
 pub(crate) enum Appended {
@@ -147,9 +183,11 @@ async fn append_at(
         .map(|batch| align_batch(batch, target_schema.clone()))
         .collect::<Result<Vec<_>>>()?;
     let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), target_schema);
+    let append_start = Instant::now();
     ds.append(reader, None)
         .await
         .context("appending to the remote dataset")?;
+    emit_phase_metric("lance_append", append_start.elapsed());
 
     // Snapshot the captured writes before optionally reading index stats: `index_statistics` can
     // write a stats migration through the same wrapper, and that must not leak into the data commit.
@@ -423,18 +461,22 @@ pub(crate) async fn replace_documents(
 }
 
 async fn replace_dataset_rows(ds: &mut Dataset, batches: Vec<RecordBatch>, delete_filter: &str) -> Result<()> {
+    let delete_start = Instant::now();
     ds.delete(delete_filter)
         .await
         .context("deleting stale canonical document rows")?;
+    emit_phase_metric("lance_delete", delete_start.elapsed());
     let target_schema = Arc::new(Schema::from(ds.schema()));
     let batches = batches
         .into_iter()
         .map(|batch| align_batch(batch, target_schema.clone()))
         .collect::<Result<Vec<_>>>()?;
     let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), target_schema);
+    let append_start = Instant::now();
     ds.append(reader, None)
         .await
         .context("appending replacement canonical document rows")?;
+    emit_phase_metric("lance_append", append_start.elapsed());
     Ok(())
 }
 
@@ -469,7 +511,8 @@ async fn open_capturing(
 /// The captured writes as physical repo-path → bytes, ready to commit. Existing flat files are
 /// unchanged; new Lance files live in deterministic buckets so no directory hits Hub's file cap.
 fn captured_files(wrapper: &CaptureWrapper) -> BTreeMap<String, Bytes> {
-    wrapper
+    let start = Instant::now();
+    let files = wrapper
         .captured
         .lock()
         .unwrap()
@@ -478,7 +521,9 @@ fn captured_files(wrapper: &CaptureWrapper) -> BTreeMap<String, Bytes> {
             let logical = p.to_string();
             (physical_path(&logical).unwrap_or(logical), b.clone())
         })
-        .collect()
+        .collect();
+    emit_phase_metric("captured_files", start.elapsed());
+    files
 }
 
 /// The largest `num_unindexed_rows` across the dataset's indexes — how many rows aren't yet folded
@@ -526,6 +571,7 @@ pub(crate) async fn head_oid(repo: &HFRepository<RepoTypeDataset>, rev: &str) ->
 /// Write captured files (path → bytes) to a scratch dir and turn them into add-file commit
 /// operations — hf-hub uploads from local paths. The returned `TempDir` must outlive all chunks.
 fn write_ops(files: &BTreeMap<String, Bytes>) -> Result<(Vec<CommitOperation>, tempfile::TempDir)> {
+    let start = Instant::now();
     let dir = tempfile::tempdir()?;
     let mut ops = Vec::with_capacity(files.len());
     for (i, (repo_path, body)) in files.iter().enumerate() {
@@ -533,6 +579,7 @@ fn write_ops(files: &BTreeMap<String, Bytes>) -> Result<(Vec<CommitOperation>, t
         std::fs::write(&local, body)?;
         ops.push(CommitOperation::add_file(repo_path.clone(), local));
     }
+    emit_phase_metric("write_ops", start.elapsed());
     Ok((ops, dir))
 }
 
@@ -647,6 +694,7 @@ async fn send_commit_chunks(
         } else {
             format!("{message} (chunk {index})")
         };
+        let chunk_start = Instant::now();
         let info = if let Some(expected_parent) = parent.take() {
             repo.create_commit()
                 .operations(chunk)
@@ -665,9 +713,15 @@ async fn send_commit_chunks(
                 .send()
                 .await?
         };
+        emit_phase_metric("hf_commit_chunk", chunk_start.elapsed());
         parent = match info.commit_oid.as_deref().filter(|oid| !oid.is_empty()) {
             Some(oid) => Some(oid.to_string()),
-            None => Some(head_oid_for_commit(repo, rev).await?),
+            None => {
+                let wait_start = Instant::now();
+                let head = head_oid_for_commit(repo, rev).await?;
+                emit_phase_metric("hf_commit_wait", wait_start.elapsed());
+                Some(head)
+            }
         };
         final_info = Some(info);
     }
@@ -1070,6 +1124,64 @@ mod tests {
                 self.store.clone()
             }
         }
+    }
+
+    #[test]
+    fn remote_phase_metrics_env_and_schema_are_strict_and_leak_free() {
+        assert!(ingest_metrics_enabled_from(Some("1")));
+        assert!(ingest_metrics_enabled_from(Some("true")));
+        assert!(ingest_metrics_enabled_from(Some("yes")));
+        assert!(ingest_metrics_enabled_from(Some("on")));
+        assert!(ingest_metrics_enabled_from(Some(" TRUE ")));
+        assert!(!ingest_metrics_enabled_from(Some("0")));
+        assert!(!ingest_metrics_enabled_from(Some("false")));
+        assert!(!ingest_metrics_enabled_from(Some("off")));
+        assert!(!ingest_metrics_enabled_from(None));
+
+        assert_eq!(round_ms(Duration::from_millis(0)), 0.0);
+        assert_eq!(round_ms(Duration::from_micros(12345)), 12.35);
+        assert_eq!(round_ms(Duration::from_millis(50)), 50.0);
+
+        for stage in [
+            "lance_append",
+            "lance_delete",
+            "captured_files",
+            "write_ops",
+            "hf_commit_chunk",
+            "hf_commit_wait",
+        ] {
+            let metric = IngestPhaseMetric {
+                stage,
+                duration_ms: 12.34,
+            };
+            let serialized = serde_json::to_string(&metric).unwrap();
+            let value: serde_json::Value = serde_json::from_str(&serialized).unwrap();
+            let obj = value.as_object().unwrap();
+            assert_eq!(obj.len(), 2);
+            assert_eq!(obj.get("stage").unwrap(), stage);
+            assert_eq!(obj.get("duration_ms").unwrap(), 12.34);
+            assert!(!serialized.contains("secret"));
+            assert!(!serialized.contains("token"));
+            assert!(!serialized.contains("http"));
+            assert!(!serialized.contains('/'));
+        }
+    }
+
+    #[test]
+    fn write_ops_and_captured_files_emit_safely_when_enabled() {
+        let wrapper = CaptureWrapper {
+            captured: Captured::default(),
+            fetcher: Arc::new(UnusedFetcher),
+        };
+        wrapper.captured.lock().unwrap().insert(
+            object_store::path::Path::from("chunks.lance/data/test.lance"),
+            Bytes::from_static(b"metric_test_bytes"),
+        );
+        let files = captured_files(&wrapper);
+        assert_eq!(files.len(), 1);
+
+        let (ops, _dir) = write_ops(&files).unwrap();
+        assert_eq!(ops.len(), 1);
     }
 
     #[test]

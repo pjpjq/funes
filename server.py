@@ -1558,6 +1558,12 @@ NATIVE_METRIC_PHASES = frozenset(
         "vector_reuse",
         "embedding",
         "lance_write_commit",
+        "lance_append",
+        "lance_delete",
+        "captured_files",
+        "write_ops",
+        "hf_commit_chunk",
+        "hf_commit_wait",
     }
 )
 

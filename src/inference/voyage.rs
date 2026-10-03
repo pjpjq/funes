@@ -41,7 +41,7 @@ const TPM_WINDOW: Duration = Duration::from_secs(60);
 // backends more aggressively without ever sending an invalid Voyage payload.
 const MAX_EMBEDDING_INPUTS: usize = 128;
 // Four capped sleeps plus five 30-second requests stay below the Space's
-// 900-second canonical-ingest subprocess deadline.
+// 1800-second canonical-ingest subprocess deadline.
 const DOCUMENT_MAX_RATE_LIMIT_DELAY: Duration = Duration::from_secs(120);
 
 #[derive(Serialize)]

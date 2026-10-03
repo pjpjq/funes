@@ -3152,6 +3152,25 @@ def test_canonical_index_min_request_interval_parsing(environ, expected):
     assert bridge._canonical_index_min_request_interval(environ) == expected
 
 
+@pytest.mark.parametrize(
+    ("environ", "expected"),
+    [
+        ({}, 1800),
+        ({"FUNES_CANONICAL_INDEX_TIMEOUT": "900"}, 900),
+        ({"FUNES_CANONICAL_INDEX_TIMEOUT": "3600"}, 3600),
+        ({"FUNES_CANONICAL_INDEX_TIMEOUT": "0"}, 1),
+        ({"FUNES_CANONICAL_INDEX_TIMEOUT": "-5"}, 1),
+        ({"FUNES_CANONICAL_INDEX_TIMEOUT": "invalid"}, 1800),
+    ],
+)
+def test_canonical_index_timeout_parsing(environ, expected):
+    assert bridge._canonical_index_timeout(environ) == expected
+
+
+def test_canonical_index_timeout_default_is_1800():
+    assert bridge.CANONICAL_INDEX_TIMEOUT == 1800
+
+
 def test_select_bounded_canonical_records_bounds_by_rows():
     records = [
         ({"source_identity": f"doc-{i}", "raw_text": f"text-{i}"}, {})

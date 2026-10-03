@@ -27,11 +27,11 @@ def test_dockerfiles_copy_canonical_space_server():
 def test_production_space_enables_safe_voyage_batching_and_pacing():
     """Keep paid-tier production batching bounded after the live A/B probe."""
     required = (
-        "FUNES_CANONICAL_INDEX_BATCH=128",
-        "FUNES_CANONICAL_INDEX_REQUEST_ROWS=64",
-        "FUNES_CANONICAL_INDEX_MAX_CHARS=96000",
+        "FUNES_CANONICAL_INDEX_BATCH=512",
+        "FUNES_CANONICAL_INDEX_REQUEST_ROWS=128",
+        "FUNES_CANONICAL_INDEX_MAX_CHARS=192000",
         "FUNES_CANONICAL_INDEX_MIN_REQUEST_INTERVAL=1",
-        "FUNES_VOYAGE_CONCURRENCY=2",
+        "FUNES_VOYAGE_CONCURRENCY=4",
         "FUNES_VOYAGE_MAX_REQUEST_TOKENS=9000",
         "FUNES_VOYAGE_TOKENS_PER_MINUTE=120000",
         "FUNES_VOYAGE_MIN_REQUEST_INTERVAL=0",

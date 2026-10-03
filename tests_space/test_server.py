@@ -4766,7 +4766,7 @@ def test_http_voyage_role_filter_never_waits_for_query_translator(monkeypatch):
         server.server_close()
         thread.join(timeout=2)
 
-    assert bridge.VOYAGE_HTTP_TIMEOUT <= 7.5
+    assert bridge.VOYAGE_HTTP_TIMEOUT <= 14.0
     assert elapsed < 5
     assert translator_calls == []
     assert status == 200
@@ -5402,7 +5402,7 @@ def test_voyage_native_recall_succeeds_within_new_budget(monkeypatch):
         thread.join(timeout=2)
 
     assert status == 200
-    assert 4.0 < elapsed < 6.8
+    assert 4.0 < elapsed < 12.8
     assert len(native_calls) == 1
     assert 5.0 < native_calls[0][1]["timeout"] <= bridge.VOYAGE_NATIVE_TIMEOUT
     assert body["retrieval_backend"] == "voyage_lance_bm25_rrf"

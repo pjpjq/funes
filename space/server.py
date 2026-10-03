@@ -202,23 +202,24 @@ except ValueError:
     CJK_NATIVE_TIMEOUT = min(HTTP_NATIVE_TIMEOUT, 5.0)
 try:
     # A Voyage query includes provider RTT plus Lance vector/BM25 fusion.  The
-    # production 3M-row index normally needs 4-5s, so the former 4s cap killed
-    # an otherwise healthy warm worker.  Stay below the clients' 8s per-attempt
-    # budget while retaining a hard operator cap.
+    # production multi-million-row index can exceed eight seconds while a warm
+    # snapshot is opened.  Keep a bounded twelve-second native budget and a
+    # separate fourteen-second HTTP budget so the worker is not killed before a
+    # healthy query completes; callers still retain their own shorter deadline.
     VOYAGE_NATIVE_TIMEOUT = min(
-        6.8,
+        12.0,
         HTTP_NATIVE_TIMEOUT,
-        max(0.1, float(os.getenv("FUNES_VOYAGE_NATIVE_TIMEOUT", "6"))),
+        max(0.1, float(os.getenv("FUNES_VOYAGE_NATIVE_TIMEOUT", "12"))),
     )
 except ValueError:
-    VOYAGE_NATIVE_TIMEOUT = min(HTTP_NATIVE_TIMEOUT, 6.0)
+    VOYAGE_NATIVE_TIMEOUT = min(HTTP_NATIVE_TIMEOUT, 12.0)
 try:
     VOYAGE_HTTP_TIMEOUT = min(
-        7.5,
-        max(0.2, float(os.getenv("FUNES_VOYAGE_HTTP_TIMEOUT", "7.4"))),
+        14.0,
+        max(0.2, float(os.getenv("FUNES_VOYAGE_HTTP_TIMEOUT", "14"))),
     )
 except ValueError:
-    VOYAGE_HTTP_TIMEOUT = 7.4
+    VOYAGE_HTTP_TIMEOUT = 14.0
 try:
     VOYAGE_FALLBACK_TIMEOUT = min(
         HTTP_NATIVE_TIMEOUT,

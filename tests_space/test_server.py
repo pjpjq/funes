@@ -998,6 +998,8 @@ def test_search_ready_stays_200_while_source_is_unavailable(
     monkeypatch.setenv("FUNES_STORAGE_REPO", "owner/source")
     monkeypatch.setattr(bridge, "SOURCE_APP", app)
     monkeypatch.setattr(bridge, "warm_state", lambda: {"state": "ready"})
+    monkeypatch.setattr(bridge, "MCP_WORKER", SimpleNamespace(process=SimpleNamespace(poll=lambda: None)))
+    monkeypatch.setattr(bridge, "_MCP_WORKER_CONFIG", bridge._native_worker_config())
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -1061,6 +1063,22 @@ def test_search_ready_stays_503_during_initial_warm_without_active_worker(monkey
     assert code == 503
     assert payload["ok"] is False
     assert payload["error"] == "native_warm_warming"
+
+
+def test_search_ready_rejects_false_ready_without_live_worker(monkeypatch):
+    monkeypatch.setattr(bridge, "REMOTE", "owner/memory")
+    monkeypatch.delenv("FUNES_STORAGE_REPO", raising=False)
+    monkeypatch.setattr(bridge, "SOURCE_APP", None)
+    monkeypatch.setattr(bridge, "MCP_WORKER", None)
+    monkeypatch.setattr(bridge, "warm_state", lambda: {"state": "ready"})
+
+    code, payload = bridge.search_ready_payload()
+
+    assert code == 503
+    assert payload["ok"] is False
+    assert payload["error"] == "native_mcp_unavailable"
+    assert payload["native_worker"]["configured"] is False
+    assert payload["native_worker"]["alive"] is False
 
 
 def test_search_ready_requires_source_for_legacy_local_provider(monkeypatch):

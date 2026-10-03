@@ -64,6 +64,8 @@ def test_sync_status_uses_status_snapshot_and_bypasses_native_subprocess(monkeyp
     app = SimpleNamespace(store=store, syncer=syncer, restore_result=0)
     monkeypatch.setattr(bridge, "SOURCE_APP", app)
     monkeypatch.setattr(bridge, "warm_state", lambda: {"state": "ready"})
+    monkeypatch.setattr(bridge, "MCP_WORKER", SimpleNamespace(process=SimpleNamespace(poll=lambda: None)))
+    monkeypatch.setattr(bridge, "_MCP_WORKER_CONFIG", bridge._native_worker_config())
     monkeypatch.setattr(bridge, "run", mock.Mock(side_effect=AssertionError("run() must not be called")))
 
     code, payload = bridge.sync_status_payload()
@@ -102,6 +104,8 @@ def test_sync_status_does_not_wait_for_upload_or_store_locks(monkeypatch):
     app = SimpleNamespace(store=store, syncer=syncer, restore_result=0)
     monkeypatch.setattr(bridge, "SOURCE_APP", app)
     monkeypatch.setattr(bridge, "warm_state", lambda: {"state": "ready"})
+    monkeypatch.setattr(bridge, "MCP_WORKER", SimpleNamespace(process=SimpleNamespace(poll=lambda: None)))
+    monkeypatch.setattr(bridge, "_MCP_WORKER_CONFIG", bridge._native_worker_config())
     monkeypatch.setattr(bridge, "run", mock.Mock(side_effect=AssertionError("run() called")))
 
     finished = threading.Event()
@@ -187,4 +191,3 @@ def test_source_state_and_sync_status_failure_redaction(monkeypatch):
     assert "postgres://" not in rendered
     assert "secret_user" not in rendered
     assert "super_secret_pw" not in rendered
-

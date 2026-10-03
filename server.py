@@ -3003,6 +3003,62 @@ class NativeMcpTimeoutError(NativeMcpError):
     """A native request exhausted its complete caller-owned time budget."""
 
 
+_NATIVE_DIAGNOSTIC_LOCK = threading.Lock()
+_NATIVE_LAST_FAILURE: dict[str, object] = {
+    "category": "",
+    "at": None,
+}
+
+
+def _native_failure_category(error: BaseException) -> str:
+    """Map native failures to a safe, stable category without exposing details."""
+    if isinstance(error, NativeMcpTimeoutError):
+        return "timeout"
+    message = str(error).lower()
+    if "process exited" in message or "closed stdout" in message:
+        return "process_exit"
+    if "write failed" in message or "stdin unavailable" in message:
+        return "io"
+    if "request failed" in message or "tool failed" in message or "malformed" in message:
+        return "protocol"
+    if "warming" in message or "unavailable" in message:
+        return "unavailable"
+    return "native_error"
+
+
+def _record_native_failure(error: BaseException) -> None:
+    with _NATIVE_DIAGNOSTIC_LOCK:
+        _NATIVE_LAST_FAILURE.update(
+            category=_native_failure_category(error),
+            at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        )
+
+
+def native_worker_status() -> dict[str, object]:
+    """Return safe worker liveness/config diagnostics for readiness and status."""
+    expected = _native_worker_config()
+    with _MCP_WORKER_LOCK:
+        worker = MCP_WORKER
+        configured = worker is not None
+        config_match = configured and _MCP_WORKER_CONFIG == expected
+        process = getattr(worker, "process", None) if configured else None
+        if process is None:
+            alive = False
+        else:
+            try:
+                alive = process.poll() is None
+            except (AttributeError, OSError):
+                alive = False
+    with _NATIVE_DIAGNOSTIC_LOCK:
+        failure = dict(_NATIVE_LAST_FAILURE)
+    return {
+        "configured": configured,
+        "config_match": bool(config_match),
+        "alive": alive,
+        "last_failure": failure,
+    }
+
+
 class NativeMcpWorker:
     """Keep one ``funes mcp`` process warm for model and remote-cache reuse."""
 
@@ -3226,10 +3282,12 @@ class NativeMcpWorker:
                     if remaining <= 0:
                         raise NativeMcpTimeoutError("native MCP request timed out")
                     return self._request_locked(method, params, remaining)
-                except NativeMcpTimeoutError:
+                except NativeMcpTimeoutError as exc:
+                    _record_native_failure(exc)
                     self._stop_locked(deadline)
                     raise
                 except NativeMcpError as exc:
+                    _record_native_failure(exc)
                     last_error = exc
                     self._stop_locked(deadline)
                     if attempt == 0 and time.monotonic() < deadline:
@@ -3393,10 +3451,8 @@ def _native_worker_config() -> tuple[object, ...]:
 
 
 def _native_search_serviceable(warm: dict[str, object]) -> bool:
-    """Return whether search can use the ready worker or a live replacement predecessor."""
-    if warm.get("state") == "ready":
-        return True
-    if warm.get("state") != "warming":
+    """Return whether search has a live worker matching the current config."""
+    if warm.get("state") not in {"ready", "warming"}:
         return False
     expected = _native_worker_config()
     with _MCP_WORKER_LOCK:
@@ -3675,7 +3731,11 @@ def _ready_payload(
             else str(sources.get("error", "source_store_unavailable"))
         )
     elif not warm_ok:
-        error = "native_warm_" + str(warm.get("state", "unavailable"))
+        error = (
+            "native_mcp_unavailable"
+            if warm.get("state") == "ready"
+            else "native_warm_" + str(warm.get("state", "unavailable"))
+        )
     else:
         error = ""
     ok = bool(REMOTE) and (source_ok or not require_source) and warm_ok
@@ -3687,6 +3747,7 @@ def _ready_payload(
             "status": "",
             "error": error,
             "native_warm": warm,
+            "native_worker": native_worker_status(),
             "source_store": sources,
             "embedding_profile": embedding_profile(),
         },
@@ -3727,6 +3788,7 @@ def sync_status_payload() -> tuple[int, dict[str, object]]:
             "status": "",
             "error": "restore_in_progress",
             "native_warm": warm_state(),
+            "native_worker": native_worker_status(),
             "source_store": source_readiness,
             "embedding_profile": embedding_profile(),
         }
@@ -3740,7 +3802,7 @@ def sync_status_payload() -> tuple[int, dict[str, object]]:
         warm = warm_state()
         sources = source_state()
         source_ok = not sources.get("configured") or bool(sources.get("ready"))
-        warm_ok = warm.get("state") == "ready"
+        warm_ok = _native_search_serviceable(warm)
         ok = source_ok and warm_ok
         error = ""
         if not source_ok:
@@ -3761,6 +3823,7 @@ def sync_status_payload() -> tuple[int, dict[str, object]]:
                 "native_status": "deferred",
                 "error": error,
                 "native_warm": warm,
+                "native_worker": native_worker_status(),
                 "source_store": sources,
                 "embedding_profile": embedding_profile(),
             },
@@ -3781,6 +3844,7 @@ def sync_status_payload() -> tuple[int, dict[str, object]]:
             "status": out[-2000:],
             "error": err[-500:],
             "native_warm": warm_state(),
+            "native_worker": native_worker_status(),
             "source_store": sources,
             "embedding_profile": embedding_profile(),
         },

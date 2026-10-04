@@ -117,14 +117,24 @@ pub async fn open_wrapped(
     // Order matters: `with_store_params` replaces the params wholesale, so install the wrapper
     // first, then layer the storage options on top (`with_storage_options` merges into them).
     DatasetBuilder::from_uri(uri)
-        .with_store_params(ObjectStoreParams {
-            object_store_wrapper: Some(wrapper),
-            ..Default::default()
-        })
+        .with_store_params(wrapped_store_params(uri, wrapper))
         .with_storage_options(storage_options)
         .load()
         .await
         .context("opening the wrapped dataset")
+}
+
+fn wrapped_store_params(uri: &str, wrapper: Arc<dyn WrappingObjectStore>) -> ObjectStoreParams {
+    ObjectStoreParams {
+        object_store_wrapper: Some(wrapper),
+        // The logical shard decorator merges multiple physical buckets. Even though the Hub's
+        // own listing is ordered, resolving a logical listing materializes the entire inventory.
+        // Let Lance use its sharded version hint instead. ShardStore ignores obsolete flat hints;
+        // a missing hint falls back to authoritative listing. Writers loaded through these same
+        // params capture the fresh hint with the manifest.
+        list_is_lexically_ordered: uri.starts_with("hf://").then_some(false),
+        ..Default::default()
+    }
 }
 
 /// Project `columns` (empty = all columns; optionally filtered by a SQL predicate, optionally
@@ -2099,6 +2109,30 @@ mod tests {
         assert_eq!(by_session.len(), 2, "one entry per session");
         assert_eq!(by_session["sess"], [chunks[0].id.clone(), chunks[2].id.clone()]);
         assert_eq!(by_session["other"], [chunks[1].id.clone()]);
+    }
+
+    #[derive(Debug)]
+    struct NoopWrapper;
+
+    impl WrappingObjectStore for NoopWrapper {
+        fn wrap(
+            &self,
+            _prefix: &str,
+            original: Arc<dyn object_store::ObjectStore>,
+        ) -> Arc<dyn object_store::ObjectStore> {
+            original
+        }
+    }
+
+    #[test]
+    fn wrapped_hf_dataset_uses_hints_without_changing_local_store_defaults() {
+        let wrapper: Arc<dyn WrappingObjectStore> = Arc::new(NoopWrapper);
+        let remote = wrapped_store_params("hf://datasets/owner/memory/chunks.lance", wrapper.clone());
+        assert_eq!(remote.list_is_lexically_ordered, Some(false));
+        assert!(remote.object_store_wrapper.is_some());
+        let local = wrapped_store_params("/tmp/memory/chunks.lance", wrapper);
+        assert_eq!(local.list_is_lexically_ordered, None);
+        assert!(local.object_store_wrapper.is_some());
     }
 
     fn text_schema() -> Arc<Schema> {

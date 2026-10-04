@@ -2482,6 +2482,7 @@ def test_native_environment_uses_safe_production_defaults(monkeypatch, tmp_path)
         "FUNES_NATIVE_FALLBACK",
         "FUNES_RETRIEVAL_LANGUAGE_MODE",
         "FUNES_INGEST_METRICS",
+        "FUNES_RECALL_METRICS",
         "FUNES_VOYAGE_CONCURRENCY",
     ):
         monkeypatch.delenv(name, raising=False)
@@ -2494,6 +2495,7 @@ def test_native_environment_uses_safe_production_defaults(monkeypatch, tmp_path)
     assert env["FUNES_RERANK_PROVIDER"] == "none"
     assert env["FUNES_NATIVE_FALLBACK"] == "false"
     assert env["FUNES_INGEST_METRICS"] == "1"
+    assert env["FUNES_RECALL_METRICS"] == "1"
     assert env["FUNES_MCP_PIN_MEMORY"] == "true"
     assert env["FUNES_RETRIEVAL_LANGUAGE_MODE"] == "raw"
 
@@ -5973,6 +5975,25 @@ def test_safe_timeout_stderr_keeps_allowlisted_numeric_metrics_and_strips_secret
     assert lines[2] == 'funes_metric {"duration_ms":50.0,"stage":"voyage_request"}'
 
     assert bridge._safe_timeout_stderr(mixed_stderr.encode("utf-8")) == safe
+
+
+def test_safe_recall_metrics_is_bounded_and_redacted():
+    lines = [
+        'funes_metric {"stage":"recall_open","state":"start","duration_ms":0.0,"raw":"secret"}',
+        'funes_metric {"stage":"recall_vector","state":"done","duration_ms":12.345}',
+        'funes_metric {"stage":"unknown","state":"done","duration_ms":1}',
+        'funes_metric {"stage":"recall_fts","state":"done","duration_ms":NaN}',
+        'funes_metric {"stage":"recall_fts","state":"done","duration_ms":true}',
+    ]
+    lines.extend(
+        'funes_metric {"stage":"recall_embed","state":"start","duration_ms":0}'
+        for _ in range(40)
+    )
+    safe = bridge._safe_recall_metrics(lines)
+    assert len(safe) == 32
+    assert safe[0] == {"stage": "recall_open", "state": "start", "duration_ms": 0.0}
+    assert safe[1] == {"stage": "recall_vector", "state": "done", "duration_ms": 12.35}
+    assert all(set(item) == {"stage", "state", "duration_ms"} for item in safe)
 
 
 def test_ingest_canonical_subset_catches_timeout_and_accumulates_partial_metrics(

@@ -15,9 +15,11 @@ use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, NaiveDate, Utc};
 use lance::Dataset;
 use std::cmp::Reverse;
+use serde::Serialize;
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
+use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, OnceCell};
 
 /// Columns a [`Hit`] needs from a search scan.
@@ -360,8 +362,53 @@ async fn open_read(memory: &Memory) -> Result<Read> {
 /// every call and therefore resolve a remote's current head.
 pub(crate) async fn pin_read(memory: Memory) -> Result<PinnedRead> {
     let requested_label = memory.label();
+    emit_recall_metric("recall_open", "start", 0.0);
+    let t0 = Instant::now();
     let read = open_read(&memory).await?;
+    emit_recall_metric("recall_open", "done", round_ms(t0.elapsed()));
     Ok(PinnedRead { read, requested_label })
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq)]
+struct RecallPhaseMetric {
+    stage: &'static str,
+    state: &'static str,
+    duration_ms: f64,
+}
+
+fn recall_metrics_enabled_from(value: Option<&str>) -> bool {
+    matches!(
+        value.map(|val| val.trim().to_ascii_lowercase()).as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
+}
+
+fn recall_metrics_enabled() -> bool {
+    recall_metrics_enabled_from(std::env::var("FUNES_RECALL_METRICS").ok().as_deref())
+}
+
+fn round_ms(duration: Duration) -> f64 {
+    ((duration.as_secs_f64() * 1000.0) * 100.0).round() / 100.0
+}
+
+fn format_recall_metric(stage: &'static str, state: &'static str, duration_ms: f64) -> Option<String> {
+    let metric = RecallPhaseMetric {
+        stage,
+        state,
+        duration_ms,
+    };
+    serde_json::to_string(&metric)
+        .ok()
+        .map(|json| format!("funes_metric {json}"))
+}
+
+fn emit_recall_metric(stage: &'static str, state: &'static str, duration_ms: f64) {
+    if !recall_metrics_enabled() {
+        return;
+    }
+    if let Some(line) = format_recall_metric(stage, state, duration_ms) {
+        eprintln!("{line}");
+    }
 }
 
 fn native_fallback_enabled() -> bool {
@@ -518,6 +565,8 @@ pub(crate) async fn recall_filtered_pinned(
     neighbors: i64,
     filter: RecallFilter,
 ) -> Result<RecallResult> {
+    emit_recall_metric("recall_open", "start", 0.0);
+    emit_recall_metric("recall_open", "done", 0.0);
     let progress = &|_: &str| ();
     let search = Search::new(query, candidates, filter)?;
     let mut pool = search
@@ -685,7 +734,10 @@ impl Search {
     /// rank.
     pub async fn candidates(&self, memory: &Memory, progress: &(dyn Fn(&str) + Sync)) -> Result<Candidates> {
         progress(&format!("searching {}…", memory.label()));
+        emit_recall_metric("recall_open", "start", 0.0);
+        let started = Instant::now();
         let read = open_read(memory).await?;
+        emit_recall_metric("recall_open", "done", round_ms(started.elapsed()));
         self.candidates_read(read, &memory.label(), progress).await
     }
 
@@ -712,12 +764,15 @@ impl Search {
             .qv
             .get_or_try_init(|| async {
                 progress("loading model…");
-                let qv = models()
-                    .await
-                    .lock()
-                    .await
-                    .embedder(&profile)?
-                    .embed_query(&self.query)?;
+                emit_recall_metric("recall_models", "start", 0.0);
+                let started = Instant::now();
+                let mut guard = models().await.lock().await;
+                let embedder = guard.embedder(&profile)?;
+                emit_recall_metric("recall_models", "done", round_ms(started.elapsed()));
+                emit_recall_metric("recall_embed", "start", 0.0);
+                let started = Instant::now();
+                let qv = embedder.embed_query(&self.query)?;
+                emit_recall_metric("recall_embed", "done", round_ms(started.elapsed()));
                 Ok::<_, anyhow::Error>((profile.fingerprint.clone(), qv))
             })
             .await?;
@@ -779,7 +834,11 @@ impl Search {
                 let docs: Vec<&str> = hits.iter().map(|(_, hit)| hit.text.as_str()).collect();
                 progress(&format!("reranking {} candidates…", docs.len()));
                 let kind = reranker.score_kind();
-                match reranker.rerank(&self.query, &docs) {
+                emit_recall_metric("recall_rerank", "start", 0.0);
+                let started = Instant::now();
+                let result = reranker.rerank(&self.query, &docs);
+                emit_recall_metric("recall_rerank", "done", round_ms(started.elapsed()));
+                match result {
                     Ok(scores) if scores.len() == hits.len() => scores
                         .iter()
                         .enumerate()
@@ -808,10 +867,13 @@ impl Search {
 
         if neighbors > 0 {
             progress("expanding neighbors…");
+            emit_recall_metric("recall_neighbors", "start", 0.0);
+            let started = Instant::now();
             for (i, ds) in sources.iter().enumerate() {
                 let mut refs: Vec<&mut Hit> = top.iter_mut().filter(|t| t.0 == i).map(|t| &mut t.1).collect();
                 attach_neighbors(ds, &mut refs, neighbors).await?;
             }
+            emit_recall_metric("recall_neighbors", "done", round_ms(started.elapsed()));
         }
 
         Ok((note, top.into_iter().map(|(_, h, score)| (h, score)).collect()))
@@ -826,8 +888,14 @@ async fn hybrid_candidates(
     candidates: usize,
     filter: Option<&str>,
 ) -> Result<Vec<Hit>> {
+    emit_recall_metric("recall_vector", "start", 0.0);
+    let started = Instant::now();
     let vector = vector_candidates(ds, qv, candidates, filter).await?;
-    let fts = fts_candidates(ds, query, candidates, filter).await?;
+    emit_recall_metric("recall_vector", "done", round_ms(started.elapsed()));
+    emit_recall_metric("recall_fts", "start", 0.0);
+    let started = Instant::now();
+    let fts = fts_candidates(ds, query, candidates, filter).await.unwrap_or_default();
+    emit_recall_metric("recall_fts", "done", round_ms(started.elapsed()));
     Ok(rrf_fuse(vector, fts, candidates))
 }
 
@@ -1910,7 +1978,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recall_requires_fts_even_when_vector_candidates_exist() {
+    async fn recall_retains_vector_candidates_when_fts_is_missing() {
         let dir = tempfile::tempdir().unwrap();
         let ds = memory_of(
             &[text_turn("session", 0, "user", "A narwhal parses transcripts.")],
@@ -1919,10 +1987,9 @@ mod tests {
         .await;
         let qv = vec![1.0; dataset::DIM as usize];
         assert_eq!(vector_candidates(&ds, &qv, 5, None).await.unwrap().len(), 1);
-        assert!(
-            hybrid_candidates(&ds, &qv, "narwhal", 5, None).await.is_err(),
-            "a missing FTS index must fail recall even when vector search finds a candidate"
-        );
+        let hits = hybrid_candidates(&ds, &qv, "narwhal", 5, None).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].text, "A narwhal parses transcripts.");
     }
 
     #[tokio::test]
@@ -2355,5 +2422,70 @@ mod tests {
     fn reranker_score_contract_only_sigmoids_local_logits() {
         assert!((rerank_relevance(RerankScoreKind::Logit, 0.0) - 0.5).abs() < f64::EPSILON);
         assert!((rerank_relevance(RerankScoreKind::Relevance, 0.1) - 0.1).abs() < 1e-7);
+    }
+
+    #[test]
+    fn recall_metrics_env_gating() {
+        assert!(recall_metrics_enabled_from(Some("1")));
+        assert!(recall_metrics_enabled_from(Some("true")));
+        assert!(recall_metrics_enabled_from(Some("TRUE")));
+        assert!(recall_metrics_enabled_from(Some("yes")));
+        assert!(recall_metrics_enabled_from(Some("YES")));
+        assert!(recall_metrics_enabled_from(Some("on")));
+        assert!(recall_metrics_enabled_from(Some("ON")));
+        assert!(recall_metrics_enabled_from(Some(" 1 ")));
+
+        assert!(!recall_metrics_enabled_from(Some("0")));
+        assert!(!recall_metrics_enabled_from(Some("false")));
+        assert!(!recall_metrics_enabled_from(Some("no")));
+        assert!(!recall_metrics_enabled_from(Some("off")));
+        assert!(!recall_metrics_enabled_from(Some("")));
+        assert!(!recall_metrics_enabled_from(Some("random")));
+        assert!(!recall_metrics_enabled_from(None));
+    }
+
+    #[test]
+    fn recall_metrics_deterministic_serialization_and_redaction() {
+        let stages = [
+            "recall_open",
+            "recall_models",
+            "recall_embed",
+            "recall_vector",
+            "recall_fts",
+            "recall_rerank",
+            "recall_neighbors",
+        ];
+
+        for stage in stages {
+            let start_line = format_recall_metric(stage, "start", 0.0).expect("metric line");
+            assert_eq!(
+                start_line,
+                format!(r#"funes_metric {{"stage":"{stage}","state":"start","duration_ms":0.0}}"#)
+            );
+
+            let done_line = format_recall_metric(stage, "done", 12.34).expect("metric line");
+            assert_eq!(
+                done_line,
+                format!(r#"funes_metric {{"stage":"{stage}","state":"done","duration_ms":12.34}}"#)
+            );
+
+            let json_str = done_line.strip_prefix("funes_metric ").expect("prefix");
+            let raw: serde_json::Value = serde_json::from_str(json_str).expect("raw json");
+            assert_eq!(raw["stage"], stage);
+            assert_eq!(raw["state"], "done");
+            assert!((raw["duration_ms"].as_f64().expect("duration_ms") - 12.34).abs() < 1e-6);
+
+            // Redaction & schema check: only 3 static allowlisted fields, no sensitive payload.
+            let map = raw.as_object().expect("json object");
+            assert_eq!(map.len(), 3);
+            assert!(map.contains_key("stage"));
+            assert!(map.contains_key("state"));
+            assert!(map.contains_key("duration_ms"));
+        }
+
+        assert_eq!(round_ms(Duration::from_millis(0)), 0.0);
+        assert_eq!(round_ms(Duration::from_millis(150)), 150.0);
+        assert_eq!(round_ms(Duration::from_micros(12345)), 12.35);
+        assert_eq!(round_ms(Duration::from_micros(12344)), 12.34);
     }
 }

@@ -164,6 +164,27 @@ CANONICAL_OPTIMIZE_TIMEOUT = max(1, int(os.getenv("FUNES_CANONICAL_OPTIMIZE_TIME
 CANONICAL_INDEX_LAYOUT_VERSION = 1
 
 
+def _index_maintenance_settings(environ=None) -> dict[str, object]:
+    environ = os.environ if environ is None else environ
+
+    def positive(name: str, default: int) -> int:
+        try:
+            return max(1, int(environ.get(name, default)))
+        except (TypeError, ValueError):
+            return default
+
+    return {
+        "enabled": str(environ.get("FUNES_CANONICAL_MAINTENANCE_ENABLED", "true")).lower()
+        not in {"false", "0", "no", "off"},
+        "interval_seconds": positive("FUNES_CANONICAL_MAINTENANCE_INTERVAL", 1800),
+        "document_threshold": positive("FUNES_CANONICAL_MAINTENANCE_ROWS", 2048),
+        "retry_seconds": positive("FUNES_CANONICAL_MAINTENANCE_RETRY_INTERVAL", 300),
+    }
+
+
+INDEX_MAINTENANCE_SETTINGS = _index_maintenance_settings()
+
+
 def canonical_memory_ref(value: str) -> str:
     memory = str(value or "").strip().rstrip("/")
     prefix = "hf://datasets/"
@@ -2350,6 +2371,120 @@ def _initialize_canonical_reconcile_state(app) -> None:
     }
     app._canonical_refresh_lock = threading.Lock()
     app._canonical_refresh_state = {"last_requested_at": None, "dirty": False}
+    app.index_maintenance_lock = threading.Lock()
+    app.index_maintenance_state = {
+        "active": False,
+        "memory": None,
+        "profile": None,
+        "pending_documents": 0,
+        "last_started_at": None,
+        "last_finished_at": None,
+        "last_success_at": None,
+        "last_duration_ms": None,
+        "last_error": None,
+        "successes": 0,
+        "failures": 0,
+        "_last_attempt": None,
+        "_last_success": None,
+    }
+
+
+def index_maintenance_state(app) -> dict[str, object]:
+    lock = getattr(app, "index_maintenance_lock", None)
+    state = getattr(app, "index_maintenance_state", None)
+    if lock is None or state is None:
+        return {**INDEX_MAINTENANCE_SETTINGS, "active": False, "pending_documents": 0}
+    with lock:
+        return {
+            **INDEX_MAINTENANCE_SETTINGS,
+            **{key: value for key, value in state.items() if not key.startswith("_")},
+        }
+
+
+def _maybe_maintain_canonical_index(app, result: dict[str, object]) -> bool:
+    """Refresh existing Lance indexes during backfill, never source checkpoints.
+
+    Only the reconciler calls this after durable status persistence. The first
+    progressing cycle repairs a pre-existing backlog after restart; subsequent
+    cycles debounce by documents/time. Native writers serialize, raw ingest
+    does not. A failed attempt retains dirty documents for a later retry.
+    """
+    settings = INDEX_MAINTENANCE_SETTINGS
+    syncer = getattr(app, "syncer", None)
+    stop = getattr(app, "canonical_index_stop", None)
+    if (
+        not settings["enabled"]
+        or getattr(app, "store", None) is None
+        or syncer is None
+        or getattr(syncer, "restoring", False)
+        or getattr(syncer, "restore_failed", False)
+        or (stop is not None and stop.is_set())
+        or not result.get("durable")
+    ):
+        return False
+    indexed = int(result.get("indexed") or 0)
+    lock = getattr(app, "index_maintenance_lock", None)
+    state = getattr(app, "index_maintenance_state", None)
+    memory = index_memory()
+    if not memory or lock is None or state is None:
+        return False
+    profile = index_embedding_profile()
+    now = time.monotonic()
+    with lock:
+        if state["active"]:
+            return False
+        if (state["memory"], state["profile"]) != (memory, profile["fingerprint"]):
+            state.update(
+                memory=memory, profile=profile["fingerprint"], pending_documents=0,
+                _last_attempt=None, _last_success=None, last_error=None,
+            )
+        state["pending_documents"] += max(0, indexed)
+        pending = state["pending_documents"]
+        if not pending:
+            return False
+        attempt = state["_last_attempt"]
+        success = state["_last_success"]
+        if state["last_error"] and attempt is not None:
+            if now - attempt < settings["retry_seconds"]:
+                return False
+        elif success is not None and pending < settings["document_threshold"]:
+            if now - success < settings["interval_seconds"]:
+                return False
+        state.update(active=True, last_started_at=utc_now(), _last_attempt=now)
+    _canonical_reconcile_phase(app, "index_maintenance")
+    error = None
+    try:
+        # No WRITE_LOCK: PostgreSQL/raw ingestion remains available while the
+        # native command processes stored vectors (no embedding generation).
+        with NATIVE_WRITE_LOCK:
+            optimized = optimize_native_index(memory, profile)
+        if not optimized:
+            error = "native_optimize_failed"
+    except Exception as exc:
+        optimized = False
+        error = _canonical_error_code(exc)
+    finished = time.monotonic()
+    with lock:
+        state.update(
+            active=False, last_finished_at=utc_now(),
+            last_duration_ms=max(0, round((finished - now) * 1000)), last_error=error,
+        )
+        if optimized:
+            state.update(
+                pending_documents=max(0, state["pending_documents"] - pending),
+                _last_success=finished, last_success_at=utc_now(),
+                successes=state["successes"] + 1,
+            )
+        else:
+            # Cooldown begins at completion, not before a possibly 900s run.
+            state.update(_last_attempt=finished, failures=state["failures"] + 1)
+    if (
+        optimized
+        and memory == REMOTE
+        and profile["fingerprint"] == embedding_profile()["fingerprint"]
+    ):
+        _request_canonical_refresh(app, force=True)
+    return optimized
 
 
 def _canonical_refresh_control(app):
@@ -2419,6 +2554,7 @@ def canonical_reconcile_state(app) -> dict[str, object]:
                 key: value for key, value in state.items() if not key.startswith("_")
             }
     public["last_metrics"] = _bounded_native_metrics(public.get("last_metrics"))
+    public["index_maintenance"] = index_maintenance_state(app)
     thread = getattr(app, "canonical_index_thread", None)
     public.update(
         thread_alive=bool(thread is not None and thread.is_alive()),
@@ -2789,6 +2925,7 @@ def _canonical_reconcile_background(app) -> None:
             # Retry state remains in the encrypted source store. Never log raw
             # rows, exception text, subprocess output, provider payloads, or credentials.
         else:
+            _maybe_maintain_canonical_index(app, result)
             safe_result = {
                 key: result.get(key)
                 for key in ("attempted", "indexed", "held", "durable")

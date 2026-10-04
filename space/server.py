@@ -3139,7 +3139,10 @@ def native_worker_status() -> dict[str, object]:
     if configured and isinstance(worker, NativeMcpWorker):
         worker_metrics = list(worker._read_metrics)
     if worker_metrics:
-        failure["read_metrics"] = _safe_recall_metrics(worker_metrics)
+        # ``_read_metrics`` is already the bounded, redacted dict form emitted
+        # by ``_snapshot_read_metrics``.  Do not feed it back through the
+        # stderr-line parser: stringifying dicts would discard every metric.
+        failure["read_metrics"] = worker_metrics
     return {
         "configured": configured,
         "config_match": bool(config_match),

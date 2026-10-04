@@ -14,7 +14,7 @@ use arrow_schema::Schema;
 use chrono::DateTime;
 use futures::TryStreamExt;
 use lance::dataset::{Dataset, MergeInsertBuilder, WhenMatched, WhenNotMatched, WhenNotMatchedBySource, WriteParams};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::borrow::Cow;
@@ -23,6 +23,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 const MAX_COMMIT_RETRIES: u32 = 10;
 const HELD_SOURCE_ID_DOMAIN: &[u8] = b"funes-held-source-v1\0";
@@ -34,6 +35,40 @@ const STORED_REVISION_COLUMNS: [&str; 5] = [
     "content_hash",
     "metadata_json",
 ];
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct IngestPhaseMetric {
+    stage: &'static str,
+    duration_ms: f64,
+}
+
+fn ingest_metrics_enabled_from(value: Option<&str>) -> bool {
+    matches!(
+        value.map(|val| val.trim().to_ascii_lowercase()).as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
+}
+
+fn ingest_metrics_enabled() -> bool {
+    ingest_metrics_enabled_from(std::env::var("FUNES_INGEST_METRICS").ok().as_deref())
+}
+
+fn round_ms(duration: Duration) -> f64 {
+    ((duration.as_secs_f64() * 1000.0) * 100.0).round() / 100.0
+}
+
+fn emit_phase_metric(stage: &'static str, duration: Duration) {
+    if !ingest_metrics_enabled() {
+        return;
+    }
+    let metric = IngestPhaseMetric {
+        stage,
+        duration_ms: round_ms(duration),
+    };
+    if let Ok(json) = serde_json::to_string(&metric) {
+        eprintln!("funes_metric {json}");
+    }
+}
 
 #[derive(Clone, Debug, Deserialize)]
 struct InputDocument {
@@ -115,6 +150,7 @@ struct Selection<'a> {
     changed: Vec<&'a Document>,
     unchanged: usize,
     stale: usize,
+    stale_source_ids: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -132,6 +168,7 @@ struct Report {
     unchanged: usize,
     stale: usize,
     held_source_ids: Vec<String>,
+    stale_source_ids: Vec<String>,
     commit: Option<String>,
 }
 
@@ -166,15 +203,23 @@ impl Report {
                 serde_json::to_string(&self.held_source_ids).expect("serializing source-id digests cannot fail");
             format!(" held_source_ids={encoded}")
         };
+        let stale_source_ids = if self.stale_source_ids.is_empty() {
+            String::new()
+        } else {
+            let encoded =
+                serde_json::to_string(&self.stale_source_ids).expect("serializing stale source-id digests cannot fail");
+            format!(" stale_source_ids={encoded}")
+        };
         format!(
-            "ingested sources={} chunks={} unchanged={} stale={} held={}{}{}\n",
+            "ingested sources={} chunks={} unchanged={} stale={} held={}{}{}{}\n",
             self.sources,
             self.chunks,
             self.unchanged,
             self.stale,
             self.held_source_ids.len(),
             commit,
-            held_source_ids
+            held_source_ids,
+            stale_source_ids,
         )
     }
 }
@@ -183,7 +228,9 @@ impl Report {
 pub async fn run(input: &Path, memory: Memory) -> Result<String> {
     let docs = read_documents(input)?;
     let scanner = scan::Trufflehog::find()?;
+    let scan_start = Instant::now();
     let (docs, held_source_ids) = secret_gate(docs, &scanner)?;
+    emit_phase_metric("secret_scan", scan_start.elapsed());
     let profile = inference::embedding_profile()?;
     let mut embedder = inference::embedder_for(&profile)?;
     let report = match memory {
@@ -439,7 +486,10 @@ fn select_documents<'a>(docs: &'a [Document], stored: &HashMap<String, StoredRev
     for doc in docs {
         match stored.get(&doc.source_identity) {
             Some(current) if current.source_version == doc.source_version => selection.unchanged += 1,
-            Some(current) if revision_order(doc) <= stored_revision_order(current) => selection.stale += 1,
+            Some(current) if revision_order(doc) <= stored_revision_order(current) => {
+                selection.stale += 1;
+                selection.stale_source_ids.push(opaque_source_id(&doc.source_identity));
+            }
             _ => selection.changed.push(doc),
         }
     }
@@ -735,6 +785,7 @@ async fn ingest_local(
             unchanged: selection.unchanged,
             stale: selection.stale,
             held_source_ids: held_source_ids.to_vec(),
+            stale_source_ids: selection.stale_source_ids.clone(),
             ..Report::default()
         });
     }
@@ -775,6 +826,7 @@ async fn ingest_local(
         unchanged: selection.unchanged,
         stale: selection.stale,
         held_source_ids: held_source_ids.to_vec(),
+        stale_source_ids: selection.stale_source_ids.clone(),
         commit: None,
     })
 }
@@ -805,6 +857,7 @@ async fn ingest_remote(
     let mut conflicts = 0u32;
     let mut embedding_cache = HashMap::new();
     loop {
+        let open_start = Instant::now();
         let expected_parent = remote::head_oid(&repo, &rev).await?;
         let (current, first, schema_allows_append) = match memory.open_remote_revision(&expected_parent).await {
             Ok(ds) => {
@@ -820,27 +873,36 @@ async fn ingest_remote(
                 )))
             }
         };
+        emit_phase_metric("remote_open", open_start.elapsed());
+        let lookup_start = Instant::now();
         let stored = match &current {
             Some(ds) => stored_revisions(ds, docs).await?,
             None => HashMap::new(),
         };
         let selection = select_documents(docs, &stored);
+        emit_phase_metric("revision_lookup", lookup_start.elapsed());
         if selection.changed.is_empty() {
             return Ok(Report {
                 unchanged: selection.unchanged,
                 stale: selection.stale,
                 held_source_ids: held_source_ids.to_vec(),
+                stale_source_ids: selection.stale_source_ids.clone(),
                 ..Report::default()
             });
         }
+        let reuse_start = Instant::now();
         if let Some(ds) = &current {
             seed_stored_embeddings(ds, &selection.changed, profile, &mut embedding_cache).await?;
         }
+        emit_phase_metric("vector_reuse", reuse_start.elapsed());
+        let embedding_start = Instant::now();
         let (chunks, vectors) =
             cached_selection_embeddings(&selection.changed, profile, embedder, &mut embedding_cache)?;
+        emit_phase_metric("embedding", embedding_start.elapsed());
         let target_schema = schema_for(profile);
         let batch = build_batch_for_schema(&chunks, &vectors, target_schema.clone())?;
         let message = format!("funes ingest-docs: {} source revision(s)", selection.changed.len());
+        let commit_start = Instant::now();
         let result = if first {
             remote::first_document_publish(
                 &repo,
@@ -877,6 +939,7 @@ async fn ingest_remote(
             )
             .await?
         };
+        emit_phase_metric("lance_write_commit", commit_start.elapsed());
         match result {
             Replaced::Committed(oid) => {
                 return Ok(Report {
@@ -885,6 +948,7 @@ async fn ingest_remote(
                     unchanged: selection.unchanged,
                     stale: selection.stale,
                     held_source_ids: held_source_ids.to_vec(),
+                    stale_source_ids: selection.stale_source_ids.clone(),
                     commit: Some(oid),
                 })
             }
@@ -1646,5 +1710,30 @@ mod tests {
         assert_eq!(embedder.calls, 2);
         assert!(embedder.texts > previous_texts);
         assert_eq!(conflicts, 1);
+    }
+
+    #[test]
+    fn ingest_metrics_env_and_phase_schema_are_strict_and_leak_free() {
+        assert!(ingest_metrics_enabled_from(Some("1")));
+        assert!(ingest_metrics_enabled_from(Some("true")));
+        assert!(ingest_metrics_enabled_from(Some("yes")));
+        assert!(ingest_metrics_enabled_from(Some("on")));
+        assert!(ingest_metrics_enabled_from(Some(" TRUE ")));
+        assert!(!ingest_metrics_enabled_from(Some("0")));
+        assert!(!ingest_metrics_enabled_from(Some("false")));
+        assert!(!ingest_metrics_enabled_from(None));
+
+        let metric = IngestPhaseMetric {
+            stage: "secret_scan",
+            duration_ms: 12.34,
+        };
+        let serialized = serde_json::to_string(&metric).unwrap();
+        assert_eq!(serialized, r#"{"stage":"secret_scan","duration_ms":12.34}"#);
+
+        let value: Value = serde_json::from_str(&serialized).unwrap();
+        let obj = value.as_object().unwrap();
+        assert_eq!(obj.len(), 2);
+        assert_eq!(obj.get("stage").unwrap(), "secret_scan");
+        assert_eq!(obj.get("duration_ms").unwrap(), 12.34);
     }
 }

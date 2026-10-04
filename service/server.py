@@ -950,7 +950,7 @@ class Store:
                     )
                 )
                 row = self.conn.execute(
-                    """SELECT id, content_hash, source_version, updated_at, retrieval_text,
+                    """SELECT id, content_hash, source_version, updated_at, raw_text, retrieval_text,
                     metadata_json, source_metadata_clock_json,
                     device_id, project, repo, worktree, source_agent,
                     source_type, session_id, message_id, role, timestamp, source_path,
@@ -958,7 +958,7 @@ class Store:
                     translation_hash, translation_version, translation_status,
                     retrieval_updated_at, native_index_version, native_index_status,
                     native_index_profile, native_index_memory, native_indexed_at,
-                    native_index_error, source_missing,
+                    native_index_error, native_index_pending, source_missing,
                     retrieval_generation, native_generation, embedding_generation
                     FROM memories WHERE source_identity=?""",
                     (source_identity,),
@@ -1323,6 +1323,31 @@ class Store:
                     results.append({"id": row["id"], "status": "stale", "source_identity": source_identity})
                     continue
                 if row:
+                    if row["content_hash"] == content_hash:
+                        existing_native_valid = (
+                            row["native_index_status"] in NATIVE_TERMINAL_STATUSES
+                            and int(row["native_index_pending"] or 0) == 0
+                        )
+                        native_supplied = any(
+                            supplied(name)
+                            for name in (
+                                "native_index_version",
+                                "native_index_status",
+                                "native_index_profile",
+                                "native_index_memory",
+                                "native_indexed_at",
+                                "native_index_error",
+                            )
+                        )
+                        if existing_native_valid and not native_supplied:
+                            values["native_index_version"] = row["native_index_version"]
+                            values["native_index_status"] = row["native_index_status"]
+                            values["native_index_profile"] = row["native_index_profile"]
+                            values["native_index_memory"] = row["native_index_memory"]
+                            values["native_indexed_at"] = row["native_indexed_at"]
+                            values["native_index_error"] = row["native_index_error"]
+                            if not supplied("native_generation"):
+                                values["native_generation"] = int(row["native_generation"] or 0)
                     self.conn.execute(
                         """UPDATE memories SET source_version=?, raw_text=?, retrieval_text=?,
                         search_identifiers=?, metadata_json=?, source_metadata_clock_json=?,
@@ -1491,7 +1516,7 @@ class Store:
     def _row(self, row: sqlite3.Row) -> dict[str, Any]:
         out = dict(row)
         out.pop("search_identifiers", None)
-        out.pop("native_index_pending", None)
+        out["native_index_pending"] = int(out.get("native_index_pending") or 0)
         out[SOURCE_METADATA_CLOCK_KEY] = self._source_metadata_clocks(
             out.pop("source_metadata_clock_json", "{}"), out.get("updated_at")
         )
@@ -4105,6 +4130,8 @@ def prepare_ingest_documents(app: Any, docs: list[dict[str, Any]]) -> list[dict[
     # per-document lookup turns a historical backfill into O(batch * rows).
     generation = app.store.latest_reindex_generation()
     embedding_generation = app.store.latest_embedding_generation()
+    validated: list[tuple[dict[str, Any], dict[str, Any], str, str]] = []
+    identities_to_fetch: list[str] = []
     for doc in docs:
         if not isinstance(doc, dict):
             raise ValueError("each document must be an object")
@@ -4116,17 +4143,36 @@ def prepare_ingest_documents(app: Any, docs: list[dict[str, Any]]) -> list[dict[
         if not isinstance(metadata, dict):
             raise ValueError("metadata must be an object")
 
+        identity = str(item.get("source_identity") or app.store._identity(item, metadata, raw))
+        item["source_identity"] = identity
+        validated.append((item, metadata, raw, identity))
+        if identity:
+            identities_to_fetch.append(identity)
+
+    existing_by_identity: dict[str, dict[str, Any]] = {}
+    if identities_to_fetch:
+        unique_identities = list(dict.fromkeys(identities_to_fetch))
+        if callable(getattr(app.store, "get_many", None)):
+            existing_rows = app.store.get_many(unique_identities)
+            for row in existing_rows:
+                if isinstance(row, dict) and "source_identity" in row and row["source_identity"] is not None:
+                    existing_by_identity[str(row["source_identity"])] = row
+        elif callable(getattr(app.store, "get", None)):
+            for ident in unique_identities:
+                row = app.store.get(ident)
+                if row:
+                    existing_by_identity[ident] = row
+
+    for item, metadata, raw, identity in validated:
         def supplied(name: str) -> bool:
             return name in item or name in metadata
 
         def incoming(name: str) -> Any:
             return item[name] if name in item else metadata.get(name)
 
-        identity = str(item.get("source_identity") or app.store._identity(item, metadata, raw))
-        item["source_identity"] = identity
         source_version = str(item.get("source_version", metadata.get("source_version", "")))
         content_hash = hashlib.sha256(raw.encode("utf-8")).hexdigest()
-        existing = app.store.get(identity)
+        existing = existing_by_identity.get(identity)
         same_revision = bool(
             existing
             and existing.get("content_hash") == content_hash
@@ -4142,6 +4188,12 @@ def prepare_ingest_documents(app: Any, docs: list[dict[str, Any]]) -> list[dict[
             # checkpoint instead of stamping the latest global reindex epoch.
             prepared.append(item)
             continue
+        existing_native_valid = bool(
+            existing
+            and existing.get("content_hash") == content_hash
+            and existing.get("native_index_status") in NATIVE_TERMINAL_STATUSES
+            and int(existing.get("native_index_pending") or 0) == 0
+        )
         if same_revision:
             for name in (
                 "retrieval_generation",
@@ -4152,16 +4204,20 @@ def prepare_ingest_documents(app: Any, docs: list[dict[str, Any]]) -> list[dict[
                     item[name] = int(existing.get(name) or 0)
         else:
             item["retrieval_generation"] = generation
-            item["native_generation"] = generation
+            if existing_native_valid and not supplied("native_generation"):
+                item["native_generation"] = int(existing.get("native_generation") or 0)
+            else:
+                item["native_generation"] = generation
             item["embedding_generation"] = embedding_generation
-        same_final_revision = bool(
-            same_revision
+        same_content = bool(
+            existing
+            and existing.get("content_hash") == content_hash
             and existing.get("translation_status") in FINAL_TRANSLATION_STATUSES
         )
         supplied_retrieval = (
             incoming("retrieval_text") if supplied("retrieval_text") else None
         )
-        if same_final_revision and not supplied_retrieval:
+        if same_content and not supplied_retrieval:
             item["retrieval_text"] = existing.get("retrieval_text") or normalize_text(raw)
             for name in ("translation_hash", "translation_version", "translation_status"):
                 if not supplied(name) and existing.get(name) is not None:
@@ -4221,6 +4277,15 @@ def prepare_ingest_documents(app: Any, docs: list[dict[str, Any]]) -> list[dict[
             )
         prepared.append(item)
     return prepared
+
+
+def _sync_committed_documents(app: Any, canonical: list[dict[str, Any]]) -> dict[str, Any]:
+    syncer = getattr(app, "syncer", None)
+    if syncer is not None and getattr(syncer, "store", None) is getattr(app, "store", None):
+        ack_fn = getattr(syncer, "ack_committed", None) or getattr(syncer, "ack_persisted", None)
+        if callable(ack_fn):
+            return ack_fn(canonical)
+    return app.syncer.upload(canonical)
 
 
 def _persist_translation_documents(app: Any, documents: list[dict[str, Any]]) -> dict[str, Any]:
@@ -4287,7 +4352,7 @@ def _persist_translation_documents(app: Any, documents: list[dict[str, Any]]) ->
     canonical = app.store.get_many(changed)
     if not canonical:
         return {"attempted": len(active), "updated": 0, "durable": True}
-    sync = app.syncer.upload(canonical)
+    sync = _sync_committed_documents(app, canonical)
     if not sync.get("durable"):
         app.store.mark_translations_pending(canonical)
     return {
@@ -4322,19 +4387,26 @@ def persist_translation_documents(app: Any, documents: list[dict[str, Any]]) -> 
 def ingest_documents(app: Any, docs: list[dict[str, Any]]) -> dict[str, Any]:
     """Persist and upload raw-first rows without provider or native work."""
     prepared = prepare_ingest_documents(app, docs)
-    for item in prepared:
-        existing = app.store.get(str(item["source_identity"]))
-        if existing and existing.get("native_index_status") == "waiting_durability":
-            item["native_index_version"] = None
-            item["native_index_status"] = "retry"
-            item["native_index_profile"] = None
-            item["native_index_memory"] = None
-            item["native_indexed_at"] = None
-            item["native_index_error"] = None
+    if prepared:
+        identities = list(dict.fromkeys(str(item["source_identity"]) for item in prepared if item.get("source_identity") is not None))
+        existing_rows = {
+            str(row["source_identity"]): row
+            for row in app.store.get_many(identities)
+            if row and "source_identity" in row
+        }
+        for item in prepared:
+            existing = existing_rows.get(str(item["source_identity"])) if item.get("source_identity") is not None else None
+            if existing and existing.get("native_index_status") == "waiting_durability":
+                item["native_index_version"] = None
+                item["native_index_status"] = "retry"
+                item["native_index_profile"] = None
+                item["native_index_memory"] = None
+                item["native_indexed_at"] = None
+                item["native_index_error"] = None
     result = app.store.ingest(prepared)
     identities = [str(item["source_identity"]) for item in result["items"]]
     canonical = app.store.get_many(identities)
-    raw_sync = app.syncer.upload(canonical)
+    raw_sync = _sync_committed_documents(app, canonical)
     result.update(
         accepted=result["created"] + result["updated"] + result["deduped"],
         durable=bool(raw_sync.get("durable")),
@@ -4408,12 +4480,19 @@ def queue_reindex(app: Any, scope: str) -> dict[str, Any]:
 
 class App:
     def __init__(self, *, rebuild_fts: bool | None = None):
-        # Free Gradio Spaces do not expose /data.  The Hub snapshot remains the
-        # durable source of truth; operators can override this with a writable
-        # mounted volume when one is available.
-        self.store = Store(os.getenv("FUNES_DATA_DIR", "/tmp/funes-data"))
+        # PostgreSQL is an explicit source-store cutover. Never fall back to an
+        # empty SQLite store if the configured database is unavailable/unready.
+        data_dir = os.getenv("FUNES_DATA_DIR", "/tmp/funes-data")
+        if os.getenv("FUNES_POSTGRES_DSN"):
+            from service.postgres import PostgresStore
+            from service.postgres_sync import PostgresSync
+
+            self.store = PostgresStore(data_dir)
+            self.syncer = PostgresSync(self.store, rebuild_fts=rebuild_fts)
+        else:
+            self.store = Store(data_dir)
+            self.syncer = SnapshotSync(self.store, rebuild_fts=rebuild_fts)
         self.translator = Translator(self.store)
-        self.syncer = SnapshotSync(self.store, rebuild_fts=rebuild_fts)
         self.restore_result = 0
         self.restore_done = threading.Event()
         self.reconcile_stop = threading.Event()
@@ -4483,14 +4562,22 @@ class App:
     def _reindex_background(self) -> None:
         self.restore_done.wait()
         while not self.reindex_stop.is_set():
-            result = self.store.apply_pending_reindex_controls(
-                getattr(self, "reindex_batch_size", 500)
-            )
-            if result["applied"]:
-                self.reconcile_wake.set()
-            if result["scanned"] or result["applied"]:
-                continue
-            self.store.compact_reindex_controls()
+            # Restore failure is a closed gate, including the control worker.
+            # PG readiness probes can later reconnect without a Space restart.
+            if not self.syncer.restoring and not self.syncer.restore_failed:
+                try:
+                    result = self.store.apply_pending_reindex_controls(
+                        getattr(self, "reindex_batch_size", 500)
+                    )
+                    if result["applied"]:
+                        self.reconcile_wake.set()
+                    if result["scanned"] or result["applied"]:
+                        continue
+                    self.store.compact_reindex_controls()
+                except Exception:
+                    if getattr(self.syncer, "backend", None) != "postgres":
+                        raise
+                    self.syncer.check_ready()
             self.reindex_wake.wait(self.reconcile_interval)
             self.reindex_wake.clear()
 
@@ -4588,57 +4675,82 @@ def make_handler(app: App):
                 return self._json(200, {"status": "ok", "service": "funes"})
             if route == "/ready":
                 try:
-                    if app.syncer.restoring:
-                        progress = getattr(app.syncer, "progress", {})
-                        return self._json(
-                            503,
-                            {
-                                "status": "restoring",
-                                "phase": progress.get("phase", "restoring"),
-                                "current": progress.get("current"),
-                                "completed": progress.get("completed", 0),
-                                "total": progress.get("total", 0),
-                                "rows": progress.get("rows", 0),
-                                "bytes": progress.get("bytes", 0),
-                                "progress": progress,
-                            },
-                        )
-                    if app.syncer.restore_failed:
-                        return self._json(503, {"status": "not_ready", "error": "restore_failed"})
-                    count = app.store.count()
-                    return self._json(
-                        200,
-                        {
-                            "status": "ready",
-                            "documents": count,
-                            "restored": app.restore_result,
-                            "progress": getattr(app.syncer, "progress", {}),
-                        },
-                    )
+                    is_pg = getattr(app.syncer, "backend", None) == "postgres"
+                    if getattr(app.syncer, "restoring", False):
+                        prog = getattr(app.syncer, "_progress", None)
+                        if not isinstance(prog, dict):
+                            prog = getattr(app.syncer, "progress", {}) if not is_pg else {}
+                        if not isinstance(prog, dict):
+                            prog = {}
+                        return self._json(503, {
+                            "status": "restoring",
+                            "phase": prog.get("phase", "restoring"),
+                            "current": prog.get("current"),
+                            "completed": prog.get("completed", 0),
+                            "total": prog.get("total", 0),
+                            "rows": prog.get("rows", 0),
+                            "bytes": prog.get("bytes", 0),
+                            "progress": prog,
+                        })
+                    if is_pg:
+                        probe_fn = getattr(app.syncer, "probe_ready", None)
+                        ready_ok = bool(probe_fn()) if callable(probe_fn) else False
+                        if not ready_ok:
+                            return self._json(503, {"status": "not_ready", "error": "postgres_unavailable"})
+                    else:
+                        if getattr(app.syncer, "restore_failed", False):
+                            return self._json(503, {"status": "not_ready", "error": "restore_failed"})
+                        if not getattr(app.syncer, "restored", True):
+                            return self._json(503, {"status": "not_ready", "error": "not_restored"})
+
+                    count = None if is_pg else app.store.count()
+                    prog = getattr(app.syncer, "_progress", None)
+                    if not isinstance(prog, dict):
+                        prog = getattr(app.syncer, "progress", {}) if not is_pg else {}
+                    if not isinstance(prog, dict):
+                        prog = {}
+                    return self._json(200, {
+                        "status": "ready",
+                        "documents": count,
+                        "restored": getattr(app, "restore_result", None),
+                        "progress": prog,
+                    })
                 except Exception as exc:
+                    if getattr(app.syncer, "backend", None) == "postgres":
+                        return self._json(503, {"status": "not_ready", "error": "postgres_unavailable"})
                     return self._json(503, {"status": "not_ready", "error": type(exc).__name__})
             if route in PROTECTED and self._authorized():
-                if route == "/sources":
-                    return self._json(200, {"sources": app.store.sources()})
-                if route == "/sync/status":
-                    if app.syncer.restoring:
-                        return self._json(
-                            503,
-                            {
-                                "status": "restoring",
-                                "restore_progress": getattr(
-                                    app.syncer, "progress", {}
-                                ),
-                            },
-                        )
-                    status = app.store.sync_status()
-                    status["restore_progress"] = getattr(app.syncer, "progress", {})
-                    return self._json(200, status)
-                if route == "/get":
-                    params = parse_qs(urlparse(self.path).query)
-                    ident = params.get("source_identity", params.get("id", [""]))[0]
-                    item = app.store.get(ident)
-                    return self._json(200 if item else 404, self._public(item) if item else {"error": "not_found"})
+                try:
+                    if (
+                        getattr(app.syncer, "backend", None) == "postgres"
+                        and not app.syncer.probe_ready()
+                    ):
+                        return self._json(503, {"error": "postgres_unavailable", "durable": False})
+                    if route == "/sources":
+                        return self._json(200, {"sources": app.store.sources()})
+                    if route == "/sync/status":
+                        if app.syncer.restoring:
+                            return self._json(
+                                503,
+                                {
+                                    "status": "restoring",
+                                    "restore_progress": getattr(
+                                        app.syncer, "progress", {}
+                                    ),
+                                },
+                            )
+                        status = app.store.sync_status()
+                        status["restore_progress"] = getattr(app.syncer, "progress", {})
+                        return self._json(200, status)
+                    if route == "/get":
+                        params = parse_qs(urlparse(self.path).query)
+                        ident = params.get("source_identity", params.get("id", [""]))[0]
+                        item = app.store.get(ident)
+                        return self._json(200 if item else 404, self._public(item) if item else {"error": "not_found"})
+                except Exception:
+                    if getattr(app.syncer, "backend", None) == "postgres":
+                        return self._json(503, {"error": "postgres_unavailable", "durable": False})
+                    raise
             return self._json(404, {"error": "not_found"})
 
         def do_POST(self) -> None:
@@ -4648,6 +4760,15 @@ def make_handler(app: App):
                 return
             try:
                 body = self._body()
+                if (
+                    getattr(app.syncer, "backend", None) == "postgres"
+                    and not (
+                        app.syncer.probe_ready()
+                        if self.path in {"/sources/check", "/search", "/recall"}
+                        else app.syncer.check_ready()
+                    )
+                ):
+                    return self._json(503, {"error": "postgres_unavailable", "durable": False})
                 if self.path == "/sources/check":
                     if app.syncer.restoring or app.syncer.restore_failed:
                         error = "restore_in_progress" if app.syncer.restoring else "restore_failed"
@@ -4732,6 +4853,8 @@ def make_handler(app: App):
             except (ValueError, json.JSONDecodeError) as exc:
                 return self._json(400, {"error": str(exc)})
             except Exception as exc:
+                if getattr(app.syncer, "backend", None) == "postgres":
+                    return self._json(503, {"error": "postgres_unavailable", "durable": False})
                 return self._json(500, {"error": type(exc).__name__})
 
     return Handler

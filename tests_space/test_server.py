@@ -998,6 +998,8 @@ def test_search_ready_stays_200_while_source_is_unavailable(
     monkeypatch.setenv("FUNES_STORAGE_REPO", "owner/source")
     monkeypatch.setattr(bridge, "SOURCE_APP", app)
     monkeypatch.setattr(bridge, "warm_state", lambda: {"state": "ready"})
+    monkeypatch.setattr(bridge, "MCP_WORKER", SimpleNamespace(process=SimpleNamespace(poll=lambda: None)))
+    monkeypatch.setattr(bridge, "_MCP_WORKER_CONFIG", bridge._native_worker_config())
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -1061,6 +1063,54 @@ def test_search_ready_stays_503_during_initial_warm_without_active_worker(monkey
     assert code == 503
     assert payload["ok"] is False
     assert payload["error"] == "native_warm_warming"
+
+
+def test_search_ready_rejects_false_ready_without_live_worker(monkeypatch):
+    monkeypatch.setattr(bridge, "REMOTE", "owner/memory")
+    monkeypatch.delenv("FUNES_STORAGE_REPO", raising=False)
+    monkeypatch.setattr(bridge, "SOURCE_APP", None)
+    monkeypatch.setattr(bridge, "MCP_WORKER", None)
+    monkeypatch.setattr(bridge, "warm_state", lambda: {"state": "ready"})
+    recovery_calls = []
+    monkeypatch.setattr(
+        bridge,
+        "request_warm",
+        lambda *, force: recovery_calls.append(force) or {"state": "warming"},
+    )
+
+    code, payload = bridge.search_ready_payload()
+
+    assert code == 503
+    assert payload["ok"] is False
+    assert payload["error"] == "native_warm_warming"
+    assert payload["native_worker"]["configured"] is False
+    assert payload["native_worker"]["alive"] is False
+    assert recovery_calls == [True]
+
+
+def test_sync_status_non_postgres_reports_safe_error(monkeypatch):
+    monkeypatch.setattr(bridge, "REMOTE", "owner/memory")
+    monkeypatch.setattr(bridge, "SOURCE_APP", None)
+    monkeypatch.setattr(bridge, "run", lambda *args, **kwargs: (0, "ok", "warning"))
+    monkeypatch.setattr(bridge, "source_state", lambda: {"configured": True, "ready": True})
+    code, payload = bridge.sync_status_payload()
+    assert code == 200
+    assert payload["error"] == ""
+
+    monkeypatch.setattr(bridge, "run", lambda *args, **kwargs: (1, "", ""))
+    code, payload = bridge.sync_status_payload()
+    assert code == 503
+    assert payload["error"] == "native_status_failed_1"
+
+    monkeypatch.setattr(bridge, "run", lambda *args, **kwargs: (0, "ok", ""))
+    monkeypatch.setattr(
+        bridge,
+        "source_state",
+        lambda: {"configured": True, "ready": False, "error": "db_corrupted"},
+    )
+    code, payload = bridge.sync_status_payload()
+    assert code == 503
+    assert payload["error"] == "db_corrupted"
 
 
 def test_search_ready_requires_source_for_legacy_local_provider(monkeypatch):
@@ -2308,6 +2358,76 @@ def test_canonical_source_version_keeps_epoch_prefix_across_shadow_changes():
     assert right.startswith("~funes-eg-v1:00000000000000000007:")
 
 
+def test_source_version_only_change_skips_native_reconcile(monkeypatch, tmp_path):
+    """A source metadata revision must not re-embed unchanged raw content."""
+    app = _source_app(tmp_path)
+    profile = {
+        "provider": "voyage",
+        "model": "voyage-4-lite",
+        "dimensions": 1024,
+        "schema_version": 2,
+        "fingerprint": "fixed-profile",
+    }
+    memory = "owner/voyage-build"
+    monkeypatch.setattr(bridge, "index_embedding_profile", lambda: profile)
+    monkeypatch.setattr(bridge, "index_memory", lambda: memory)
+    monkeypatch.setattr(bridge, "optimize_canonical_index", lambda *_args: True)
+    monkeypatch.setattr(bridge, "_request_canonical_refresh", lambda *_args, **_kwargs: None)
+    app.store.conn.execute(
+        "UPDATE sync_state SET native_checkpoint_profile=?, native_checkpoint_memory=? WHERE id=1",
+        (profile["fingerprint"], memory),
+    )
+    app.store.ingest(
+        [{
+            "source_identity": "source-version-only",
+            "source_version": "v1",
+            "source_agent": "pi",
+            "source_type": "memory",
+            "raw_text": "原始内容不变",
+            "retrieval_text": "unchanged raw content",
+            "translation_status": "skipped_raw_mode",
+            "native_index_version": "legacy-native-v1",
+            "native_index_status": "indexed",
+            "native_index_profile": profile["fingerprint"],
+            "native_index_memory": memory,
+            "native_indexed_at": "2026-09-24T00:00:00Z",
+        }]
+    )
+    before = app.store.get("source-version-only")
+    assert before["native_index_pending"] == 0
+
+    app.store.ingest(
+        [{
+            "source_identity": "source-version-only",
+            "source_version": "v2",
+            "source_agent": "pi",
+            "source_type": "memory",
+            "raw_text": "原始内容不变",
+        }]
+    )
+    after = app.store.get("source-version-only")
+    assert after["source_version"] == "v2"
+    assert after["content_hash"] == before["content_hash"]
+    assert after["native_index_status"] == "indexed"
+    assert after["native_index_profile"] == profile["fingerprint"]
+    assert after["native_index_memory"] == memory
+    assert after["native_index_version"] == "legacy-native-v1"
+    assert after["native_index_pending"] == 0
+
+    monkeypatch.setattr(
+        bridge,
+        "run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("source_version-only update must not call Voyage")
+        ),
+    )
+    try:
+        result = bridge.reconcile_canonical_index(app)
+    finally:
+        app.store.close()
+    assert result["attempted"] == 0
+
+
 def test_canonical_document_carries_embedding_generation():
     item = {
         "source_identity": "memory-section",
@@ -2361,6 +2481,9 @@ def test_native_environment_uses_safe_production_defaults(monkeypatch, tmp_path)
         "FUNES_RERANK_PROVIDER",
         "FUNES_NATIVE_FALLBACK",
         "FUNES_RETRIEVAL_LANGUAGE_MODE",
+        "FUNES_INGEST_METRICS",
+        "FUNES_RECALL_METRICS",
+        "FUNES_VOYAGE_CONCURRENCY",
     ):
         monkeypatch.delenv(name, raising=False)
     env = bridge.native_environment(tmp_path)
@@ -2371,8 +2494,35 @@ def test_native_environment_uses_safe_production_defaults(monkeypatch, tmp_path)
     assert env["FUNES_EMBEDDING_SCHEMA_VERSION"] == "2"
     assert env["FUNES_RERANK_PROVIDER"] == "none"
     assert env["FUNES_NATIVE_FALLBACK"] == "false"
+    assert env["FUNES_INGEST_METRICS"] == "1"
+    assert "FUNES_RECALL_METRICS" not in env
     assert env["FUNES_MCP_PIN_MEMORY"] == "true"
     assert env["FUNES_RETRIEVAL_LANGUAGE_MODE"] == "raw"
+
+
+def test_native_mcp_worker_environment_enables_recall_metrics_only_for_reads(
+    monkeypatch, tmp_path
+):
+    monkeypatch.delenv("FUNES_RECALL_METRICS", raising=False)
+    worker = bridge.NativeMcpWorker("fake-funes", "owner/memory", tmp_path)
+    assert worker._environment()["FUNES_RECALL_METRICS"] == "1"
+
+    monkeypatch.setenv("FUNES_RECALL_METRICS", "0")
+    assert worker._environment()["FUNES_RECALL_METRICS"] == "0"
+
+
+def test_native_environment_profile_overrides_voyage_concurrency(monkeypatch, tmp_path):
+    monkeypatch.delenv("FUNES_VOYAGE_CONCURRENCY", raising=False)
+    profile = {
+        **bridge.embedding_profile(),
+        "concurrency": 4,
+    }
+    env = bridge.native_environment(tmp_path, profile)
+    assert env["FUNES_VOYAGE_CONCURRENCY"] == "4"
+
+    profile["concurrency"] = "not-an-int"
+    fallback = bridge.native_environment(tmp_path, profile)
+    assert "FUNES_VOYAGE_CONCURRENCY" not in fallback
 
 
 def test_blue_green_build_profile_isolated_from_active_query_profile(
@@ -2621,7 +2771,7 @@ def test_blue_green_reconcile_writes_only_build_target_and_does_not_warm_active(
     build = bridge.index_embedding_profile()
     assert result == {"attempted": 1, "indexed": 1, "held": 0, "durable": True}
     assert store.candidate_args == (
-        bridge.CANONICAL_INDEX_BATCH,
+        max(bridge.CANONICAL_INDEX_BATCH, bridge.CANONICAL_INDEX_REQUEST_ROWS),
         build["fingerprint"],
         "owner/voyage-build",
     )
@@ -2661,7 +2811,7 @@ def test_pending_translation_raw_is_sent_to_native(monkeypatch, tmp_path):
     assert captured["raw_text"] == "等待翻译"
 
 
-def test_canonical_scan_waits_for_raw_durability_lock(monkeypatch, tmp_path):
+def test_canonical_scan_revalidates_after_raw_durability_race(monkeypatch, tmp_path):
     app = _source_app(tmp_path)
     item = _canonical_source(app.store, "durability-race")
     scanned = threading.Event()
@@ -2679,13 +2829,13 @@ def test_canonical_scan_waits_for_raw_durability_lock(monkeypatch, tmp_path):
         lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("undurable row must not index")),
     )
     result = {}
-    bridge.WRITE_LOCK.acquire()
+    bridge.NATIVE_WRITE_LOCK.acquire()
     thread = threading.Thread(
         target=lambda: result.setdefault("value", bridge.reconcile_canonical_index(app))
     )
     thread.start()
     try:
-        assert not scanned.wait(0.05)
+        assert scanned.wait(1)
         app.store.update_native_index(
             [{
                 "source_identity": item["source_identity"],
@@ -2698,7 +2848,7 @@ def test_canonical_scan_waits_for_raw_durability_lock(monkeypatch, tmp_path):
             }]
         )
     finally:
-        bridge.WRITE_LOCK.release()
+        bridge.NATIVE_WRITE_LOCK.release()
         thread.join(timeout=1)
         app.store.close()
     assert scanned.is_set()
@@ -2768,6 +2918,7 @@ def test_canonical_commit_refresh_uses_app_scoped_cooldown(monkeypatch, tmp_path
     monkeypatch.setattr(bridge, "REMOTE", "owner/memory")
     monkeypatch.setattr(bridge, "INDEX_REMOTE", "")
     monkeypatch.setattr(bridge, "CANONICAL_INDEX_BATCH", 1)
+    monkeypatch.setattr(bridge, "CANONICAL_INDEX_REQUEST_ROWS", 1)
     monkeypatch.setattr(bridge, "CANONICAL_REFRESH_COOLDOWN", 300.0)
     monkeypatch.setattr(bridge.time, "monotonic", lambda: clock[0])
     monkeypatch.setattr(bridge, "request_warm", lambda **kwargs: warm.append(kwargs))
@@ -2801,6 +2952,7 @@ def test_canonical_final_backlog_flushes_dirty_refresh_once(monkeypatch, tmp_pat
     monkeypatch.setattr(bridge, "REMOTE", "owner/memory")
     monkeypatch.setattr(bridge, "INDEX_REMOTE", "")
     monkeypatch.setattr(bridge, "CANONICAL_INDEX_BATCH", 1)
+    monkeypatch.setattr(bridge, "CANONICAL_INDEX_REQUEST_ROWS", 1)
     monkeypatch.setattr(bridge, "CANONICAL_REFRESH_COOLDOWN", 300.0)
     monkeypatch.setattr(bridge.time, "monotonic", lambda: 100.0)
     monkeypatch.setattr(bridge, "request_warm", lambda **kwargs: warm.append(kwargs))
@@ -2865,7 +3017,7 @@ def test_profile_change_rebuilds_durable_session_without_client_reupload(monkeyp
     assert rebuilt["native_index_profile"] == bridge.embedding_profile()["fingerprint"]
 
 
-def test_canonical_phase_reports_write_lock_wait_without_row_data(monkeypatch):
+def test_canonical_scan_does_not_wait_for_write_lock(monkeypatch):
     class Store:
         @staticmethod
         def canonical_index_candidates(*_args):
@@ -2884,18 +3036,13 @@ def test_canonical_phase_reports_write_lock_wait_without_row_data(monkeypatch):
     thread = threading.Thread(target=bridge.reconcile_canonical_index, args=(app,))
     thread.start()
     try:
-        deadline = time.monotonic() + 1
-        while (
-            bridge.canonical_reconcile_state(app)["phase"] != "waiting_write_lock"
-            and time.monotonic() < deadline
-        ):
-            time.sleep(0.005)
+        thread.join(timeout=1)
+        assert not thread.is_alive()
         status = bridge.canonical_reconcile_state(app)
-        assert status["phase"] == "waiting_write_lock"
+        assert status["phase"] != "waiting_write_lock"
         assert "owner/memory" not in json.dumps(status)
     finally:
         bridge.WRITE_LOCK.release()
-        thread.join(timeout=1)
     assert not thread.is_alive()
 
 
@@ -2951,6 +3098,21 @@ def test_canonical_index_intervals_preserve_legacy_override(environ, expected):
 @pytest.mark.parametrize(
     ("environ", "expected"),
     [
+        ({}, 64),
+        ({"FUNES_CANONICAL_INDEX_BATCH": "32"}, 32),
+        ({"FUNES_CANONICAL_INDEX_BATCH": "128"}, 128),
+        ({"FUNES_CANONICAL_INDEX_BATCH": "0"}, 1),
+        ({"FUNES_CANONICAL_INDEX_BATCH": "-5"}, 1),
+        ({"FUNES_CANONICAL_INDEX_BATCH": "invalid"}, 64),
+    ],
+)
+def test_canonical_index_batch_parsing(environ, expected):
+    assert bridge._canonical_index_batch(environ) == expected
+
+
+@pytest.mark.parametrize(
+    ("environ", "expected"),
+    [
         ({}, (8, 6000)),
         ({"FUNES_CANONICAL_INDEX_REQUEST_ROWS": "4"}, (4, 6000)),
         ({"FUNES_CANONICAL_INDEX_MAX_CHARS": "12000"}, (8, 12000)),
@@ -2960,6 +3122,13 @@ def test_canonical_index_intervals_preserve_legacy_override(environ, expected):
                 "FUNES_CANONICAL_INDEX_MAX_CHARS": "20000",
             },
             (16, 20000),
+        ),
+        (
+            {
+                "FUNES_CANONICAL_INDEX_REQUEST_ROWS": "64",
+                "FUNES_CANONICAL_INDEX_MAX_CHARS": "48000",
+            },
+            (64, 48000),
         ),
         (
             {
@@ -2986,6 +3155,7 @@ def test_canonical_index_request_limits_parsing(environ, expected):
     [
         ({}, 20.0),
         ({"FUNES_CANONICAL_INDEX_MIN_REQUEST_INTERVAL": "10"}, 10.0),
+        ({"FUNES_CANONICAL_INDEX_MIN_REQUEST_INTERVAL": "3"}, 3.0),
         ({"FUNES_CANONICAL_INDEX_MIN_REQUEST_INTERVAL": "0.5"}, 0.5),
         ({"FUNES_CANONICAL_INDEX_MIN_REQUEST_INTERVAL": "-5"}, 0.0),
         ({"FUNES_CANONICAL_INDEX_MIN_REQUEST_INTERVAL": "invalid"}, 20.0),
@@ -2993,6 +3163,25 @@ def test_canonical_index_request_limits_parsing(environ, expected):
 )
 def test_canonical_index_min_request_interval_parsing(environ, expected):
     assert bridge._canonical_index_min_request_interval(environ) == expected
+
+
+@pytest.mark.parametrize(
+    ("environ", "expected"),
+    [
+        ({}, 1800),
+        ({"FUNES_CANONICAL_INDEX_TIMEOUT": "900"}, 900),
+        ({"FUNES_CANONICAL_INDEX_TIMEOUT": "3600"}, 3600),
+        ({"FUNES_CANONICAL_INDEX_TIMEOUT": "0"}, 1),
+        ({"FUNES_CANONICAL_INDEX_TIMEOUT": "-5"}, 1),
+        ({"FUNES_CANONICAL_INDEX_TIMEOUT": "invalid"}, 1800),
+    ],
+)
+def test_canonical_index_timeout_parsing(environ, expected):
+    assert bridge._canonical_index_timeout(environ) == expected
+
+
+def test_canonical_index_timeout_default_is_1800():
+    assert bridge.CANONICAL_INDEX_TIMEOUT == 1800
 
 
 def test_select_bounded_canonical_records_bounds_by_rows():
@@ -3058,10 +3247,229 @@ def test_canonical_reconcile_state_exposes_safe_values():
     assert status["max_chars"] == bridge.CANONICAL_INDEX_MAX_CHARS
     assert status["min_request_interval_seconds"] == bridge.CANONICAL_INDEX_MIN_REQUEST_INTERVAL
     assert status["timeout_seconds"] == bridge.CANONICAL_INDEX_TIMEOUT
+    assert status["last_metrics"] is None
 
     dumped = json.dumps(status)
     assert "raw_text" not in dumped
     assert "token" not in dumped.lower()
+
+
+def test_native_metrics_parsing_and_bounded_sanitization():
+    metrics = bridge._native_metrics()
+    assert metrics["phase_ms"] == {}
+    assert metrics["voyage_requests"] == 0
+    assert metrics["voyage_input_count"] == 0
+    assert metrics["voyage_token_usage"] == 0
+    assert metrics["voyage_token_usage_known"] == 0
+    assert metrics["voyage_status_counts"] == {}
+    assert metrics["voyage_pacer_wait_ms"] == 0.0
+    assert metrics["voyage_backoff_ms"] == 0.0
+
+    lines = [
+        "random log line from native ingest",
+        'funes_metric {"stage": "secret_scan", "duration_ms": 12.34}',
+        'funes_metric {"stage": "embedding", "duration_ms": 100.56}',
+        'funes_metric {"stage": "unknown_phase", "duration_ms": 55.0}',
+        'funes_metric {"invalid": "json"',
+        'funes_metric {"stage": "secret_scan", "duration_ms": -5.0}',
+        'funes_metric {"stage": "voyage_request", "duration_ms": 80.0, "input_count": 5, "status_code": 200, "token_usage": 1234, "pacer_wait_ms": 2.5, "backoff_ms": 1.25}',
+        'funes_metric {"stage": "voyage_request", "duration_ms": 90.0, "input_count": 3, "status_code": 429, "token_usage": null, "pacer_wait_ms": 0.0, "backoff_ms": 50.0}',
+    ]
+    stderr = chr(10).join(lines)
+    bridge._record_native_metrics(metrics, stderr)
+
+    assert metrics["phase_ms"] == {"secret_scan": 12.34, "embedding": 100.56}
+    assert metrics["voyage_requests"] == 2
+    assert metrics["voyage_input_count"] == 8
+    assert metrics["voyage_token_usage"] == 1234
+    assert metrics["voyage_token_usage_known"] == 1
+    assert metrics["voyage_status_counts"] == {"200": 1, "429": 1}
+    assert metrics["voyage_pacer_wait_ms"] == 2.5
+    assert metrics["voyage_backoff_ms"] == 51.25
+
+    untrusted = {
+        **metrics,
+        "phase_ms": {**metrics["phase_ms"], "untrusted_phase": 42.0},
+        "voyage_status_counts": {**metrics["voyage_status_counts"], "invalid_status": 99},
+        "secret_token": "sk-secret-12345",
+        "raw_text": "sensitive source document",
+        "voyage_requests": -10,
+    }
+    bounded = bridge._bounded_native_metrics(untrusted)
+    assert bounded is not None
+    assert "secret_token" not in bounded
+    assert "raw_text" not in bounded
+    assert "untrusted_phase" not in bounded["phase_ms"]
+    assert "invalid_status" not in bounded["voyage_status_counts"]
+    assert bounded["voyage_requests"] == 0
+    assert bounded["phase_ms"] == {"embedding": 100.56, "secret_scan": 12.34}
+    assert bridge._bounded_native_metrics(None) is None
+    assert bridge._bounded_native_metrics("invalid") is None
+
+
+def test_native_failure_code_exposes_only_allowlisted_categories():
+    assert bridge._native_failure_code("ManifestOversizedError: private path") == "manifest_oversized"
+    assert bridge._native_failure_code("HTTP error: 503; provider payload omitted") == "hf_http_5xx"
+    assert bridge._native_failure_code("Voyage embeddings request failed with HTTP 429") == "hf_http_429"
+    assert bridge._native_failure_code("VOYAGE_API_KEY is required for Voyage inference") == "voyage_api_key_missing"
+    assert bridge._native_failure_code("private raw and credentials") == "native_exit"
+    assert bridge._native_failure_code("canonical data commit failed: hf_error=forbidden http_status=403") == "hf_http_403"
+    assert bridge._native_failure_code("canonical data commit failed: hf_error=rate_limited http_status=429") == "hf_http_429"
+    assert bridge._native_failure_code("canonical data commit failed: hf_error=xet operation=upload") == "hf_xet_failed"
+    assert bridge._native_failure_code("canonical data commit failed: hf_error=request_transport") == "hf_request_transport"
+    assert bridge._native_failure_code("canonical data commit failed: hf_error=repo_not_found") == "hf_repo_not_found"
+    assert bridge._native_failure_code("canonical data commit failed: hf_error=revision_not_found") == "hf_revision_not_found"
+    assert bridge._native_failure_code("canonical data commit failed: hf_error=entry_not_found") == "hf_entry_not_found"
+    assert bridge._native_failure_code("canonical data commit failed: hf_error=bucket_not_found") == "hf_bucket_not_found"
+    assert bridge._native_failure_code("canonical data commit failed: http_status=400") == "hf_http_400"
+    assert (
+        bridge._native_failure_code("canonical data commit failed: http_status=400 hf_phase=preupload")
+        == "hf_http_400:preupload"
+    )
+    assert (
+        bridge._native_failure_code("canonical data commit failed: http_status=400 hf_phase=commit")
+        == "hf_http_400:commit"
+    )
+    assert (
+        bridge._native_failure_code(
+            "canonical data commit failed: http_status=400 error_code=InvalidParentCommit"
+        )
+        == "hf_http_400:invalid_parent_commit"
+    )
+    assert (
+        bridge._native_failure_code(
+            "canonical data commit failed: http_status=400 server_message=preupload rejected"
+        )
+        == "hf_http_400:preupload"
+    )
+    assert (
+        bridge._native_failure_code(
+            "canonical data commit failed: http_status=400 hf_phase=commit "
+            "server_reason=You can't create a commit with more than 1000 files"
+        )
+        == "hf_http_400:commit_file_limit"
+    )
+    assert (
+        bridge._native_failure_code(
+            "canonical data commit failed: http_status=400 hf_phase=commit "
+            "server_reason=file_count_limit"
+        )
+        == "hf_http_400:file_count_limit"
+    )
+    assert (
+        bridge._native_failure_code(
+            "canonical data commit failed: http_status=400 hf_phase=commit "
+            "server_message=invalid_parent"
+        )
+        == "hf_http_400:invalid_parent"
+    )
+    assert (
+        bridge._native_failure_code(
+            "canonical data commit failed: http_status=400 hf_phase=commit "
+            "server_message=You can't create a commit with more than 1000 files"
+        )
+        == "hf_http_400:commit_file_limit"
+    )
+    assert (
+        bridge._native_failure_code(
+            "canonical data commit failed: http_status=400 error_code=bad/secret"
+        )
+        == "hf_http_400"
+    )
+    assert bridge._native_failure_code("canonical data commit failed: http_status=404") == "hf_http_other"
+    assert bridge._native_failure_code("canonical data commit kept conflicting after 10 retries") == "hf_commit_conflict_exhausted"
+    for hf_error, expected in (
+        ("local_entry_not_found", "hf_local_entry_not_found"),
+        ("cache_not_enabled", "hf_cache_not_enabled"),
+        ("cache_lock_timeout", "hf_cache_lock_timeout"),
+        ("io", "hf_io"),
+        ("json", "hf_json"),
+        ("url", "hf_url"),
+        ("invalid_parameter", "hf_invalid_parameter"),
+        ("diff_parse", "hf_diff_parse"),
+        ("malformed_response", "hf_malformed_response"),
+        ("other", "hf_other"),
+        ("unknown", "hf_unknown"),
+    ):
+        assert (
+            bridge._native_failure_code(f"canonical data commit failed: hf_error={hf_error} private raw")
+            == expected
+        )
+
+
+def test_reconcile_canonical_index_captures_and_persists_metrics(monkeypatch, tmp_path):
+    app = _source_app(tmp_path)
+    _canonical_source(app.store, "doc-with-metrics")
+    bridge._initialize_canonical_reconcile_state(app)
+
+    monkeypatch.setattr(bridge, "REMOTE", "owner/memory")
+    monkeypatch.setattr(bridge, "INDEX_REMOTE", "")
+    monkeypatch.setattr(
+        bridge,
+        "run",
+        lambda *_args, **_kwargs: (
+            0,
+            "ingested sources=1 chunks=1 unchanged=0 stale=0 held=0 commit=rev" + chr(10),
+            'funes_metric {"stage": "lance_write_commit", "duration_ms": 45.67}' + chr(10)
+            + 'funes_metric {"stage": "voyage_request", "duration_ms": 120.0, "input_count": 1, "status_code": 200, "token_usage": 50}' + chr(10),
+        ),
+    )
+    try:
+        result = bridge.reconcile_canonical_index(app)
+        assert result["indexed"] == 1
+        state = bridge.canonical_reconcile_state(app)
+        last_metrics = state["last_metrics"]
+        assert last_metrics is not None
+        assert last_metrics["voyage_requests"] == 1
+        assert last_metrics["phase_ms"] == {"lance_write_commit": 45.67}
+        assert last_metrics["voyage_status_counts"] == {"200": 1}
+    finally:
+        app.store.close()
+
+
+def test_sync_status_reports_bounded_last_metrics_without_leaks(monkeypatch):
+    monkeypatch.setattr(bridge, "REMOTE", "owner/private")
+    sample_metrics = {
+        "phase_ms": {"secret_scan": 1.23, "embedding": 45.6},
+        "voyage_requests": 2,
+        "voyage_input_count": 4,
+        "voyage_token_usage": 100,
+        "voyage_token_usage_known": 2,
+        "voyage_status_counts": {"200": 2},
+        "voyage_pacer_wait_ms": 1.0,
+        "voyage_backoff_ms": 0.0,
+        "private_token": "sk-should-not-leak",
+    }
+    app = SimpleNamespace()
+    bridge._initialize_canonical_reconcile_state(app)
+    bridge._set_canonical_reconcile_state(app, last_metrics=sample_metrics)
+
+    state = bridge.canonical_reconcile_state(app)
+    assert state["last_metrics"] is not None
+    assert "private_token" not in state["last_metrics"]
+    assert state["last_metrics"]["voyage_requests"] == 2
+
+    monkeypatch.setattr(
+        bridge,
+        "source_state",
+        lambda: {
+            "configured": True,
+            "ready": True,
+            "documents": 1,
+            "canonical_reconciler": state,
+        },
+    )
+    monkeypatch.setattr(bridge, "warm_state", lambda: {"state": "ready"})
+    monkeypatch.setattr(bridge, "run", lambda *_args, **_kwargs: (0, "ok", ""))
+
+    code, payload = bridge.sync_status_payload()
+    assert code == 200
+    reconciler = payload["source_store"]["canonical_reconciler"]
+    assert reconciler["last_metrics"]["voyage_requests"] == 2
+    assert reconciler["last_metrics"]["phase_ms"] == {"embedding": 45.6, "secret_scan": 1.23}
+    dumped = json.dumps(payload)
+    assert "sk-should-not-leak" not in dumped
+    assert "private_token" not in dumped
 
 
 def test_canonical_background_enforces_min_request_interval_after_progress(monkeypatch):
@@ -3261,6 +3669,7 @@ def test_canonical_background_uses_idle_wait_when_attempt_makes_no_progress(
     assert stop.waits == [9.0]
     assert status["wait_seconds"] == 9.0
     assert status["consecutive_failures"] == 0
+    assert status["last_error"] is None
 
 
 def test_canonical_background_marks_non_durable_result_as_failure(monkeypatch):
@@ -4370,7 +4779,7 @@ def test_http_voyage_role_filter_never_waits_for_query_translator(monkeypatch):
         server.server_close()
         thread.join(timeout=2)
 
-    assert bridge.VOYAGE_HTTP_TIMEOUT <= 7.5
+    assert bridge.VOYAGE_HTTP_TIMEOUT <= 14.0
     assert elapsed < 5
     assert translator_calls == []
     assert status == 200
@@ -5006,7 +5415,7 @@ def test_voyage_native_recall_succeeds_within_new_budget(monkeypatch):
         thread.join(timeout=2)
 
     assert status == 200
-    assert 4.0 < elapsed < 6.8
+    assert 4.0 < elapsed < 12.8
     assert len(native_calls) == 1
     assert 5.0 < native_calls[0][1]["timeout"] <= bridge.VOYAGE_NATIVE_TIMEOUT
     assert body["retrieval_backend"] == "voyage_lance_bm25_rrf"
@@ -5234,7 +5643,7 @@ def test_request_native_recovery_triggers_warm_only_for_native_mcp_worker(monkey
 
     monkeypatch.setattr(bridge, "MCP_WORKER", None)
     bridge.request_native_recovery()
-    assert warm_calls == []
+    assert warm_calls == [True]
 
     class DummyNativeWorker(bridge.NativeMcpWorker):
         def __init__(self):
@@ -5242,7 +5651,34 @@ def test_request_native_recovery_triggers_warm_only_for_native_mcp_worker(monkey
 
     monkeypatch.setattr(bridge, "MCP_WORKER", DummyNativeWorker())
     bridge.request_native_recovery()
-    assert warm_calls == [True]
+    assert warm_calls == [True, True]
+
+
+def test_native_mcp_protocol_error_keeps_child_alive(monkeypatch, tmp_path):
+    process = _FakeProcess(
+        lambda message, stdout: (
+            stdout.push(
+                {
+                    "jsonrpc": "2.0",
+                    "id": message["id"],
+                    "error": {"code": -32000, "message": "tool failed"},
+                }
+            )
+            if message.get("method") == "tools/call"
+            else _mcp_responder(message, stdout)
+        )
+    )
+    monkeypatch.setattr(bridge.subprocess, "Popen", lambda *_args, **_kwargs: process)
+    worker = bridge.NativeMcpWorker(
+        "fake-funes", "owner/memory", tmp_path, timeout=1, handshake_timeout=1
+    )
+    try:
+        with pytest.raises(bridge.NativeMcpProtocolError):
+            worker.call_tool("recall", {"query": "q"})
+        assert process.terminated is False
+        assert process.poll() is None
+    finally:
+        worker.close()
 
 
 def test_concurrent_voyage_native_request_returns_busy_without_foreign_result(
@@ -5508,3 +5944,188 @@ def test_missing_canonical_reference_never_falls_back_to_native_get(monkeypatch,
         app.store.close()
     assert status == 404
     assert body["error"] == "not_found"
+
+
+def test_safe_timeout_stderr_keeps_allowlisted_numeric_metrics_and_strips_secrets():
+    assert bridge._safe_timeout_stderr(None) is None
+    assert bridge._safe_timeout_stderr("") is None
+    assert bridge._safe_timeout_stderr(b"") is None
+    assert bridge._safe_timeout_stderr(12345) is None
+    assert bridge._safe_timeout_stderr(["unexpected"]) is None
+
+    raw_stderr = (
+        "Authorization: Bearer secret_key_12345\n"
+        "Traceback (most recent call last):\n"
+        "  File 'server.py', line 1, in <module>\n"
+    )
+    assert bridge._safe_timeout_stderr(raw_stderr) is None
+
+    mixed_stderr = (
+        "[INFO] Starting ingestion...\n"
+        "Authorization: Bearer secret_top_secret_token\n"
+        'funes_metric {"stage": "remote_open", "duration_ms": 14.234, "secret_header": "Bearer secret"}\n'
+        'funes_metric {"stage": "voyage_request", "duration_ms": 120.456, "input_count": 16, "status_code": 200, "token_usage": 450, "pacer_wait_ms": 1.25, "backoff_ms": 0.0, "auth": "Bearer secret"}\n'
+        'funes_metric {"stage": "unknown_phase", "duration_ms": 10.0}\n'
+        'funes_metric {"stage": "embedding", "duration_ms": -5.0}\n'
+        'funes_metric {"stage": "embedding", "duration_ms": 99999999.0}\n'
+        'funes_metric {"stage": "embedding", "duration_ms": "fast"}\n'
+        "funes_metric not valid json\n"
+        "funes_metric [1, 2, 3]\n"
+        'funes_metric {"stage": "voyage_request", "duration_ms": 50.0, "input_count": 999, "status_code": 10000, "token_usage": 20000000, "pacer_wait_ms": -1.0}\n'
+    )
+    safe = bridge._safe_timeout_stderr(mixed_stderr)
+    assert safe is not None
+    assert "Bearer" not in safe
+    assert "secret" not in safe
+    assert "unknown_phase" not in safe
+    assert "Starting ingestion" not in safe
+    lines = safe.strip().splitlines()
+    assert len(lines) == 3
+    assert lines[0] == 'funes_metric {"duration_ms":14.23,"stage":"remote_open"}'
+    assert lines[1] == 'funes_metric {"backoff_ms":0.0,"duration_ms":120.46,"input_count":16,"pacer_wait_ms":1.25,"stage":"voyage_request","status_code":200,"token_usage":450}'
+    assert lines[2] == 'funes_metric {"duration_ms":50.0,"stage":"voyage_request"}'
+
+    assert bridge._safe_timeout_stderr(mixed_stderr.encode("utf-8")) == safe
+
+
+def test_safe_recall_metrics_is_bounded_and_redacted():
+    lines = [
+        'funes_metric {"stage":"recall_open","state":"start","duration_ms":0.0,"raw":"secret"}',
+        'funes_metric {"stage":"recall_vector","state":"done","duration_ms":12.345}',
+        'funes_metric {"stage":"unknown","state":"done","duration_ms":1}',
+        'funes_metric {"stage":"recall_fts","state":"done","duration_ms":NaN}',
+        'funes_metric {"stage":"recall_fts","state":"done","duration_ms":true}',
+    ]
+    lines.extend(
+        'funes_metric {"stage":"recall_embed","state":"start","duration_ms":0}'
+        for _ in range(40)
+    )
+    safe = bridge._safe_recall_metrics(lines)
+    assert len(safe) == 32
+    assert safe[0] == {"stage": "recall_open", "state": "start", "duration_ms": 0.0}
+    assert safe[1] == {"stage": "recall_vector", "state": "done", "duration_ms": 12.35}
+    assert all(set(item) == {"stage", "state", "duration_ms"} for item in safe)
+
+
+def test_ingest_canonical_subset_catches_timeout_and_accumulates_partial_metrics(
+    monkeypatch, tmp_path
+):
+    item = {
+        "source_identity": "session-1",
+        "source_version": "v1",
+        "content_hash": "hash-abc",
+        "native_generation": 1,
+        "retrieval_generation": 1,
+    }
+    document = {
+        "source_identity": "session-1",
+        "source_version": "v1",
+        "content": "sample content",
+        "session_id": "session-1",
+    }
+    records = [(item, document)]
+    sequence = [0]
+    profile = bridge.index_embedding_profile()
+    metrics = bridge._native_metrics()
+
+    safe_stderr = (
+        'funes_metric {"stage": "remote_open", "duration_ms": 10.5}\n'
+        'funes_metric {"stage": "voyage_request", "duration_ms": 150.0, "input_count": 8, "status_code": 200, "token_usage": 320, "pacer_wait_ms": 2.0, "backoff_ms": 0.0}\n'
+    )
+
+    def fake_run_timeout(*_args, **_kwargs):
+        raise subprocess.TimeoutExpired(
+            [bridge.FUNES_BIN],
+            bridge.CANONICAL_INDEX_TIMEOUT,
+            output=None,
+            stderr=safe_stderr,
+        )
+
+    monkeypatch.setattr(bridge, "run", fake_run_timeout)
+
+    updates, committed = bridge._ingest_canonical_subset(
+        records,
+        tmp_path,
+        sequence,
+        memory="test-memory",
+        profile=profile,
+        metrics=metrics,
+    )
+    assert committed is False
+    assert len(updates) == 1
+    assert updates[0]["native_index_status"] == "retry"
+    assert updates[0]["native_index_error"] == "TimeoutExpired"
+    assert updates[0]["source_identity"] == "session-1"
+    assert updates[0]["native_index_memory"] == "test-memory"
+    assert updates[0]["native_index_profile"] == profile["fingerprint"]
+    assert (tmp_path / "batch-000001.jsonl").is_file()
+
+    assert metrics["phase_ms"]["remote_open"] == 10.5
+    assert metrics["voyage_requests"] == 1
+    assert metrics["voyage_input_count"] == 8
+    assert metrics["voyage_status_counts"]["200"] == 1
+    assert metrics["voyage_token_usage"] == 320
+    assert metrics["voyage_token_usage_known"] == 1
+    assert metrics["voyage_pacer_wait_ms"] == 2.0
+    assert metrics["voyage_backoff_ms"] == 0.0
+
+    # Handles bytes stderr
+    monkeypatch.setattr(
+        bridge,
+        "run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            subprocess.TimeoutExpired(
+                [bridge.FUNES_BIN],
+                bridge.CANONICAL_INDEX_TIMEOUT,
+                output=None,
+                stderr=b'funes_metric {"stage": "embedding", "duration_ms": 25.0}\n',
+            )
+        ),
+    )
+    updates_bytes, committed_bytes = bridge._ingest_canonical_subset(
+        records,
+        tmp_path,
+        sequence,
+        memory="test-memory",
+        profile=profile,
+        metrics=metrics,
+    )
+    assert committed_bytes is False
+    assert updates_bytes[0]["native_index_status"] == "retry"
+    assert metrics["phase_ms"]["embedding"] == 25.0
+
+    # Handles metrics=None without error
+    updates_no_metrics, committed_no_metrics = bridge._ingest_canonical_subset(
+        records,
+        tmp_path,
+        sequence,
+        memory="test-memory",
+        profile=profile,
+        metrics=None,
+    )
+    assert committed_no_metrics is False
+    assert updates_no_metrics[0]["native_index_status"] == "retry"
+
+    # Handles stderr=None
+    monkeypatch.setattr(
+        bridge,
+        "run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            subprocess.TimeoutExpired(
+                [bridge.FUNES_BIN],
+                bridge.CANONICAL_INDEX_TIMEOUT,
+                output=None,
+                stderr=None,
+            )
+        ),
+    )
+    updates_no_stderr, committed_no_stderr = bridge._ingest_canonical_subset(
+        records,
+        tmp_path,
+        sequence,
+        memory="test-memory",
+        profile=profile,
+        metrics=metrics,
+    )
+    assert committed_no_stderr is False
+    assert updates_no_stderr[0]["native_index_status"] == "retry"

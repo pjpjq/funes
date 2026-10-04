@@ -1,18 +1,56 @@
-FROM python:3.12-slim-bookworm
-ARG FUNES_VERSION=v1.3.0
-ARG FUNES_SHA256=7ac544a6d14c0018949ada32c39b374fd0b5f6b963a75eb4688b4d23afc944f9
+FROM python:3.12-slim-trixie
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+ARG FUNES_SOURCE_REV=841d8c3f5e5e806e3d8e9418adcec36560ea8a69
+ARG FUNES_BINARY_SHA256=70dd609aafff7b5c3320d8a29e22a33910f01d48259364d20bcd8db9f89cff2e
+ARG FUNES_ARCHIVE_SHA256=d180b4d525be1637474a2b5cc6541c4ecabe82c0fcb38f63653761165aaf2d67
+ARG FUNES_BINARY_URL=https://raw.githubusercontent.com/pjpjq/funes/${FUNES_SOURCE_REV}/space/bin/funes-x86_64-linux.bin.zst
+LABEL org.opencontainers.image.source="https://github.com/pjpjq/funes" \
+      org.opencontainers.image.revision="${FUNES_SOURCE_REV}"
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl \
-    && curl -fsSL "https://github.com/huggingface/funes/releases/download/${FUNES_VERSION}/funes-x86_64-linux" -o /usr/local/bin/funes \
-    && printf '%s  %s\n' "${FUNES_SHA256}" /usr/local/bin/funes | sha256sum -c - \
-    && chmod 0755 /usr/local/bin/funes \
-    && curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh \
-        | sh -s -- -b /usr/local/bin v3.95.5 \
+    && apt-get install -y --no-install-recommends ca-certificates curl zstd \
+    && curl --fail --show-error --location --retry 5 --retry-all-errors --connect-timeout 15 --max-time 120 \
+        https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh \
+        | bash -s -- -b /usr/local/bin v3.95.5 \
+    && test -x /usr/local/bin/trufflehog \
     && rm -rf /var/lib/apt/lists/*
+RUN curl --fail --show-error --location --retry 5 --retry-all-errors --connect-timeout 15 --max-time 300 \
+        "${FUNES_BINARY_URL}" -o /tmp/funes.bin.zst \
+    && printf '%s  %s\n' "${FUNES_ARCHIVE_SHA256}" /tmp/funes.bin.zst | sha256sum -c - \
+    && zstd -q -d /tmp/funes.bin.zst -o /usr/local/bin/funes \
+    && printf '%s  %s\n' "${FUNES_BINARY_SHA256}" /usr/local/bin/funes | sha256sum -c - \
+    && chmod 0755 /usr/local/bin/funes \
+    && /usr/local/bin/funes --version \
+    && rm /tmp/funes.bin.zst
+COPY space/server.py /app/server.py
 COPY service /app/service
 RUN pip install --no-cache-dir -r /app/service/requirements.txt
-COPY server.py /app/server.py
-ENV FUNES_HOME=/data/.funes PYTHONUNBUFFERED=1 PORT=7860
+ENV FUNES_HOME=/data/.funes \
+    HF_HOME=/data/huggingface \
+    HF_HUB_CACHE=/data/huggingface/hub \
+    FUNES_HUB_CACHE_BUCKET=bolikoto/funes-runtime-cache \
+    FUNES_HUB_CACHE_MOUNT=/mnt/funes-hub-cache \
+    FUNES_HUB_CACHE_INTERVAL=300 \
+    FUNES_HUB_CACHE_MAX_BYTES=34359738368 \
+    PYTHONUNBUFFERED=1 \
+    PORT=7860 \
+    FUNES_EMBEDDING_PROVIDER=voyage \
+    FUNES_EMBEDDING_MODEL=voyage-4-lite \
+    FUNES_EMBEDDING_DIMENSIONS=1024 \
+    FUNES_EMBEDDING_SCHEMA_VERSION=2 \
+    FUNES_RERANK_PROVIDER=none \
+    FUNES_RERANK_MODEL=rerank-3-lite \
+    FUNES_NATIVE_FALLBACK=false \
+    FUNES_RETRIEVAL_LANGUAGE_MODE=raw \
+    FUNES_CANONICAL_INDEX_ACTIVE_INTERVAL=1 \
+    FUNES_CANONICAL_INDEX_IDLE_INTERVAL=300 \
+    FUNES_CANONICAL_INDEX_BATCH=512 \
+    FUNES_CANONICAL_INDEX_REQUEST_ROWS=128 \
+    FUNES_CANONICAL_INDEX_MAX_CHARS=192000 \
+    FUNES_CANONICAL_INDEX_MIN_REQUEST_INTERVAL=1 \
+    FUNES_VOYAGE_CONCURRENCY=4 \
+    FUNES_VOYAGE_MAX_REQUEST_TOKENS=9000 \
+    FUNES_VOYAGE_TOKENS_PER_MINUTE=120000 \
+    FUNES_VOYAGE_MIN_REQUEST_INTERVAL=0
 RUN mkdir -p /data/.funes/sources
 WORKDIR /app
 EXPOSE 7860

@@ -1,14 +1,15 @@
 //! The remote side of a memory: how its Lance dataset is read from and written to a Hub repo.
 //!
 //! [`append`] adds rows; [`reindex`] folds the unindexed backlog into the FTS/IVF indexes. Each
-//! runs a native Lance op and lands the result in one `create_commit` on the branch, guarded by a
-//! `parent_commit` against the head it read — atomic. Each is a single attempt: if the head moved
-//! first it reports a conflict ([`Appended::Conflict`] / [`Reindexed::Conflict`]) and the caller
-//! retries against the new head.
+//! runs a native Lance op and lands the result in one or more bounded `create_commit` calls on the
+//! branch, guarded by a chained `parent_commit` against the head it read. Activation metadata is
+//! always uploaded last, so readers keep seeing the previous manifest until the final chunk. Each
+//! operation is a single attempt: if the head moved first it reports a conflict
+//! ([`Appended::Conflict`] / [`Reindexed::Conflict`]) and the caller retries against the new head.
 //!
-//! The result goes up as a *single* `create_commit` because Lance, left to write straight to
-//! `hf://`, would commit each file on its own: that store is OpenDAL's HuggingFace service, where
-//! every `put` is its own git commit.
+//! The result goes up as bounded `create_commit` calls because the Hub rejects a commit with more
+//! than 1000 files. Lance, left to write straight to `hf://`, would commit each file on its own:
+//! that store is OpenDAL's HuggingFace service, where every `put` is its own git commit.
 //!
 //! ```text
 //!   Lance Dataset → object_store → OpenDAL hf service → HF Hub
@@ -18,7 +19,7 @@
 //! A multi-file write would then be several commits — non-atomic, no CAS. So the op runs through a
 //! [`CaptureStore`](super::capture_store::CaptureStore) installed via Lance's
 //! [`WrappingObjectStore`] seam: Lance's writes are captured in memory instead of hitting the Hub,
-//! and we ship the whole set as one guarded `create_commit`.
+//! and we ship the whole set as a bounded sequence of guarded `create_commit` calls.
 //!
 //! # Why this shape
 //!
@@ -39,6 +40,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{ensure, Context, Result};
 use arrow_array::{new_null_array, RecordBatch, RecordBatchIterator};
@@ -53,11 +55,47 @@ use lance::index::DatasetIndexExt;
 use lance_index::optimize::OptimizeOptions;
 use lance_io::object_store::WrappingObjectStore;
 use object_store::ObjectStore as OSObjectStore;
+use serde::Serialize;
 
 use super::capture_store::{CaptureStore, Captured};
 use super::dataset;
 use super::fetch_store::{FetchStore, FileFetcher};
+use super::shard_store::{physical_path, ShardStore};
 use crate::hub;
+
+#[derive(Clone, Debug, Serialize)]
+struct IngestPhaseMetric {
+    stage: &'static str,
+    duration_ms: f64,
+}
+
+fn ingest_metrics_enabled_from(value: Option<&str>) -> bool {
+    matches!(
+        value.map(|val| val.trim().to_ascii_lowercase()).as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
+}
+
+fn ingest_metrics_enabled() -> bool {
+    ingest_metrics_enabled_from(std::env::var("FUNES_INGEST_METRICS").ok().as_deref())
+}
+
+fn round_ms(duration: Duration) -> f64 {
+    ((duration.as_secs_f64() * 1000.0) * 100.0).round() / 100.0
+}
+
+fn emit_phase_metric(stage: &'static str, duration: Duration) {
+    if !ingest_metrics_enabled() {
+        return;
+    }
+    let metric = IngestPhaseMetric {
+        stage,
+        duration_ms: round_ms(duration),
+    };
+    if let Ok(json) = serde_json::to_string(&metric) {
+        eprintln!("funes_metric {json}");
+    }
+}
 
 /// Outcome of an [`append`] commit.
 pub(crate) enum Appended {
@@ -145,9 +183,11 @@ async fn append_at(
         .map(|batch| align_batch(batch, target_schema.clone()))
         .collect::<Result<Vec<_>>>()?;
     let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), target_schema);
+    let append_start = Instant::now();
     ds.append(reader, None)
         .await
         .context("appending to the remote dataset")?;
+    emit_phase_metric("lance_append", append_start.elapsed());
 
     // Snapshot the captured writes before optionally reading index stats: `index_statistics` can
     // write a stats migration through the same wrapper, and that must not leak into the data commit.
@@ -169,7 +209,7 @@ async fn append_at(
             unindexed,
         }),
         Err(e) if head_moved(&e) => Ok(Appended::Conflict),
-        Err(e) => Err(anyhow::Error::new(e).context("data commit failed")),
+        Err(e) => Err(commit_error("data commit failed", &e)),
     }
 }
 
@@ -221,9 +261,9 @@ fn align_batch(batch: RecordBatch, target: SchemaRef) -> Result<RecordBatch> {
     Ok(RecordBatch::try_new(target, columns)?)
 }
 
-/// Build the whole dataset locally (data + indexes) and upload it in one `create_commit` — unlike
-/// [`append`]/[`reindex`], no head to guard against, since the dataset doesn't exist yet. `None` if
-/// the build produced no files.
+/// Build the whole dataset locally (data + indexes) and upload it in bounded chained commits —
+/// unlike [`append`]/[`reindex`], the first commit has no head to guard against since the dataset
+/// does not exist yet. `None` if the build produced no files.
 #[allow(clippy::too_many_arguments)] // internal orchestration, one call site (`push`)
 pub(crate) async fn first_publish(
     repo: &HFRepository<RepoTypeDataset>,
@@ -267,13 +307,7 @@ pub(crate) async fn first_publish(
     let (extra_ops, _extra_dir) = write_ops(extra_files)?;
     ops.extend(extra_ops);
 
-    let info = repo
-        .create_commit()
-        .operations(ops)
-        .commit_message(message)
-        .revision(rev.to_string())
-        .progress(upload_progress())
-        .send()
+    let info = send_commit_chunks(repo, ops, None, rev, message)
         .await
         .map_err(|e| anyhow::Error::new(e).context("create_commit failed"))?;
     Ok(Some(info.commit_oid.unwrap_or_else(|| "?".to_string())))
@@ -319,7 +353,7 @@ pub(crate) async fn first_document_publish(
     match send_commit(repo, ops, expected_parent.to_string(), rev, message).await {
         Ok(info) => Ok(Replaced::Committed(info.commit_oid.unwrap_or_else(|| "?".to_string()))),
         Err(e) if head_moved(&e) => Ok(Replaced::Conflict),
-        Err(e) => Err(anyhow::Error::new(e).context("canonical data commit failed")),
+        Err(e) => Err(commit_error("canonical data commit failed", &e)),
     }
 }
 
@@ -367,7 +401,7 @@ pub(crate) async fn reindex(
     match send_commit(repo, ops, parent, rev, message).await {
         Ok(info) => Ok(Reindexed::Committed(info.commit_oid.unwrap_or_else(|| "?".to_string()))),
         Err(e) if head_moved(&e) => Ok(Reindexed::Conflict),
-        Err(e) => Err(anyhow::Error::new(e).context("reindex commit failed")),
+        Err(e) => Err(commit_error("reindex commit failed", &e)),
     }
 }
 
@@ -395,7 +429,7 @@ pub async fn add_column(
     let (ops, _dir) = write_ops(&files)?;
     let info = send_commit(repo, ops, parent, rev, message)
         .await
-        .map_err(|e| anyhow::Error::new(e).context("add_column commit failed"))?;
+        .map_err(|e| commit_error("add_column commit failed", &e))?;
     Ok(info.commit_oid.unwrap_or_else(|| "?".to_string()))
 }
 
@@ -422,23 +456,27 @@ pub(crate) async fn replace_documents(
     match send_commit(repo, ops, expected_parent.to_string(), rev, message).await {
         Ok(info) => Ok(Replaced::Committed(info.commit_oid.unwrap_or_else(|| "?".to_string()))),
         Err(e) if head_moved(&e) => Ok(Replaced::Conflict),
-        Err(e) => Err(anyhow::Error::new(e).context("canonical data commit failed")),
+        Err(e) => Err(commit_error("canonical data commit failed", &e)),
     }
 }
 
 async fn replace_dataset_rows(ds: &mut Dataset, batches: Vec<RecordBatch>, delete_filter: &str) -> Result<()> {
+    let delete_start = Instant::now();
     ds.delete(delete_filter)
         .await
         .context("deleting stale canonical document rows")?;
+    emit_phase_metric("lance_delete", delete_start.elapsed());
     let target_schema = Arc::new(Schema::from(ds.schema()));
     let batches = batches
         .into_iter()
         .map(|batch| align_batch(batch, target_schema.clone()))
         .collect::<Result<Vec<_>>>()?;
     let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), target_schema);
+    let append_start = Instant::now();
     ds.append(reader, None)
         .await
         .context("appending replacement canonical document rows")?;
+    emit_phase_metric("lance_append", append_start.elapsed());
     Ok(())
 }
 
@@ -470,15 +508,22 @@ async fn open_capturing(
     Ok((ds, wrapper))
 }
 
-/// The captured writes as repo-path → bytes — the files Lance wrote, ready to commit.
+/// The captured writes as physical repo-path → bytes, ready to commit. Existing flat files are
+/// unchanged; new Lance files live in deterministic buckets so no directory hits Hub's file cap.
 fn captured_files(wrapper: &CaptureWrapper) -> BTreeMap<String, Bytes> {
-    wrapper
+    let start = Instant::now();
+    let files = wrapper
         .captured
         .lock()
         .unwrap()
         .iter()
-        .map(|(p, b)| (p.to_string(), b.clone()))
-        .collect()
+        .map(|(p, b)| {
+            let logical = p.to_string();
+            (physical_path(&logical).unwrap_or(logical), b.clone())
+        })
+        .collect();
+    emit_phase_metric("captured_files", start.elapsed());
+    files
 }
 
 /// The largest `num_unindexed_rows` across the dataset's indexes — how many rows aren't yet folded
@@ -524,8 +569,9 @@ pub(crate) async fn head_oid(repo: &HFRepository<RepoTypeDataset>, rev: &str) ->
 }
 
 /// Write captured files (path → bytes) to a scratch dir and turn them into add-file commit
-/// operations — hf-hub uploads from local paths. The returned `TempDir` must outlive the commit.
+/// operations — hf-hub uploads from local paths. The returned `TempDir` must outlive all chunks.
 fn write_ops(files: &BTreeMap<String, Bytes>) -> Result<(Vec<CommitOperation>, tempfile::TempDir)> {
+    let start = Instant::now();
     let dir = tempfile::tempdir()?;
     let mut ops = Vec::with_capacity(files.len());
     for (i, (repo_path, body)) in files.iter().enumerate() {
@@ -533,6 +579,7 @@ fn write_ops(files: &BTreeMap<String, Bytes>) -> Result<(Vec<CommitOperation>, t
         std::fs::write(&local, body)?;
         ops.push(CommitOperation::add_file(repo_path.clone(), local));
     }
+    emit_phase_metric("write_ops", start.elapsed());
     Ok((ops, dir))
 }
 
@@ -553,8 +600,9 @@ pub(crate) async fn fetch_readme(repo: &HFRepository<RepoTypeDataset>, rev: &str
     }
 }
 
-/// One `create_commit` of `ops` on branch `rev`, guarded by `parent`. Returns the raw hf-hub
-/// result so callers can tell a head-moved [`HFError::Conflict`] from other failures.
+/// Upload `ops` in bounded chained `create_commit` calls on branch `rev`, guarded by `parent`.
+/// The returned result is the final Hub response so callers can tell a head-moved
+/// [`HFError::Conflict`] from other failures. Activation metadata is forced into the last chunk.
 async fn send_commit(
     repo: &HFRepository<RepoTypeDataset>,
     ops: Vec<CommitOperation>,
@@ -562,14 +610,289 @@ async fn send_commit(
     rev: &str,
     message: String,
 ) -> std::result::Result<CommitInfo, HFError> {
-    repo.create_commit()
-        .operations(ops)
-        .commit_message(message)
-        .parent_commit(parent)
-        .revision(rev.to_string())
-        .progress(upload_progress())
-        .send()
-        .await
+    send_commit_chunks(repo, ops, Some(parent), rev, message).await
+}
+
+/// Hub currently rejects a single commit containing more than 1000 files. Keep headroom for
+/// retries and future metadata by using a lower bound, and make activation metadata the final
+/// chunk so an interrupted upload cannot expose a manifest that references missing files.
+const MAX_COMMIT_OPERATIONS: usize = 900;
+
+/// Paths that activate a new Lance snapshot. The final chunk may also contain `README.md`, which
+/// is updated with the same dataset snapshot and should not precede the manifest activation.
+fn is_activation_path(path: &str) -> bool {
+    let path = path.trim_start_matches("./");
+    path == "README.md"
+        || path.starts_with("_versions/")
+        || path.contains("/_versions/")
+        || path.starts_with("_transactions/")
+        || path.contains("/_transactions/")
+        || path.ends_with(".manifest")
+        || path.ends_with("latest_version_hint.json")
+}
+
+fn operation_path(operation: &CommitOperation) -> &str {
+    match operation {
+        CommitOperation::Add { path_in_repo, .. } | CommitOperation::Delete { path_in_repo } => path_in_repo,
+    }
+}
+
+/// Split a commit before any network upload. Activation metadata is deliberately rejected when it
+/// cannot fit in one final chunk; uploading part of it would make the ordering guarantee false.
+fn split_commit_operations(ops: Vec<CommitOperation>) -> std::result::Result<Vec<Vec<CommitOperation>>, HFError> {
+    let mut regular = Vec::with_capacity(ops.len());
+    let mut activation = Vec::new();
+    for operation in ops {
+        if is_activation_path(operation_path(&operation)) {
+            activation.push(operation);
+        } else {
+            regular.push(operation);
+        }
+    }
+    if activation.len() > MAX_COMMIT_OPERATIONS {
+        return Err(HFError::InvalidParameter(format!(
+            "activation metadata exceeds one commit chunk: {} operations (limit {})",
+            activation.len(),
+            MAX_COMMIT_OPERATIONS
+        )));
+    }
+
+    let mut chunks = regular
+        .chunks(MAX_COMMIT_OPERATIONS)
+        .map(|chunk| chunk.to_vec())
+        .collect::<Vec<_>>();
+    if !activation.is_empty() {
+        if let Some(last) = chunks.last_mut() {
+            if last.len() + activation.len() <= MAX_COMMIT_OPERATIONS {
+                last.extend(activation);
+            } else {
+                chunks.push(activation);
+            }
+        } else {
+            chunks.push(activation);
+        }
+    }
+    Ok(chunks)
+}
+
+/// Upload chunks serially. The first chunk uses the caller's expected parent (if any); every
+/// later chunk uses the successful preceding commit SHA. A missing SHA is handled by reading the
+/// branch head rather than passing an empty parent to the next request.
+async fn send_commit_chunks(
+    repo: &HFRepository<RepoTypeDataset>,
+    ops: Vec<CommitOperation>,
+    parent: Option<String>,
+    rev: &str,
+    message: String,
+) -> std::result::Result<CommitInfo, HFError> {
+    let chunks = split_commit_operations(ops)?;
+    let mut parent = parent;
+    let mut final_info = None;
+    for (index, chunk) in chunks.into_iter().enumerate() {
+        let chunk_message = if index == 0 {
+            message.clone()
+        } else {
+            format!("{message} (chunk {index})")
+        };
+        let chunk_start = Instant::now();
+        let info = if let Some(expected_parent) = parent.take() {
+            repo.create_commit()
+                .operations(chunk)
+                .commit_message(chunk_message)
+                .parent_commit(expected_parent)
+                .revision(rev.to_string())
+                .progress(upload_progress())
+                .send()
+                .await?
+        } else {
+            repo.create_commit()
+                .operations(chunk)
+                .commit_message(chunk_message)
+                .revision(rev.to_string())
+                .progress(upload_progress())
+                .send()
+                .await?
+        };
+        emit_phase_metric("hf_commit_chunk", chunk_start.elapsed());
+        parent = match info.commit_oid.as_deref().filter(|oid| !oid.is_empty()) {
+            Some(oid) => Some(oid.to_string()),
+            None => {
+                let wait_start = Instant::now();
+                let head = head_oid_for_commit(repo, rev).await?;
+                emit_phase_metric("hf_commit_wait", wait_start.elapsed());
+                Some(head)
+            }
+        };
+        final_info = Some(info);
+    }
+    final_info.ok_or_else(|| HFError::InvalidParameter("cannot commit an empty operation list".to_string()))
+}
+
+/// Same branch-head lookup as [`head_oid`], retaining the HF error type used by chunk uploads and
+/// never copying an arbitrary response body into a persisted diagnostic.
+async fn head_oid_for_commit(repo: &HFRepository<RepoTypeDataset>, rev: &str) -> std::result::Result<String, HFError> {
+    let refs = repo.list_refs().send().await?;
+    refs.branches
+        .iter()
+        .find(|branch| branch.name == rev)
+        .map(|branch| branch.target_commit.clone())
+        .ok_or_else(|| HFError::InvalidParameter("target branch not found on the remote".to_string()))
+}
+
+/// Keep enough of a Hub rejection to identify its class without persisting URLs,
+/// repository paths, credentials, or an unbounded response body.
+fn safe_server_reason(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    let classified = if lower.contains("larger than 10 mib")
+        || lower.contains("larger than 10 mb")
+        || lower.contains("file size")
+        || lower.contains("git-lfs")
+        || lower.contains("git lfs")
+    {
+        Some("file_size_or_lfs")
+    } else if lower.contains("more than 1000 files") || lower.contains("too many files") || lower.contains("file limit")
+    {
+        Some("file_count_limit")
+    } else if lower.contains("lfs pointer") || lower.contains("lfs object") {
+        Some("missing_lfs_object")
+    } else if lower.contains("parent commit") || lower.contains("parentcommit") {
+        Some("invalid_parent")
+    } else if lower.contains("empty commit") || lower.contains("no operations") || lower.contains("commit content") {
+        Some("empty_commit")
+    } else if lower.contains("invalid path") || lower.contains("path is invalid") {
+        Some("invalid_path")
+    } else if lower.contains("rate limit") || lower.contains("too many requests") {
+        Some("rate_limit")
+    } else if lower.contains("unauthorized") || lower.contains("forbidden") || lower.contains("permission") {
+        Some("auth_or_permission")
+    } else if lower.contains("conflict") || lower.contains("head moved") {
+        Some("stale_parent")
+    } else {
+        None
+    };
+    if let Some(reason) = classified {
+        return Some(reason.to_string());
+    }
+
+    let sanitized = trimmed
+        .split_whitespace()
+        .map(|word| {
+            let lower_word = word.to_ascii_lowercase();
+            if word.contains("://") {
+                "<url>".to_string()
+            } else if word.starts_with('/') || word.contains('\\') {
+                "<path>".to_string()
+            } else if lower_word.contains("bearer")
+                || lower_word.starts_with("token=")
+                || lower_word.starts_with("api_key=")
+            {
+                "<redacted>".to_string()
+            } else {
+                word.chars()
+                    .filter(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '.' | ',' | ':' | ';' | '-' | '_'))
+                    .collect::<String>()
+            }
+        })
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let bounded = sanitized.chars().take(160).collect::<String>();
+    (!bounded.is_empty()).then_some(bounded)
+}
+
+/// Convert an HF commit failure into a bounded diagnostic that is safe to persist in the
+/// reconciler state. `HFError`'s Display implementation intentionally includes response URLs and,
+/// for conflicts, the full response body; neither belongs in logs or API responses.
+fn commit_error(label: &str, error: &HFError) -> anyhow::Error {
+    fn safe_atom(value: &str) -> Option<String> {
+        let value = value.trim();
+        if value.is_empty()
+            || value.contains("://")
+            || value.contains('/')
+            || value.contains('\\')
+            || value.to_ascii_lowercase().contains("bearer")
+            || value.to_ascii_lowercase().contains("token")
+        {
+            return None;
+        }
+        let sanitized: String = value
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '.' | ',' | ':' | ';' | '-' | '_'))
+            .take(160)
+            .collect();
+        let sanitized = sanitized.split_whitespace().collect::<Vec<_>>().join(" ");
+        (!sanitized.is_empty()).then_some(sanitized)
+    }
+
+    macro_rules! http_detail {
+        ($variant:expr, $context:expr) => {{
+            let context = $context;
+            let phase = hf_http_phase(&context.url);
+            let mut detail = format!(
+                "{label}: hf_error={} http_status={} hf_phase={phase}",
+                $variant,
+                context.status.as_u16()
+            );
+            if let Some(code) = context.error_code.as_deref().and_then(safe_atom) {
+                detail.push_str(&format!(" error_code={code}"));
+            }
+            let server_reason = context
+                .server_message
+                .as_deref()
+                .and_then(safe_server_reason)
+                .or_else(|| safe_server_reason(&context.body));
+            if let Some(message) = server_reason {
+                detail.push_str(&format!(" server_reason={message}"));
+            }
+            anyhow::anyhow!(detail)
+        }};
+    }
+
+    match error {
+        HFError::Http { context } => http_detail!("http", context),
+        HFError::AuthRequired { context } => http_detail!("auth_required", context),
+        HFError::Forbidden { context } => http_detail!("forbidden", context),
+        HFError::RateLimited { context, .. } => http_detail!("rate_limited", context),
+        HFError::Conflict { context } => http_detail!("conflict", context),
+        HFError::Xet { operation, .. } => anyhow::anyhow!("{label}: hf_error=xet operation={operation}"),
+        HFError::Request { .. } => anyhow::anyhow!("{label}: hf_error=request_transport"),
+        HFError::RepoNotFound { .. } => anyhow::anyhow!("{label}: hf_error=repo_not_found"),
+        HFError::RevisionNotFound { .. } => anyhow::anyhow!("{label}: hf_error=revision_not_found"),
+        HFError::EntryNotFound { .. } => anyhow::anyhow!("{label}: hf_error=entry_not_found"),
+        HFError::BucketNotFound { .. } => anyhow::anyhow!("{label}: hf_error=bucket_not_found"),
+        HFError::LocalEntryNotFound { .. } => {
+            anyhow::anyhow!("{label}: hf_error=local_entry_not_found")
+        }
+        HFError::CacheNotEnabled => anyhow::anyhow!("{label}: hf_error=cache_not_enabled"),
+        HFError::CacheLockTimeout { .. } => {
+            anyhow::anyhow!("{label}: hf_error=cache_lock_timeout")
+        }
+        HFError::Io(_) => anyhow::anyhow!("{label}: hf_error=io"),
+        HFError::Json(_) => anyhow::anyhow!("{label}: hf_error=json"),
+        HFError::Url(_) => anyhow::anyhow!("{label}: hf_error=url"),
+        HFError::InvalidParameter(_) => anyhow::anyhow!("{label}: hf_error=invalid_parameter"),
+        HFError::DiffParse(_) => anyhow::anyhow!("{label}: hf_error=diff_parse"),
+        HFError::MalformedResponse { .. } => {
+            anyhow::anyhow!("{label}: hf_error=malformed_response")
+        }
+        HFError::Other(_) => anyhow::anyhow!("{label}: hf_error=other"),
+        _ => anyhow::anyhow!("{label}: hf_error=unknown"),
+    }
+}
+
+/// Bounded phase label derived from the Hub endpoint only; never persist the URL itself.
+fn hf_http_phase(url: &str) -> &'static str {
+    if url.contains("/preupload/") {
+        "preupload"
+    } else if url.contains("/commit/") {
+        "commit"
+    } else {
+        "unknown"
+    }
 }
 
 /// Whether a [`send_commit`] failure is the Hub rejecting a stale `parent_commit`: the commit API
@@ -660,7 +983,8 @@ struct CaptureWrapper {
 impl WrappingObjectStore for CaptureWrapper {
     fn wrap(&self, _prefix: &str, original: Arc<dyn OSObjectStore>) -> Arc<dyn OSObjectStore> {
         let cached = Arc::new(FetchStore::new(original, self.fetcher.clone()));
-        Arc::new(CaptureStore::new(cached, self.captured.clone()))
+        let logical = Arc::new(ShardStore::new(cached));
+        Arc::new(CaptureStore::new(logical, self.captured.clone()))
     }
 }
 
@@ -720,7 +1044,8 @@ impl FetchWrapper {
 
 impl WrappingObjectStore for FetchWrapper {
     fn wrap(&self, _prefix: &str, original: Arc<dyn OSObjectStore>) -> Arc<dyn OSObjectStore> {
-        Arc::new(FetchStore::new(original, self.fetcher.clone()))
+        let cached = Arc::new(FetchStore::new(original, self.fetcher.clone()));
+        Arc::new(ShardStore::new(cached))
     }
 }
 
@@ -758,6 +1083,122 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
     use lance_index::scalar::{InvertedIndexParams, ScalarIndexParams};
     use lance_index::IndexType;
+    use object_store::ObjectStoreExt;
+
+    #[derive(Debug)]
+    struct UnusedFetcher;
+
+    #[async_trait]
+    impl FileFetcher for UnusedFetcher {
+        async fn fetch(&self, _filename: &str) -> Result<PathBuf> {
+            anyhow::bail!("test reads use the in-memory backend")
+        }
+
+        async fn discard(&self, _path: &Path) -> Result<()> {
+            anyhow::bail!("test reads use the in-memory backend")
+        }
+    }
+
+    /// Use the real production decorators over a deterministic backend, without Hub or Voyage.
+    #[derive(Debug)]
+    struct TestStoreWrapper {
+        store: Arc<dyn OSObjectStore>,
+        sharded: bool,
+        captured: Option<Captured>,
+    }
+
+    impl WrappingObjectStore for TestStoreWrapper {
+        fn wrap(&self, prefix: &str, _original: Arc<dyn OSObjectStore>) -> Arc<dyn OSObjectStore> {
+            if let Some(captured) = &self.captured {
+                CaptureWrapper {
+                    captured: captured.clone(),
+                    fetcher: Arc::new(UnusedFetcher),
+                }
+                .wrap(prefix, self.store.clone())
+            } else if self.sharded {
+                FetchWrapper {
+                    fetcher: Arc::new(UnusedFetcher),
+                }
+                .wrap(prefix, self.store.clone())
+            } else {
+                self.store.clone()
+            }
+        }
+    }
+
+    #[test]
+    fn remote_phase_metrics_env_and_schema_are_strict_and_leak_free() {
+        assert!(ingest_metrics_enabled_from(Some("1")));
+        assert!(ingest_metrics_enabled_from(Some("true")));
+        assert!(ingest_metrics_enabled_from(Some("yes")));
+        assert!(ingest_metrics_enabled_from(Some("on")));
+        assert!(ingest_metrics_enabled_from(Some(" TRUE ")));
+        assert!(!ingest_metrics_enabled_from(Some("0")));
+        assert!(!ingest_metrics_enabled_from(Some("false")));
+        assert!(!ingest_metrics_enabled_from(Some("off")));
+        assert!(!ingest_metrics_enabled_from(None));
+
+        assert_eq!(round_ms(Duration::from_millis(0)), 0.0);
+        assert_eq!(round_ms(Duration::from_micros(12345)), 12.35);
+        assert_eq!(round_ms(Duration::from_millis(50)), 50.0);
+
+        for stage in [
+            "lance_append",
+            "lance_delete",
+            "captured_files",
+            "write_ops",
+            "hf_commit_chunk",
+            "hf_commit_wait",
+        ] {
+            let metric = IngestPhaseMetric {
+                stage,
+                duration_ms: 12.34,
+            };
+            let serialized = serde_json::to_string(&metric).unwrap();
+            let value: serde_json::Value = serde_json::from_str(&serialized).unwrap();
+            let obj = value.as_object().unwrap();
+            assert_eq!(obj.len(), 2);
+            assert_eq!(obj.get("stage").unwrap(), stage);
+            assert_eq!(obj.get("duration_ms").unwrap(), 12.34);
+            assert!(!serialized.contains("secret"));
+            assert!(!serialized.contains("token"));
+            assert!(!serialized.contains("http"));
+            assert!(!serialized.contains('/'));
+        }
+    }
+
+    #[test]
+    fn write_ops_and_captured_files_emit_safely_when_enabled() {
+        let wrapper = CaptureWrapper {
+            captured: Captured::default(),
+            fetcher: Arc::new(UnusedFetcher),
+        };
+        wrapper.captured.lock().unwrap().insert(
+            object_store::path::Path::from("chunks.lance/data/test.lance"),
+            Bytes::from_static(b"metric_test_bytes"),
+        );
+        let files = captured_files(&wrapper);
+        assert_eq!(files.len(), 1);
+
+        let (ops, _dir) = write_ops(&files).unwrap();
+        assert_eq!(ops.len(), 1);
+    }
+
+    #[test]
+    fn hf_http_phase_is_bounded_and_does_not_expose_urls() {
+        assert_eq!(
+            hf_http_phase("https://huggingface.co/api/datasets/a/b/preupload/main"),
+            "preupload"
+        );
+        assert_eq!(
+            hf_http_phase("https://huggingface.co/api/datasets/a/b/commit/main"),
+            "commit"
+        );
+        assert_eq!(
+            hf_http_phase("https://huggingface.co/api/datasets/a/b/tree/main"),
+            "unknown"
+        );
+    }
 
     /// Pins the Lance behavior [`reindex`] relies on: `append()` adds one delta sub-index per
     /// backlog, and `merge(deltas)` folds the deltas back into one without touching the base.
@@ -882,5 +1323,267 @@ mod tests {
         assert_eq!(human_bytes(1536), "1.5 KiB");
         assert_eq!(human_bytes(5 * 1024 * 1024), "5.0 MiB");
         assert_eq!(human_bytes(3 * 1024 * 1024 * 1024), "3.0 GiB");
+    }
+
+    #[test]
+    fn server_reason_classifies_and_redacts_hub_messages() {
+        assert_eq!(
+            safe_server_reason("Your push was rejected because it contains files larger than 10 MiB; see https://huggingface.co/docs/hub"),
+            Some("file_size_or_lfs".to_string())
+        );
+        assert_eq!(
+            safe_server_reason("You can't create a commit with more than 1000 files"),
+            Some("file_count_limit".to_string())
+        );
+        let redacted =
+            safe_server_reason("unexpected failure at /private/data with https://example.invalid and token=secret")
+                .unwrap();
+        assert!(!redacted.contains("/private/data"));
+        assert!(!redacted.contains("https://example.invalid"));
+        assert!(!redacted.contains("secret"));
+    }
+
+    #[test]
+    fn commit_chunks_bound_operations_and_activate_metadata_last() {
+        let mut ops = (0..(MAX_COMMIT_OPERATIONS * 2 + 7))
+            .map(|i| CommitOperation::add_bytes(format!("chunks.lance/data/{i}.bin"), Bytes::from_static(b"x")))
+            .collect::<Vec<_>>();
+        // Transactions sort before data in real Hub table paths. Place this first so an
+        // unrecognized table prefix cannot accidentally pass by landing in the final chunk.
+        ops.insert(
+            0,
+            CommitOperation::add_bytes("chunks.lance/_transactions/7.txn", Bytes::from_static(b"txn")),
+        );
+        ops.push(CommitOperation::add_bytes(
+            "chunks.lance/_versions/7.manifest",
+            Bytes::from_static(b"manifest"),
+        ));
+        ops.push(CommitOperation::add_bytes(
+            "chunks.lance/_versions/latest_version_hint.json",
+            Bytes::from_static(b"hint"),
+        ));
+        ops.push(CommitOperation::add_bytes("README.md", Bytes::from_static(b"readme")));
+
+        let chunks = split_commit_operations(ops).unwrap();
+        assert!(chunks.iter().all(|chunk| chunk.len() <= MAX_COMMIT_OPERATIONS));
+        let last = chunks.last().unwrap();
+        let first_activation = last
+            .iter()
+            .position(|op| is_activation_path(operation_path(op)))
+            .expect("activation metadata must be present in the last chunk");
+        assert!(last[first_activation..]
+            .iter()
+            .all(|op| is_activation_path(operation_path(op))));
+        assert!(chunks[..chunks.len() - 1]
+            .iter()
+            .flatten()
+            .all(|op| !is_activation_path(operation_path(op))));
+        for path in [
+            "chunks.lance/_transactions/7.txn",
+            "chunks.lance/_versions/7.manifest",
+            "chunks.lance/_versions/latest_version_hint.json",
+            "README.md",
+        ] {
+            assert!(
+                last.iter().any(|op| operation_path(op) == path),
+                "activation path missing from final chunk: {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn commit_chunks_reject_oversized_activation_metadata_before_upload() {
+        let ops = (0..=MAX_COMMIT_OPERATIONS)
+            .map(|i| {
+                CommitOperation::add_bytes(format!("chunks.lance/_transactions/{i}.txn"), Bytes::from_static(b"x"))
+            })
+            .collect::<Vec<_>>();
+        let error = split_commit_operations(ops).unwrap_err();
+        assert!(matches!(error, HFError::InvalidParameter(message) if message.contains("activation metadata")));
+    }
+
+    #[test]
+    fn captured_lance_files_are_sharded_but_repo_metadata_stays_flat() {
+        let wrapper = CaptureWrapper {
+            captured: Captured::default(),
+            fetcher: Arc::new(UnusedFetcher),
+        };
+        for logical in [
+            "chunks.lance/data/new.lance",
+            "chunks.lance/_versions/10001.manifest",
+            "chunks.lance/_transactions/10001.txn",
+            "README.md",
+        ] {
+            wrapper.captured.lock().unwrap().insert(
+                object_store::path::Path::from(logical),
+                Bytes::from_static(b"unchanged"),
+            );
+        }
+        let files = captured_files(&wrapper);
+        assert_eq!(files.len(), 4);
+        assert!(files.contains_key("README.md"));
+        for logical in [
+            "chunks.lance/data/new.lance",
+            "chunks.lance/_versions/10001.manifest",
+            "chunks.lance/_transactions/10001.txn",
+        ] {
+            assert!(!files.contains_key(logical));
+            assert_eq!(
+                files.get(&physical_path(logical).unwrap()),
+                Some(&Bytes::from_static(b"unchanged"))
+            );
+        }
+    }
+
+    #[test]
+    fn sharded_manifest_transaction_and_hint_activate_in_the_final_commit() {
+        let mut ops = (0..(MAX_COMMIT_OPERATIONS + 3))
+            .map(|i| {
+                let logical = format!("chunks.lance/data/{i}.lance");
+                CommitOperation::add_bytes(physical_path(&logical).unwrap(), Bytes::from_static(b"data"))
+            })
+            .collect::<Vec<_>>();
+        let activation = [
+            "chunks.lance/_transactions/10001.txn",
+            "chunks.lance/_versions/10001.manifest",
+            "chunks.lance/_versions/_latest.manifest",
+        ]
+        .map(|logical| physical_path(logical).unwrap());
+        for path in &activation {
+            ops.insert(
+                0,
+                CommitOperation::add_bytes(path.clone(), Bytes::from_static(b"metadata")),
+            );
+        }
+        let chunks = split_commit_operations(ops).unwrap();
+        assert_eq!(chunks.len(), 2);
+        assert!(chunks[0].iter().all(|op| !is_activation_path(operation_path(op))));
+        let last = chunks.last().unwrap();
+        assert!(activation
+            .iter()
+            .all(|path| last.iter().any(|op| operation_path(op) == path)));
+        assert!(last[last.len() - activation.len()..]
+            .iter()
+            .all(|op| is_activation_path(operation_path(op))));
+    }
+
+    #[tokio::test]
+    async fn real_lance_reopens_and_appends_sharded_files_without_changing_flat_history() {
+        use futures::TryStreamExt;
+        use lance::dataset::builder::DatasetBuilder;
+        use lance_io::object_store::ObjectStoreParams;
+        use object_store::memory::InMemory;
+        use object_store::path::Path as OPath;
+        use object_store::{GetOptions, PutOptions, PutPayload};
+
+        let store = Arc::new(InMemory::new());
+        let uri = "memory://shard-regression/chunks.lance";
+        let batch = |texts: Vec<String>| {
+            let schema = Arc::new(Schema::new(vec![Field::new("text", DataType::Utf8, false)]));
+            let rows = RecordBatch::try_new(schema.clone(), vec![Arc::new(StringArray::from(texts))]);
+            RecordBatchIterator::new([rows], schema)
+        };
+        let initial = Dataset::write(
+            batch(vec!["original raw memory".to_string()]),
+            uri,
+            Some(WriteParams {
+                store_params: Some(ObjectStoreParams {
+                    object_store_wrapper: Some(Arc::new(TestStoreWrapper {
+                        store: store.clone(),
+                        sharded: false,
+                        captured: None,
+                    })),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let initial_version = initial.version().version;
+        let flat_objects = store.list(None).try_collect::<Vec<_>>().await.unwrap();
+        let mut flat_bytes = BTreeMap::new();
+        for meta in &flat_objects {
+            flat_bytes.insert(
+                meta.location.clone(),
+                store.get(&meta.location).await.unwrap().bytes().await.unwrap(),
+            );
+        }
+
+        for expected_rows in 2..=3 {
+            let captured = Captured::default();
+            let mut ds = dataset::open_wrapped(
+                uri,
+                HashMap::new(),
+                Arc::new(TestStoreWrapper {
+                    store: store.clone(),
+                    sharded: true,
+                    captured: Some(captured.clone()),
+                }),
+            )
+            .await
+            .unwrap();
+            ds.append(batch(vec![format!("new raw memory {expected_rows}")]), None)
+                .await
+                .unwrap();
+            let files = captured_files(&CaptureWrapper {
+                captured,
+                fetcher: Arc::new(UnusedFetcher),
+            });
+            assert!(!files.is_empty());
+            assert!(files.keys().all(|path| path.starts_with("__funes_shards__/v1/")));
+            for (path, bytes) in &files {
+                store
+                    .put_opts(
+                        &OPath::from(path.as_str()),
+                        PutPayload::from(bytes.clone()),
+                        PutOptions::default(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            let read_wrapper = Arc::new(TestStoreWrapper {
+                store: store.clone(),
+                sharded: true,
+                captured: None,
+            });
+            let reopened = dataset::open_wrapped(uri, HashMap::new(), read_wrapper.clone())
+                .await
+                .unwrap();
+            assert_eq!(reopened.count_rows(None).await.unwrap(), expected_rows);
+            let rows = dataset::scan_rows(&reopened, &["text"], None, None).await.unwrap();
+            let actual = rows
+                .iter()
+                .flat_map(|row| {
+                    let text = row.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+                    (0..row.num_rows()).map(|i| text.value(i).to_string())
+                })
+                .collect::<Vec<_>>();
+            assert!(actual.contains(&"original raw memory".to_string()));
+            assert!(actual.contains(&format!("new raw memory {expected_rows}")));
+
+            let old = DatasetBuilder::from_uri(uri)
+                .with_store_params(ObjectStoreParams {
+                    object_store_wrapper: Some(read_wrapper),
+                    ..Default::default()
+                })
+                .with_version(initial_version)
+                .load()
+                .await
+                .unwrap();
+            assert_eq!(old.count_rows(None).await.unwrap(), 1);
+            for (path, bytes) in &flat_bytes {
+                assert_eq!(
+                    &store
+                        .get_opts(path, GetOptions::default())
+                        .await
+                        .unwrap()
+                        .bytes()
+                        .await
+                        .unwrap(),
+                    bytes
+                );
+            }
+        }
     }
 }

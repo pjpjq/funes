@@ -2155,5 +2155,48 @@
       "candidate": "c4_r64",
       "status": "fastest short sample only; not promoted to production because process-local pacer resets between cycles"
     }
+  },
+  "current_acceptance_1517_utc": {
+    "utc": "2026-10-04T15:17:19.782813+00:00",
+    "space_revision": "0a8ee555234349aaf747b215fb77348a0eb9deaf",
+    "stage": "RUNNING",
+    "health_http": 200,
+    "ready_http": 200,
+    "sync_status_http": 200,
+    "warm": {
+      "state": "ready",
+      "started_at": "2026-10-04T15:16:45Z",
+      "finished_at": "2026-10-04T15:16:49Z",
+      "refresh_pending": false
+    },
+    "documents": 4403063,
+    "eligible": 1949091,
+    "indexed": 659106,
+    "pending": 1289799,
+    "held": 186,
+    "invalid": 0,
+    "checkpoint_current": true,
+    "complete": false,
+    "cutover_ready": false,
+    "last_cycle": {
+      "attempted": 34,
+      "indexed": 34,
+      "held": 0,
+      "durable": true,
+      "duration_ms": 890273,
+      "finished_at": "2026-10-04T15:01:54.097764+00:00"
+    },
+    "last_metrics": {
+      "revision_lookup_ms": 814471.51,
+      "embedding_ms": 60966.69,
+      "voyage_requests": 24,
+      "voyage_token_usage": 153189,
+      "voyage_status_counts": {
+        "200": 24
+      },
+      "voyage_pacer_wait_ms": 118069.84,
+      "voyage_retries": 0
+    },
+    "interpretation": "Warm replacement completed and service is ready. The latest long cycle includes a separate remote revision_lookup outlier; embedding still shows the 120k TPM process-local pacer."
   }
 }

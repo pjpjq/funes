@@ -1,16 +1,16 @@
 # Voyage 回填恢复与验收边界（2026-10-04）
 
-## 本轮结论（15:08:29 UTC 最新快照）
+## 本轮结论（15:17:19 UTC 最新快照）
 
-**当前仍未完成全量回填；生产 worker 正在一次 warm replacement，`/ready=503` 是 `native_warm_warming`，不是本轮新增错误。** HF revision `0a8ee555234349aaf747b215fb77348a0eb9deaf` 与预期一致；不重启、不重建、不清理 Lance/PG/checkpoint。
+**warm replacement 已完成，服务门禁恢复；全量回填仍未完成。** HF revision `0a8ee555234349aaf747b215fb77348a0eb9deaf` 与预期一致；本轮没有重启、重建、清理 Lance/PG/checkpoint。
 
-1. **当前生产状态**：Space `RUNNING`，`/health=200`；15:08:29 UTC `/ready=503`、`/sync/status=503`，warm started `15:01:50Z`、`finished_at=null`、`refresh_pending=true`。source store 已 ready；native warm 尚未完成。
-2. **回填仍有进展**：documents `4,402,146`；eligible `1,948,205`（随后只读接口读到 `1,948,212`）；indexed `659,072`；pending `1,288,947`（随后只读接口读到 `1,288,954`）；held `186`；invalid `0`；checkpoint current；complete/cutover_ready 均 false。最新成功周期 `37/37`、`80,857 ms`，durable=true。
-3. **Voyage 实测**：最新周期 24 次 HTTP 200、无 retry；embedding `70,555 ms`。本轮 A/B 已完成 12/12，268 条 durable 写入、192 请求，429/5xx/retry 均为 0。短测最快为 `c4_r64`（周期均值约 `1.661 rows/s`，仅 cycle wall time）；`c4_r128` 因单周期约 `153k–159k` tokens 超过生产本地 `120k TPM/60s` pacer，约 `61s` embedding，不能采用。
-4. **限流结论与边界**：慢因是批次 token 预算超过进程内 120k TPM 滑窗，不是已证实的 Voyage 429/5xx。`c4_r64` 的短测跨 native process 重置 pacer，不能直接外推长期稳定吞吐；当前生产变量未改、Secret 未轮换、Space 未主动重启。
-5. **完成门槛**：仍需 `pending=0`、`invalid=0`、`complete=true`、`cutover_ready=true`、最终 optimize/native ready。当前 backlog 仍会随新 eligible 记录增长，因此没有可诚实承诺的有限 ETA。
+1. **当前生产状态**：Space `RUNNING`；`/health=200`、`/ready=200`、`/sync/status=200`。warm `15:16:45Z → 15:16:49Z` 完成，`refresh_pending=false`。
+2. **回填计数**：documents `4,403,063`；eligible `1,949,091`；indexed `659,106`；pending `1,289,799`；held `186`；invalid `0`；checkpoint current；complete/cutover_ready 均 false。最新周期 `34/34`、durable=true。
+3. **Voyage 状态**：最新周期 24 次 HTTP 200、无 retry，输入约 `153,189` tokens；embedding `60,967 ms`、pacer 累计 `118,070 ms`。这复现了单批超过生产本地 `120k TPM/60s` 滑窗的限流等待，不是 provider 429/5xx。
+4. **另一个慢点**：该周期 `revision_lookup=814,472 ms`，使总周期 `890,273 ms`；这是远端版本查询/缓存路径异常慢，与 Voyage embedding 分开记录，不能把总周期全部归因于模型调用。
+5. **完成门槛**：仍需 `pending=0`、`invalid=0`、`complete=true`、`cutover_ready=true`、最终 optimize/native ready。当前 backlog 会随新 eligible 记录增长，暂无诚实的有限 ETA。
 
-本节是当前快照；下方历史时间线保留先前部署、维护、查询和失败证据，不覆盖当前事实。
+本节是当前快照；下方历史时间线保留先前部署、维护、查询和 A/B 证据，不覆盖当前事实。
 
 ## 发布身份与版本演进
 

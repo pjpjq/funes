@@ -1,0 +1,887 @@
+{
+  "source_commit": "be256128add230476ec08a9e2ec5b9fa07ddcfd4",
+  "space_revision": "8f34235a11d6156b3bba73d36e3273abbc518bf7",
+  "hint_bootstrap": {
+    "applied_at": "2026-10-04T03:02:01.542236+00:00",
+    "repo": "bolikoto/funes-memory-voyage",
+    "parent_commit": "ad635fb2bc81cda5040e486619da1416296e1b01",
+    "commit": "3b17946deac9ede2919453a9224a46096eb4c603",
+    "changed_paths": [
+      "__funes_shards__/v1/a1/chunks.lance/_versions/latest_version_hint.json"
+    ],
+    "read_back": {
+      "version": 12755
+    },
+    "existing_objects_unchanged": 40791,
+    "space_restarted": false,
+    "voyage_requests": 0
+  },
+  "hint_audit": {
+    "audited_at": "2026-10-04T02:59:23.176295+00:00",
+    "repo": "bolikoto/funes-memory-voyage",
+    "parent_commit": "ad635fb2bc81cda5040e486619da1416296e1b01",
+    "siblings": 40791,
+    "manifest_objects": 12755,
+    "unique_versions": 12755,
+    "max_version": 12755,
+    "max_manifests": [
+      {
+        "path": "__funes_shards__/v1/18/chunks.lance/_versions/18446744073709538860.manifest",
+        "bytes": 1574197,
+        "sha256": "20f714088d0ab74ddd92d476554a7c3ec421a056c74bdfeb054c8a31cc96b498"
+      }
+    ],
+    "sharded_hint_present": false,
+    "hint_path": "__funes_shards__/v1/a1/chunks.lance/_versions/latest_version_hint.json",
+    "new_hint": {
+      "version": 12755
+    },
+    "unknown_version_paths": [],
+    "manifest_schemes": {
+      "V1": {
+        "objects": 0,
+        "min": null,
+        "max": null
+      },
+      "V2": {
+        "objects": 12755,
+        "min": 1,
+        "max": 12755
+      }
+    }
+  },
+  "hint_after_backfill": {
+    "at": "2026-10-04T03:21:50.922276+00:00",
+    "http": 200,
+    "path": "__funes_shards__/v1/a1/chunks.lance/_versions/latest_version_hint.json",
+    "hint": {
+      "version": 12757
+    },
+    "repo_commit": "ea95d912a64cc3a3ff08ca7ba913f8427693ecc1",
+    "seconds": 1.104
+  },
+  "samples": [
+    {
+      "sample_utc": "20261004T030516Z",
+      "documents": 4362864,
+      "canonical": {
+        "eligible": 1921970,
+        "indexed": 644518,
+        "pending": 1277287,
+        "held": 165,
+        "invalid": 0,
+        "checkpoint_current": true,
+        "complete": false,
+        "cutover_ready": false
+      },
+      "warm": {
+        "state": "warming",
+        "started_at": "2026-10-04T02:57:55Z",
+        "finished_at": null,
+        "refresh_pending": false
+      },
+      "worker": {
+        "configured": true,
+        "config_match": true,
+        "alive": false,
+        "last_failure": {
+          "category": "timeout",
+          "at": "2026-10-04T02:57:55Z"
+        }
+      },
+      "reconciler": {
+        "phase": "sleeping",
+        "last_started_at": "2026-10-04T02:34:45.619118+00:00",
+        "last_finished_at": "2026-10-04T03:04:49.635789+00:00",
+        "last_progress_at": null,
+        "last_duration_ms": 1804017,
+        "last_result": {
+          "attempted": 32,
+          "indexed": 0,
+          "held": 0,
+          "durable": true
+        },
+        "failure_counts": {
+          "TimeoutExpired": 32
+        },
+        "consecutive_failures": 1
+      },
+      "metrics": {
+        "voyage_requests": 0,
+        "voyage_input_count": 0,
+        "voyage_token_usage": 0,
+        "voyage_token_usage_known": 0,
+        "voyage_status_counts": {},
+        "voyage_pacer_wait_ms": 0.0,
+        "voyage_backoff_ms": 0.0,
+        "phase_ms": {
+          "remote_open": 1381113.18,
+          "revision_lookup": 161604.78,
+          "secret_scan": 2932.83
+        }
+      }
+    },
+    {
+      "sample_utc": "20261004T030638Z",
+      "documents": 4362880,
+      "canonical": {
+        "eligible": 1921970,
+        "indexed": 644518,
+        "pending": 1277287,
+        "held": 165,
+        "invalid": 0,
+        "checkpoint_current": true,
+        "complete": false,
+        "cutover_ready": false
+      },
+      "warm": {
+        "state": "warming",
+        "started_at": "2026-10-04T02:57:55Z",
+        "finished_at": null,
+        "refresh_pending": false
+      },
+      "worker": {
+        "configured": true,
+        "config_match": true,
+        "alive": false,
+        "last_failure": {
+          "category": "timeout",
+          "at": "2026-10-04T02:57:55Z"
+        }
+      },
+      "reconciler": {
+        "phase": "sleeping",
+        "last_started_at": "2026-10-04T02:34:45.619118+00:00",
+        "last_finished_at": "2026-10-04T03:04:49.635789+00:00",
+        "last_progress_at": null,
+        "last_duration_ms": 1804017,
+        "last_result": {
+          "attempted": 32,
+          "indexed": 0,
+          "held": 0,
+          "durable": true
+        },
+        "failure_counts": {
+          "TimeoutExpired": 32
+        },
+        "consecutive_failures": 1
+      },
+      "metrics": {
+        "voyage_requests": 0,
+        "voyage_input_count": 0,
+        "voyage_token_usage": 0,
+        "voyage_token_usage_known": 0,
+        "voyage_status_counts": {},
+        "voyage_pacer_wait_ms": 0.0,
+        "voyage_backoff_ms": 0.0,
+        "phase_ms": {
+          "remote_open": 1381113.18,
+          "revision_lookup": 161604.78,
+          "secret_scan": 2932.83
+        }
+      }
+    },
+    {
+      "sample_utc": "20261004T030759Z",
+      "documents": 4362944,
+      "canonical": {
+        "eligible": 1921976,
+        "indexed": 644518,
+        "pending": 1277293,
+        "held": 165,
+        "invalid": 0,
+        "checkpoint_current": true,
+        "complete": false,
+        "cutover_ready": false
+      },
+      "warm": {
+        "state": "warming",
+        "started_at": "2026-10-04T03:07:57Z",
+        "finished_at": null,
+        "refresh_pending": false
+      },
+      "worker": {
+        "configured": true,
+        "config_match": true,
+        "alive": false,
+        "last_failure": {
+          "category": "timeout",
+          "at": "2026-10-04T03:07:55Z"
+        }
+      },
+      "reconciler": {
+        "phase": "sleeping",
+        "last_started_at": "2026-10-04T02:34:45.619118+00:00",
+        "last_finished_at": "2026-10-04T03:04:49.635789+00:00",
+        "last_progress_at": null,
+        "last_duration_ms": 1804017,
+        "last_result": {
+          "attempted": 32,
+          "indexed": 0,
+          "held": 0,
+          "durable": true
+        },
+        "failure_counts": {
+          "TimeoutExpired": 32
+        },
+        "consecutive_failures": 1
+      },
+      "metrics": {
+        "voyage_requests": 0,
+        "voyage_input_count": 0,
+        "voyage_token_usage": 0,
+        "voyage_token_usage_known": 0,
+        "voyage_status_counts": {},
+        "voyage_pacer_wait_ms": 0.0,
+        "voyage_backoff_ms": 0.0,
+        "phase_ms": {
+          "remote_open": 1381113.18,
+          "revision_lookup": 161604.78,
+          "secret_scan": 2932.83
+        }
+      }
+    },
+    {
+      "sample_utc": "20261004T030921Z",
+      "documents": 4362944,
+      "canonical": {
+        "eligible": 1921976,
+        "indexed": 644518,
+        "pending": 1277293,
+        "held": 165,
+        "invalid": 0,
+        "checkpoint_current": true,
+        "complete": false,
+        "cutover_ready": false
+      },
+      "warm": {
+        "state": "warming",
+        "started_at": "2026-10-04T03:07:57Z",
+        "finished_at": null,
+        "refresh_pending": false
+      },
+      "worker": {
+        "configured": true,
+        "config_match": true,
+        "alive": false,
+        "last_failure": {
+          "category": "timeout",
+          "at": "2026-10-04T03:07:55Z"
+        }
+      },
+      "reconciler": {
+        "phase": "sleeping",
+        "last_started_at": "2026-10-04T02:34:45.619118+00:00",
+        "last_finished_at": "2026-10-04T03:04:49.635789+00:00",
+        "last_progress_at": null,
+        "last_duration_ms": 1804017,
+        "last_result": {
+          "attempted": 32,
+          "indexed": 0,
+          "held": 0,
+          "durable": true
+        },
+        "failure_counts": {
+          "TimeoutExpired": 32
+        },
+        "consecutive_failures": 1
+      },
+      "metrics": {
+        "voyage_requests": 0,
+        "voyage_input_count": 0,
+        "voyage_token_usage": 0,
+        "voyage_token_usage_known": 0,
+        "voyage_status_counts": {},
+        "voyage_pacer_wait_ms": 0.0,
+        "voyage_backoff_ms": 0.0,
+        "phase_ms": {
+          "remote_open": 1381113.18,
+          "revision_lookup": 161604.78,
+          "secret_scan": 2932.83
+        }
+      }
+    },
+    {
+      "sample_utc": "20261004T031042Z",
+      "documents": 4363095,
+      "canonical": {
+        "eligible": 1921985,
+        "indexed": 644518,
+        "pending": 1277302,
+        "held": 165,
+        "invalid": 0,
+        "checkpoint_current": true,
+        "complete": false,
+        "cutover_ready": false
+      },
+      "warm": {
+        "state": "warming",
+        "started_at": "2026-10-04T03:07:57Z",
+        "finished_at": null,
+        "refresh_pending": false
+      },
+      "worker": {
+        "configured": true,
+        "config_match": true,
+        "alive": false,
+        "last_failure": {
+          "category": "timeout",
+          "at": "2026-10-04T03:07:55Z"
+        }
+      },
+      "reconciler": {
+        "phase": "native_ingest",
+        "last_started_at": "2026-10-04T03:09:49.635936+00:00",
+        "last_finished_at": "2026-10-04T03:04:49.635789+00:00",
+        "last_progress_at": null,
+        "last_duration_ms": 1804017,
+        "last_result": {
+          "attempted": 32,
+          "indexed": 0,
+          "held": 0,
+          "durable": true
+        },
+        "failure_counts": {
+          "TimeoutExpired": 32
+        },
+        "consecutive_failures": 1
+      },
+      "metrics": {
+        "voyage_requests": 0,
+        "voyage_input_count": 0,
+        "voyage_token_usage": 0,
+        "voyage_token_usage_known": 0,
+        "voyage_status_counts": {},
+        "voyage_pacer_wait_ms": 0.0,
+        "voyage_backoff_ms": 0.0,
+        "phase_ms": {
+          "remote_open": 1381113.18,
+          "revision_lookup": 161604.78,
+          "secret_scan": 2932.83
+        }
+      }
+    },
+    {
+      "sample_utc": "20261004T031203Z",
+      "documents": 4363142,
+      "canonical": {
+        "eligible": 1921991,
+        "indexed": 644518,
+        "pending": 1277308,
+        "held": 165,
+        "invalid": 0,
+        "checkpoint_current": true,
+        "complete": false,
+        "cutover_ready": false
+      },
+      "warm": {
+        "state": "warming",
+        "started_at": "2026-10-04T03:07:57Z",
+        "finished_at": null,
+        "refresh_pending": false
+      },
+      "worker": {
+        "configured": true,
+        "config_match": true,
+        "alive": false,
+        "last_failure": {
+          "category": "timeout",
+          "at": "2026-10-04T03:07:55Z"
+        }
+      },
+      "reconciler": {
+        "phase": "native_ingest",
+        "last_started_at": "2026-10-04T03:09:49.635936+00:00",
+        "last_finished_at": "2026-10-04T03:04:49.635789+00:00",
+        "last_progress_at": null,
+        "last_duration_ms": 1804017,
+        "last_result": {
+          "attempted": 32,
+          "indexed": 0,
+          "held": 0,
+          "durable": true
+        },
+        "failure_counts": {
+          "TimeoutExpired": 32
+        },
+        "consecutive_failures": 1
+      },
+      "metrics": {
+        "voyage_requests": 0,
+        "voyage_input_count": 0,
+        "voyage_token_usage": 0,
+        "voyage_token_usage_known": 0,
+        "voyage_status_counts": {},
+        "voyage_pacer_wait_ms": 0.0,
+        "voyage_backoff_ms": 0.0,
+        "phase_ms": {
+          "remote_open": 1381113.18,
+          "revision_lookup": 161604.78,
+          "secret_scan": 2932.83
+        }
+      }
+    },
+    {
+      "sample_utc": "20261004T031325Z",
+      "documents": 4363142,
+      "canonical": {
+        "eligible": 1921991,
+        "indexed": 644518,
+        "pending": 1277308,
+        "held": 165,
+        "invalid": 0,
+        "checkpoint_current": true,
+        "complete": false,
+        "cutover_ready": false
+      },
+      "warm": {
+        "state": "ready",
+        "started_at": "2026-10-04T03:07:57Z",
+        "finished_at": "2026-10-04T03:12:41Z",
+        "refresh_pending": false
+      },
+      "worker": {
+        "configured": true,
+        "config_match": true,
+        "alive": true,
+        "last_failure": {
+          "category": "timeout",
+          "at": "2026-10-04T03:07:55Z"
+        }
+      },
+      "reconciler": {
+        "phase": "native_ingest",
+        "last_started_at": "2026-10-04T03:09:49.635936+00:00",
+        "last_finished_at": "2026-10-04T03:04:49.635789+00:00",
+        "last_progress_at": null,
+        "last_duration_ms": 1804017,
+        "last_result": {
+          "attempted": 32,
+          "indexed": 0,
+          "held": 0,
+          "durable": true
+        },
+        "failure_counts": {
+          "TimeoutExpired": 32
+        },
+        "consecutive_failures": 1
+      },
+      "metrics": {
+        "voyage_requests": 0,
+        "voyage_input_count": 0,
+        "voyage_token_usage": 0,
+        "voyage_token_usage_known": 0,
+        "voyage_status_counts": {},
+        "voyage_pacer_wait_ms": 0.0,
+        "voyage_backoff_ms": 0.0,
+        "phase_ms": {
+          "remote_open": 1381113.18,
+          "revision_lookup": 161604.78,
+          "secret_scan": 2932.83
+        }
+      }
+    },
+    {
+      "sample_utc": "20261004T031447Z",
+      "documents": 4363284,
+      "canonical": {
+        "eligible": 1922085,
+        "indexed": 644550,
+        "pending": 1277370,
+        "held": 165,
+        "invalid": 0,
+        "checkpoint_current": true,
+        "complete": false,
+        "cutover_ready": false
+      },
+      "warm": {
+        "state": "warming",
+        "started_at": "2026-10-04T03:14:14Z",
+        "finished_at": null,
+        "refresh_pending": false
+      },
+      "worker": {
+        "configured": true,
+        "config_match": true,
+        "alive": true,
+        "last_failure": {
+          "category": "timeout",
+          "at": "2026-10-04T03:07:55Z"
+        }
+      },
+      "reconciler": {
+        "phase": "native_ingest",
+        "last_started_at": "2026-10-04T03:14:17.815623+00:00",
+        "last_finished_at": "2026-10-04T03:14:16.815438+00:00",
+        "last_progress_at": "2026-10-04T03:14:16.815450+00:00",
+        "last_duration_ms": 267180,
+        "last_result": {
+          "attempted": 32,
+          "indexed": 32,
+          "held": 0,
+          "durable": true
+        },
+        "failure_counts": {},
+        "consecutive_failures": 0
+      },
+      "metrics": {
+        "voyage_requests": 24,
+        "voyage_input_count": 188,
+        "voyage_token_usage": 155881,
+        "voyage_token_usage_known": 24,
+        "voyage_status_counts": {
+          "200": 24
+        },
+        "voyage_pacer_wait_ms": 118371.1,
+        "voyage_backoff_ms": 0.0,
+        "phase_ms": {
+          "captured_files": 0.02,
+          "embedding": 61867.81,
+          "hf_commit_chunk": 1987.15,
+          "lance_append": 219.22,
+          "lance_write_commit": 2290.79,
+          "remote_open": 243.03,
+          "revision_lookup": 166553.86,
+          "secret_scan": 3069.82,
+          "vector_reuse": 28822.2,
+          "write_ops": 0.82
+        }
+      }
+    },
+    {
+      "sample_utc": "20261004T031609Z",
+      "documents": 4363326,
+      "canonical": {
+        "eligible": 1922095,
+        "indexed": 644550,
+        "pending": 1277380,
+        "held": 165,
+        "invalid": 0,
+        "checkpoint_current": true,
+        "complete": false,
+        "cutover_ready": false
+      },
+      "warm": {
+        "state": "ready",
+        "started_at": "2026-10-04T03:15:14Z",
+        "finished_at": "2026-10-04T03:16:06Z",
+        "refresh_pending": false
+      },
+      "worker": {
+        "configured": true,
+        "config_match": true,
+        "alive": true,
+        "last_failure": {
+          "category": "timeout",
+          "at": "2026-10-04T03:15:14Z"
+        }
+      },
+      "reconciler": {
+        "phase": "native_ingest",
+        "last_started_at": "2026-10-04T03:14:17.815623+00:00",
+        "last_finished_at": "2026-10-04T03:14:16.815438+00:00",
+        "last_progress_at": "2026-10-04T03:14:16.815450+00:00",
+        "last_duration_ms": 267180,
+        "last_result": {
+          "attempted": 32,
+          "indexed": 32,
+          "held": 0,
+          "durable": true
+        },
+        "failure_counts": {},
+        "consecutive_failures": 0
+      },
+      "metrics": {
+        "voyage_requests": 24,
+        "voyage_input_count": 188,
+        "voyage_token_usage": 155881,
+        "voyage_token_usage_known": 24,
+        "voyage_status_counts": {
+          "200": 24
+        },
+        "voyage_pacer_wait_ms": 118371.1,
+        "voyage_backoff_ms": 0.0,
+        "phase_ms": {
+          "captured_files": 0.02,
+          "embedding": 61867.81,
+          "hf_commit_chunk": 1987.15,
+          "lance_append": 219.22,
+          "lance_write_commit": 2290.79,
+          "remote_open": 243.03,
+          "revision_lookup": 166553.86,
+          "secret_scan": 3069.82,
+          "vector_reuse": 28822.2,
+          "write_ops": 0.82
+        }
+      }
+    },
+    {
+      "sample_utc": "20261004T031730Z",
+      "documents": 4363326,
+      "canonical": {
+        "eligible": 1922095,
+        "indexed": 644582,
+        "pending": 1277348,
+        "held": 165,
+        "invalid": 0,
+        "checkpoint_current": true,
+        "complete": false,
+        "cutover_ready": false
+      },
+      "warm": {
+        "state": "ready",
+        "started_at": "2026-10-04T03:15:14Z",
+        "finished_at": "2026-10-04T03:16:06Z",
+        "refresh_pending": false
+      },
+      "worker": {
+        "configured": true,
+        "config_match": true,
+        "alive": true,
+        "last_failure": {
+          "category": "timeout",
+          "at": "2026-10-04T03:15:14Z"
+        }
+      },
+      "reconciler": {
+        "phase": "native_ingest",
+        "last_started_at": "2026-10-04T03:16:14.945377+00:00",
+        "last_finished_at": "2026-10-04T03:16:13.945220+00:00",
+        "last_progress_at": "2026-10-04T03:16:13.945230+00:00",
+        "last_duration_ms": 116130,
+        "last_result": {
+          "attempted": 32,
+          "indexed": 32,
+          "held": 0,
+          "durable": true
+        },
+        "failure_counts": {},
+        "consecutive_failures": 0
+      },
+      "metrics": {
+        "voyage_requests": 24,
+        "voyage_input_count": 187,
+        "voyage_token_usage": 155561,
+        "voyage_token_usage_known": 24,
+        "voyage_status_counts": {
+          "200": 24
+        },
+        "voyage_pacer_wait_ms": 117557.28,
+        "voyage_backoff_ms": 0.0,
+        "phase_ms": {
+          "captured_files": 0.02,
+          "embedding": 64713.51,
+          "hf_commit_chunk": 1934.29,
+          "lance_append": 234.6,
+          "lance_write_commit": 2240.52,
+          "remote_open": 293.58,
+          "revision_lookup": 16293.8,
+          "secret_scan": 3066.04,
+          "vector_reuse": 25667.12,
+          "write_ops": 0.84
+        }
+      }
+    },
+    {
+      "sample_utc": "20261004T031852Z",
+      "documents": 4363491,
+      "canonical": {
+        "eligible": 1922193,
+        "indexed": 644582,
+        "pending": 1277446,
+        "held": 165,
+        "invalid": 0,
+        "checkpoint_current": true,
+        "complete": false,
+        "cutover_ready": false
+      },
+      "warm": {
+        "state": "ready",
+        "started_at": "2026-10-04T03:15:14Z",
+        "finished_at": "2026-10-04T03:16:06Z",
+        "refresh_pending": false
+      },
+      "worker": {
+        "configured": true,
+        "config_match": true,
+        "alive": true,
+        "last_failure": {
+          "category": "timeout",
+          "at": "2026-10-04T03:15:14Z"
+        }
+      },
+      "reconciler": {
+        "phase": "native_ingest",
+        "last_started_at": "2026-10-04T03:16:14.945377+00:00",
+        "last_finished_at": "2026-10-04T03:16:13.945220+00:00",
+        "last_progress_at": "2026-10-04T03:16:13.945230+00:00",
+        "last_duration_ms": 116130,
+        "last_result": {
+          "attempted": 32,
+          "indexed": 32,
+          "held": 0,
+          "durable": true
+        },
+        "failure_counts": {},
+        "consecutive_failures": 0
+      },
+      "metrics": {
+        "voyage_requests": 24,
+        "voyage_input_count": 187,
+        "voyage_token_usage": 155561,
+        "voyage_token_usage_known": 24,
+        "voyage_status_counts": {
+          "200": 24
+        },
+        "voyage_pacer_wait_ms": 117557.28,
+        "voyage_backoff_ms": 0.0,
+        "phase_ms": {
+          "captured_files": 0.02,
+          "embedding": 64713.51,
+          "hf_commit_chunk": 1934.29,
+          "lance_append": 234.6,
+          "lance_write_commit": 2240.52,
+          "remote_open": 293.58,
+          "revision_lookup": 16293.8,
+          "secret_scan": 3066.04,
+          "vector_reuse": 25667.12,
+          "write_ops": 0.84
+        }
+      }
+    },
+    {
+      "sample_utc": "20261004T032013Z",
+      "documents": 4363547,
+      "canonical": {
+        "eligible": 1922199,
+        "indexed": 644582,
+        "pending": 1277452,
+        "held": 165,
+        "invalid": 0,
+        "checkpoint_current": true,
+        "complete": false,
+        "cutover_ready": false
+      },
+      "warm": {
+        "state": "warming",
+        "started_at": "2026-10-04T03:19:33Z",
+        "finished_at": null,
+        "refresh_pending": true
+      },
+      "worker": {
+        "configured": true,
+        "config_match": true,
+        "alive": false,
+        "last_failure": {
+          "category": "timeout",
+          "at": "2026-10-04T03:19:41Z"
+        }
+      },
+      "reconciler": {
+        "phase": "native_ingest",
+        "last_started_at": "2026-10-04T03:16:14.945377+00:00",
+        "last_finished_at": "2026-10-04T03:16:13.945220+00:00",
+        "last_progress_at": "2026-10-04T03:16:13.945230+00:00",
+        "last_duration_ms": 116130,
+        "last_result": {
+          "attempted": 32,
+          "indexed": 32,
+          "held": 0,
+          "durable": true
+        },
+        "failure_counts": {},
+        "consecutive_failures": 0
+      },
+      "metrics": {
+        "voyage_requests": 24,
+        "voyage_input_count": 187,
+        "voyage_token_usage": 155561,
+        "voyage_token_usage_known": 24,
+        "voyage_status_counts": {
+          "200": 24
+        },
+        "voyage_pacer_wait_ms": 117557.28,
+        "voyage_backoff_ms": 0.0,
+        "phase_ms": {
+          "captured_files": 0.02,
+          "embedding": 64713.51,
+          "hf_commit_chunk": 1934.29,
+          "lance_append": 234.6,
+          "lance_write_commit": 2240.52,
+          "remote_open": 293.58,
+          "revision_lookup": 16293.8,
+          "secret_scan": 3066.04,
+          "vector_reuse": 25667.12,
+          "write_ops": 0.84
+        }
+      }
+    },
+    {
+      "sample_utc": "20261004T033206Z",
+      "documents": 4363945,
+      "canonical": {
+        "eligible": 1922329,
+        "indexed": 644653,
+        "pending": 1277511,
+        "held": 165,
+        "invalid": 0,
+        "checkpoint_current": true,
+        "complete": false,
+        "cutover_ready": false
+      },
+      "warm": {
+        "state": "warming",
+        "started_at": "2026-10-04T03:32:01Z",
+        "finished_at": null,
+        "refresh_pending": false
+      },
+      "worker": {
+        "configured": true,
+        "config_match": true,
+        "alive": true,
+        "last_failure": {
+          "category": "timeout",
+          "at": "2026-10-04T03:22:14Z"
+        }
+      },
+      "reconciler": {
+        "phase": "validating_status",
+        "last_started_at": "2026-10-04T03:26:04.643193+00:00",
+        "last_finished_at": "2026-10-04T03:26:03.643011+00:00",
+        "last_progress_at": "2026-10-04T03:26:03.643024+00:00",
+        "last_duration_ms": 130991,
+        "last_result": {
+          "attempted": 36,
+          "indexed": 36,
+          "held": 0,
+          "durable": true
+        },
+        "failure_counts": {},
+        "consecutive_failures": 0,
+        "last_metrics": {
+          "phase_ms": {
+            "captured_files": 0.02,
+            "embedding": 61178.32,
+            "hf_commit_chunk": 1890.57,
+            "lance_append": 307.01,
+            "lance_write_commit": 2274.63,
+            "remote_open": 401.08,
+            "revision_lookup": 33736.7,
+            "secret_scan": 3492.22,
+            "vector_reuse": 15356.82,
+            "write_ops": 0.79
+          },
+          "voyage_requests": 24,
+          "voyage_input_count": 192,
+          "voyage_token_usage": 155803,
+          "voyage_token_usage_known": 24,
+          "voyage_status_counts": {
+            "200": 24
+          },
+          "voyage_pacer_wait_ms": 117921.66,
+          "voyage_backoff_ms": 0.0
+        }
+      }
+    }
+  ]
+}

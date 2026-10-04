@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+from types import SimpleNamespace
 from http.client import HTTPConnection
 from http.server import ThreadingHTTPServer
 from unittest import mock
@@ -12,6 +13,77 @@ import pytest
 
 import space.server as bridge
 from space.server import canonical_reference
+
+
+@pytest.mark.parametrize("success,opened,alive,matching,expected", [
+    (None, 200.0, True, True, False),
+    (100.0, 99.0, True, True, False),
+    (100.0, 101.0, False, True, False),
+    (100.0, 101.0, True, False, False),
+    (100.0, 101.0, True, True, True),
+])
+def test_source_type_filter_gate_requires_maintained_active_snapshot(
+    monkeypatch, success, opened, alive, matching, expected,
+):
+    app = SimpleNamespace(index_maintenance_lock=threading.Lock(), index_maintenance_state={
+        "memory": "owner/active", "profile": "profile", "_last_success": success,
+    })
+    worker = bridge.NativeMcpWorker("/unused", "owner/active", "/tmp/unused")
+    worker._snapshot_opened_after = opened
+    worker._process = SimpleNamespace(poll=lambda: None if alive else 1)
+    monkeypatch.setattr(bridge, "REMOTE", "owner/active")
+    monkeypatch.setattr(bridge, "embedding_profile", lambda: {"fingerprint": "profile"})
+    monkeypatch.setattr(bridge, "_native_worker_config", lambda: ("matching",))
+    monkeypatch.setattr(bridge, "_MCP_WORKER_CONFIG", ("matching" if matching else "other",))
+    monkeypatch.setattr(bridge, "MCP_WORKER", worker)
+    assert bridge._source_type_prefilter_ready(app) is expected
+    worker._process = None
+
+
+def test_source_type_filter_gate_rejects_wrong_maintenance_target(monkeypatch):
+    app = SimpleNamespace(index_maintenance_lock=threading.Lock(), index_maintenance_state={
+        "memory": "owner/staging", "profile": "other", "_last_success": 100.0,
+    })
+    monkeypatch.setattr(bridge, "REMOTE", "owner/active")
+    monkeypatch.setattr(bridge, "embedding_profile", lambda: {"fingerprint": "profile"})
+    assert bridge._source_type_prefilter_ready(app) is False
+
+
+@pytest.mark.parametrize("maintenance_success,expected", [(99.0, True), (100.5, False)])
+def test_refresh_snapshot_gate_handles_maintenance_during_warm_probe(
+    monkeypatch, tmp_path, maintenance_success, expected,
+):
+    clock = {"now": 100.0}
+    app = SimpleNamespace(index_maintenance_lock=threading.Lock(), index_maintenance_state={
+        "memory": "owner/active", "profile": "profile", "_last_success": 99.0,
+    })
+
+    class FakeWorker:
+        def __init__(self, *_args, **_kwargs):
+            self.process = SimpleNamespace(poll=lambda: None)
+
+        def recall(self, *_args, **_kwargs):
+            # Snapshot opens before the maintenance commit; warm completes later.
+            app.index_maintenance_state["_last_success"] = maintenance_success
+            clock["now"] = 101.0
+            return "probe ok"
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(bridge, "HOME", tmp_path)
+    monkeypatch.setattr(bridge, "REMOTE", "owner/active")
+    monkeypatch.setattr(bridge, "embedding_profile", lambda: {"fingerprint": "profile"})
+    monkeypatch.setattr(bridge, "_native_worker_config", lambda: ("matching",))
+    monkeypatch.setattr(bridge.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(bridge, "NativeMcpWorker", FakeWorker)
+    monkeypatch.setattr(bridge, "MCP_WORKER", None)
+    monkeypatch.setattr(bridge, "_MCP_WORKER_CONFIG", None)
+
+    bridge._refresh_native_worker()
+
+    assert bridge.MCP_WORKER._snapshot_opened_after == 100.0
+    assert bridge._source_type_prefilter_ready(app) is expected
 
 
 def _post(server, path, payload, token="test-token"):
@@ -26,6 +98,23 @@ def _post(server, path, payload, token="test-token"):
     body = json.loads(response.read())
     conn.close()
     return response.status, body
+
+
+def _maintained_native_snapshot(monkeypatch, app):
+    """Model the maintained, live snapshot without bypassing the real guard."""
+    monkeypatch.setattr(bridge, "REMOTE", "owner/active")
+    app.index_maintenance_lock = threading.Lock()
+    app.index_maintenance_state = {
+        "memory": bridge.REMOTE,
+        "profile": bridge.embedding_profile()["fingerprint"],
+        "_last_success": 200.0,
+    }
+    worker = SimpleNamespace(
+        process=SimpleNamespace(poll=lambda: None),
+        _snapshot_opened_after=201.0,
+    )
+    monkeypatch.setattr(bridge, "MCP_WORKER", worker)
+    monkeypatch.setattr(bridge, "_MCP_WORKER_CONFIG", bridge._native_worker_config())
 
 
 class MemoryStoreDouble:
@@ -246,6 +335,7 @@ def test_supported_canonical_filters_passed_to_native_tuning_without_false_503(m
     monkeypatch.setenv("FUNES_EMBEDDING_PROVIDER", "voyage")
     monkeypatch.setenv("FUNES_POSTGRES_DSN", "postgresql://user:pass@localhost:5432/funes")
     monkeypatch.setattr(bridge, "recall", fake_recall)
+    _maintained_native_snapshot(monkeypatch, app)
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -305,6 +395,7 @@ def pg_filtered_search(monkeypatch):
     monkeypatch.setattr(bridge, "TOKEN", "test-token")
     monkeypatch.setenv("FUNES_EMBEDDING_PROVIDER", "voyage")
     monkeypatch.setenv("FUNES_POSTGRES_DSN", "postgresql://user:pass@localhost:5432/funes")
+    _maintained_native_snapshot(monkeypatch, app)
     monkeypatch.setattr(bridge, "HTTP_MAX_CANDIDATES", 12)
     monkeypatch.setattr(bridge, "recall", fake_recall)
     monkeypatch.setattr(bridge, "get", unexpected_scan)
@@ -327,6 +418,23 @@ def _native_fixture_results(store, state, records):
     state["output"] = "NATIVE_ONLY_UNFILTERED_EXCERPT\n" + "".join(
         f"  → get {canonical_reference(item['source_identity'])}\n" for item in records
     )
+
+
+@pytest.mark.parametrize("last_success,opened_after", [(None, 201.0), (202.0, 201.0)])
+def test_pg_source_type_warming_rejected_before_native_recall(
+    pg_filtered_search, last_success, opened_after,
+):
+    server, _store, state, app = pg_filtered_search
+    app.index_maintenance_state["_last_success"] = last_success
+    bridge.MCP_WORKER._snapshot_opened_after = opened_after
+    status, body = _post(server, "/search", {
+        "query": "test query", "source_type": "memory",
+    })
+    assert status == 503
+    assert body["error"] == "native_filter_index_warming"
+    assert body["results"] == []
+    assert body["results_text"] == ""
+    assert state["recall_calls"] == []
 
 
 @pytest.mark.parametrize("filters,rejected_metadata", [

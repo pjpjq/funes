@@ -10,6 +10,7 @@ import base64
 import gzip
 import io
 import json
+import math
 import os
 import re
 import select
@@ -23,6 +24,7 @@ import time
 import urllib.error
 import urllib.request
 import zlib
+from collections import deque
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 from typing import Any
@@ -1578,8 +1580,69 @@ NATIVE_METRIC_PHASES = frozenset(
         "write_ops",
         "hf_commit_chunk",
         "hf_commit_wait",
+        "recall_open",
+        "recall_models",
+        "recall_embed",
+        "recall_vector",
+        "recall_fts",
+        "recall_rerank",
+        "recall_neighbors",
     }
 )
+
+RECALL_METRIC_STAGES = frozenset(
+    {
+        "recall_open",
+        "recall_models",
+        "recall_embed",
+        "recall_vector",
+        "recall_fts",
+        "recall_rerank",
+        "recall_neighbors",
+    }
+)
+
+
+def _safe_recall_metrics(lines: Sequence[str] | None) -> list[dict[str, object]]:
+    """Keep at most 32 strictly allowlisted read-stage metric events."""
+    result: list[dict[str, object]] = []
+    for line in lines or ():
+        match = NATIVE_METRIC_RE.fullmatch(str(line).strip())
+        if match is None:
+            continue
+        try:
+            item = json.loads(match.group(1))
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(item, dict):
+            continue
+        stage = item.get("stage")
+        state = item.get("state")
+        duration = item.get("duration_ms")
+        if (
+            not isinstance(stage, str)
+            or stage not in RECALL_METRIC_STAGES
+            or not isinstance(state, str)
+            or state not in {"start", "done"}
+            or isinstance(duration, bool)
+        ):
+            continue
+        try:
+            duration_value = float(duration)
+        except (TypeError, ValueError):
+            continue
+        if not (0.0 <= duration_value < 86_400_000) or not math.isfinite(duration_value):
+            continue
+        result.append(
+            {
+                "stage": stage,
+                "state": state,
+                "duration_ms": round(duration_value, 2),
+            }
+        )
+        if len(result) >= 32:
+            break
+    return result
 
 
 def _safe_timeout_stderr(stderr: str | bytes | None) -> str | None:
@@ -3025,6 +3088,7 @@ _NATIVE_DIAGNOSTIC_LOCK = threading.Lock()
 _NATIVE_LAST_FAILURE: dict[str, object] = {
     "category": "",
     "at": None,
+    "read_metrics": [],
 }
 
 
@@ -3071,6 +3135,14 @@ def native_worker_status() -> dict[str, object]:
                 alive = False
     with _NATIVE_DIAGNOSTIC_LOCK:
         failure = dict(_NATIVE_LAST_FAILURE)
+    worker_metrics = []
+    if configured and isinstance(worker, NativeMcpWorker):
+        worker_metrics = list(worker._read_metrics)
+    if worker_metrics:
+        # ``_read_metrics`` is already the bounded, redacted dict form emitted
+        # by ``_snapshot_read_metrics``.  Do not feed it back through the
+        # stderr-line parser: stringifying dicts would discard every metric.
+        failure["read_metrics"] = worker_metrics
     return {
         "configured": configured,
         "config_match": bool(config_match),
@@ -3099,6 +3171,10 @@ class NativeMcpWorker:
         self._process = None
         self._next_id = 1
         self._lock = threading.RLock()
+        self._stderr_thread: threading.Thread | None = None
+        self._stderr_stop = threading.Event()
+        self._stderr_lines: deque[str] = deque(maxlen=32)
+        self._read_metrics: list[dict[str, object]] = []
 
     @property
     def process(self):
@@ -3109,10 +3185,37 @@ class NativeMcpWorker:
         with self._lock:
             self._stop_locked()
 
+    def reset_read_metrics(self) -> None:
+        self._read_metrics = []
+        self._stderr_lines.clear()
+
+    def _drain_stderr(self, stream) -> None:
+        """Drain child stderr continuously so metrics cannot block the child."""
+        try:
+            while not self._stderr_stop.is_set():
+                line = stream.readline()
+                if line in ("", b""):
+                    break
+                if isinstance(line, bytes):
+                    line = line.decode("utf-8", "replace")
+                if len(line) <= 8192 and line.startswith("funes_metric "):
+                    self._stderr_lines.append(line.strip())
+        except (OSError, ValueError):
+            pass
+
+    def _snapshot_read_metrics(self) -> list[dict[str, object]]:
+        self._read_metrics = _safe_recall_metrics(list(self._stderr_lines))
+        return list(self._read_metrics)
+
     def _environment(self) -> dict[str, str]:
         # Keep HF_TOKEN/HF_HOME and any other caller-provided Hub settings.  Only
         # FUNES_HOME is pinned to the Space's durable warm-cache directory.
-        return native_environment(self.home)
+        env = native_environment(self.home)
+        # Read-stage metrics belong only to the long-lived MCP read worker.  Do
+        # not enable them in ingest/backfill subprocesses, where they add noise
+        # and can obscure the bounded ingest diagnostics.
+        env["FUNES_RECALL_METRICS"] = os.getenv("FUNES_RECALL_METRICS", "1") or "1"
+        return env
 
     @staticmethod
     def _alive(process) -> bool:
@@ -3142,6 +3245,7 @@ class NativeMcpWorker:
         self._process = None
         if process is None:
             return
+        self._stderr_stop.set()
         if self._alive(process):
             try:
                 process.terminate()
@@ -3172,6 +3276,11 @@ class NativeMcpWorker:
                         pass
         self._close_stream(getattr(process, "stdin", None))
         self._close_stream(getattr(process, "stdout", None))
+        self._close_stream(getattr(process, "stderr", None))
+        thread = self._stderr_thread
+        self._stderr_thread = None
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=0.5)
 
     def _start_locked(self, deadline: float | None = None) -> None:
         args = [self.binary, "mcp"]
@@ -3182,7 +3291,7 @@ class NativeMcpWorker:
                 args,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
                 text=True,
                 bufsize=1,
                 env=self._environment(),
@@ -3190,6 +3299,17 @@ class NativeMcpWorker:
         except OSError as exc:
             raise NativeMcpError("native MCP unavailable") from exc
         self._process = process
+        self._stderr_stop.clear()
+        self._stderr_lines.clear()
+        stderr = getattr(process, "stderr", None)
+        if stderr is not None:
+            self._stderr_thread = threading.Thread(
+                target=self._drain_stderr,
+                args=(stderr,),
+                name="funes-native-mcp-stderr",
+                daemon=True,
+            )
+            self._stderr_thread.start()
         # JSON-RPC ids are local to one child.  Resetting here also makes a
         # restarted worker interoperable with strict fake/native servers.
         self._next_id = 1
@@ -3301,8 +3421,12 @@ class NativeMcpWorker:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         raise NativeMcpTimeoutError("native MCP request timed out")
+                    self.reset_read_metrics()
                     return self._request_locked(method, params, remaining)
                 except NativeMcpTimeoutError as exc:
+                    read_metrics = self._snapshot_read_metrics()
+                    with _NATIVE_DIAGNOSTIC_LOCK:
+                        _NATIVE_LAST_FAILURE["read_metrics"] = read_metrics
                     _record_native_failure(exc)
                     self._stop_locked(deadline)
                     raise

@@ -429,3 +429,86 @@ def test_restart_after_completed_or_aborted():
     assert controller.phase == "running"
     assert controller.status()["completed_cycles"] == 0
     assert len(controller.status()["records"]) == 0
+
+
+def test_durable_retry_is_not_success():
+    controller = CanonicalABController()
+    controller.start()
+    profile = controller.begin_cycle()
+    assert controller.finish_cycle(
+        result={"attempted": 64, "indexed": 0, "held": 0, "durable": True},
+        profile=profile,
+    )
+    assert controller.status()["error_reason"] == "no_progress"
+    assert controller.phase == "error"
+    assert controller.begin_cycle() is None
+
+
+def test_held_only_cycle_is_valid():
+    controller = CanonicalABController()
+    controller.start()
+    profile = controller.begin_cycle()
+    controller.finish_cycle(
+        result={"attempted": 64, "indexed": 0, "held": 64, "durable": True},
+        profile=profile,
+    )
+    assert controller.phase == "running"
+
+
+def test_restart_waits_for_aborted_writer_and_never_misattribution():
+    controller = CanonicalABController()
+    controller.start()
+    profile = controller.begin_cycle()
+    assert controller.begin_cycle() is None
+    controller.abort()
+    with pytest.raises(RuntimeError, match="canonical_ab_already_running"):
+        controller.start()
+    assert controller.finish_cycle(
+        result={"attempted": 1, "indexed": 1, "durable": True}, profile=profile,
+    )
+    controller.start()
+    assert not controller.finish_cycle(
+        result={"attempted": 1, "indexed": 1, "durable": True}, profile=profile,
+    )
+    assert controller.status()["run_id"] == "run_2"
+    assert controller.status()["records"] == []
+
+
+def test_timeout_preserves_in_flight_cycle_and_clock_can_start_at_zero():
+    now = [0.0]
+    controller = CanonicalABController(clock=lambda: now[0])
+    controller.start()
+    profile = controller.begin_cycle()
+    now[0] = 1200.0
+    assert controller.begin_cycle() is None
+    assert controller.status()["elapsed_seconds"] == 1200
+    with pytest.raises(RuntimeError):
+        controller.start()
+    assert controller.finish_cycle(
+        result={"attempted": 1, "indexed": 1, "durable": True}, profile=profile,
+    )
+    status = controller.status()
+    assert status["phase"] == "aborted"
+    assert status["error_reason"] == "timeout"
+    assert len(status["records"]) == 1
+    assert status["in_flight_cycles"] == 0
+
+
+def test_status_numeric_fields_and_phases_are_bounded_independent_snapshots():
+    controller = CanonicalABController()
+    controller.start()
+    profile = controller.begin_cycle()
+    controller.finish_cycle(
+        result={"attempted": 64, "indexed": 60, "held": 4, "durable": True},
+        duration_ms=float("inf"), profile=profile,
+        metrics={"tokens": 450, "retries": -1, "http_5xx": float("nan"), "raw_text": "secret"},
+        phase_ms={"embedding": 12.34, "lance_append": float("inf"), "raw_text": 9, "hf_commit_wait": -1},
+    )
+    status = controller.status()
+    assert status["records"][0]["duration_ms"] == 0
+    assert status["records"][0]["metrics"] == {"tokens": 450}
+    assert status["records"][0]["phase_ms"] == {"embedding": 12.34}
+    status["records"][0]["metrics"]["tokens"] = 999
+    status["records"][0]["phase_ms"]["embedding"] = 999
+    assert controller.status()["records"][0]["metrics"] == {"tokens": 450}
+    assert controller.status()["records"][0]["phase_ms"] == {"embedding": 12.34}

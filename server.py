@@ -31,6 +31,8 @@ from typing import Any
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from space.canonical_ab import CanonicalABController, FIXED_PROFILES
+
 from service.hub_cache import HubCache
 from service.server import App as SourceApp
 from service.server import expanded_candidate_limit
@@ -487,6 +489,47 @@ def source_fts_ready(app) -> bool:
         return True
     ready = getattr(store, "fts_ready", None)
     return bool(ready()) if callable(ready) else True
+
+
+def _source_type_prefilter_ready(app) -> bool:
+    """Return whether the active native snapshot can authoritatively filter source_type.
+
+    The source-type bitmap is maintained alongside the canonical Lance snapshot.
+    Never serve a stale snapshot as an apparently valid filtered result: require
+    a successful maintenance run for the active memory/profile and a live worker
+    that was opened after that run completed.
+    """
+    lock = getattr(app, "index_maintenance_lock", None)
+    state = getattr(app, "index_maintenance_state", None)
+    if lock is None or state is None:
+        return False
+    with lock:
+        memory = state.get("memory")
+        profile = state.get("profile")
+        last_success = state.get("_last_success")
+    if not memory or memory != REMOTE or last_success is None:
+        return False
+    try:
+        expected_profile = embedding_profile()["fingerprint"]
+    except (KeyError, TypeError):
+        return False
+    if profile != expected_profile:
+        return False
+    expected_config = _native_worker_config()
+    with _MCP_WORKER_LOCK:
+        worker = MCP_WORKER
+        if worker is None or _MCP_WORKER_CONFIG != expected_config:
+            return False
+        process = getattr(worker, "process", None)
+        if process is None:
+            return False
+        try:
+            if process.poll() is not None:
+                return False
+        except (AttributeError, OSError):
+            return False
+        opened_after = getattr(worker, "_snapshot_opened_after", None)
+    return opened_after is not None and opened_after >= last_success
 
 
 def source_state() -> dict[str, object]:
@@ -1740,6 +1783,13 @@ def _safe_timeout_stderr(stderr: str | bytes | None) -> str | None:
                         clean_item[field] = round(value, 2)
                 except (TypeError, ValueError):
                     pass
+            if "attempt" in item:
+                try:
+                    attempt = int(item["attempt"])
+                    if 1 <= attempt <= 100:
+                        clean_item["attempt"] = attempt
+                except (TypeError, ValueError):
+                    pass
         else:
             continue
 
@@ -1754,6 +1804,8 @@ def _native_metrics() -> dict[str, object]:
     return {
         "phase_ms": {},
         "voyage_requests": 0,
+        "voyage_retries": 0,
+        "voyage_duration_ms": 0.0,
         "voyage_input_count": 0,
         "voyage_token_usage": 0,
         "voyage_token_usage_known": 0,
@@ -1837,6 +1889,15 @@ def _record_native_metrics(metrics: dict[str, object], stderr: str | None) -> No
         if stage != "voyage_request":
             continue
         metrics["voyage_requests"] = int(metrics["voyage_requests"]) + 1
+        metrics["voyage_duration_ms"] = round(
+            float(metrics.get("voyage_duration_ms", 0.0)) + duration_ms, 2
+        )
+        try:
+            attempt = int(item.get("attempt", 1))
+        except (TypeError, ValueError):
+            attempt = 1
+        if 2 <= attempt <= 100:
+            metrics["voyage_retries"] = int(metrics.get("voyage_retries", 0)) + 1
         try:
             input_count = int(item.get("input_count", 0))
         except (TypeError, ValueError):
@@ -1914,6 +1975,8 @@ def _bounded_native_metrics(metrics: object) -> dict[str, object] | None:
     return {
         "phase_ms": phase_ms,
         "voyage_requests": _safe_int("voyage_requests"),
+        "voyage_retries": _safe_int("voyage_retries"),
+        "voyage_duration_ms": _safe_float("voyage_duration_ms"),
         "voyage_input_count": _safe_int("voyage_input_count"),
         "voyage_token_usage": _safe_int("voyage_token_usage"),
         "voyage_token_usage_known": _safe_int("voyage_token_usage_known"),
@@ -2354,6 +2417,9 @@ def _ingest_canonical_subset(
 
 
 def _initialize_canonical_reconcile_state(app) -> None:
+    # The run and its override are intentionally volatile. A process restart
+    # resumes the ordinary canonical checkpoint with the global configuration.
+    app.canonical_ab = CanonicalABController()
     app.canonical_index_state_lock = threading.Lock()
     app.canonical_index_state = {
         "active": False,
@@ -2574,7 +2640,9 @@ def _canonical_reconcile_phase(app, phase: str) -> None:
     _set_canonical_reconcile_state(app, phase=phase, phase_started_at=utc_now())
 
 
-def reconcile_canonical_index(app) -> dict[str, object]:
+def reconcile_canonical_index(
+    app, *, profile_override: Mapping[str, object] | None = None,
+) -> dict[str, object]:
     """Index one restart-safe batch and persist only derived status in the sidecar."""
     metrics = _native_metrics()
     memory = index_memory()
@@ -2582,13 +2650,29 @@ def reconcile_canonical_index(app) -> dict[str, object]:
         return {"attempted": 0, "indexed": 0, "held": 0, "durable": False}
 
     profile = index_embedding_profile()
+    batch_size = CANONICAL_INDEX_BATCH
+    request_rows = CANONICAL_INDEX_REQUEST_ROWS
+    max_chars = CANONICAL_INDEX_MAX_CHARS
+    if profile_override is not None:
+        # Only controller-owned fixed execution settings may vary. In
+        # particular never replace the model, fingerprint, schema or memory.
+        fixed = next((
+            fixed for fixed in FIXED_PROFILES
+            if all(profile_override.get(key) == value for key, value in fixed.items())
+        ), None)
+        if fixed is None:
+            raise ValueError("invalid_canonical_ab_profile")
+        batch_size = int(fixed["batch_size"])
+        request_rows = int(fixed["request_rows"])
+        max_chars = int(fixed["max_chars"])
+        profile = {**profile, "concurrency": int(fixed["concurrency"])}
 
     def select_candidates():
         if app.syncer.restoring or app.syncer.restore_failed:
             return []
         _canonical_reconcile_phase(app, "selecting")
         rows = app.store.canonical_index_candidates(
-            max(CANONICAL_INDEX_BATCH, CANONICAL_INDEX_REQUEST_ROWS),
+            max(batch_size, request_rows),
             str(profile["fingerprint"]),
             memory,
         )
@@ -2607,8 +2691,8 @@ def reconcile_canonical_index(app) -> dict[str, object]:
             candidates.append((item, document))
         selected = select_bounded_canonical_records(
             candidates,
-            max_rows=CANONICAL_INDEX_REQUEST_ROWS,
-            max_chars=CANONICAL_INDEX_MAX_CHARS,
+            max_rows=request_rows,
+            max_chars=max_chars,
         )
         return selected
 
@@ -2890,10 +2974,51 @@ def _canonical_error_code(exc: Exception) -> str:
     return "unexpected"
 
 
+def _canonical_ab_metrics(
+    native_metrics: object, duration_ms: int, profile: Mapping[str, object],
+) -> tuple[dict[str, object], dict[str, object]]:
+    """Map the current cycle's native aggregates; never include stderr or rows."""
+    bounded = _bounded_native_metrics(native_metrics) or _native_metrics()
+    statuses = bounded["voyage_status_counts"]
+    return {
+        "http_429": statuses.get("429", 0),
+        "http_5xx": sum(count for code, count in statuses.items() if 500 <= int(code) <= 599),
+        "transport_errors": statuses.get("0", 0),
+        "requests": bounded["voyage_requests"],
+        "retries": bounded["voyage_retries"],
+        "tokens": bounded["voyage_token_usage"],
+        "request_duration_ms": bounded["voyage_duration_ms"],
+        "pacer_wait_ms": bounded["voyage_pacer_wait_ms"],
+        "backoff_ms": bounded["voyage_backoff_ms"],
+        "duration_ms": duration_ms,
+        **{key: profile[key] for key in ("batch_size", "request_rows", "max_chars", "concurrency")},
+    }, bounded["phase_ms"]
+
+
+def _finish_canonical_ab_cycle(
+    app, controller, profile, result, started, *, error: str | None = None,
+) -> None:
+    if controller is None or profile is None:
+        return
+    duration_ms = max(0, round((time.monotonic() - started) * 1000))
+    state = canonical_reconcile_state(app)
+    metrics, phase_ms = _canonical_ab_metrics(state.get("last_metrics"), duration_ms, profile)
+    controller.finish_cycle(
+        result=result, duration_ms=duration_ms, metrics=metrics, phase_ms=phase_ms,
+        profile=profile, error=error,
+    )
+
+
 def _canonical_reconcile_background(app) -> None:
     app.restore_done.wait()
     while not app.canonical_index_stop.is_set():
+        controller = getattr(app, "canonical_ab", None)
+        cycle_profile = controller.begin_cycle() if controller is not None else None
         started = time.monotonic()
+        if cycle_profile is not None:
+            # A baseline cycle that completed before this run must never be
+            # attributed to the A/B token, including its last metrics snapshot.
+            _set_canonical_reconcile_state(app, last_metrics=None, failure_counts={})
         _set_canonical_reconcile_state(
             app,
             active=True,
@@ -2903,8 +3028,15 @@ def _canonical_reconcile_background(app) -> None:
             _started_monotonic=started,
         )
         try:
-            result = reconcile_canonical_index(app)
+            if cycle_profile is None:
+                # Keep the original call shape for ordinary callers/test doubles.
+                result = reconcile_canonical_index(app)
+            else:
+                result = reconcile_canonical_index(app, profile_override=cycle_profile)
         except Exception as exc:
+            _finish_canonical_ab_cycle(
+                app, controller, cycle_profile, None, started, error=_canonical_error_code(exc),
+            )
             wait_seconds = CANONICAL_INDEX_INTERVAL
             state = canonical_reconcile_state(app)
             failures = int(state.get("consecutive_failures") or 0) + 1
@@ -2925,6 +3057,7 @@ def _canonical_reconcile_background(app) -> None:
             # Retry state remains in the encrypted source store. Never log raw
             # rows, exception text, subprocess output, provider payloads, or credentials.
         else:
+            _finish_canonical_ab_cycle(app, controller, cycle_profile, result, started)
             _maybe_maintain_canonical_index(app, result)
             safe_result = {
                 key: result.get(key)
@@ -2987,10 +3120,12 @@ def _canonical_reconcile_background(app) -> None:
 
 
 def start_canonical_reconciler(app) -> None:
-    if not index_memory() or getattr(app, "canonical_index_thread", None) is not None:
+    if getattr(app, "canonical_index_thread", None) is not None:
+        return
+    _initialize_canonical_reconcile_state(app)
+    if not index_memory():
         return
     app.canonical_index_stop = threading.Event()
-    _initialize_canonical_reconcile_state(app)
     app.canonical_index_thread = threading.Thread(
         target=_canonical_reconcile_background,
         args=(app,),
@@ -2998,6 +3133,33 @@ def start_canonical_reconciler(app) -> None:
         daemon=True,
     )
     app.canonical_index_thread.start()
+
+
+def canonical_ab_payload(action: str) -> tuple[int, dict[str, object]]:
+    """Control only the existing reconciler; these calls never create a writer."""
+    app = source_app()
+    controller = getattr(app, "canonical_ab", None)
+    if app is None or controller is None:
+        return 503, {"ok": False, "error": "canonical_index_unavailable"}
+    if action == "start":
+        if app.syncer.restore_failed:
+            return 503, {"ok": False, "error": "restore_failed"}
+        restored = getattr(app, "restore_done", None)
+        if app.syncer.restoring or restored is None or not restored.is_set() or not app.syncer.restored:
+            return 503, {"ok": False, "error": "restore_in_progress"}
+        thread = getattr(app, "canonical_index_thread", None)
+        stop = getattr(app, "canonical_index_stop", None)
+        if not index_memory() or thread is None or not thread.is_alive() or stop is None or stop.is_set():
+            return 503, {"ok": False, "error": "canonical_index_disabled"}
+        try:
+            status = controller.start()
+        except RuntimeError:
+            return 409, {"ok": False, "error": "canonical_ab_already_running"}
+    elif action == "abort":
+        status = controller.abort()
+    else:
+        status = controller.status()
+    return 200, {"ok": True, **status}
 
 
 def stop_canonical_reconciler(app) -> None:
@@ -3312,6 +3474,9 @@ class NativeMcpWorker:
         self._stderr_stop = threading.Event()
         self._stderr_lines: deque[str] = deque(maxlen=32)
         self._read_metrics: list[dict[str, object]] = []
+        # Set only after a replacement child has completed its warm recall.
+        # Handshake alone does not prove that the active Lance snapshot is open.
+        self._snapshot_opened_after: float | None = None
 
     @property
     def process(self):
@@ -3798,6 +3963,9 @@ def _refresh_native_worker() -> None:
     """Warm a replacement child and atomically swap it with the active one."""
     global MCP_WORKER, _MCP_WORKER_CONFIG
     config = _native_worker_config()
+    # A maintenance commit may complete while the warm probe is running.
+    # Use a conservative lower bound on snapshot open, not probe completion.
+    opened_at = time.monotonic()
     candidate = NativeMcpWorker(
         FUNES_BIN,
         REMOTE,
@@ -3809,6 +3977,7 @@ def _refresh_native_worker() -> None:
         probe = candidate.recall("memory", k=1, candidates=1, half_life=0, neighbors=0)
         if probe.startswith("recall error:"):
             raise NativeMcpError("native recall failed")
+        candidate._snapshot_opened_after = opened_at
     except Exception:
         candidate.close()
         raise
@@ -4207,6 +4376,12 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/health":
             self.send_json(200, {"ok": True, "service": "funes"})
             return
+        if self.path == "/admin/canonical-ab/status":
+            if not auth_ok(self):
+                self.send_json(401, {"error": "unauthorized"})
+                return
+            self.send_json(*canonical_ab_payload("status"))
+            return
         operation_prefix = "/ingest/operations/"
         if self.path.startswith(operation_prefix):
             if not auth_ok(self):
@@ -4242,6 +4417,12 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             obj = self.body()
+            if self.path in ("/admin/canonical-ab/start", "/admin/canonical-ab/abort"):
+                if obj:
+                    self.send_json(400, {"error": "canonical_ab_accepts_no_parameters"})
+                    return
+                self.send_json(*canonical_ab_payload(self.path.rsplit("/", 1)[-1]))
+                return
             if self.path == "/sync/status":
                 code, payload = sync_status_payload()
                 payload["hub_cache"] = hub_cache_status()
@@ -4385,6 +4566,25 @@ class Handler(BaseHTTPRequestHandler):
                             },
                         )
                         return
+                if (
+                    embedding_provider == "voyage"
+                    and "source_type" in filters
+                    and not sidecar_authoritative
+                    and not source_restore_error
+                    and not _source_type_prefilter_ready(app)
+                ):
+                    self.send_json(
+                        503,
+                        {
+                            "ok": False,
+                            "results": [],
+                            "results_text": "",
+                            "error": "native_filter_index_warming",
+                            "retrieval_backend": "unavailable",
+                            "embedding_profile": profile,
+                        },
+                    )
+                    return
                 pg_native_post_filter = bool(
                     os.getenv("FUNES_POSTGRES_DSN")
                     and embedding_provider == "voyage"

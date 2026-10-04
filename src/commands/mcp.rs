@@ -8,7 +8,7 @@ use crate::agents;
 use anyhow::Result;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, Content, Implementation, ServerCapabilities, ServerConfig};
+use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerConfig};
 use rmcp::transport::stdio;
 use rmcp::{schemars, tool, tool_handler, tool_router, ServerHandler, ServiceExt};
 use std::sync::Arc;
@@ -63,14 +63,14 @@ fn recall_tool_result(result: recall::RecallResult) -> CallToolResult {
                 .collect(),
         })
         .collect();
-    let mut response = CallToolResult::success(vec![Content::text(result.text)]);
+    let mut response = CallToolResult::success(vec![ContentBlock::text(result.text)]);
     response.structured_content =
         Some(serde_json::to_value(StructuredRecall { hits }).expect("recall hits contain only JSON-compatible values"));
     response
 }
 
 fn text_tool_result(text: String) -> CallToolResult {
-    CallToolResult::success(vec![Content::text(text)])
+    CallToolResult::success(vec![ContentBlock::text(text)])
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]

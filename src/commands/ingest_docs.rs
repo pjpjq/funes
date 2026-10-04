@@ -1500,7 +1500,7 @@ mod tests {
         let appended = normalize(serde_json::from_value(appended_value).unwrap()).unwrap();
         let chunks = document_chunks(&appended);
         let vectors = vec![vec![0.0; DIM as usize]; chunks.len()];
-        let uri = dataset::table_uri(&memory.to_string_lossy());
+        let uri = dataset::table_uri(&memory);
         let mut ds = dataset::open(&uri, HashMap::new()).await.unwrap();
         let schema = Arc::new(Schema::from(ds.schema()));
         let batch = build_batch_for_schema(&chunks, &vectors, schema.clone()).unwrap();

@@ -775,8 +775,24 @@ pub async fn build_indexes(ds: &mut Dataset, on_event: impl Fn(IndexBuildEvent))
         .await?;
     }
     if has_column(ds, "source_agent") {
-        refresh_or_build(ds, &SOURCE_AGENT, &existing,
-            &ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap), &on_event).await?;
+        refresh_or_build(
+            ds,
+            &SOURCE_AGENT,
+            &existing,
+            &ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap),
+            &on_event,
+        )
+        .await?;
+    }
+    if has_column(ds, "source_type") {
+        refresh_or_build(
+            ds,
+            &SOURCE_TYPE,
+            &existing,
+            &ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap),
+            &on_event,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -795,7 +811,11 @@ pub(crate) async fn indexes_need_rebuild(ds: &Dataset) -> Result<bool> {
     if fts_needs_refresh(ds).await? {
         return Ok(true);
     }
-    for (column, index) in [("source_identity", SOURCE_IDENTITY_INDEX_NAME), ("source_agent", SOURCE_AGENT_INDEX_NAME)] {
+    for (column, index) in [
+        ("source_identity", SOURCE_IDENTITY_INDEX_NAME),
+        ("source_agent", SOURCE_AGENT_INDEX_NAME),
+        ("source_type", SOURCE_TYPE_INDEX_NAME),
+    ] {
         if has_column(ds, column) && !ds.unindexed_fragments(index).await?.is_empty() {
             return Ok(true);
         }
@@ -861,6 +881,14 @@ const SOURCE_AGENT: IndexSpec = IndexSpec {
     column: "source_agent",
     index_type: IndexType::Bitmap,
     label: "source agent index",
+};
+
+const SOURCE_TYPE_INDEX_NAME: &str = "source_type_idx";
+const SOURCE_TYPE: IndexSpec = IndexSpec {
+    name: SOURCE_TYPE_INDEX_NAME,
+    column: "source_type",
+    index_type: IndexType::Bitmap,
+    label: "source type index",
 };
 
 /// Refresh `index` if `existing` lists it, else build it whole with `params`. A refresh that fails
@@ -1514,7 +1542,8 @@ mod tests {
             [
                 IndexBuildEvent::Building("text search index"),
                 IndexBuildEvent::Building("source identity index"),
-                IndexBuildEvent::Building("source agent index")
+                IndexBuildEvent::Building("source agent index"),
+                IndexBuildEvent::Building("source type index")
             ]
         ));
         let indexes = sub_index_counts(&ds).await.unwrap();
@@ -2153,6 +2182,7 @@ mod tests {
             ),
             Field::new("source_identity", DataType::Utf8, true),
             Field::new("source_agent", DataType::Utf8, true),
+            Field::new("source_type", DataType::Utf8, true),
         ]))
     }
 
@@ -2166,6 +2196,9 @@ mod tests {
             .collect::<Vec<_>>();
         let agents = (start..start + rows)
             .map(|row| Some(if row % 2 == 0 { "codex" } else { "pi" }))
+            .collect::<Vec<_>>();
+        let source_types = (start..start + rows)
+            .map(|row| Some(if row % 2 == 0 { "codex_session" } else { "pi_session" }))
             .collect::<Vec<_>>();
         let vectors = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
             (start..start + rows).map(|row| {
@@ -2184,6 +2217,7 @@ mod tests {
                 Arc::new(vectors),
                 Arc::new(StringArray::from(identities)),
                 Arc::new(StringArray::from(agents)),
+                Arc::new(StringArray::from(source_types)),
             ],
         )
         .unwrap()
@@ -2275,7 +2309,12 @@ mod tests {
         optimize_index(&mut ds, SOURCE_IDENTITY_INDEX_NAME, 1, |_| {})
             .await
             .unwrap();
-        optimize_index(&mut ds, SOURCE_AGENT_INDEX_NAME, 1, |_| {}).await.unwrap();
+        optimize_index(&mut ds, SOURCE_AGENT_INDEX_NAME, 1, |_| {})
+            .await
+            .unwrap();
+        optimize_index(&mut ds, SOURCE_TYPE_INDEX_NAME, 1, |_| {})
+            .await
+            .unwrap();
         assert!(!ds.unindexed_fragments(VECTOR_INDEX).await.unwrap().is_empty());
         assert!(!indexes_need_rebuild(&ds).await.unwrap());
         let vector = vectors(1).pop().unwrap();
@@ -2318,6 +2357,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn source_type_bitmap_health_repairs_missing_and_unindexed_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().join("chunks.lance");
+        let first = indexable_batch(0, 8);
+        let mut ds = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(first)].into_iter(), indexable_schema()),
+            uri.to_str().unwrap(),
+            Some(WriteParams::default()),
+        )
+        .await
+        .unwrap();
+
+        build_indexes(&mut ds, |_| {}).await.unwrap();
+        assert!(!indexes_need_rebuild(&ds).await.unwrap());
+        let original = ds.load_indices().await.unwrap();
+        let source_type = original
+            .iter()
+            .find(|index| index.name == SOURCE_TYPE_INDEX_NAME)
+            .expect("source_type bitmap must be created");
+        assert_eq!(source_type.fields, vec![ds.schema().field("source_type").unwrap().id]);
+        assert!(source_type
+            .index_details
+            .as_ref()
+            .unwrap()
+            .type_url
+            .ends_with("BitmapIndexDetails"));
+        let vectors = scan_rows(&ds, &["vector"], None, None).await.unwrap();
+        let schema = Schema::from(ds.schema());
+
+        ds.drop_index(SOURCE_TYPE_INDEX_NAME).await.unwrap();
+        assert!(indexes_need_rebuild(&ds).await.unwrap());
+        assert!(ensure_required_indexes(&mut ds, |_| {}).await.unwrap());
+        assert!(!indexes_need_rebuild(&ds).await.unwrap());
+        assert!(!ensure_required_indexes(&mut ds, |_| {}).await.unwrap());
+
+        let repaired = ds.load_indices().await.unwrap();
+        for index in original.iter().filter(|index| index.name != SOURCE_TYPE_INDEX_NAME) {
+            assert!(repaired
+                .iter()
+                .any(|other| other.name == index.name && other.uuid == index.uuid));
+        }
+        assert_eq!(Schema::from(ds.schema()), schema);
+        assert_eq!(scan_rows(&ds, &["vector"], None, None).await.unwrap(), vectors);
+
+        // Only source_type has index debt: other required indexes already cover the append.
+        let appended = indexable_batch(8, 1);
+        ds.append(
+            RecordBatchIterator::new(vec![Ok(appended)].into_iter(), indexable_schema()),
+            None,
+        )
+        .await
+        .unwrap();
+        let mut options = OptimizeOptions::append();
+        options.index_names = Some(vec![
+            TEXT_INDEX_NAME.to_string(),
+            SOURCE_IDENTITY_INDEX_NAME.to_string(),
+            SOURCE_AGENT_INDEX_NAME.to_string(),
+        ]);
+        ds.optimize_indices(&options).await.unwrap();
+        assert!(indexes_need_rebuild(&ds).await.unwrap());
+        let mut options = OptimizeOptions::append();
+        options.index_names = Some(vec![SOURCE_TYPE_INDEX_NAME.to_string()]);
+        ds.optimize_indices(&options).await.unwrap();
+        assert!(!indexes_need_rebuild(&ds).await.unwrap());
+    }
+
+    #[tokio::test]
     async fn index_maintenance_adds_vector_and_canonical_filter_indexes_after_growth() {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().join("chunks.lance");
@@ -2341,18 +2447,21 @@ mod tests {
         assert!(initial.contains(FTS_INDEX));
         assert!(initial.contains(SOURCE_IDENTITY_INDEX_NAME));
         assert!(initial.contains(SOURCE_AGENT_INDEX_NAME));
+        assert!(initial.contains(SOURCE_TYPE_INDEX_NAME));
         assert!(!initial.contains(VECTOR_INDEX));
-        let mut filtered = ds.scan();
-        filtered
-            .nearest("vector", &Float32Array::from(vec![0.0; DIM as usize]), 3)
-            .unwrap();
-        filtered.prefilter(true);
-        filtered.filter("source_agent = 'pi'").unwrap();
-        let plan = filtered.explain_plan(false).await.unwrap();
-        assert!(
-            plan.contains("ScalarIndexQuery"),
-            "source_agent prefilter must use source_agent_idx: {plan}"
-        );
+        for predicate in ["source_agent = 'pi'", "source_type = 'pi_session'"] {
+            let mut filtered = ds.scan();
+            filtered
+                .nearest("vector", &Float32Array::from(vec![0.0; DIM as usize]), 3)
+                .unwrap();
+            filtered.prefilter(true);
+            filtered.filter(predicate).unwrap();
+            let plan = filtered.explain_plan(false).await.unwrap();
+            assert!(
+                plan.contains("ScalarIndexQuery"),
+                "canonical prefilter must use its bitmap index ({predicate}): {plan}"
+            );
+        }
 
         let appended = indexable_batch(255, 77);
         ds.append(

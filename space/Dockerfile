@@ -26,6 +26,7 @@ FROM python:3.12-slim-bookworm
 COPY --from=build /src/target/release/funes /usr/local/bin/funes
 COPY --from=build /usr/local/bin/trufflehog /usr/local/bin/trufflehog
 COPY space/server.py /app/server.py
+COPY space/canonical_ab.py /app/space/canonical_ab.py
 COPY service /app/service
 RUN pip install --no-cache-dir -r /app/service/requirements.txt
 ENV FUNES_HOME=/data/.funes \

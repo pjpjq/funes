@@ -12,6 +12,7 @@ Pure in-memory, thread-safe with single lock.
 
 from __future__ import annotations
 
+import copy
 import math
 import threading
 import time
@@ -59,6 +60,16 @@ ALLOWLISTED_METRICS: frozenset[str] = frozenset({
     "request_rows",
     "max_chars",
     "latency_ms",
+    "request_duration_ms",
+    "pacer_wait_ms",
+    "backoff_ms",
+})
+
+ALLOWLISTED_PHASES = frozenset({
+    "secret_scan", "remote_open", "revision_lookup", "vector_reuse", "embedding",
+    "lance_write_commit", "lance_append", "lance_delete", "captured_files", "write_ops",
+    "hf_commit_chunk", "hf_commit_wait", "recall_open", "recall_models", "recall_embed",
+    "recall_vector", "recall_fts", "recall_rerank", "recall_neighbors",
 })
 
 
@@ -71,9 +82,34 @@ def _sanitize_metrics(raw_metrics: Any) -> dict[str, int | float]:
             continue
         if isinstance(v, bool):
             continue
-        if isinstance(v, (int, float)) and math.isfinite(v):
+        if isinstance(v, (int, float)) and math.isfinite(v) and 0 <= v <= 1_000_000_000:
             clean[k] = int(v) if isinstance(v, int) or v.is_integer() else round(float(v), 4)
     return clean
+
+
+def _sanitize_phase_ms(raw: Any) -> dict[str, float]:
+    if not isinstance(raw, Mapping):
+        return {}
+    return {
+        key: round(float(value), 2)
+        for key, value in raw.items()
+        if key in ALLOWLISTED_PHASES
+        and not isinstance(value, bool)
+        and isinstance(value, (int, float))
+        and math.isfinite(value)
+        and 0 <= value < 86_400_000
+    }
+
+
+def _count(value: Any) -> int:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or not 0 <= value <= 1_000_000_000
+    ):
+        return 0
+    return int(value)
 
 
 class CanonicalABController:
@@ -109,7 +145,7 @@ class CanonicalABController:
         """Start a new A/B run. Rejects concurrent start if currently running."""
         with self._lock:
             self._check_deadline_locked()
-            if self._phase == "running":
+            if self._phase == "running" or self._in_flight:
                 raise RuntimeError("canonical_ab_already_running")
 
             self._run_counter += 1
@@ -138,6 +174,10 @@ class CanonicalABController:
             self._check_deadline_locked()
             if self._phase != "running":
                 return None
+            # The existing reconciler owns execution. Never dispatch another
+            # override while an aborted/timed-out native cycle is draining.
+            if self._in_flight:
+                return None
             if self._dispatched_cycles >= MAX_CYCLES:
                 return None
 
@@ -165,6 +205,7 @@ class CanonicalABController:
         metrics: dict[str, Any] | None = None,
         error: str | None = None,
         profile: dict[str, Any] | None = None,
+        phase_ms: Mapping[str, Any] | None = None,
         **kwargs: Any,
     ) -> bool:
         """Record completed cycle. Thread-safe, bounded, safe error triggers."""
@@ -207,8 +248,10 @@ class CanonicalABController:
 
             clean_metrics = _sanitize_metrics(actual_metrics)
             safe_duration_ms = (
-                max(0, int(actual_duration_ms))
-                if isinstance(actual_duration_ms, (int, float)) and math.isfinite(actual_duration_ms)
+                min(86_400_000, max(0, int(actual_duration_ms)))
+                if not isinstance(actual_duration_ms, bool)
+                and isinstance(actual_duration_ms, (int, float))
+                and math.isfinite(actual_duration_ms)
                 else 0
             )
 
@@ -228,15 +271,20 @@ class CanonicalABController:
                 has_error = True
                 error_reason = "invalid_result"
             else:
-                attempted = actual_result.get("attempted", 0)
+                attempted = _count(actual_result.get("attempted", 0))
                 durable = actual_result.get("durable", False)
 
                 if not bool(durable):
                     has_error = True
                     error_reason = "not_durable"
-                elif not isinstance(attempted, (int, float)) or attempted <= 0:
+                elif attempted <= 0:
                     has_error = True
                     error_reason = "attempted_zero"
+                elif not _count(actual_result.get("indexed", 0)) and not _count(actual_result.get("held", 0)):
+                    # A durably persisted retry checkpoint is not successful
+                    # indexing, even when the source-store ACK succeeded.
+                    has_error = True
+                    error_reason = "no_progress"
                 elif clean_metrics.get("http_429", 0) > 0:
                     has_error = True
                     error_reason = "http_429"
@@ -248,9 +296,9 @@ class CanonicalABController:
                     error_reason = "transport_errors"
 
             if isinstance(actual_result, dict):
-                rec_attempted = int(actual_result.get("attempted", 0) or 0)
-                rec_indexed = int(actual_result.get("indexed", 0) or 0)
-                rec_held = int(actual_result.get("held", 0) or 0)
+                rec_attempted = _count(actual_result.get("attempted", 0))
+                rec_indexed = _count(actual_result.get("indexed", 0))
+                rec_held = _count(actual_result.get("held", 0))
                 rec_durable = bool(actual_result.get("durable", False))
             else:
                 rec_attempted = 0
@@ -267,6 +315,7 @@ class CanonicalABController:
                 "durable": rec_durable,
                 "duration_ms": safe_duration_ms,
                 "metrics": clean_metrics,
+                "phase_ms": _sanitize_phase_ms(phase_ms),
             }
 
             if len(self._records) < MAX_CYCLES:
@@ -287,11 +336,13 @@ class CanonicalABController:
     def _status_locked(self) -> dict[str, Any]:
         self._check_deadline_locked()
         elapsed = 0.0
-        if self._started_at > 0:
+        if self._run_id is not None:
             elapsed = max(0.0, float(self._clock() - self._started_at))
 
         active_profile_name: str | None = None
-        if self._phase == "running" and self._dispatched_cycles < MAX_CYCLES:
+        if self._phase == "running" and self._in_flight:
+            active_profile_name = next(iter(self._in_flight.values()))["name"]
+        elif self._phase == "running" and self._dispatched_cycles < MAX_CYCLES:
             profile_idx = self._dispatched_cycles // CYCLES_PER_PROFILE
             active_profile_name = FIXED_PROFILES[profile_idx]["name"]
 
@@ -303,9 +354,10 @@ class CanonicalABController:
             "completed_cycles": len(self._records),
             "active_profile": active_profile_name,
             "current_cycle_index": self._dispatched_cycles,
+            "in_flight_cycles": len(self._in_flight),
             "elapsed_seconds": round(elapsed, 3),
             "deadline_seconds": self._deadline_seconds,
-            "records": [dict(r) for r in self._records],
+            "records": copy.deepcopy(self._records),
         }
 
     def status(self) -> dict[str, Any]:

@@ -7,7 +7,7 @@ ARG FUNES_BINARY_URL=https://raw.githubusercontent.com/pjpjq/funes/${FUNES_SOURC
 LABEL org.opencontainers.image.source="https://github.com/pjpjq/funes" \
       org.opencontainers.image.revision="${FUNES_SOURCE_REV}"
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl zstd \
+    && apt-get install -y --no-install-recommends ca-certificates curl zstd libstdc++6 \
     && curl --fail --show-error --location --retry 5 --retry-all-errors --connect-timeout 15 --max-time 120 \
         https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh \
         | bash -s -- -b /usr/local/bin v3.95.5 \
@@ -22,6 +22,7 @@ RUN curl --fail --show-error --location --retry 5 --retry-all-errors --connect-t
     && /usr/local/bin/funes --version \
     && rm /tmp/funes.bin.zst
 COPY space/server.py /app/server.py
+COPY space/canonical_ab.py /app/space/canonical_ab.py
 COPY service /app/service
 RUN pip install --no-cache-dir -r /app/service/requirements.txt
 ENV FUNES_HOME=/data/.funes \

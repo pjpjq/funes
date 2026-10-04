@@ -1088,6 +1088,22 @@ def test_search_ready_rejects_false_ready_without_live_worker(monkeypatch):
     assert recovery_calls == [True]
 
 
+def test_native_worker_status_preserves_already_parsed_recall_metrics(monkeypatch, tmp_path):
+    worker = bridge.NativeMcpWorker("fake-funes", "owner/memory", tmp_path)
+    parsed = [
+        {"stage": "recall_open", "state": "start", "duration_ms": 0.0},
+        {"stage": "recall_vector", "state": "done", "duration_ms": 12.35},
+    ]
+    worker._read_metrics = list(parsed)
+    worker._process = SimpleNamespace(poll=lambda: None)
+    monkeypatch.setattr(bridge, "MCP_WORKER", worker)
+    monkeypatch.setattr(bridge, "_MCP_WORKER_CONFIG", bridge._native_worker_config())
+
+    status = bridge.native_worker_status()
+
+    assert status["last_failure"]["read_metrics"] == parsed
+
+
 def test_sync_status_non_postgres_reports_safe_error(monkeypatch):
     monkeypatch.setattr(bridge, "REMOTE", "owner/memory")
     monkeypatch.setattr(bridge, "SOURCE_APP", None)

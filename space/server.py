@@ -350,10 +350,6 @@ def native_environment(
     # emitted records are allowlisted numeric aggregates; no source text or
     # credentials are included.
     env["FUNES_INGEST_METRICS"] = os.getenv("FUNES_INGEST_METRICS", "1") or "1"
-    # Read-stage metrics are enabled only in this child environment. They are
-    # emitted on stderr and drained by NativeMcpWorker; no query/source payload
-    # is sent to the HTTP response or persisted.
-    env["FUNES_RECALL_METRICS"] = os.getenv("FUNES_RECALL_METRICS", "1") or "1"
     # A/B profiles may override the Rust document concurrency for an isolated
     # cycle.  Production calls without this field retain the process setting.
     if isinstance(profile, dict) and profile.get("concurrency") is not None:
@@ -3211,7 +3207,12 @@ class NativeMcpWorker:
     def _environment(self) -> dict[str, str]:
         # Keep HF_TOKEN/HF_HOME and any other caller-provided Hub settings.  Only
         # FUNES_HOME is pinned to the Space's durable warm-cache directory.
-        return native_environment(self.home)
+        env = native_environment(self.home)
+        # Read-stage metrics belong only to the long-lived MCP read worker.  Do
+        # not enable them in ingest/backfill subprocesses, where they add noise
+        # and can obscure the bounded ingest diagnostics.
+        env["FUNES_RECALL_METRICS"] = os.getenv("FUNES_RECALL_METRICS", "1") or "1"
+        return env
 
     @staticmethod
     def _alive(process) -> bool:

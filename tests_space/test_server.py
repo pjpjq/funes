@@ -2495,9 +2495,20 @@ def test_native_environment_uses_safe_production_defaults(monkeypatch, tmp_path)
     assert env["FUNES_RERANK_PROVIDER"] == "none"
     assert env["FUNES_NATIVE_FALLBACK"] == "false"
     assert env["FUNES_INGEST_METRICS"] == "1"
-    assert env["FUNES_RECALL_METRICS"] == "1"
+    assert "FUNES_RECALL_METRICS" not in env
     assert env["FUNES_MCP_PIN_MEMORY"] == "true"
     assert env["FUNES_RETRIEVAL_LANGUAGE_MODE"] == "raw"
+
+
+def test_native_mcp_worker_environment_enables_recall_metrics_only_for_reads(
+    monkeypatch, tmp_path
+):
+    monkeypatch.delenv("FUNES_RECALL_METRICS", raising=False)
+    worker = bridge.NativeMcpWorker("fake-funes", "owner/memory", tmp_path)
+    assert worker._environment()["FUNES_RECALL_METRICS"] == "1"
+
+    monkeypatch.setenv("FUNES_RECALL_METRICS", "0")
+    assert worker._environment()["FUNES_RECALL_METRICS"] == "0"
 
 
 def test_native_environment_profile_overrides_voyage_concurrency(monkeypatch, tmp_path):

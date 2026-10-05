@@ -425,11 +425,7 @@ impl DocumentPacer {
     }
 
     fn settle(&mut self, reservation_id: ReservationId, actual_tokens: usize) {
-        if let Some((_, _, tokens)) = self
-            .window_history
-            .iter_mut()
-            .find(|(id, _, _)| *id == reservation_id)
-        {
+        if let Some((_, _, tokens)) = self.window_history.iter_mut().find(|(id, _, _)| *id == reservation_id) {
             *tokens = actual_tokens;
         }
     }
@@ -752,9 +748,7 @@ impl VoyageEmbedder {
                 let response = match response.json::<EmbeddingsResponse>() {
                     Ok(response) => {
                         let token_usage = response.usage.as_ref().and_then(|u| u.total_tokens);
-                        if let (Some(reservation_id), Some(actual_tokens)) =
-                            (reservation_id, token_usage)
-                        {
+                        if let (Some(reservation_id), Some(actual_tokens)) = (reservation_id, token_usage) {
                             self.settle_document_attempt(reservation_id, actual_tokens);
                         }
                         emit_voyage_metric(&VoyageRequestMetric {
@@ -1244,10 +1238,7 @@ mod tests {
         })
     }
 
-    fn embedding_response_with_usage(
-        vectors: Vec<(usize, Vec<f32>)>,
-        total_tokens: u64,
-    ) -> Value {
+    fn embedding_response_with_usage(vectors: Vec<(usize, Vec<f32>)>, total_tokens: u64) -> Value {
         let mut response = embedding_response(vectors);
         response["usage"] = json!({ "total_tokens": total_tokens });
         response
@@ -1576,10 +1567,7 @@ mod tests {
     #[test]
     fn document_embedding_usage_releases_conservative_reservation() {
         let server = MockServer::start(vec![
-            MockResponse::json(
-                200,
-                embedding_response_with_usage(vec![(0, unit_vector(0))], 1_000),
-            ),
+            MockResponse::json(200, embedding_response_with_usage(vec![(0, unit_vector(0))], 1_000)),
             MockResponse::json(200, embedding_response(vec![(0, unit_vector(1))])),
         ]);
         let clock = Arc::new(MockClock::new(Instant::now()));

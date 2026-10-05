@@ -43,6 +43,7 @@ const MAX_EMBEDDING_INPUTS: usize = 128;
 // Four capped sleeps plus five 30-second requests stay below the Space's
 // 1800-second canonical-ingest subprocess deadline.
 const DOCUMENT_MAX_RATE_LIMIT_DELAY: Duration = Duration::from_secs(120);
+type ReservationId = u64;
 
 #[derive(Serialize)]
 struct EmbeddingsRequest<'a> {
@@ -335,7 +336,8 @@ struct DocumentPacer {
     min_interval: Duration,
     tokens_per_minute: usize,
     last_request_start: Option<Instant>,
-    window_history: VecDeque<(Instant, usize)>,
+    window_history: VecDeque<(ReservationId, Instant, usize)>,
+    next_reservation_id: ReservationId,
     not_before: Option<Instant>,
 }
 
@@ -346,12 +348,13 @@ impl DocumentPacer {
             tokens_per_minute,
             last_request_start: None,
             window_history: VecDeque::new(),
+            next_reservation_id: 0,
             not_before: None,
         }
     }
 
     fn prune_history(&mut self, now: Instant) {
-        while let Some(&(start, _)) = self.window_history.front() {
+        while let Some(&(_, start, _)) = self.window_history.front() {
             if now.saturating_duration_since(start) >= TPM_WINDOW {
                 self.window_history.pop_front();
             } else {
@@ -381,8 +384,8 @@ impl DocumentPacer {
         let mut active_tokens: usize = self
             .window_history
             .iter()
-            .filter(|(start, _)| now.saturating_duration_since(*start) < TPM_WINDOW)
-            .map(|(_, count)| *count)
+            .filter(|(_, start, _)| now.saturating_duration_since(*start) < TPM_WINDOW)
+            .map(|(_, _, count)| *count)
             .sum();
 
         if active_tokens.saturating_add(tokens) <= self.tokens_per_minute {
@@ -390,7 +393,7 @@ impl DocumentPacer {
         }
 
         let mut tpm_delay = Duration::ZERO;
-        for &(start, count) in self.window_history.iter() {
+        for &(_, start, count) in self.window_history.iter() {
             if now.saturating_duration_since(start) >= TPM_WINDOW {
                 continue;
             }
@@ -406,14 +409,28 @@ impl DocumentPacer {
         interval_delay.max(tpm_delay)
     }
 
-    fn record_attempt(&mut self, now: Instant, tokens: usize) {
+    fn record_attempt(&mut self, now: Instant, tokens: usize) -> Option<ReservationId> {
         self.last_request_start = Some(now);
         if self.not_before.is_some_and(|deadline| now >= deadline) {
             self.not_before = None;
         }
         if self.tokens_per_minute > 0 && tokens > 0 {
             self.prune_history(now);
-            self.window_history.push_back((now, tokens));
+            let reservation_id = self.next_reservation_id;
+            self.next_reservation_id = self.next_reservation_id.wrapping_add(1);
+            self.window_history.push_back((reservation_id, now, tokens));
+            return Some(reservation_id);
+        }
+        None
+    }
+
+    fn settle(&mut self, reservation_id: ReservationId, actual_tokens: usize) {
+        if let Some((_, _, tokens)) = self
+            .window_history
+            .iter_mut()
+            .find(|(id, _, _)| *id == reservation_id)
+        {
+            *tokens = actual_tokens;
         }
     }
 
@@ -602,7 +619,7 @@ impl VoyageEmbedder {
         self.document_concurrency.clamp(1, MAX_DOCUMENT_CONCURRENCY)
     }
 
-    fn pace_document_attempt(&self, tokens: usize) {
+    fn pace_document_attempt(&self, tokens: usize) -> Option<ReservationId> {
         loop {
             let delay = {
                 let pacer = self.pacer.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -619,8 +636,7 @@ impl VoyageEmbedder {
             let now = self.clock.now();
             let delay = pacer.delay_at(now, tokens);
             if delay.is_zero() {
-                pacer.record_attempt(now, tokens);
-                return;
+                return pacer.record_attempt(now, tokens);
             }
             drop(pacer);
             self.clock.sleep(delay);
@@ -630,6 +646,12 @@ impl VoyageEmbedder {
     fn defer_document_attempt(&self, delay: Duration) {
         let mut pacer = self.pacer.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         pacer.defer_until(self.clock.now(), delay);
+    }
+
+    fn settle_document_attempt(&self, reservation_id: ReservationId, actual_tokens: u64) {
+        let actual_tokens = actual_tokens.min(usize::MAX as u64) as usize;
+        let mut pacer = self.pacer.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        pacer.settle(reservation_id, actual_tokens);
     }
 
     fn rate_limit_delay(&self, response: &reqwest::blocking::Response, attempt: usize) -> Duration {
@@ -666,13 +688,18 @@ impl VoyageEmbedder {
         } else {
             0
         };
+        let mut reservation_id = None;
 
         for attempt in 0..attempts {
             let pacer_start = self.clock.now();
             if documents {
                 // Count a batch once. Retries still honor interval/retry-after
                 // pacing, but do not consume the same TPM budget repeatedly.
-                self.pace_document_attempt(if attempt == 0 { estimated_tokens } else { 0 });
+                if attempt == 0 {
+                    reservation_id = self.pace_document_attempt(estimated_tokens);
+                } else {
+                    self.pace_document_attempt(0);
+                }
             }
             let pacer_wait = self.clock.now().saturating_duration_since(pacer_start);
             let pacer_wait_ms = round_ms(pacer_wait);
@@ -725,6 +752,11 @@ impl VoyageEmbedder {
                 let response = match response.json::<EmbeddingsResponse>() {
                     Ok(response) => {
                         let token_usage = response.usage.as_ref().and_then(|u| u.total_tokens);
+                        if let (Some(reservation_id), Some(actual_tokens)) =
+                            (reservation_id, token_usage)
+                        {
+                            self.settle_document_attempt(reservation_id, actual_tokens);
+                        }
                         emit_voyage_metric(&VoyageRequestMetric {
                             stage: "voyage_request",
                             attempt: attempt + 1,
@@ -1212,6 +1244,15 @@ mod tests {
         })
     }
 
+    fn embedding_response_with_usage(
+        vectors: Vec<(usize, Vec<f32>)>,
+        total_tokens: u64,
+    ) -> Value {
+        let mut response = embedding_response(vectors);
+        response["usage"] = json!({ "total_tokens": total_tokens });
+        response
+    }
+
     #[test]
     fn retained_clients_are_send_and_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
@@ -1486,6 +1527,91 @@ mod tests {
         let t4 = t0 + Duration::from_secs(60);
         assert_eq!(pacer.delay_at(t4, 2_000), Duration::ZERO);
         pacer.record_attempt(t4, 2_000);
+    }
+
+    #[test]
+    fn document_pacer_settles_actual_tokens_without_removing_other_reservations() {
+        let mut pacer = DocumentPacer::new(Duration::ZERO, 10_000);
+        let t0 = Instant::now();
+        let first = pacer.record_attempt(t0, 6_000).unwrap();
+        let second = pacer.record_attempt(t0 + Duration::from_secs(1), 3_000).unwrap();
+
+        pacer.settle(first, 1_000);
+
+        assert_eq!(
+            pacer
+                .window_history
+                .iter()
+                .find(|(id, _, _)| *id == first)
+                .map(|(_, _, tokens)| *tokens),
+            Some(1_000)
+        );
+        assert_eq!(
+            pacer
+                .window_history
+                .iter()
+                .find(|(id, _, _)| *id == second)
+                .map(|(_, _, tokens)| *tokens),
+            Some(3_000)
+        );
+        assert_eq!(pacer.window_history.len(), 2);
+        assert_eq!(
+            pacer.delay_at(t0 + Duration::from_secs(2), 7_000),
+            Duration::from_secs(58)
+        );
+    }
+
+    #[test]
+    fn document_pacer_without_usage_keeps_conservative_reservation() {
+        let mut pacer = DocumentPacer::new(Duration::ZERO, 10_000);
+        let t0 = Instant::now();
+        assert!(pacer.record_attempt(t0, 6_000).is_some());
+
+        assert_eq!(
+            pacer.delay_at(t0 + Duration::from_secs(1), 5_000),
+            Duration::from_secs(59)
+        );
+    }
+
+    #[test]
+    fn document_embedding_usage_releases_conservative_reservation() {
+        let server = MockServer::start(vec![
+            MockResponse::json(
+                200,
+                embedding_response_with_usage(vec![(0, unit_vector(0))], 1_000),
+            ),
+            MockResponse::json(200, embedding_response(vec![(0, unit_vector(1))])),
+        ]);
+        let clock = Arc::new(MockClock::new(Instant::now()));
+        let mut embedder = VoyageEmbedder::with_config_and_clock(
+            "test-api-key".to_string(),
+            server.url.clone(),
+            "test-embedding-model".to_string(),
+            TEST_DIMENSIONS,
+            Duration::from_secs(1),
+            Duration::from_millis(100),
+            DOCUMENT_ATTEMPTS,
+            Duration::ZERO,
+            Duration::ZERO,
+            9_000,
+            10_000,
+            Duration::ZERO,
+            clock.clone(),
+        )
+        .unwrap();
+
+        let first = "a".repeat(6_000);
+        let second = "b".repeat(6_000);
+        assert_eq!(
+            embedder.embed_documents(&[first.as_str()]).unwrap(),
+            vec![unit_vector(0)]
+        );
+        assert_eq!(
+            embedder.embed_documents(&[second.as_str()]).unwrap(),
+            vec![unit_vector(1)]
+        );
+        assert_eq!(clock.total_slept(), Duration::ZERO);
+        assert_eq!(server.finish().len(), 2);
     }
 
     #[test]

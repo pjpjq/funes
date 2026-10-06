@@ -844,6 +844,9 @@ async fn ingest_remote(
     let (owner, name, prefix) = hub::parse_hf(uri)?;
     let token = hub::hf_token().context("no HF token (set HF_TOKEN) — required to ingest")?;
     let repo = hub::client(Some(&token), true)?.dataset(owner, name);
+    // Commit retries must observe Retry-After, not hf-hub's short automatic 429 retries.
+    // Keep the normal read client, and let remote::send_commit_chunks own write retries.
+    let commit_repo = hub::client(Some(&token), false)?.dataset(repo.owner(), repo.name());
     let rev = "main".to_string();
     let dataset_uri = dataset::table_uri(uri);
     let opts = HashMap::from([("hf_token".to_string(), token)]);
@@ -905,7 +908,7 @@ async fn ingest_remote(
         let commit_start = Instant::now();
         let result = if first {
             remote::first_document_publish(
-                &repo,
+                &commit_repo,
                 &prefix,
                 vec![batch],
                 target_schema,
@@ -917,6 +920,7 @@ async fn ingest_remote(
         } else if append_only(&selection, &stored, schema_allows_append) {
             remote::append_documents(
                 &repo,
+                &commit_repo,
                 &dataset_uri,
                 opts.clone(),
                 &expected_parent,
@@ -929,6 +933,7 @@ async fn ingest_remote(
         } else {
             remote::replace_documents(
                 &repo,
+                &commit_repo,
                 &dataset_uri,
                 opts.clone(),
                 &expected_parent,

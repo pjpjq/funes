@@ -9,6 +9,7 @@ import atexit
 import base64
 import gzip
 import io
+import itertools
 import json
 import math
 import os
@@ -1790,6 +1791,52 @@ def _safe_timeout_stderr(stderr: str | bytes | None) -> str | None:
                         clean_item["attempt"] = attempt
                 except (TypeError, ValueError):
                     pass
+        elif stage == "hf_commit_attempt":
+            clean_item = {
+                "stage": stage,
+                "duration_ms": round(duration_ms, 2),
+            }
+            if "attempt" in item:
+                try:
+                    attempt = int(item["attempt"])
+                    if 1 <= attempt <= 100:
+                        clean_item["attempt"] = attempt
+                except (TypeError, ValueError):
+                    pass
+            if "status_code" in item:
+                try:
+                    value = int(item["status_code"])
+                    if 0 <= value <= 999:
+                        clean_item["status_code"] = value
+                except (TypeError, ValueError):
+                    pass
+            if "phase" in item:
+                phase = str(item["phase"])
+                if phase in {"preupload", "commit", "unknown"}:
+                    clean_item["phase"] = phase
+            if "retry_after_ms" in item:
+                if item["retry_after_ms"] is None:
+                    clean_item["retry_after_ms"] = None
+                else:
+                    try:
+                        value = float(item["retry_after_ms"])
+                        if 0.0 <= value < 86_400_000:
+                            clean_item["retry_after_ms"] = round(value, 2)
+                    except (TypeError, ValueError):
+                        pass
+            if "backoff_ms" in item and item["backoff_ms"] is not None:
+                try:
+                    value = float(item["backoff_ms"])
+                    if 0.0 <= value < 86_400_000:
+                        clean_item["backoff_ms"] = round(value, 2)
+                except (TypeError, ValueError):
+                    pass
+            if "retrying" in item and isinstance(item["retrying"], bool):
+                clean_item["retrying"] = item["retrying"]
+            if "limit_kind" in item:
+                limit_kind = str(item["limit_kind"])
+                if limit_kind in {"commit_action", "api", "concurrency", "unknown"}:
+                    clean_item["limit_kind"] = limit_kind
         else:
             continue
 
@@ -1799,9 +1846,13 @@ def _safe_timeout_stderr(stderr: str | bytes | None) -> str | None:
     return "\n".join(safe_lines) + "\n" if safe_lines else None
 
 
+_CANONICAL_METRIC_COUNTER = itertools.count(1)
+
+
 def _native_metrics() -> dict[str, object]:
     """Return a bounded aggregate for native ingest timing diagnostics."""
     return {
+        "_metric_id": next(_CANONICAL_METRIC_COUNTER),
         "phase_ms": {},
         "voyage_requests": 0,
         "voyage_retries": 0,
@@ -1812,6 +1863,14 @@ def _native_metrics() -> dict[str, object]:
         "voyage_status_counts": {},
         "voyage_pacer_wait_ms": 0.0,
         "voyage_backoff_ms": 0.0,
+        "hf_send_attempts": 0,
+        "hf_retries": 0,
+        "hf_status_counts": {},
+        "hf_phase_counts": {},
+        "hf_429_count": 0,
+        "hf_backoff_ms": 0.0,
+        "hf_retry_after_ms": 0.0,
+        "hf_limit_kind_counts": {},
     }
 
 
@@ -1885,6 +1944,45 @@ def _record_native_metrics(metrics: dict[str, object], stderr: str | None) -> No
             continue
         if stage in NATIVE_METRIC_PHASES:
             phase_ms[stage] = round(float(phase_ms.get(stage, 0.0)) + duration_ms, 2)
+            continue
+        if stage == "hf_commit_attempt":
+            metrics["hf_send_attempts"] = int(metrics.get("hf_send_attempts", 0)) + 1
+            try:
+                attempt = int(item.get("attempt", 1))
+            except (TypeError, ValueError):
+                attempt = 1
+            retrying_flag = item.get("retrying") is True
+            if (2 <= attempt <= 100) or ("attempt" not in item and retrying_flag):
+                metrics["hf_retries"] = int(metrics.get("hf_retries", 0)) + 1
+            try:
+                status = int(item.get("status_code", 0))
+            except (TypeError, ValueError):
+                status = 0
+            if 0 <= status <= 999:
+                skey = str(status)
+                hf_status_counts = metrics.setdefault("hf_status_counts", {})
+                if isinstance(hf_status_counts, dict):
+                    hf_status_counts[skey] = int(hf_status_counts.get(skey, 0)) + 1
+                if status == 429:
+                    metrics["hf_429_count"] = int(metrics.get("hf_429_count", 0)) + 1
+            phase = item.get("phase")
+            if isinstance(phase, str) and phase in {"preupload", "commit", "unknown"}:
+                hf_phase_counts = metrics.setdefault("hf_phase_counts", {})
+                if isinstance(hf_phase_counts, dict):
+                    hf_phase_counts[phase] = int(hf_phase_counts.get(phase, 0)) + 1
+            limit_kind = item.get("limit_kind")
+            if isinstance(limit_kind, str) and limit_kind in {"commit_action", "api", "concurrency", "unknown"}:
+                hf_limit_kind_counts = metrics.setdefault("hf_limit_kind_counts", {})
+                if isinstance(hf_limit_kind_counts, dict):
+                    hf_limit_kind_counts[limit_kind] = int(hf_limit_kind_counts.get(limit_kind, 0)) + 1
+            for field, target_key in (("backoff_ms", "hf_backoff_ms"), ("retry_after_ms", "hf_retry_after_ms")):
+                if field in item and item[field] is not None:
+                    try:
+                        val = float(item[field])
+                        if 0.0 <= val < 86_400_000:
+                            metrics[target_key] = round(float(metrics.get(target_key, 0.0)) + val, 2)
+                    except (TypeError, ValueError):
+                        pass
             continue
         if stage != "voyage_request":
             continue
@@ -1972,6 +2070,42 @@ def _bounded_native_metrics(metrics: object) -> dict[str, object] | None:
             return 0.0
         return round(val, 2) if min_val <= val < max_val else 0.0
 
+    hf_status_counts: dict[str, int] = {}
+    raw_hf_status = metrics.get("hf_status_counts")
+    if isinstance(raw_hf_status, dict):
+        for raw_k, raw_v in raw_hf_status.items():
+            try:
+                code = int(raw_k)
+                count = int(raw_v)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= code <= 999 and count >= 0:
+                hf_status_counts[str(code)] = count
+
+    hf_phase_counts: dict[str, int] = {}
+    raw_hf_phases = metrics.get("hf_phase_counts")
+    if isinstance(raw_hf_phases, dict):
+        for raw_k, raw_v in raw_hf_phases.items():
+            if str(raw_k) in {"preupload", "commit", "unknown"}:
+                try:
+                    count = int(raw_v)
+                    if count >= 0:
+                        hf_phase_counts[str(raw_k)] = count
+                except (TypeError, ValueError):
+                    continue
+
+    hf_limit_kind_counts: dict[str, int] = {}
+    raw_hf_limits = metrics.get("hf_limit_kind_counts")
+    if isinstance(raw_hf_limits, dict):
+        for raw_k, raw_v in raw_hf_limits.items():
+            if str(raw_k) in {"commit_action", "api", "concurrency", "unknown"}:
+                try:
+                    count = int(raw_v)
+                    if count >= 0:
+                        hf_limit_kind_counts[str(raw_k)] = count
+                except (TypeError, ValueError):
+                    continue
+
     return {
         "phase_ms": phase_ms,
         "voyage_requests": _safe_int("voyage_requests"),
@@ -1983,6 +2117,14 @@ def _bounded_native_metrics(metrics: object) -> dict[str, object] | None:
         "voyage_status_counts": status_counts,
         "voyage_pacer_wait_ms": _safe_float("voyage_pacer_wait_ms"),
         "voyage_backoff_ms": _safe_float("voyage_backoff_ms"),
+        "hf_send_attempts": _safe_int("hf_send_attempts"),
+        "hf_retries": _safe_int("hf_retries"),
+        "hf_status_counts": hf_status_counts,
+        "hf_phase_counts": hf_phase_counts,
+        "hf_429_count": _safe_int("hf_429_count"),
+        "hf_backoff_ms": _safe_float("hf_backoff_ms"),
+        "hf_retry_after_ms": _safe_float("hf_retry_after_ms"),
+        "hf_limit_kind_counts": hf_limit_kind_counts,
     }
 
 CANONICAL_REF_PREFIX = "funes-doc:"
@@ -2416,15 +2558,104 @@ def _ingest_canonical_subset(
     return left + right, committed or left_commit or right_commit
 
 
+def _empty_cumulative_metrics(since: str | None = None) -> dict[str, object]:
+    ts = since or utc_now()
+    return {
+        "since": ts,
+        "process_started_at": ts,
+        "hf_429": 0,
+        "hf_send_attempts": 0,
+        "hf_retries": 0,
+        "hf_backoff_ms": 0.0,
+        "hf_retry_after_ms": 0.0,
+        "hf_phase_counts": {},
+        "hf_status_counts": {},
+        "hf_limit_kind_counts": {},
+        "voyage_429": 0,
+        "voyage_5xx": 0,
+        "voyage_requests": 0,
+        "voyage_backoff_ms": 0.0,
+        "total_backoff_ms": 0.0,
+        "cycles": 0,
+    }
+
+
+def _accumulate_canonical_metrics(state: dict[str, object], raw_metrics: object) -> None:
+    if not isinstance(raw_metrics, dict):
+        return
+    metric_id = raw_metrics.get("_metric_id")
+    if metric_id is None:
+        metric_id = raw_metrics.setdefault("_metric_id", next(_CANONICAL_METRIC_COUNTER))
+    if state.get("_last_accumulated_metric_id") == metric_id:
+        return
+    state["_last_accumulated_metric_id"] = metric_id
+
+    bounded = _bounded_native_metrics(raw_metrics)
+    if bounded is None:
+        return
+
+    cumulative = state.get("cumulative_metrics")
+    if not isinstance(cumulative, dict):
+        cumulative = _empty_cumulative_metrics(state.get("phase_started_at") or utc_now())
+        state["cumulative_metrics"] = cumulative
+
+    hf_send_attempts = int(bounded.get("hf_send_attempts", 0))
+    hf_retries = int(bounded.get("hf_retries", 0))
+    hf_429 = int(bounded.get("hf_429_count", 0))
+    hf_backoff_ms = float(bounded.get("hf_backoff_ms", 0.0))
+    hf_retry_after_ms = float(bounded.get("hf_retry_after_ms", 0.0))
+    hf_phase_counts = bounded.get("hf_phase_counts") or {}
+    hf_status_counts = bounded.get("hf_status_counts") or {}
+
+    voyage_requests = int(bounded.get("voyage_requests", 0))
+    voyage_backoff_ms = float(bounded.get("voyage_backoff_ms", 0.0))
+    voyage_status_counts = bounded.get("voyage_status_counts") or {}
+
+    voyage_429 = int(voyage_status_counts.get("429", 0))
+    voyage_5xx = sum(
+        int(c) for code, c in voyage_status_counts.items()
+        if isinstance(code, str) and code.startswith("5")
+    )
+
+    cumulative["cycles"] = int(cumulative.get("cycles", 0)) + 1
+    cumulative["hf_send_attempts"] = int(cumulative.get("hf_send_attempts", 0)) + hf_send_attempts
+    cumulative["hf_retries"] = int(cumulative.get("hf_retries", 0)) + hf_retries
+    cumulative["hf_429"] = int(cumulative.get("hf_429", 0)) + hf_429
+    cumulative["hf_backoff_ms"] = round(float(cumulative.get("hf_backoff_ms", 0.0)) + hf_backoff_ms, 2)
+    cumulative["hf_retry_after_ms"] = round(float(cumulative.get("hf_retry_after_ms", 0.0)) + hf_retry_after_ms, 2)
+    cumulative["voyage_requests"] = int(cumulative.get("voyage_requests", 0)) + voyage_requests
+    cumulative["voyage_backoff_ms"] = round(float(cumulative.get("voyage_backoff_ms", 0.0)) + voyage_backoff_ms, 2)
+    cumulative["voyage_429"] = int(cumulative.get("voyage_429", 0)) + voyage_429
+    cumulative["voyage_5xx"] = int(cumulative.get("voyage_5xx", 0)) + voyage_5xx
+    cumulative["total_backoff_ms"] = round(float(cumulative["hf_backoff_ms"]) + float(cumulative["voyage_backoff_ms"]), 2)
+
+    cum_hf_phases = cumulative.setdefault("hf_phase_counts", {})
+    if isinstance(cum_hf_phases, dict) and isinstance(hf_phase_counts, dict):
+        for k, v in hf_phase_counts.items():
+            cum_hf_phases[k] = int(cum_hf_phases.get(k, 0)) + int(v)
+
+    cum_hf_statuses = cumulative.setdefault("hf_status_counts", {})
+    if isinstance(cum_hf_statuses, dict) and isinstance(hf_status_counts, dict):
+        for k, v in hf_status_counts.items():
+            cum_hf_statuses[k] = int(cum_hf_statuses.get(k, 0)) + int(v)
+
+    hf_limit_kind_counts = bounded.get("hf_limit_kind_counts") or {}
+    cum_hf_limits = cumulative.setdefault("hf_limit_kind_counts", {})
+    if isinstance(cum_hf_limits, dict) and isinstance(hf_limit_kind_counts, dict):
+        for k, v in hf_limit_kind_counts.items():
+            cum_hf_limits[k] = int(cum_hf_limits.get(k, 0)) + int(v)
+
+
 def _initialize_canonical_reconcile_state(app) -> None:
     # The run and its override are intentionally volatile. A process restart
     # resumes the ordinary canonical checkpoint with the global configuration.
     app.canonical_ab = CanonicalABController()
     app.canonical_index_state_lock = threading.Lock()
+    now_iso = utc_now()
     app.canonical_index_state = {
         "active": False,
         "phase": "waiting_restore",
-        "phase_started_at": utc_now(),
+        "phase_started_at": now_iso,
         "last_started_at": None,
         "last_finished_at": None,
         "last_duration_ms": None,
@@ -2432,8 +2663,10 @@ def _initialize_canonical_reconcile_state(app) -> None:
         "last_error": None,
         "last_progress_at": None,
         "last_metrics": None,
+        "cumulative_metrics": _empty_cumulative_metrics(now_iso),
         "consecutive_failures": 0,
         "wait_seconds": CANONICAL_INDEX_INTERVAL,
+        "_last_accumulated_metric_id": None,
     }
     app._canonical_refresh_lock = threading.Lock()
     app._canonical_refresh_state = {"last_requested_at": None, "dirty": False}
@@ -2592,6 +2825,8 @@ def _set_canonical_reconcile_state(app, **changes: object) -> None:
     if lock is None or state is None:
         return
     with lock:
+        if "last_metrics" in changes and changes["last_metrics"] is not None:
+            _accumulate_canonical_metrics(state, changes["last_metrics"])
         state.update(changes)
 
 
@@ -2611,6 +2846,7 @@ def canonical_reconcile_state(app) -> dict[str, object]:
             "last_error": None,
             "last_progress_at": None,
             "last_metrics": None,
+            "cumulative_metrics": _empty_cumulative_metrics(),
             "consecutive_failures": 0,
             "wait_seconds": CANONICAL_INDEX_INTERVAL,
         }
@@ -2619,7 +2855,16 @@ def canonical_reconcile_state(app) -> dict[str, object]:
             public = {
                 key: value for key, value in state.items() if not key.startswith("_")
             }
-    public["last_metrics"] = _bounded_native_metrics(public.get("last_metrics"))
+            cum = public.get("cumulative_metrics")
+            if isinstance(cum, dict):
+                copied_cum = dict(cum)
+                for sub_k in ("hf_phase_counts", "hf_status_counts", "hf_limit_kind_counts"):
+                    if isinstance(copied_cum.get(sub_k), dict):
+                        copied_cum[sub_k] = dict(copied_cum[sub_k])
+                public["cumulative_metrics"] = copied_cum
+            else:
+                public["cumulative_metrics"] = _empty_cumulative_metrics()
+            public["last_metrics"] = _bounded_native_metrics(public.get("last_metrics"))
     public["index_maintenance"] = index_maintenance_state(app)
     thread = getattr(app, "canonical_index_thread", None)
     public.update(
@@ -2645,6 +2890,16 @@ def reconcile_canonical_index(
 ) -> dict[str, object]:
     """Index one restart-safe batch and persist only derived status in the sidecar."""
     metrics = _native_metrics()
+    try:
+        return _reconcile_canonical_index_body(app, metrics, profile_override=profile_override)
+    except Exception:
+        _set_canonical_reconcile_state(app, last_metrics=metrics)
+        raise
+
+
+def _reconcile_canonical_index_body(
+    app, metrics: dict[str, object], *, profile_override: Mapping[str, object] | None = None,
+) -> dict[str, object]:
     memory = index_memory()
     if not memory or app.syncer.restoring or app.syncer.restore_failed:
         return {"attempted": 0, "indexed": 0, "held": 0, "durable": False}

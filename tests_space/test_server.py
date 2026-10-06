@@ -3488,6 +3488,126 @@ def test_sync_status_reports_bounded_last_metrics_without_leaks(monkeypatch):
     assert "private_token" not in dumped
 
 
+def test_record_native_metrics_and_bounded_metrics_hf_commit():
+    metrics = bridge._native_metrics()
+    assert "_metric_id" in metrics
+    assert metrics["hf_send_attempts"] == 0
+    assert metrics["hf_retries"] == 0
+    assert metrics["hf_limit_kind_counts"] == {}
+
+    lines = [
+        'funes_metric {"stage": "hf_commit_attempt", "duration_ms": 150.0, "attempt": 1, "status_code": 429, "phase": "preupload", "retry_after_ms": 5000.0, "backoff_ms": 5000.0, "retrying": true, "limit_kind": "commit_action"}',
+        'funes_metric {"stage": "hf_commit_attempt", "duration_ms": 200.0, "attempt": 2, "status_code": 200, "phase": "commit", "retry_after_ms": null, "backoff_ms": 0.0, "retrying": false, "limit_kind": "unknown"}',
+    ]
+    bridge._record_native_metrics(metrics, "\n".join(lines))
+
+    assert metrics["hf_send_attempts"] == 2
+    assert metrics["hf_retries"] == 1
+    assert metrics["hf_429_count"] == 1
+    assert metrics["hf_status_counts"] == {"429": 1, "200": 1}
+    assert metrics["hf_phase_counts"] == {"preupload": 1, "commit": 1}
+    assert metrics["hf_limit_kind_counts"] == {"commit_action": 1, "unknown": 1}
+    assert metrics["hf_backoff_ms"] == 5000.0
+    assert metrics["hf_retry_after_ms"] == 5000.0
+
+    untrusted = {
+        **metrics,
+        "hf_limit_kind_counts": {**metrics["hf_limit_kind_counts"], "invalid_kind": 99},
+        "secret_token": "sk-secret-hf",
+    }
+    bounded = bridge._bounded_native_metrics(untrusted)
+    assert bounded is not None
+    assert "secret_token" not in bounded
+    assert "_metric_id" not in bounded
+    assert "invalid_kind" not in bounded["hf_limit_kind_counts"]
+    assert bounded["hf_limit_kind_counts"] == {"commit_action": 1, "unknown": 1}
+
+
+def test_cumulative_metrics_accumulates_hf_limit_kinds_and_deduplicates_by_metric_id():
+    app = SimpleNamespace()
+    bridge._initialize_canonical_reconcile_state(app)
+
+    m1 = bridge._native_metrics()
+    m1.update({
+        "hf_send_attempts": 2,
+        "hf_retries": 1,
+        "hf_429_count": 1,
+        "hf_backoff_ms": 100.0,
+        "hf_retry_after_ms": 50.0,
+        "hf_status_counts": {"429": 1, "200": 1},
+        "hf_phase_counts": {"commit": 2},
+        "hf_limit_kind_counts": {"commit_action": 1},
+        "voyage_requests": 1,
+        "voyage_backoff_ms": 20.0,
+        "voyage_status_counts": {"200": 1},
+    })
+
+    bridge._set_canonical_reconcile_state(app, last_metrics=m1)
+    bridge._set_canonical_reconcile_state(app, last_metrics=m1)
+
+    state = bridge.canonical_reconcile_state(app)
+    cum = state["cumulative_metrics"]
+    assert cum["cycles"] == 1
+    assert cum["hf_send_attempts"] == 2
+    assert cum["hf_retries"] == 1
+    assert cum["hf_429"] == 1
+    assert cum["hf_backoff_ms"] == 100.0
+    assert cum["hf_retry_after_ms"] == 50.0
+    assert cum["hf_limit_kind_counts"] == {"commit_action": 1}
+    assert cum["hf_status_counts"] == {"429": 1, "200": 1}
+    assert cum["hf_phase_counts"] == {"commit": 2}
+    assert cum["total_backoff_ms"] == 120.0
+    for alias in ("send", "totalbackoff", "voyage429", "http_429", "http_5xx"):
+        assert alias not in cum
+
+    m2 = bridge._native_metrics()
+    m2.update({
+        "hf_send_attempts": 1,
+        "hf_retries": 0,
+        "hf_429_count": 0,
+        "hf_backoff_ms": 0.0,
+        "hf_retry_after_ms": 0.0,
+        "hf_status_counts": {"200": 1},
+        "hf_phase_counts": {"commit": 1},
+        "hf_limit_kind_counts": {"commit_action": 2},
+    })
+    bridge._set_canonical_reconcile_state(app, last_metrics=m2)
+
+    state2 = bridge.canonical_reconcile_state(app)
+    cum2 = state2["cumulative_metrics"]
+    assert cum2["cycles"] == 2
+    assert cum2["hf_send_attempts"] == 3
+    assert cum2["hf_limit_kind_counts"] == {"commit_action": 3}
+
+
+def test_reconcile_canonical_index_timeout_records_partial_metrics_once(monkeypatch, tmp_path):
+    app = _source_app(tmp_path)
+    _canonical_source(app.store, "timeout-doc")
+    bridge._initialize_canonical_reconcile_state(app)
+
+    monkeypatch.setattr(bridge, "REMOTE", "owner/memory")
+    monkeypatch.setattr(bridge, "INDEX_REMOTE", "")
+
+    partial_err = (
+        'funes_metric {"stage": "hf_commit_attempt", "duration_ms": 50.0, "attempt": 1, "status_code": 429, "phase": "commit", "limit_kind": "commit_action"}\n'
+    )
+    def fake_run(*_args, **_kwargs):
+        raise subprocess.TimeoutExpired(cmd=["funes"], timeout=1.0, stderr=partial_err)
+
+    monkeypatch.setattr(bridge, "run", fake_run)
+    try:
+        result = bridge.reconcile_canonical_index(app)
+        assert result["indexed"] == 0
+        state = bridge.canonical_reconcile_state(app)
+        assert state["last_metrics"]["hf_send_attempts"] == 1
+        assert state["last_metrics"]["hf_429_count"] == 1
+        assert state["cumulative_metrics"]["hf_send_attempts"] == 1
+        assert state["cumulative_metrics"]["hf_limit_kind_counts"] == {"commit_action": 1}
+        assert state["cumulative_metrics"]["cycles"] == 1
+    finally:
+        app.store.close()
+
+
 def test_canonical_background_enforces_min_request_interval_after_progress(monkeypatch):
     stop = _RecordingCanonicalStop(stop_after=2)
     app = SimpleNamespace(

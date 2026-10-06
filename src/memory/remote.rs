@@ -37,6 +37,7 @@
 //! anything. It is also the non-deprecated seam.
 
 use std::collections::{BTreeMap, HashMap};
+use std::future::Future;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -47,6 +48,7 @@ use arrow_array::{new_null_array, RecordBatch, RecordBatchIterator};
 use arrow_schema::{Schema, SchemaRef};
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures::FutureExt;
 use hf_hub::progress::{Progress, ProgressEvent, ProgressHandler, UploadEvent};
 use hf_hub::repository::{CommitInfo, CommitOperation};
 use hf_hub::{HFError, HFRepository, RepoTypeDataset};
@@ -146,6 +148,7 @@ pub(crate) async fn append(
     let parent = head_oid(repo, rev).await?;
     append_at(
         repo,
+        repo,
         dataset_uri,
         storage_options,
         parent,
@@ -162,6 +165,7 @@ pub(crate) async fn append(
 #[allow(clippy::too_many_arguments)] // Shared CAS append boundary for push and canonical ingestion.
 async fn append_at(
     repo: &HFRepository<RepoTypeDataset>,
+    commit_repo: &HFRepository<RepoTypeDataset>,
     dataset_uri: &str,
     storage_options: HashMap<String, String>,
     parent: String,
@@ -203,7 +207,7 @@ async fn append_at(
     }
 
     let (ops, _dir) = write_ops(&files)?;
-    match send_commit(repo, ops, parent, rev, message).await {
+    match send_commit(commit_repo, ops, parent, rev, message).await {
         Ok(info) => Ok(Appended::Committed {
             oid: info.commit_oid.unwrap_or_else(|| "?".to_string()),
             unindexed,
@@ -217,6 +221,7 @@ async fn append_at(
 #[allow(clippy::too_many_arguments)] // Keep the selected snapshot and CAS target explicit.
 pub(crate) async fn append_documents(
     repo: &HFRepository<RepoTypeDataset>,
+    commit_repo: &HFRepository<RepoTypeDataset>,
     dataset_uri: &str,
     storage_options: HashMap<String, String>,
     expected_parent: &str,
@@ -228,6 +233,7 @@ pub(crate) async fn append_documents(
     let extra_files = BTreeMap::new();
     match append_at(
         repo,
+        commit_repo,
         dataset_uri,
         storage_options,
         expected_parent.to_string(),
@@ -438,6 +444,7 @@ pub async fn add_column(
 #[allow(clippy::too_many_arguments)] // Keep the selected snapshot and CAS target explicit at this write boundary.
 pub(crate) async fn replace_documents(
     repo: &HFRepository<RepoTypeDataset>,
+    commit_repo: &HFRepository<RepoTypeDataset>,
     dataset_uri: &str,
     storage_options: HashMap<String, String>,
     expected_parent: &str,
@@ -453,7 +460,7 @@ pub(crate) async fn replace_documents(
     let files = captured_files(&wrapper);
     ensure!(!files.is_empty(), "canonical replace produced no files to commit");
     let (ops, _dir) = write_ops(&files)?;
-    match send_commit(repo, ops, expected_parent.to_string(), rev, message).await {
+    match send_commit(commit_repo, ops, expected_parent.to_string(), rev, message).await {
         Ok(info) => Ok(Replaced::Committed(info.commit_oid.unwrap_or_else(|| "?".to_string()))),
         Err(e) if head_moved(&e) => Ok(Replaced::Conflict),
         Err(e) => Err(commit_error("canonical data commit failed", &e)),
@@ -618,6 +625,126 @@ async fn send_commit(
 /// chunk so an interrupted upload cannot expose a manifest that references missing files.
 const MAX_COMMIT_OPERATIONS: usize = 900;
 
+const MAX_COMMIT_ATTEMPTS: u32 = 6;
+// Shared across chunks; bounds retry waits, not in-flight request time. Never shorten Retry-After.
+const COMMIT_RETRY_BUDGET: Duration = Duration::from_secs(900);
+
+#[derive(Debug, Serialize)]
+struct HfCommitMetric {
+    stage: &'static str,
+    duration_ms: f64,
+    attempt: u32,
+    status_code: u16,
+    phase: &'static str,
+    retry_after_ms: Option<f64>,
+    backoff_ms: f64,
+    retrying: bool,
+    limit_kind: &'static str,
+}
+
+fn hf_limit_kind(server_message: Option<&str>, body: &str) -> &'static str {
+    let reason = format!("{} {}", server_message.unwrap_or(""), body).to_ascii_lowercase();
+    if ["too many commits", "commit rate limit", "commits per"]
+        .iter()
+        .any(|hint| reason.contains(hint))
+    {
+        "commit_action"
+    } else if reason.contains("api rate limit") {
+        "api"
+    } else if reason.contains("concurrent") && reason.contains("limit") {
+        "concurrency"
+    } else {
+        "unknown"
+    }
+}
+
+fn commit_retry_wait(
+    error: &HFError,
+    attempt: u32,
+    elapsed: Duration,
+    budget: Duration,
+    guarded: bool,
+) -> Option<Duration> {
+    if !guarded || attempt >= MAX_COMMIT_ATTEMPTS {
+        return None;
+    }
+    let wait = match error {
+        HFError::RateLimited { retry_after, .. } => {
+            retry_after.unwrap_or_else(|| Duration::from_secs((30u64 << attempt.saturating_sub(1).min(4)).min(300)))
+        }
+        // The canonical writer disables hf-hub's retries; retain bounded transient retries.
+        HFError::Http { context } if matches!(context.status.as_u16(), 408 | 500 | 502 | 503 | 504) => {
+            Duration::from_millis(200u64 << attempt.saturating_sub(1).min(4))
+        }
+        // Request-phase transport failures include resets/incomplete responses. Parent CAS makes
+        // retries safe even when the server accepted a request before the connection disappeared.
+        HFError::Request { source: error, .. } if error.is_connect() || error.is_timeout() || error.is_request() => {
+            Duration::from_millis(200u64 << attempt.saturating_sub(1).min(4))
+        }
+        _ => return None,
+    };
+    (elapsed.checked_add(wait)? < budget).then_some(wait)
+}
+
+/// Keep captured files and vectors alive while a guarded commit is rate-limited. A 409/412
+/// is never retried here: the caller must reopen the head and recheck every source revision.
+async fn retry_commit<F, Fut>(
+    guarded: bool,
+    started: Instant,
+    budget: Duration,
+    mut send: F,
+) -> std::result::Result<CommitInfo, HFError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = std::result::Result<CommitInfo, HFError>>,
+{
+    for attempt in 1..=MAX_COMMIT_ATTEMPTS {
+        let attempt_started = Instant::now();
+        let result = send().await;
+        let wait = result
+            .as_ref()
+            .err()
+            .and_then(|error| commit_retry_wait(error, attempt, started.elapsed(), budget, guarded));
+        if ingest_metrics_enabled() {
+            let (status_code, phase, retry_after_ms, limit_kind) = match &result {
+                Ok(_) => (200, "commit", None, "unknown"),
+                Err(HFError::RateLimited { retry_after, context }) => (
+                    context.status.as_u16(),
+                    hf_http_phase(&context.url),
+                    retry_after.map(round_ms),
+                    hf_limit_kind(context.server_message.as_deref(), &context.body),
+                ),
+                Err(
+                    HFError::Http { context }
+                    | HFError::Conflict { context }
+                    | HFError::AuthRequired { context }
+                    | HFError::Forbidden { context },
+                ) => (context.status.as_u16(), hf_http_phase(&context.url), None, "unknown"),
+                _ => (0, "unknown", None, "unknown"),
+            };
+            let metric = HfCommitMetric {
+                stage: "hf_commit_attempt",
+                duration_ms: round_ms(attempt_started.elapsed()),
+                attempt,
+                status_code,
+                phase,
+                retry_after_ms,
+                backoff_ms: wait.map(round_ms).unwrap_or(0.0),
+                retrying: wait.is_some(),
+                limit_kind,
+            };
+            if let Ok(json) = serde_json::to_string(&metric) {
+                eprintln!("funes_metric {json}");
+            }
+        }
+        match wait {
+            Some(wait) => tokio::time::sleep(wait).await,
+            None => return result,
+        }
+    }
+    unreachable!("last attempt never retries")
+}
+
 /// Paths that activate a new Lance snapshot. The final chunk may also contain `README.md`, which
 /// is updated with the same dataset snapshot and should not precede the manifest activation.
 fn is_activation_path(path: &str) -> bool {
@@ -688,6 +815,7 @@ async fn send_commit_chunks(
     let chunks = split_commit_operations(ops)?;
     let mut parent = parent;
     let mut final_info = None;
+    let started = Instant::now();
     for (index, chunk) in chunks.into_iter().enumerate() {
         let chunk_message = if index == 0 {
             message.clone()
@@ -695,24 +823,24 @@ async fn send_commit_chunks(
             format!("{message} (chunk {index})")
         };
         let chunk_start = Instant::now();
-        let info = if let Some(expected_parent) = parent.take() {
-            repo.create_commit()
-                .operations(chunk)
-                .commit_message(chunk_message)
-                .parent_commit(expected_parent)
-                .revision(rev.to_string())
-                .progress(upload_progress())
-                .send()
-                .await?
-        } else {
-            repo.create_commit()
-                .operations(chunk)
-                .commit_message(chunk_message)
-                .revision(rev.to_string())
-                .progress(upload_progress())
-                .send()
-                .await?
-        };
+        let info = retry_commit(parent.is_some(), started, COMMIT_RETRY_BUDGET, || {
+            async {
+                let commit = repo
+                    .create_commit()
+                    .operations(chunk.clone())
+                    .commit_message(chunk_message.clone())
+                    .revision(rev.to_string())
+                    .progress(upload_progress());
+                if let Some(expected_parent) = &parent {
+                    commit.parent_commit(expected_parent.clone()).send().await
+                } else {
+                    commit.send().await
+                }
+            }
+            // Erase the upload future's deep type so every caller stays within rustc's limit.
+            .boxed()
+        })
+        .await?;
         emit_phase_metric("hf_commit_chunk", chunk_start.elapsed());
         parent = match info.commit_oid.as_deref().filter(|oid| !oid.is_empty()) {
             Some(oid) => Some(oid.to_string()),
@@ -1084,6 +1212,231 @@ mod tests {
     use lance_index::scalar::{InvertedIndexParams, ScalarIndexParams};
     use lance_index::IndexType;
     use object_store::ObjectStoreExt;
+
+    // Real hf-hub errors, without network credentials or Hub/Voyage calls.
+    fn mock_commit_repo(
+        responses: Vec<(u16, Option<u64>, &'static str)>,
+    ) -> (HFRepository<RepoTypeDataset>, std::thread::JoinHandle<Vec<String>>) {
+        use std::io::Read;
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let handle = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for (status, retry_after, body) in responses {
+                let start = Instant::now();
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(start.elapsed() < Duration::from_secs(10), "missing mock request");
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("mock accept: {error}"),
+                    }
+                };
+                stream.set_nonblocking(false).unwrap();
+                stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let mut bytes = Vec::new();
+                loop {
+                    let mut buffer = [0; 4096];
+                    let count = stream.read(&mut buffer).unwrap();
+                    assert!(count > 0, "incomplete mock request");
+                    bytes.extend_from_slice(&buffer[..count]);
+                    if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                        let header = String::from_utf8_lossy(&bytes[..end]);
+                        let length = header
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().unwrap())
+                            })
+                            .unwrap_or(0);
+                        if bytes.len() >= end + 4 + length {
+                            break;
+                        }
+                    }
+                }
+                requests.push(String::from_utf8(bytes).unwrap());
+                if status == 0 {
+                    // Simulate a server closing the connection before any response headers.
+                    continue;
+                }
+                let retry_header = retry_after
+                    .map(|seconds| format!("Retry-After: {seconds}\r\n"))
+                    .unwrap_or_default();
+                write!(stream, "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\n{retry_header}Content-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+            requests
+        });
+        let repo = hf_hub::HFClient::builder()
+            .endpoint(endpoint)
+            .token("test-only")
+            .retry_max_attempts(0)
+            .build()
+            .unwrap()
+            .dataset("test", "memory");
+        (repo, handle)
+    }
+
+    #[tokio::test]
+    async fn commit_retry_preserves_parent_and_captured_bytes_after_rate_limit() {
+        let (repo, requests) = mock_commit_repo(vec![
+            (429, Some(0), r#"{"error":"too many commits"}"#),
+            (
+                200,
+                None,
+                r#"{"files":[{"path":"vectors","uploadMode":"regular","shouldIgnore":false}]}"#,
+            ),
+            (429, Some(0), r#"{"error":"commit rate limit"}"#),
+            (
+                200,
+                None,
+                r#"{"files":[{"path":"vectors","uploadMode":"regular","shouldIgnore":false}]}"#,
+            ),
+            (200, None, r#"{"commitOid":"new-head"}"#),
+        ]);
+        let info = send_commit_chunks(
+            &repo,
+            vec![CommitOperation::add_bytes("vectors", b"already-embedded".to_vec())],
+            Some("original-head".to_string()),
+            "main",
+            "same vectors".to_string(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(info.commit_oid.as_deref(), Some("new-head"));
+        let requests = requests.join().unwrap();
+        assert_eq!(requests.len(), 5);
+        let bodies = requests
+            .iter()
+            .map(|request| request.split_once("\r\n\r\n").unwrap().1)
+            .collect::<Vec<_>>();
+        assert_eq!(bodies[0], bodies[1]);
+        assert_eq!(bodies[1], bodies[3]);
+        assert_eq!(bodies[2], bodies[4]);
+        assert!(bodies[2].contains("original-head"));
+    }
+
+    #[tokio::test]
+    async fn commit_retry_respects_budget_bootstrap_and_cas_conflicts() {
+        for (status, guarded) in [(429, false), (409, true), (412, true), (401, true)] {
+            let (repo, requests) = mock_commit_repo(vec![(status, Some(120), r#"{"error":"bounded"}"#)]);
+            let error = send_commit_chunks(
+                &repo,
+                vec![CommitOperation::delete("old")],
+                guarded.then_some("parent".to_string()),
+                "main",
+                "test".to_string(),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(requests.join().unwrap().len(), 1);
+            assert!(commit_retry_wait(&error, 1, Duration::ZERO, Duration::from_secs(100), guarded).is_none());
+            if status == 429 {
+                assert_eq!(
+                    commit_retry_wait(&error, 1, Duration::ZERO, Duration::from_secs(121), true),
+                    Some(Duration::from_secs(120))
+                );
+                assert!(
+                    commit_retry_wait(&error, MAX_COMMIT_ATTEMPTS, Duration::ZERO, COMMIT_RETRY_BUDGET, true).is_none()
+                );
+                assert!(commit_retry_wait(&error, 1, Duration::from_secs(1), Duration::from_secs(121), true).is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn commit_retry_shares_deadline_across_chunks() {
+        let started = Instant::now();
+        let budget = Duration::from_millis(300);
+        let (repo, first_requests) = mock_commit_repo(vec![(200, None, r#"{"commitOid":"first"}"#)]);
+        retry_commit(true, started, budget, || async {
+            repo.create_commit()
+                .operations(vec![CommitOperation::delete("old")])
+                .commit_message("first")
+                .parent_commit("parent")
+                .send()
+                .await
+        })
+        .await
+        .unwrap();
+        assert_eq!(first_requests.join().unwrap().len(), 1);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let (repo, second_requests) = mock_commit_repo(vec![(503, None, r#"{"error":"temporary"}"#)]);
+        let error = retry_commit(true, started, budget, || async {
+            repo.create_commit()
+                .operations(vec![CommitOperation::delete("old")])
+                .commit_message("second")
+                .parent_commit("first")
+                .send()
+                .await
+        })
+        .await
+        .unwrap_err();
+        assert!(matches!(error, HFError::Http { .. }));
+        assert_eq!(second_requests.join().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn commit_retry_handles_connection_reset_without_reembedding() {
+        let (repo, requests) = mock_commit_repo(vec![(0, None, ""), (200, None, r#"{"commitOid":"recovered"}"#)]);
+        let info = send_commit_chunks(
+            &repo,
+            vec![CommitOperation::delete("old")],
+            Some("parent".to_string()),
+            "main",
+            "same operation".to_string(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(info.commit_oid.as_deref(), Some("recovered"));
+        let requests = requests.join().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[0].split_once("\r\n\r\n").unwrap().1,
+            requests[1].split_once("\r\n\r\n").unwrap().1
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_retry_keeps_transient_retry_and_safe_metrics() {
+        let (repo, requests) = mock_commit_repo(vec![
+            (503, None, r#"{"error":"temporary"}"#),
+            (200, None, r#"{"commitOid":"recovered"}"#),
+        ]);
+        let info = send_commit_chunks(
+            &repo,
+            vec![CommitOperation::delete("old")],
+            Some("parent".to_string()),
+            "main",
+            "test".to_string(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(info.commit_oid.as_deref(), Some("recovered"));
+        assert_eq!(requests.join().unwrap().len(), 2);
+        let metric = HfCommitMetric {
+            stage: "hf_commit_attempt",
+            duration_ms: 1.0,
+            attempt: 1,
+            status_code: 429,
+            phase: "preupload",
+            retry_after_ms: Some(120000.0),
+            backoff_ms: 120000.0,
+            retrying: true,
+            limit_kind: "commit_action",
+        };
+        let json = serde_json::to_value(metric).unwrap();
+        assert_eq!(json.as_object().unwrap().len(), 9);
+        assert_eq!(json["retry_after_ms"], 120000.0);
+        for forbidden in ["http://", "https://", "token", "already-embedded", "original-head"] {
+            assert!(!json.to_string().contains(forbidden));
+        }
+    }
 
     #[derive(Debug)]
     struct UnusedFetcher;

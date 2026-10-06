@@ -122,6 +122,7 @@ environment: never commit it, write it into these files, or include it in logs.
 | `FUNES_REMOTE_MAX_RESPONSE_BYTES` | Maximum ingest/status response body; default `1048576` (1 MiB). |
 | `FUNES_HTTP_GZIP` | Compress HTTP ingest bodies when beneficial; enabled by default. |
 | `FUNES_INGEST_OPERATION_TIMEOUT` | Space-side durable worker deadline; default `1800` seconds. A stall fail-stops the process for platform restart without ACKing local data. |
+| `FUNES_CANONICAL_INDEX_TIMEOUT` | Subprocess deadline for one canonical index batch; default `1800` seconds. |
 | `FUNES_API_TOKEN` | Bearer token for the compatibility HTTP bridge; never written to launchd plist, loaded from Keychain on macOS. |
 | `FUNES_TRUFFLEHOG` | Explicit TruffleHog binary for secret scanning. Index-time redaction is best-effort; push and scrub scanning fail closed. |
 | `HF_TOKEN`, `HUGGING_FACE_HUB_TOKEN`, `HUGGINGFACE_TOKEN` | Hugging Face authentication, in the precedence shown above. |

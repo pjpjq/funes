@@ -9,7 +9,9 @@ import atexit
 import base64
 import gzip
 import io
+import itertools
 import json
+import math
 import os
 import re
 import select
@@ -23,11 +25,16 @@ import time
 import urllib.error
 import urllib.request
 import zlib
+from collections import deque
 from collections.abc import Mapping, Sequence
+from datetime import datetime, timezone
 from typing import Any
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from space.canonical_ab import CanonicalABController, FIXED_PROFILES
+
+from service.hub_cache import HubCache
 from service.server import App as SourceApp
 from service.server import expanded_candidate_limit
 from service.server import ingest_documents as persist_source_ingest
@@ -40,6 +47,33 @@ from service.server import utc_now
 from service.server import validate_source_identity_batch
 
 
+# The optional Bucket only stores derived immutable Hub cache files. Locks and
+# snapshot symlinks stay on the local POSIX filesystem; originals/checkpoints
+# remain in the source store, and the canonical index remains in its Dataset.
+HUB_CACHE: HubCache | None = None
+HUB_CACHE_ERROR = ""
+
+
+def start_hub_cache() -> None:
+    global HUB_CACHE, HUB_CACHE_ERROR
+    try:
+        HUB_CACHE = HubCache.from_env()
+        if HUB_CACHE is not None:
+            HUB_CACHE.restore()
+            HUB_CACHE.start()
+            atexit.register(HUB_CACHE.stop)
+    except Exception as exc:
+        # Cache failure must never prevent the normal Hub read path or ingestion.
+        # Exception messages can contain private paths or provider credentials.
+        HUB_CACHE_ERROR = type(exc).__name__
+
+
+def hub_cache_status() -> dict[str, object]:
+    if HUB_CACHE is not None:
+        return HUB_CACHE.status()
+    return {"enabled": False, "error_class": HUB_CACHE_ERROR}
+
+
 FUNES_BIN = os.getenv("FUNES_BIN", "/usr/local/bin/funes")
 REMOTE = os.getenv("FUNES_MEMORY", "")
 INDEX_REMOTE = os.getenv("FUNES_INDEX_MEMORY", "")
@@ -49,7 +83,18 @@ PORT = int(os.getenv("PORT", "7860"))
 TRANSLATION_THRESHOLD = float(os.getenv("TRANSLATE_CHINESE_THRESHOLD", "0.15"))
 INGEST_INDEX_TIMEOUT = int(os.getenv("FUNES_INGEST_INDEX_TIMEOUT", "900"))
 INGEST_PUSH_TIMEOUT = int(os.getenv("FUNES_INGEST_PUSH_TIMEOUT", "1800"))
-CANONICAL_INDEX_BATCH = max(1, int(os.getenv("FUNES_CANONICAL_INDEX_BATCH", "32")))
+def _canonical_index_batch(
+    environ: Mapping[str, str] | None = None,
+) -> int:
+    environ = os.environ if environ is None else environ
+    val = environ.get("FUNES_CANONICAL_INDEX_BATCH")
+    try:
+        return max(1, int(val)) if val is not None else 64
+    except (TypeError, ValueError):
+        return 64
+
+
+CANONICAL_INDEX_BATCH = _canonical_index_batch()
 
 
 def _canonical_index_request_limits(
@@ -102,11 +147,45 @@ def _canonical_index_min_request_interval(
 
 
 CANONICAL_INDEX_MIN_REQUEST_INTERVAL = _canonical_index_min_request_interval()
-CANONICAL_INDEX_TIMEOUT = max(1, int(os.getenv("FUNES_CANONICAL_INDEX_TIMEOUT", "900")))
+
+
+def _canonical_index_timeout(
+    environ: Mapping[str, str] | None = None,
+) -> int:
+    environ = os.environ if environ is None else environ
+    val = environ.get("FUNES_CANONICAL_INDEX_TIMEOUT")
+    try:
+        return max(1, int(val)) if val is not None else 1800
+    except (TypeError, ValueError):
+        return 1800
+
+
+CANONICAL_INDEX_TIMEOUT = _canonical_index_timeout()
 CANONICAL_OPTIMIZE_TIMEOUT = max(1, int(os.getenv("FUNES_CANONICAL_OPTIMIZE_TIMEOUT", "900")))
 # Bump when a deployed native index needs one-time structural maintenance even
 # though its source/profile checkpoint is already complete.
 CANONICAL_INDEX_LAYOUT_VERSION = 1
+
+
+def _index_maintenance_settings(environ=None) -> dict[str, object]:
+    environ = os.environ if environ is None else environ
+
+    def positive(name: str, default: int) -> int:
+        try:
+            return max(1, int(environ.get(name, default)))
+        except (TypeError, ValueError):
+            return default
+
+    return {
+        "enabled": str(environ.get("FUNES_CANONICAL_MAINTENANCE_ENABLED", "true")).lower()
+        not in {"false", "0", "no", "off"},
+        "interval_seconds": positive("FUNES_CANONICAL_MAINTENANCE_INTERVAL", 1800),
+        "document_threshold": positive("FUNES_CANONICAL_MAINTENANCE_ROWS", 2048),
+        "retry_seconds": positive("FUNES_CANONICAL_MAINTENANCE_RETRY_INTERVAL", 300),
+    }
+
+
+INDEX_MAINTENANCE_SETTINGS = _index_maintenance_settings()
 
 
 def canonical_memory_ref(value: str) -> str:
@@ -132,6 +211,10 @@ try:
     HTTP_MAX_CANDIDATES = max(1, int(os.getenv("FUNES_HTTP_MAX_CANDIDATES", "12")))
 except ValueError:
     HTTP_MAX_CANDIDATES = 12
+# Source-only facets are post-filtered over one bounded native result window.
+# The existing operator cap may lower this window but never raise the hard cap.
+PG_POST_FILTER_MAX_CANDIDATES = 128
+PG_POST_FILTER_OVERFETCH = 4
 try:
     HTTP_NATIVE_TIMEOUT = min(50.0, max(0.1, float(os.getenv("FUNES_HTTP_NATIVE_TIMEOUT", "12"))))
 except ValueError:
@@ -145,23 +228,24 @@ except ValueError:
     CJK_NATIVE_TIMEOUT = min(HTTP_NATIVE_TIMEOUT, 5.0)
 try:
     # A Voyage query includes provider RTT plus Lance vector/BM25 fusion.  The
-    # production 3M-row index normally needs 4-5s, so the former 4s cap killed
-    # an otherwise healthy warm worker.  Stay below the clients' 8s per-attempt
-    # budget while retaining a hard operator cap.
+    # production multi-million-row index can exceed eight seconds while a warm
+    # snapshot is opened.  Keep a bounded twelve-second native budget and a
+    # separate fourteen-second HTTP budget so the worker is not killed before a
+    # healthy query completes; callers still retain their own shorter deadline.
     VOYAGE_NATIVE_TIMEOUT = min(
-        6.8,
+        12.0,
         HTTP_NATIVE_TIMEOUT,
-        max(0.1, float(os.getenv("FUNES_VOYAGE_NATIVE_TIMEOUT", "6"))),
+        max(0.1, float(os.getenv("FUNES_VOYAGE_NATIVE_TIMEOUT", "12"))),
     )
 except ValueError:
-    VOYAGE_NATIVE_TIMEOUT = min(HTTP_NATIVE_TIMEOUT, 6.0)
+    VOYAGE_NATIVE_TIMEOUT = min(HTTP_NATIVE_TIMEOUT, 12.0)
 try:
     VOYAGE_HTTP_TIMEOUT = min(
-        7.5,
-        max(0.2, float(os.getenv("FUNES_VOYAGE_HTTP_TIMEOUT", "7.4"))),
+        14.0,
+        max(0.2, float(os.getenv("FUNES_VOYAGE_HTTP_TIMEOUT", "14"))),
     )
 except ValueError:
-    VOYAGE_HTTP_TIMEOUT = 7.4
+    VOYAGE_HTTP_TIMEOUT = 14.0
 try:
     VOYAGE_FALLBACK_TIMEOUT = min(
         HTTP_NATIVE_TIMEOUT,
@@ -181,6 +265,11 @@ INDEX_LOCK = threading.Lock()
 # Python-level serialization separate from reads so a background ingest/push
 # cannot make an HTTP recall wait for the full upload duration.
 WRITE_LOCK = threading.Lock()
+# The native Lance/HF index has a single-writer CAS head.  Keep that
+# serialization independent from raw-source durability so canonical indexing
+# does not block source ingest, readiness, or status reads for the duration of
+# a Voyage/native upload.
+NATIVE_WRITE_LOCK = threading.Lock()
 SOURCE_APP = None
 SOURCE_APP_LOCK = threading.Lock()
 INGEST_OPERATION_LOCK = threading.Lock()
@@ -281,6 +370,19 @@ def native_environment(
     env["FUNES_EMBEDDING_SCHEMA_VERSION"] = str(profile["schema_version"])
     env["FUNES_RERANK_PROVIDER"] = os.getenv("FUNES_RERANK_PROVIDER", "none") or "none"
     env["FUNES_NATIVE_FALLBACK"] = os.getenv("FUNES_NATIVE_FALLBACK", "false") or "false"
+    # Keep native diagnostics on for the bounded backfill controller.  The
+    # emitted records are allowlisted numeric aggregates; no source text or
+    # credentials are included.
+    env["FUNES_INGEST_METRICS"] = os.getenv("FUNES_INGEST_METRICS", "1") or "1"
+    # A/B profiles may override the Rust document concurrency for an isolated
+    # cycle.  Production calls without this field retain the process setting.
+    if isinstance(profile, dict) and profile.get("concurrency") is not None:
+        try:
+            concurrency = max(1, min(32, int(profile["concurrency"])))
+        except (TypeError, ValueError):
+            concurrency = None
+        if concurrency is not None:
+            env["FUNES_VOYAGE_CONCURRENCY"] = str(concurrency)
     # A Space refreshes the complete MCP child after committed index revisions.
     # Pin that child's immutable Dataset handle so recalls do not resolve/open the
     # same Hub revision again on every request. Ordinary MCP/CLI processes remain
@@ -293,11 +395,17 @@ def native_environment(
 
 
 def source_app():
-    """Return the encrypted raw/source store, or None when not configured."""
+    """Return the configured source store, retrying unavailable PostgreSQL."""
     global SOURCE_APP
     if SOURCE_APP is not None:
+        if (
+            getattr(SOURCE_APP.syncer, "backend", None) == "postgres"
+            and SOURCE_APP.syncer.restore_failed
+        ):
+            SOURCE_APP.syncer.check_ready()
         return SOURCE_APP
-    if not os.getenv("FUNES_STORAGE_REPO"):
+    postgres_configured = bool(os.getenv("FUNES_POSTGRES_DSN"))
+    if not postgres_configured and not os.getenv("FUNES_STORAGE_REPO"):
         return None
     with SOURCE_APP_LOCK:
         if SOURCE_APP is None:
@@ -305,36 +413,65 @@ def source_app():
             os.environ.setdefault("FUNES_LAZY_RESTORE", "true")
             os.environ.setdefault("FUNES_REQUIRE_DURABLE_ACK", "true")
             os.environ.setdefault("FUNES_BULK_RESTORE_REBUILD_FTS", "false")
-            SOURCE_APP = SourceApp()
+            try:
+                SOURCE_APP = SourceApp()
+            except Exception:
+                if not postgres_configured:
+                    raise
+                # A missing migration or network outage is not permission to
+                # open an empty local source store. A later request retries.
+                return None
             start_canonical_reconciler(SOURCE_APP)
     return SOURCE_APP
 
 
 def source_readiness_state() -> dict[str, object]:
-    """Snapshot source readiness without initializing or querying the store."""
+    """Snapshot source readiness; PG performs a bounded connectivity check."""
     app = SOURCE_APP
-    configured = app is not None or bool(os.getenv("FUNES_STORAGE_REPO"))
+    postgres_configured = bool(os.getenv("FUNES_POSTGRES_DSN"))
+    configured = app is not None or postgres_configured or bool(os.getenv("FUNES_STORAGE_REPO"))
     if not configured:
         return {"configured": False, "ready": False, "restoring": False}
+    if app is None and postgres_configured:
+        app = source_app()
     if app is None:
         return {
             "configured": True,
             "ready": False,
             "restoring": False,
-            "error": "source_store_unavailable",
+            "error": "postgres_unavailable" if postgres_configured else "source_store_unavailable",
         }
-    restoring = bool(app.syncer.restoring)
-    restore_failed = bool(app.syncer.restore_failed)
+    restoring = bool(getattr(app.syncer, "restoring", False))
+    probe_ok = True
+    if getattr(app.syncer, "backend", None) == "postgres" and not restoring:
+        probe = getattr(app.syncer, "probe_ready", None)
+        if callable(probe):
+            probe_ok = bool(probe())
+        else:
+            check = getattr(app.syncer, "check_ready", None)
+            probe_ok = bool(check()) if callable(check) else True
+        if probe_ok and getattr(app, "restore_result", 0) < 0:
+            app.restore_result = 0
+    restoring = bool(getattr(app.syncer, "restoring", False))
+    restore_failed = bool(getattr(app.syncer, "restore_failed", False))
+    ready = not restoring and not restore_failed and probe_ok
     state: dict[str, object] = {
         "configured": True,
-        "ready": not restoring and not restore_failed,
+        "ready": ready,
         "restoring": restoring,
-        "restored": app.restore_result,
+        "restored": getattr(app, "restore_result", 0),
     }
     if restoring:
-        state["progress"] = getattr(app.syncer, "progress", {})
-    if restore_failed:
-        state["error"] = "restore_failed"
+        progress_val = getattr(app.syncer, "_progress", None)
+        if progress_val is None:
+            progress_val = getattr(app.syncer, "progress", {})
+        state["progress"] = dict(progress_val)
+    if restore_failed or not probe_ok:
+        state["error"] = (
+            "postgres_unavailable"
+            if getattr(app.syncer, "backend", None) == "postgres"
+            else "restore_failed"
+        )
     return state
 
 
@@ -355,10 +492,70 @@ def source_fts_ready(app) -> bool:
     return bool(ready()) if callable(ready) else True
 
 
+def _source_type_prefilter_ready(app) -> bool:
+    """Return whether the active native snapshot can authoritatively filter source_type.
+
+    The source-type bitmap is maintained alongside the canonical Lance snapshot.
+    Never serve a stale snapshot as an apparently valid filtered result: require
+    a successful maintenance run for the active memory/profile and a live worker
+    that was opened after that run completed.
+    """
+    lock = getattr(app, "index_maintenance_lock", None)
+    state = getattr(app, "index_maintenance_state", None)
+    if lock is None or state is None:
+        return False
+    with lock:
+        memory = state.get("memory")
+        profile = state.get("profile")
+        last_success = state.get("_last_success")
+    if not memory or memory != REMOTE or last_success is None:
+        return False
+    try:
+        expected_profile = embedding_profile()["fingerprint"]
+    except (KeyError, TypeError):
+        return False
+    if profile != expected_profile:
+        return False
+    expected_config = _native_worker_config()
+    with _MCP_WORKER_LOCK:
+        worker = MCP_WORKER
+        if worker is None or _MCP_WORKER_CONFIG != expected_config:
+            return False
+        process = getattr(worker, "process", None)
+        if process is None:
+            return False
+        try:
+            if process.poll() is not None:
+                return False
+        except (AttributeError, OSError):
+            return False
+        opened_after = getattr(worker, "_snapshot_opened_after", None)
+    return opened_after is not None and opened_after >= last_success
+
+
 def source_state() -> dict[str, object]:
     app = source_app()
     if app is None:
+        if os.getenv("FUNES_POSTGRES_DSN"):
+            return {"configured": True, "ready": False, "documents": 0,
+                    "error": "postgres_unavailable"}
         return {"configured": False, "ready": False, "documents": 0}
+    try:
+        return _source_state(app)
+    except Exception:
+        if getattr(app.syncer, "backend", None) != "postgres":
+            raise
+        # A disconnect can happen after the readiness precheck. Never expose
+        # the driver error/DSN or turn an incomplete diagnostic into ready.
+        return {"configured": True, "ready": False, "restoring": False,
+                "error": "postgres_unavailable"}
+
+
+def _source_state(app) -> dict[str, object]:
+    if getattr(app.syncer, "backend", None) == "postgres":
+        state = source_readiness_state()
+        if not state["ready"]:
+            return state
     if app.syncer.restoring:
         return {
             "configured": True,
@@ -378,6 +575,23 @@ def source_state() -> dict[str, object]:
     active_profile = embedding_profile()
     build_profile = index_embedding_profile()
     build_memory = index_memory()
+    if hasattr(app.store, "status_snapshot"):
+        snapshot = app.store.status_snapshot(
+            build_profile,
+            build_memory,
+            index_layout_version=CANONICAL_INDEX_LAYOUT_VERSION,
+        )
+        return {
+            "configured": True,
+            "ready": True,
+            "documents": snapshot.get("documents", 0),
+            "restored": getattr(app, "restore_result", 0),
+            "sync": snapshot.get("sync", {}),
+            "active_index": {"memory": REMOTE, "profile": active_profile},
+            "build_index": {"memory": build_memory, "profile": build_profile},
+            "canonical_index": snapshot.get("canonical_index", {}),
+            "canonical_reconciler": canonical_reconcile_state(app),
+        }
     checkpoint = app.store.native_index_checkpoint(build_profile, build_memory)
     checkpoint["failures"] = app.store.native_index_failure_counts()
     optimize = app.store.native_optimize_checkpoint()
@@ -426,6 +640,9 @@ def prepare_source_documents(app, docs: list[dict]) -> list[dict]:
 def ingest_source_documents(docs: list[dict]) -> tuple[int, dict, list[dict]] | None:
     app = source_app()
     if app is None:
+        if os.getenv("FUNES_POSTGRES_DSN"):
+            return 503, {"ok": False, "durable": False,
+                         "error": "postgres_unavailable"}, []
         return None
     if app.syncer.restoring or app.syncer.restore_failed:
         error = "restore_in_progress" if app.syncer.restoring else "restore_failed"
@@ -953,7 +1170,7 @@ def request_warm(*, force: bool = False) -> dict[str, object]:
 
 def request_native_recovery() -> None:
     """Rebuild a failed active MCP child outside the current HTTP request."""
-    if isinstance(MCP_WORKER, NativeMcpWorker):
+    if MCP_WORKER is None or isinstance(MCP_WORKER, NativeMcpWorker):
         request_warm(force=True)
 
 
@@ -1243,7 +1460,7 @@ def run(
         )
         try:
             stdout, stderr = process.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired:
+        except subprocess.TimeoutExpired as exc:
             if os.name == "posix":
                 try:
                     os.killpg(process.pid, signal.SIGKILL)
@@ -1253,10 +1470,22 @@ def run(
                     process.kill()
             else:
                 process.kill()
-            process.communicate()
-            # Never retain stdout/stderr or caller arguments in the exception:
+            try:
+                _, killed_stderr = process.communicate()
+            except Exception:
+                killed_stderr = None
+            raw_stderr = (
+                killed_stderr
+                if killed_stderr is not None
+                else getattr(exc, "stderr", None)
+            )
+            safe_stderr = _safe_timeout_stderr(raw_stderr)
+            # Never retain stdout or caller arguments in the exception:
             # a descendant may have emitted payloads, paths, or raw memory.
-            raise subprocess.TimeoutExpired([FUNES_BIN], timeout) from None
+            # stderr contains only allowlisted, re-serialized diagnostic metrics.
+            raise subprocess.TimeoutExpired(
+                [FUNES_BIN], timeout, output=None, stderr=safe_stderr
+            ) from None
         return process.returncode, stdout, stderr
 
 
@@ -1292,7 +1521,8 @@ SIDECAR_AUTHORITATIVE_FILTERS = frozenset(
     )
 )
 # Voyage can apply these exact canonical metadata filters without relying on
-# the local SQLite FTS sidecar. Date/role filters still require a ready sidecar.
+# the local SQLite FTS sidecar. PostgreSQL can post-filter role/date facets only
+# after a bounded native window has been hydrated from canonical source rows.
 NATIVE_CANONICAL_FILTERS = frozenset(
     (
         "source_type",
@@ -1303,6 +1533,7 @@ NATIVE_CANONICAL_FILTERS = frozenset(
         "source_missing",
     )
 )
+NATIVE_SOURCE_POST_FILTERS = frozenset(("role", "since", "until"))
 NATIVE_GET_RE = re.compile(
     r"(?m)^\s*→\s*get\s+(.+?)(?=\s+--(?:from|to|memory)\b|$)"
 )
@@ -1313,10 +1544,589 @@ NATIVE_HELD_SOURCE_IDS_RE = re.compile(
     r"(?m)[ \t]held_source_ids=(\[[^\r\n]*\])[ \t]*$"
 )
 NATIVE_HELD_SOURCE_ID_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
+NATIVE_STALE_SOURCE_IDS_RE = re.compile(
+    r"(?m)[ \t]stale_source_ids=(\[[^\r\n]*\])[ \t]*$"
+)
+NATIVE_STALE_SOURCE_ID_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
 NATIVE_RECORD_ERROR_RE = re.compile(
     r"invalid canonical JSONL record|must not be empty|must not contain NUL|invalid timestamp",
     re.IGNORECASE,
 )
+# HF's generic HTTP error does not preserve the useful response discriminator.
+# Rust emits only bounded `error_code`/`server_message` atoms; normalize those
+# into a short category and never persist the provider message itself.
+NATIVE_HF_ERROR_CODE_RE = re.compile(
+    r"\berror_code=([A-Za-z0-9][A-Za-z0-9_.-]{0,63})(?=\s|$|[,;])", re.IGNORECASE
+)
+NATIVE_HF_PHASE_RE = re.compile(r"\bhf_phase=(preupload|commit)\b", re.IGNORECASE)
+# Rust emits a bounded `server_reason` classification; accept the older
+# `server_message` spelling too so deployed binaries and bridge revisions can
+# be rolled independently without hiding the Hub rejection class.
+NATIVE_HF_SERVER_MESSAGE_RE = re.compile(
+    r"\b(?:server_reason|server_message)=([^\r\n]+)", re.IGNORECASE
+)
+NATIVE_HF_400_HINTS = (
+    (
+        "commit_file_limit",
+        re.compile(
+            r"\b(?:more than|over|maximum of)\s+\d+\s+files\b"
+            r"|\b(?:file|operation)s?\s+(?:limit|maximum)\b"
+            r"|\bmax(?:imum)?[_ -]?files\b",
+            re.IGNORECASE,
+        ),
+    ),
+    ("preupload", re.compile(r"\bpreupload\b", re.IGNORECASE)),
+    ("parent_commit", re.compile(r"\bparent(?:[_ -]?commit)?\b", re.IGNORECASE)),
+    ("payload", re.compile(r"\b(?:payload|ndjson|invalid[_ -]?json)\b", re.IGNORECASE)),
+)
+# Native stderr is never returned or persisted. These patterns only select a
+# bounded diagnostic label so failed ingest can be distinguished without
+# leaking provider payloads, paths, or credentials.
+NATIVE_FAILURE_PATTERNS = (
+    ("manifest_oversized", re.compile(r"ManifestOversizedError|manifest.{0,32}(?:too large|oversized)", re.IGNORECASE)),
+    (
+        "hf_commit_conflict_exhausted",
+        re.compile(r"canonical (?:dataset commit conflicted 10 times|data commit kept conflicting)", re.IGNORECASE),
+    ),
+    ("hf_request_transport", re.compile(r"hf_error=request_transport\b", re.IGNORECASE)),
+    ("hf_repo_not_found", re.compile(r"hf_error=repo_not_found\b", re.IGNORECASE)),
+    ("hf_revision_not_found", re.compile(r"hf_error=revision_not_found\b", re.IGNORECASE)),
+    ("hf_entry_not_found", re.compile(r"hf_error=entry_not_found\b", re.IGNORECASE)),
+    ("hf_bucket_not_found", re.compile(r"hf_error=bucket_not_found\b", re.IGNORECASE)),
+    ("hf_http_400", re.compile(r"(?:HTTP error:\s*|http_status=)400\b", re.IGNORECASE)),
+    ("hf_http_401", re.compile(r"(?:HTTP error:\s*|http_status=)401\b", re.IGNORECASE)),
+    ("hf_http_403", re.compile(r"(?:HTTP error:\s*|http_status=)403\b|hf_error=forbidden", re.IGNORECASE)),
+    ("hf_http_409", re.compile(r"(?:HTTP error:\s*|http_status=)409\b|hf_error=conflict", re.IGNORECASE)),
+    ("hf_http_413", re.compile(r"(?:HTTP error:\s*|http_status=)413\b", re.IGNORECASE)),
+    ("hf_http_422", re.compile(r"(?:HTTP error:\s*|http_status=)422\b", re.IGNORECASE)),
+    (
+        "hf_http_429",
+        re.compile(r"(?:HTTP error:\s*|http_status=|failed with HTTP\s*)429\b|hf_error=rate_limited", re.IGNORECASE),
+    ),
+    ("hf_http_5xx", re.compile(r"(?:HTTP error:\s*|http_status=)5(?:00|02|03|04)\b", re.IGNORECASE)),
+    ("hf_http_other", re.compile(r"(?:HTTP error:\s*|http_status=|failed with HTTP\s*)\d{3}\b", re.IGNORECASE)),
+    ("hf_xet_failed", re.compile(r"hf_error=xet\b|Xet .* failed", re.IGNORECASE)),
+    ("hf_local_entry_not_found", re.compile(r"hf_error=local_entry_not_found\b", re.IGNORECASE)),
+    ("hf_cache_not_enabled", re.compile(r"hf_error=cache_not_enabled\b", re.IGNORECASE)),
+    ("hf_cache_lock_timeout", re.compile(r"hf_error=cache_lock_timeout\b", re.IGNORECASE)),
+    ("hf_io", re.compile(r"hf_error=io\b", re.IGNORECASE)),
+    ("hf_json", re.compile(r"hf_error=json\b", re.IGNORECASE)),
+    ("hf_url", re.compile(r"hf_error=url\b", re.IGNORECASE)),
+    ("hf_invalid_parameter", re.compile(r"hf_error=invalid_parameter\b", re.IGNORECASE)),
+    ("hf_diff_parse", re.compile(r"hf_error=diff_parse\b", re.IGNORECASE)),
+    ("hf_malformed_response", re.compile(r"hf_error=malformed_response\b", re.IGNORECASE)),
+    ("hf_other", re.compile(r"hf_error=other\b", re.IGNORECASE)),
+    ("hf_unknown", re.compile(r"hf_error=unknown\b", re.IGNORECASE)),
+    (
+        "voyage_api_key_missing",
+        re.compile(r"VOYAGE_API_KEY\s+is\s+required", re.IGNORECASE),
+    ),
+    ("hf_auth_required", re.compile(r"Authentication required|unauthori[sz]ed|invalid api key|hf_error=auth_required", re.IGNORECASE)),
+    ("hf_rate_limited", re.compile(r"Rate limited|rate[ -]?limit|too many requests", re.IGNORECASE)),
+    ("lance_remote_open_failed", re.compile(r"opening the remote dataset", re.IGNORECASE)),
+    ("hf_commit_failed", re.compile(r"canonical data commit failed|data commit failed", re.IGNORECASE)),
+    ("lance_schema_migration_failed", re.compile(r"adding canonical document columns", re.IGNORECASE)),
+    ("lance_delete_failed", re.compile(r"deleting stale canonical document rows", re.IGNORECASE)),
+    ("lance_append_failed", re.compile(r"appending replacement canonical document rows", re.IGNORECASE)),
+    ("disk_full", re.compile(r"No space left on device", re.IGNORECASE)),
+)
+NATIVE_METRIC_RE = re.compile(r"^funes_metric (\{.*\})\s*$")
+NATIVE_METRIC_PHASES = frozenset(
+    {
+        "secret_scan",
+        "remote_open",
+        "revision_lookup",
+        "vector_reuse",
+        "embedding",
+        "lance_write_commit",
+        "lance_append",
+        "lance_delete",
+        "captured_files",
+        "write_ops",
+        "hf_commit_chunk",
+        "hf_commit_wait",
+        "recall_open",
+        "recall_models",
+        "recall_embed",
+        "recall_vector",
+        "recall_fts",
+        "recall_rerank",
+        "recall_neighbors",
+    }
+)
+
+RECALL_METRIC_STAGES = frozenset(
+    {
+        "recall_open",
+        "recall_models",
+        "recall_embed",
+        "recall_vector",
+        "recall_fts",
+        "recall_rerank",
+        "recall_neighbors",
+    }
+)
+
+
+def _safe_recall_metrics(lines: Sequence[str] | None) -> list[dict[str, object]]:
+    """Keep at most 32 strictly allowlisted read-stage metric events."""
+    result: list[dict[str, object]] = []
+    for line in lines or ():
+        match = NATIVE_METRIC_RE.fullmatch(str(line).strip())
+        if match is None:
+            continue
+        try:
+            item = json.loads(match.group(1))
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(item, dict):
+            continue
+        stage = item.get("stage")
+        state = item.get("state")
+        duration = item.get("duration_ms")
+        if (
+            not isinstance(stage, str)
+            or stage not in RECALL_METRIC_STAGES
+            or not isinstance(state, str)
+            or state not in {"start", "done"}
+            or isinstance(duration, bool)
+        ):
+            continue
+        try:
+            duration_value = float(duration)
+        except (TypeError, ValueError):
+            continue
+        if not (0.0 <= duration_value < 86_400_000) or not math.isfinite(duration_value):
+            continue
+        result.append(
+            {
+                "stage": stage,
+                "state": state,
+                "duration_ms": round(duration_value, 2),
+            }
+        )
+        if len(result) >= 32:
+            break
+    return result
+
+
+def _safe_timeout_stderr(stderr: str | bytes | None) -> str | None:
+    """Extract and re-serialize only allowlisted numeric metrics on timeout."""
+    if stderr is None:
+        return None
+    if isinstance(stderr, bytes):
+        text = stderr.decode("utf-8", "replace")
+    elif isinstance(stderr, str):
+        text = stderr
+    else:
+        return None
+
+    safe_lines: list[str] = []
+    for line in text.splitlines():
+        match = NATIVE_METRIC_RE.fullmatch(line.strip())
+        if match is None:
+            continue
+        try:
+            item = json.loads(match.group(1))
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(item, dict):
+            continue
+        stage = item.get("stage")
+        try:
+            duration_ms = float(item.get("duration_ms"))
+        except (TypeError, ValueError):
+            continue
+        if (
+            not isinstance(stage, str)
+            or duration_ms < 0.0
+            or duration_ms >= 86_400_000
+        ):
+            continue
+
+        if stage in NATIVE_METRIC_PHASES:
+            clean_item: dict[str, object] = {
+                "stage": stage,
+                "duration_ms": round(duration_ms, 2),
+            }
+        elif stage == "voyage_request":
+            clean_item = {
+                "stage": stage,
+                "duration_ms": round(duration_ms, 2),
+            }
+            if "input_count" in item:
+                try:
+                    value = int(item["input_count"])
+                    if 0 <= value <= 128:
+                        clean_item["input_count"] = value
+                except (TypeError, ValueError):
+                    pass
+            if "status_code" in item:
+                try:
+                    value = int(item["status_code"])
+                    if 0 <= value <= 999:
+                        clean_item["status_code"] = value
+                except (TypeError, ValueError):
+                    pass
+            if "token_usage" in item and item["token_usage"] is not None:
+                try:
+                    value = int(item["token_usage"])
+                    if 0 <= value <= 10_000_000:
+                        clean_item["token_usage"] = value
+                except (TypeError, ValueError):
+                    pass
+            for field in ("pacer_wait_ms", "backoff_ms"):
+                if field not in item or item[field] is None:
+                    continue
+                try:
+                    value = float(item[field])
+                    if 0.0 <= value < 86_400_000:
+                        clean_item[field] = round(value, 2)
+                except (TypeError, ValueError):
+                    pass
+            if "attempt" in item:
+                try:
+                    attempt = int(item["attempt"])
+                    if 1 <= attempt <= 100:
+                        clean_item["attempt"] = attempt
+                except (TypeError, ValueError):
+                    pass
+        elif stage == "hf_commit_attempt":
+            clean_item = {
+                "stage": stage,
+                "duration_ms": round(duration_ms, 2),
+            }
+            if "attempt" in item:
+                try:
+                    attempt = int(item["attempt"])
+                    if 1 <= attempt <= 100:
+                        clean_item["attempt"] = attempt
+                except (TypeError, ValueError):
+                    pass
+            if "status_code" in item:
+                try:
+                    value = int(item["status_code"])
+                    if 0 <= value <= 999:
+                        clean_item["status_code"] = value
+                except (TypeError, ValueError):
+                    pass
+            if "phase" in item:
+                phase = str(item["phase"])
+                if phase in {"preupload", "commit", "unknown"}:
+                    clean_item["phase"] = phase
+            if "retry_after_ms" in item:
+                if item["retry_after_ms"] is None:
+                    clean_item["retry_after_ms"] = None
+                else:
+                    try:
+                        value = float(item["retry_after_ms"])
+                        if 0.0 <= value < 86_400_000:
+                            clean_item["retry_after_ms"] = round(value, 2)
+                    except (TypeError, ValueError):
+                        pass
+            if "backoff_ms" in item and item["backoff_ms"] is not None:
+                try:
+                    value = float(item["backoff_ms"])
+                    if 0.0 <= value < 86_400_000:
+                        clean_item["backoff_ms"] = round(value, 2)
+                except (TypeError, ValueError):
+                    pass
+            if "retrying" in item and isinstance(item["retrying"], bool):
+                clean_item["retrying"] = item["retrying"]
+            if "limit_kind" in item:
+                limit_kind = str(item["limit_kind"])
+                if limit_kind in {"commit_action", "api", "concurrency", "unknown"}:
+                    clean_item["limit_kind"] = limit_kind
+        else:
+            continue
+
+        clean_json = json.dumps(clean_item, separators=(",", ":"), sort_keys=True)
+        safe_lines.append(f"funes_metric {clean_json}")
+
+    return "\n".join(safe_lines) + "\n" if safe_lines else None
+
+
+_CANONICAL_METRIC_COUNTER = itertools.count(1)
+
+
+def _native_metrics() -> dict[str, object]:
+    """Return a bounded aggregate for native ingest timing diagnostics."""
+    return {
+        "_metric_id": next(_CANONICAL_METRIC_COUNTER),
+        "phase_ms": {},
+        "voyage_requests": 0,
+        "voyage_retries": 0,
+        "voyage_duration_ms": 0.0,
+        "voyage_input_count": 0,
+        "voyage_token_usage": 0,
+        "voyage_token_usage_known": 0,
+        "voyage_status_counts": {},
+        "voyage_pacer_wait_ms": 0.0,
+        "voyage_backoff_ms": 0.0,
+        "hf_send_attempts": 0,
+        "hf_retries": 0,
+        "hf_status_counts": {},
+        "hf_phase_counts": {},
+        "hf_429_count": 0,
+        "hf_backoff_ms": 0.0,
+        "hf_retry_after_ms": 0.0,
+        "hf_limit_kind_counts": {},
+    }
+
+
+def _native_failure_code(stderr: str | None) -> str:
+    """Map untrusted native stderr to one safe, bounded diagnostic label."""
+    text = stderr if isinstance(stderr, str) else ""
+    http_400 = bool(re.search(r"(?:HTTP error:\s*|http_status=)400\b", text, re.IGNORECASE))
+    for code, pattern in NATIVE_FAILURE_PATTERNS:
+        if code in {"hf_http_400", "hf_http_other", "hf_commit_failed"} and http_400:
+            # A bare HTTP 400 is a fallback.  Prefer a bounded child category
+            # when the native error contains a safe Hub discriminator.
+            continue
+        if pattern.search(text):
+            return code
+    if http_400:
+        error_code = NATIVE_HF_ERROR_CODE_RE.search(text)
+        if error_code is not None:
+            normalized = re.sub(
+                r"(?<=[a-z0-9])(?=[A-Z])", "_", error_code.group(1)
+            )
+            normalized = re.sub(r"[^a-zA-Z0-9]+", "_", normalized).strip("_").lower()
+            if normalized:
+                return f"hf_http_400:{normalized[:48]}"
+        server_message = NATIVE_HF_SERVER_MESSAGE_RE.search(text)
+        if server_message is not None:
+            raw_reason = server_message.group(1).strip()
+            # The Rust bridge emits bounded snake_case classifications (for
+            # example ``file_count_limit``) rather than the provider's raw
+            # response. Preserve those atoms so production diagnostics do not
+            # collapse back to the generic phase-only ``:commit`` label.
+            if re.fullmatch(r"[a-z0-9_]{3,48}", raw_reason):
+                return f"hf_http_400:{raw_reason}"
+            for label, pattern in NATIVE_HF_400_HINTS:
+                if pattern.search(raw_reason):
+                    return f"hf_http_400:{label}"
+        phase = NATIVE_HF_PHASE_RE.search(text)
+        if phase is not None:
+            return f"hf_http_400:{phase.group(1).lower()}"
+        return "hf_http_400"
+    return "native_exit"
+
+
+def _record_native_metrics(metrics: dict[str, object], stderr: str | None) -> None:
+    """Parse only allowlisted numeric metrics; never retain native stderr."""
+    if not stderr:
+        return
+    phase_ms = metrics["phase_ms"]
+    status_counts = metrics["voyage_status_counts"]
+    if not isinstance(phase_ms, dict) or not isinstance(status_counts, dict):
+        return
+    for line in stderr.splitlines():
+        match = NATIVE_METRIC_RE.fullmatch(line.strip())
+        if match is None:
+            continue
+        try:
+            item = json.loads(match.group(1))
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(item, dict):
+            continue
+        stage = item.get("stage")
+        try:
+            duration_ms = float(item.get("duration_ms"))
+        except (TypeError, ValueError):
+            duration_ms = -1.0
+        if (
+            not isinstance(stage, str)
+            or duration_ms < 0.0
+            or duration_ms >= 86_400_000
+        ):
+            continue
+        if stage in NATIVE_METRIC_PHASES:
+            phase_ms[stage] = round(float(phase_ms.get(stage, 0.0)) + duration_ms, 2)
+            continue
+        if stage == "hf_commit_attempt":
+            metrics["hf_send_attempts"] = int(metrics.get("hf_send_attempts", 0)) + 1
+            try:
+                attempt = int(item.get("attempt", 1))
+            except (TypeError, ValueError):
+                attempt = 1
+            retrying_flag = item.get("retrying") is True
+            if (2 <= attempt <= 100) or ("attempt" not in item and retrying_flag):
+                metrics["hf_retries"] = int(metrics.get("hf_retries", 0)) + 1
+            try:
+                status = int(item.get("status_code", 0))
+            except (TypeError, ValueError):
+                status = 0
+            if 0 <= status <= 999:
+                skey = str(status)
+                hf_status_counts = metrics.setdefault("hf_status_counts", {})
+                if isinstance(hf_status_counts, dict):
+                    hf_status_counts[skey] = int(hf_status_counts.get(skey, 0)) + 1
+                if status == 429:
+                    metrics["hf_429_count"] = int(metrics.get("hf_429_count", 0)) + 1
+            phase = item.get("phase")
+            if isinstance(phase, str) and phase in {"preupload", "commit", "unknown"}:
+                hf_phase_counts = metrics.setdefault("hf_phase_counts", {})
+                if isinstance(hf_phase_counts, dict):
+                    hf_phase_counts[phase] = int(hf_phase_counts.get(phase, 0)) + 1
+            limit_kind = item.get("limit_kind")
+            if isinstance(limit_kind, str) and limit_kind in {"commit_action", "api", "concurrency", "unknown"}:
+                hf_limit_kind_counts = metrics.setdefault("hf_limit_kind_counts", {})
+                if isinstance(hf_limit_kind_counts, dict):
+                    hf_limit_kind_counts[limit_kind] = int(hf_limit_kind_counts.get(limit_kind, 0)) + 1
+            for field, target_key in (("backoff_ms", "hf_backoff_ms"), ("retry_after_ms", "hf_retry_after_ms")):
+                if field in item and item[field] is not None:
+                    try:
+                        val = float(item[field])
+                        if 0.0 <= val < 86_400_000:
+                            metrics[target_key] = round(float(metrics.get(target_key, 0.0)) + val, 2)
+                    except (TypeError, ValueError):
+                        pass
+            continue
+        if stage != "voyage_request":
+            continue
+        metrics["voyage_requests"] = int(metrics["voyage_requests"]) + 1
+        metrics["voyage_duration_ms"] = round(
+            float(metrics.get("voyage_duration_ms", 0.0)) + duration_ms, 2
+        )
+        try:
+            attempt = int(item.get("attempt", 1))
+        except (TypeError, ValueError):
+            attempt = 1
+        if 2 <= attempt <= 100:
+            metrics["voyage_retries"] = int(metrics.get("voyage_retries", 0)) + 1
+        try:
+            input_count = int(item.get("input_count", 0))
+        except (TypeError, ValueError):
+            input_count = 0
+        if 0 <= input_count <= 128:
+            metrics["voyage_input_count"] = int(metrics["voyage_input_count"]) + input_count
+        try:
+            status = int(item.get("status_code", 0))
+        except (TypeError, ValueError):
+            status = 0
+        if 0 <= status <= 999:
+            key = str(status)
+            status_counts[key] = int(status_counts.get(key, 0)) + 1
+        token_usage = item.get("token_usage")
+        if token_usage is not None:
+            try:
+                token_usage = int(token_usage)
+            except (TypeError, ValueError):
+                token_usage = -1
+            if 0 <= token_usage <= 10_000_000:
+                metrics["voyage_token_usage"] = int(metrics["voyage_token_usage"]) + token_usage
+                metrics["voyage_token_usage_known"] = int(metrics["voyage_token_usage_known"]) + 1
+        for field in ("pacer_wait_ms", "backoff_ms"):
+            try:
+                value = float(item.get(field, 0.0))
+            except (TypeError, ValueError):
+                value = -1.0
+            if 0.0 <= value < 86_400_000:
+                key = "voyage_pacer_wait_ms" if field == "pacer_wait_ms" else "voyage_backoff_ms"
+                metrics[key] = round(float(metrics[key]) + value, 2)
+
+
+def _bounded_native_metrics(metrics: object) -> dict[str, object] | None:
+    """Sanitize native ingest metrics to safe numeric aggregates and allowlisted phases."""
+    if not isinstance(metrics, dict):
+        return None
+    phase_ms: dict[str, float] = {}
+    raw_phase = metrics.get("phase_ms")
+    if isinstance(raw_phase, dict):
+        for stage in sorted(NATIVE_METRIC_PHASES):
+            if stage in raw_phase:
+                try:
+                    val = float(raw_phase[stage])
+                except (TypeError, ValueError):
+                    continue
+                if 0.0 <= val < 86_400_000:
+                    phase_ms[stage] = round(val, 2)
+
+    status_counts: dict[str, int] = {}
+    raw_status = metrics.get("voyage_status_counts")
+    if isinstance(raw_status, dict):
+        for raw_k, raw_v in raw_status.items():
+            try:
+                code = int(raw_k)
+                count = int(raw_v)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= code <= 999 and count >= 0:
+                status_counts[str(code)] = count
+
+    def _safe_int(key: str, min_val: int = 0, max_val: int = 1_000_000_000) -> int:
+        try:
+            val = int(metrics.get(key, 0))  # type: ignore[union-attr]
+        except (TypeError, ValueError):
+            return 0
+        return val if min_val <= val <= max_val else 0
+
+    def _safe_float(key: str, min_val: float = 0.0, max_val: float = 86_400_000.0) -> float:
+        try:
+            val = float(metrics.get(key, 0.0))  # type: ignore[union-attr]
+        except (TypeError, ValueError):
+            return 0.0
+        return round(val, 2) if min_val <= val < max_val else 0.0
+
+    hf_status_counts: dict[str, int] = {}
+    raw_hf_status = metrics.get("hf_status_counts")
+    if isinstance(raw_hf_status, dict):
+        for raw_k, raw_v in raw_hf_status.items():
+            try:
+                code = int(raw_k)
+                count = int(raw_v)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= code <= 999 and count >= 0:
+                hf_status_counts[str(code)] = count
+
+    hf_phase_counts: dict[str, int] = {}
+    raw_hf_phases = metrics.get("hf_phase_counts")
+    if isinstance(raw_hf_phases, dict):
+        for raw_k, raw_v in raw_hf_phases.items():
+            if str(raw_k) in {"preupload", "commit", "unknown"}:
+                try:
+                    count = int(raw_v)
+                    if count >= 0:
+                        hf_phase_counts[str(raw_k)] = count
+                except (TypeError, ValueError):
+                    continue
+
+    hf_limit_kind_counts: dict[str, int] = {}
+    raw_hf_limits = metrics.get("hf_limit_kind_counts")
+    if isinstance(raw_hf_limits, dict):
+        for raw_k, raw_v in raw_hf_limits.items():
+            if str(raw_k) in {"commit_action", "api", "concurrency", "unknown"}:
+                try:
+                    count = int(raw_v)
+                    if count >= 0:
+                        hf_limit_kind_counts[str(raw_k)] = count
+                except (TypeError, ValueError):
+                    continue
+
+    return {
+        "phase_ms": phase_ms,
+        "voyage_requests": _safe_int("voyage_requests"),
+        "voyage_retries": _safe_int("voyage_retries"),
+        "voyage_duration_ms": _safe_float("voyage_duration_ms"),
+        "voyage_input_count": _safe_int("voyage_input_count"),
+        "voyage_token_usage": _safe_int("voyage_token_usage"),
+        "voyage_token_usage_known": _safe_int("voyage_token_usage_known"),
+        "voyage_status_counts": status_counts,
+        "voyage_pacer_wait_ms": _safe_float("voyage_pacer_wait_ms"),
+        "voyage_backoff_ms": _safe_float("voyage_backoff_ms"),
+        "hf_send_attempts": _safe_int("hf_send_attempts"),
+        "hf_retries": _safe_int("hf_retries"),
+        "hf_status_counts": hf_status_counts,
+        "hf_phase_counts": hf_phase_counts,
+        "hf_429_count": _safe_int("hf_429_count"),
+        "hf_backoff_ms": _safe_float("hf_backoff_ms"),
+        "hf_retry_after_ms": _safe_float("hf_retry_after_ms"),
+        "hf_limit_kind_counts": hf_limit_kind_counts,
+    }
+
 CANONICAL_REF_PREFIX = "funes-doc:"
 HELD_SOURCE_ID_DOMAIN = b"funes-held-source-v1\0"
 
@@ -1429,6 +2239,7 @@ def _native_update(
         ),
         "native_index_error": error,
         "native_generation": int(item.get("native_generation") or 0),
+        "retrieval_generation": int(item.get("retrieval_generation") or 0),
     }
 
 
@@ -1524,6 +2335,35 @@ def _reported_held_source_ids(
     return set(source_ids)
 
 
+def _reported_stale_source_ids(
+    output: str,
+    records: list[tuple[dict, dict]],
+    stale: int,
+) -> set[str] | None:
+    """Validate the opaque stale mapping before trusting a non-bisecting report."""
+    matches = NATIVE_STALE_SOURCE_IDS_RE.findall(output)
+    if len(matches) != 1:
+        return None
+    try:
+        source_ids = json.loads(matches[0])
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(source_ids, list) or len(source_ids) != stale:
+        return None
+    if any(
+        not isinstance(source_id, str)
+        or NATIVE_STALE_SOURCE_ID_RE.fullmatch(source_id) is None
+        for source_id in source_ids
+    ) or len(set(source_ids)) != stale:
+        return None
+    record_source_ids = {
+        _opaque_source_id(str(item["source_identity"])) for item, _ in records
+    }
+    if len(record_source_ids) != len(records) or not set(source_ids) <= record_source_ids:
+        return None
+    return set(source_ids)
+
+
 def _ingest_canonical_subset(
     records: list[tuple[dict, dict]],
     directory: Path,
@@ -1531,6 +2371,7 @@ def _ingest_canonical_subset(
     *,
     memory: str,
     profile: dict[str, object],
+    metrics: dict[str, object] | None = None,
 ) -> tuple[list[dict], bool]:
     sequence[0] += 1
     path = directory / f"batch-{sequence[0]:06d}.jsonl"
@@ -1544,7 +2385,15 @@ def _ingest_canonical_subset(
             timeout=CANONICAL_INDEX_TIMEOUT,
             profile=profile,
         )
-    except subprocess.TimeoutExpired:
+        if metrics is not None:
+            _record_native_metrics(metrics, error_output)
+    except subprocess.TimeoutExpired as exc:
+        if metrics is not None:
+            partial_stderr = getattr(exc, "stderr", None)
+            if isinstance(partial_stderr, bytes):
+                partial_stderr = partial_stderr.decode("utf-8", "replace")
+            if isinstance(partial_stderr, str):
+                _record_native_metrics(metrics, partial_stderr)
         return [
             _native_update(
                 item, "retry", None, "TimeoutExpired", profile=profile, memory=memory
@@ -1574,15 +2423,16 @@ def _ingest_canonical_subset(
                 ], False
             middle = len(records) // 2
             left, left_commit = _ingest_canonical_subset(
-                records[:middle], directory, sequence, memory=memory, profile=profile
+                records[:middle], directory, sequence, memory=memory, profile=profile, metrics=metrics
             )
             right, right_commit = _ingest_canonical_subset(
-                records[middle:], directory, sequence, memory=memory, profile=profile
+                records[middle:], directory, sequence, memory=memory, profile=profile, metrics=metrics
             )
             return left + right, left_commit or right_commit
+        failure_code = _native_failure_code(error_output)
         return [
             _native_update(
-                item, "retry", None, "native_exit", profile=profile, memory=memory
+                item, "retry", None, failure_code, profile=profile, memory=memory
             )
             for item, _ in records
         ], False
@@ -1616,7 +2466,44 @@ def _ingest_canonical_subset(
                 memory=memory,
             )
             for item, document in records
-        ], committed
+            ], committed
+    stale_source_ids = _reported_stale_source_ids(output, records, stale)
+    held_source_ids = _reported_held_source_ids(output, records, held) if held else set()
+    # Newer native binaries identify stale rows, so mixed batches can be handled in one
+    # invocation. This preserves stale->retry and never advances a stale checkpoint.
+    if stale_source_ids is not None and (held == 0 or held_source_ids is not None):
+        if sources == 0 or committed:
+            held_source_ids = held_source_ids or set()
+            updates = []
+            for item, document in records:
+                opaque_id = _opaque_source_id(str(item["source_identity"]))
+                if opaque_id in stale_source_ids:
+                    updates.append(
+                        _native_update(
+                            item, "retry", None, "native_stale", profile=profile, memory=memory
+                        )
+                    )
+                elif opaque_id in held_source_ids:
+                    updates.append(
+                        _native_update(
+                            item,
+                            "held_secret",
+                            document["source_version"],
+                            profile=profile,
+                            memory=memory,
+                        )
+                    )
+                else:
+                    updates.append(
+                        _native_update(
+                            item,
+                            "indexed",
+                            document["source_version"],
+                            profile=profile,
+                            memory=memory,
+                        )
+                    )
+            return updates, committed
     # The extension identifies held rows only.  A stale row has no identity mapping, so preserve
     # the legacy bisection fallback unless every non-held row is safe to mark indexed.
     if stale == 0:
@@ -1654,33 +2541,249 @@ def _ingest_canonical_subset(
                 item, "retry", None, "native_stale", profile=profile, memory=memory
             )
         ], committed
+    # A legacy native binary may not emit stale identities. Avoid a full binary tree when the
+    # whole batch is stale; one retry is safe and the next reconciliation can observe a new head.
+    if stale == len(records):
+        return [
+            _native_update(item, "retry", None, "native_stale", profile=profile, memory=memory)
+            for item, _ in records
+        ], committed
     middle = len(records) // 2
     left, left_commit = _ingest_canonical_subset(
-        records[:middle], directory, sequence, memory=memory, profile=profile
+        records[:middle], directory, sequence, memory=memory, profile=profile, metrics=metrics
     )
     right, right_commit = _ingest_canonical_subset(
-        records[middle:], directory, sequence, memory=memory, profile=profile
+        records[middle:], directory, sequence, memory=memory, profile=profile, metrics=metrics
     )
     return left + right, committed or left_commit or right_commit
 
 
+def _empty_cumulative_metrics(since: str | None = None) -> dict[str, object]:
+    ts = since or utc_now()
+    return {
+        "since": ts,
+        "process_started_at": ts,
+        "hf_429": 0,
+        "hf_send_attempts": 0,
+        "hf_retries": 0,
+        "hf_backoff_ms": 0.0,
+        "hf_retry_after_ms": 0.0,
+        "hf_phase_counts": {},
+        "hf_status_counts": {},
+        "hf_limit_kind_counts": {},
+        "voyage_429": 0,
+        "voyage_5xx": 0,
+        "voyage_requests": 0,
+        "voyage_backoff_ms": 0.0,
+        "total_backoff_ms": 0.0,
+        "cycles": 0,
+    }
+
+
+def _accumulate_canonical_metrics(state: dict[str, object], raw_metrics: object) -> None:
+    if not isinstance(raw_metrics, dict):
+        return
+    metric_id = raw_metrics.get("_metric_id")
+    if metric_id is None:
+        metric_id = raw_metrics.setdefault("_metric_id", next(_CANONICAL_METRIC_COUNTER))
+    if state.get("_last_accumulated_metric_id") == metric_id:
+        return
+    state["_last_accumulated_metric_id"] = metric_id
+
+    bounded = _bounded_native_metrics(raw_metrics)
+    if bounded is None:
+        return
+
+    cumulative = state.get("cumulative_metrics")
+    if not isinstance(cumulative, dict):
+        cumulative = _empty_cumulative_metrics(state.get("phase_started_at") or utc_now())
+        state["cumulative_metrics"] = cumulative
+
+    hf_send_attempts = int(bounded.get("hf_send_attempts", 0))
+    hf_retries = int(bounded.get("hf_retries", 0))
+    hf_429 = int(bounded.get("hf_429_count", 0))
+    hf_backoff_ms = float(bounded.get("hf_backoff_ms", 0.0))
+    hf_retry_after_ms = float(bounded.get("hf_retry_after_ms", 0.0))
+    hf_phase_counts = bounded.get("hf_phase_counts") or {}
+    hf_status_counts = bounded.get("hf_status_counts") or {}
+
+    voyage_requests = int(bounded.get("voyage_requests", 0))
+    voyage_backoff_ms = float(bounded.get("voyage_backoff_ms", 0.0))
+    voyage_status_counts = bounded.get("voyage_status_counts") or {}
+
+    voyage_429 = int(voyage_status_counts.get("429", 0))
+    voyage_5xx = sum(
+        int(c) for code, c in voyage_status_counts.items()
+        if isinstance(code, str) and code.startswith("5")
+    )
+
+    cumulative["cycles"] = int(cumulative.get("cycles", 0)) + 1
+    cumulative["hf_send_attempts"] = int(cumulative.get("hf_send_attempts", 0)) + hf_send_attempts
+    cumulative["hf_retries"] = int(cumulative.get("hf_retries", 0)) + hf_retries
+    cumulative["hf_429"] = int(cumulative.get("hf_429", 0)) + hf_429
+    cumulative["hf_backoff_ms"] = round(float(cumulative.get("hf_backoff_ms", 0.0)) + hf_backoff_ms, 2)
+    cumulative["hf_retry_after_ms"] = round(float(cumulative.get("hf_retry_after_ms", 0.0)) + hf_retry_after_ms, 2)
+    cumulative["voyage_requests"] = int(cumulative.get("voyage_requests", 0)) + voyage_requests
+    cumulative["voyage_backoff_ms"] = round(float(cumulative.get("voyage_backoff_ms", 0.0)) + voyage_backoff_ms, 2)
+    cumulative["voyage_429"] = int(cumulative.get("voyage_429", 0)) + voyage_429
+    cumulative["voyage_5xx"] = int(cumulative.get("voyage_5xx", 0)) + voyage_5xx
+    cumulative["total_backoff_ms"] = round(float(cumulative["hf_backoff_ms"]) + float(cumulative["voyage_backoff_ms"]), 2)
+
+    cum_hf_phases = cumulative.setdefault("hf_phase_counts", {})
+    if isinstance(cum_hf_phases, dict) and isinstance(hf_phase_counts, dict):
+        for k, v in hf_phase_counts.items():
+            cum_hf_phases[k] = int(cum_hf_phases.get(k, 0)) + int(v)
+
+    cum_hf_statuses = cumulative.setdefault("hf_status_counts", {})
+    if isinstance(cum_hf_statuses, dict) and isinstance(hf_status_counts, dict):
+        for k, v in hf_status_counts.items():
+            cum_hf_statuses[k] = int(cum_hf_statuses.get(k, 0)) + int(v)
+
+    hf_limit_kind_counts = bounded.get("hf_limit_kind_counts") or {}
+    cum_hf_limits = cumulative.setdefault("hf_limit_kind_counts", {})
+    if isinstance(cum_hf_limits, dict) and isinstance(hf_limit_kind_counts, dict):
+        for k, v in hf_limit_kind_counts.items():
+            cum_hf_limits[k] = int(cum_hf_limits.get(k, 0)) + int(v)
+
+
 def _initialize_canonical_reconcile_state(app) -> None:
+    # The run and its override are intentionally volatile. A process restart
+    # resumes the ordinary canonical checkpoint with the global configuration.
+    app.canonical_ab = CanonicalABController()
     app.canonical_index_state_lock = threading.Lock()
+    now_iso = utc_now()
     app.canonical_index_state = {
         "active": False,
         "phase": "waiting_restore",
-        "phase_started_at": utc_now(),
+        "phase_started_at": now_iso,
         "last_started_at": None,
         "last_finished_at": None,
         "last_duration_ms": None,
         "last_result": None,
         "last_error": None,
         "last_progress_at": None,
+        "last_metrics": None,
+        "cumulative_metrics": _empty_cumulative_metrics(now_iso),
         "consecutive_failures": 0,
         "wait_seconds": CANONICAL_INDEX_INTERVAL,
+        "_last_accumulated_metric_id": None,
     }
     app._canonical_refresh_lock = threading.Lock()
     app._canonical_refresh_state = {"last_requested_at": None, "dirty": False}
+    app.index_maintenance_lock = threading.Lock()
+    app.index_maintenance_state = {
+        "active": False,
+        "memory": None,
+        "profile": None,
+        "pending_documents": 0,
+        "last_started_at": None,
+        "last_finished_at": None,
+        "last_success_at": None,
+        "last_duration_ms": None,
+        "last_error": None,
+        "successes": 0,
+        "failures": 0,
+        "_last_attempt": None,
+        "_last_success": None,
+    }
+
+
+def index_maintenance_state(app) -> dict[str, object]:
+    lock = getattr(app, "index_maintenance_lock", None)
+    state = getattr(app, "index_maintenance_state", None)
+    if lock is None or state is None:
+        return {**INDEX_MAINTENANCE_SETTINGS, "active": False, "pending_documents": 0}
+    with lock:
+        return {
+            **INDEX_MAINTENANCE_SETTINGS,
+            **{key: value for key, value in state.items() if not key.startswith("_")},
+        }
+
+
+def _maybe_maintain_canonical_index(app, result: dict[str, object]) -> bool:
+    """Refresh existing Lance indexes during backfill, never source checkpoints.
+
+    Only the reconciler calls this after durable status persistence. The first
+    progressing cycle repairs a pre-existing backlog after restart; subsequent
+    cycles debounce by documents/time. Native writers serialize, raw ingest
+    does not. A failed attempt retains dirty documents for a later retry.
+    """
+    settings = INDEX_MAINTENANCE_SETTINGS
+    syncer = getattr(app, "syncer", None)
+    stop = getattr(app, "canonical_index_stop", None)
+    if (
+        not settings["enabled"]
+        or getattr(app, "store", None) is None
+        or syncer is None
+        or getattr(syncer, "restoring", False)
+        or getattr(syncer, "restore_failed", False)
+        or (stop is not None and stop.is_set())
+        or not result.get("durable")
+    ):
+        return False
+    indexed = int(result.get("indexed") or 0)
+    lock = getattr(app, "index_maintenance_lock", None)
+    state = getattr(app, "index_maintenance_state", None)
+    memory = index_memory()
+    if not memory or lock is None or state is None:
+        return False
+    profile = index_embedding_profile()
+    now = time.monotonic()
+    with lock:
+        if state["active"]:
+            return False
+        if (state["memory"], state["profile"]) != (memory, profile["fingerprint"]):
+            state.update(
+                memory=memory, profile=profile["fingerprint"], pending_documents=0,
+                _last_attempt=None, _last_success=None, last_error=None,
+            )
+        state["pending_documents"] += max(0, indexed)
+        pending = state["pending_documents"]
+        if not pending:
+            return False
+        attempt = state["_last_attempt"]
+        success = state["_last_success"]
+        if state["last_error"] and attempt is not None:
+            if now - attempt < settings["retry_seconds"]:
+                return False
+        elif success is not None and pending < settings["document_threshold"]:
+            if now - success < settings["interval_seconds"]:
+                return False
+        state.update(active=True, last_started_at=utc_now(), _last_attempt=now)
+    _canonical_reconcile_phase(app, "index_maintenance")
+    error = None
+    try:
+        # No WRITE_LOCK: PostgreSQL/raw ingestion remains available while the
+        # native command processes stored vectors (no embedding generation).
+        with NATIVE_WRITE_LOCK:
+            optimized = optimize_native_index(memory, profile)
+        if not optimized:
+            error = "native_optimize_failed"
+    except Exception as exc:
+        optimized = False
+        error = _canonical_error_code(exc)
+    finished = time.monotonic()
+    with lock:
+        state.update(
+            active=False, last_finished_at=utc_now(),
+            last_duration_ms=max(0, round((finished - now) * 1000)), last_error=error,
+        )
+        if optimized:
+            state.update(
+                pending_documents=max(0, state["pending_documents"] - pending),
+                _last_success=finished, last_success_at=utc_now(),
+                successes=state["successes"] + 1,
+            )
+        else:
+            # Cooldown begins at completion, not before a possibly 900s run.
+            state.update(_last_attempt=finished, failures=state["failures"] + 1)
+    if (
+        optimized
+        and memory == REMOTE
+        and profile["fingerprint"] == embedding_profile()["fingerprint"]
+    ):
+        _request_canonical_refresh(app, force=True)
+    return optimized
 
 
 def _canonical_refresh_control(app):
@@ -1722,6 +2825,8 @@ def _set_canonical_reconcile_state(app, **changes: object) -> None:
     if lock is None or state is None:
         return
     with lock:
+        if "last_metrics" in changes and changes["last_metrics"] is not None:
+            _accumulate_canonical_metrics(state, changes["last_metrics"])
         state.update(changes)
 
 
@@ -1740,6 +2845,8 @@ def canonical_reconcile_state(app) -> dict[str, object]:
             "last_result": None,
             "last_error": None,
             "last_progress_at": None,
+            "last_metrics": None,
+            "cumulative_metrics": _empty_cumulative_metrics(),
             "consecutive_failures": 0,
             "wait_seconds": CANONICAL_INDEX_INTERVAL,
         }
@@ -1748,6 +2855,17 @@ def canonical_reconcile_state(app) -> dict[str, object]:
             public = {
                 key: value for key, value in state.items() if not key.startswith("_")
             }
+            cum = public.get("cumulative_metrics")
+            if isinstance(cum, dict):
+                copied_cum = dict(cum)
+                for sub_k in ("hf_phase_counts", "hf_status_counts", "hf_limit_kind_counts"):
+                    if isinstance(copied_cum.get(sub_k), dict):
+                        copied_cum[sub_k] = dict(copied_cum[sub_k])
+                public["cumulative_metrics"] = copied_cum
+            else:
+                public["cumulative_metrics"] = _empty_cumulative_metrics()
+            public["last_metrics"] = _bounded_native_metrics(public.get("last_metrics"))
+    public["index_maintenance"] = index_maintenance_state(app)
     thread = getattr(app, "canonical_index_thread", None)
     public.update(
         thread_alive=bool(thread is not None and thread.is_alive()),
@@ -1767,20 +2885,49 @@ def _canonical_reconcile_phase(app, phase: str) -> None:
     _set_canonical_reconcile_state(app, phase=phase, phase_started_at=utc_now())
 
 
-def reconcile_canonical_index(app) -> dict[str, object]:
+def reconcile_canonical_index(
+    app, *, profile_override: Mapping[str, object] | None = None,
+) -> dict[str, object]:
     """Index one restart-safe batch and persist only derived status in the sidecar."""
+    metrics = _native_metrics()
+    try:
+        return _reconcile_canonical_index_body(app, metrics, profile_override=profile_override)
+    except Exception:
+        _set_canonical_reconcile_state(app, last_metrics=metrics)
+        raise
+
+
+def _reconcile_canonical_index_body(
+    app, metrics: dict[str, object], *, profile_override: Mapping[str, object] | None = None,
+) -> dict[str, object]:
     memory = index_memory()
     if not memory or app.syncer.restoring or app.syncer.restore_failed:
         return {"attempted": 0, "indexed": 0, "held": 0, "durable": False}
 
     profile = index_embedding_profile()
+    batch_size = CANONICAL_INDEX_BATCH
+    request_rows = CANONICAL_INDEX_REQUEST_ROWS
+    max_chars = CANONICAL_INDEX_MAX_CHARS
+    if profile_override is not None:
+        # Only controller-owned fixed execution settings may vary. In
+        # particular never replace the model, fingerprint, schema or memory.
+        fixed = next((
+            fixed for fixed in FIXED_PROFILES
+            if all(profile_override.get(key) == value for key, value in fixed.items())
+        ), None)
+        if fixed is None:
+            raise ValueError("invalid_canonical_ab_profile")
+        batch_size = int(fixed["batch_size"])
+        request_rows = int(fixed["request_rows"])
+        max_chars = int(fixed["max_chars"])
+        profile = {**profile, "concurrency": int(fixed["concurrency"])}
 
-    def select_and_ingest(directory: Path):
+    def select_candidates():
         if app.syncer.restoring or app.syncer.restore_failed:
-            return [], [], False
+            return []
         _canonical_reconcile_phase(app, "selecting")
         rows = app.store.canonical_index_candidates(
-            CANONICAL_INDEX_BATCH,
+            max(batch_size, request_rows),
             str(profile["fingerprint"]),
             memory,
         )
@@ -1799,35 +2946,85 @@ def reconcile_canonical_index(app) -> dict[str, object]:
             candidates.append((item, document))
         selected = select_bounded_canonical_records(
             candidates,
-            max_rows=CANONICAL_INDEX_REQUEST_ROWS,
-            max_chars=CANONICAL_INDEX_MAX_CHARS,
+            max_rows=request_rows,
+            max_chars=max_chars,
         )
+        return selected
+
+    def revalidate_candidates(selected):
+        """Re-read candidates immediately before native ingest.
+
+        Candidate selection intentionally happens without WRITE_LOCK.  A raw
+        ingest can therefore change a row while Voyage is being prepared; only
+        the exact durable revision observed here may enter the native writer.
+        """
         if not selected:
-            return selected, [], False
-        _canonical_reconcile_phase(app, "native_ingest")
-        updates, committed = _ingest_canonical_subset(
-            selected,
-            directory,
-            [0],
-            memory=memory,
-            profile=profile,
-        )
-        return selected, updates, committed
+            return []
+        identities = [str(item["source_identity"]) for item, _ in selected]
+        if hasattr(app.store, "get_many"):
+            current_rows = app.store.get_many(identities)
+            current_by_identity = {
+                str(item["source_identity"]): item
+                for item in current_rows
+                if isinstance(item, dict) and item.get("source_identity") is not None
+            }
+        else:
+            current_by_identity = {
+                identity: app.store.get(identity)
+                for identity in identities
+            }
+        stable = []
+        terminal = {"indexed", "held_secret", "held_invalid"}
+        for original, _ in selected:
+            identity = str(original["source_identity"])
+            current = current_by_identity.get(identity)
+            if not current or current.get("native_index_status") == "waiting_durability":
+                continue
+            if any(
+                str(current.get(field, "")) != str(original.get(field, ""))
+                for field in ("source_version", "content_hash")
+            ) or any(
+                int(current.get(field) or 0) != int(original.get(field) or 0)
+                for field in ("native_generation", "retrieval_generation")
+            ):
+                continue
+            document = canonical_document(current, profile)
+            if (
+                current.get("native_index_status") in terminal
+                and current.get("native_index_version") == document["source_version"]
+                and current.get("native_index_profile") == profile["fingerprint"]
+                and current.get("native_index_memory") == memory
+            ):
+                continue
+            stable.append((current, document))
+        return stable
 
     _canonical_reconcile_phase(app, "preparing")
     with tempfile.TemporaryDirectory(prefix="funes-canonical-") as temporary:
-        _canonical_reconcile_phase(app, "waiting_write_lock")
-        with WRITE_LOCK:
-            translation_lock = getattr(app, "translation_lock", None)
-            if translation_lock is None:
-                records, updates, committed = select_and_ingest(Path(temporary))
-            else:
-                _canonical_reconcile_phase(app, "waiting_translation_lock")
-                with translation_lock:
-                    records, updates, committed = select_and_ingest(Path(temporary))
+        selected = select_candidates()
+        candidate_seen = bool(selected)
+        records, updates, committed = [], [], False
+        if selected:
+            _canonical_reconcile_phase(app, "waiting_native_lock")
+            with NATIVE_WRITE_LOCK:
+                selected = revalidate_candidates(selected)
+                if selected:
+                    _canonical_reconcile_phase(app, "native_ingest")
+                    records = selected
+                    updates, committed = _ingest_canonical_subset(
+                        selected,
+                        Path(temporary),
+                        [0],
+                        memory=memory,
+                        profile=profile,
+                        metrics=metrics,
+                    )
     if not records:
         durable = not app.syncer.restoring and not app.syncer.restore_failed
-        if durable:
+        _set_canonical_reconcile_state(
+            app, last_metrics=metrics, failure_counts={}
+        )
+        if durable and not candidate_seen:
             _canonical_reconcile_phase(app, "optimizing")
             optimize_canonical_index(app, profile, memory)
             _request_canonical_refresh(app, force=True, only_if_dirty=True)
@@ -1837,20 +3034,51 @@ def reconcile_canonical_index(app) -> dict[str, object]:
         and memory == REMOTE
         and profile["fingerprint"] == embedding_profile()["fingerprint"]
     ):
+        # Keep the app-scoped cooldown: one active worker replacement can
+        # serve searches while the new worker warms, while trailing commits
+        # remain marked dirty for the next allowed refresh.
         _request_canonical_refresh(app)
     _canonical_reconcile_phase(app, "validating_status")
     status_documents = []
     valid_updates = []
-    for update in updates:
-        current = app.store.get(update["source_identity"])
-        if (
-            current is None
-            or str(current.get("source_version", "")) != update["source_version"]
-            or str(current.get("content_hash", "")) != update["content_hash"]
-        ):
-            continue
-        status_documents.append({**current, **update})
-        valid_updates.append(update)
+    if hasattr(app.store, "get_many"):
+        identities = [
+            str(u["source_identity"])
+            for u in updates
+            if u.get("source_identity") is not None
+        ]
+        hydrated = {
+            str(d["source_identity"]): d
+            for d in app.store.get_many(identities)
+            if isinstance(d, dict) and d.get("source_identity") is not None
+        }
+        for update in updates:
+            ident = str(update.get("source_identity", ""))
+            current = hydrated.get(ident)
+            if (
+                current is None
+                or str(current.get("source_version", "")) != str(update.get("source_version", ""))
+                or str(current.get("content_hash", "")) != str(update.get("content_hash", ""))
+                or int(current.get("native_generation") or 0) != int(update.get("native_generation") or 0)
+                or int(current.get("retrieval_generation") or 0) != int(update.get("retrieval_generation") or 0)
+            ):
+                continue
+            status_documents.append({**current, **update})
+            valid_updates.append(update)
+    else:
+        for update in updates:
+            ident = str(update.get("source_identity", ""))
+            current = app.store.get(ident)
+            if (
+                current is None
+                or str(current.get("source_version", "")) != str(update.get("source_version", ""))
+                or str(current.get("content_hash", "")) != str(update.get("content_hash", ""))
+                or int(current.get("native_generation") or 0) != int(update.get("native_generation") or 0)
+                or int(current.get("retrieval_generation") or 0) != int(update.get("retrieval_generation") or 0)
+            ):
+                continue
+            status_documents.append({**current, **update})
+            valid_updates.append(update)
     pending_marker = None
     if any(update["native_index_status"] == "indexed" for update in valid_updates):
         previous = app.store.native_optimize_checkpoint()
@@ -1860,15 +3088,42 @@ def reconcile_canonical_index(app) -> dict[str, object]:
         status_documents.append(pending_marker)
     if valid_updates:
         status_documents.append(app.store.native_index_state_record(valid_updates))
-    _canonical_reconcile_phase(app, "persisting_source_status")
-    sync = app.syncer.upload(status_documents) if status_documents else {"durable": False}
-    durable = bool(sync.get("durable"))
-    if durable:
+    syncer_store = getattr(app.syncer, "store", None)
+    ack_fn = getattr(app.syncer, "ack_committed", None) or getattr(
+        app.syncer, "ack_persisted", None
+    )
+    use_postgres_ack = syncer_store is app.store and callable(ack_fn)
+    if use_postgres_ack:
+        # PostgreSQL is already the durable source store.  Re-uploading the
+        # hydrated rows through PostgresSync would perform a second upsert and
+        # needlessly serialize the whole batch under its upload lock.
         _canonical_reconcile_phase(app, "applying_checkpoint")
         app.store.update_native_index(valid_updates)
         if pending_marker is not None:
             app.store.set_native_optimize_checkpoint(pending_marker)
-    return {
+        sync = ack_fn(status_documents) if status_documents else {"durable": False}
+    else:
+        _canonical_reconcile_phase(app, "persisting_source_status")
+        sync = (
+            app.syncer.upload(status_documents)
+            if status_documents
+            else {"durable": False}
+        )
+        if sync.get("durable"):
+            _canonical_reconcile_phase(app, "applying_checkpoint")
+            app.store.update_native_index(valid_updates)
+            if pending_marker is not None:
+                app.store.set_native_optimize_checkpoint(pending_marker)
+    durable = bool(sync.get("durable"))
+    failure_counts: dict[str, int] = {}
+    for update in updates:
+        error = str(update.get("native_index_error") or "")
+        if error and update.get("native_index_status") == "retry":
+            failure_counts[error] = failure_counts.get(error, 0) + 1
+    _set_canonical_reconcile_state(
+        app, last_metrics=metrics, failure_counts=failure_counts
+    )
+    result = {
         "attempted": len(records),
         "indexed": sum(item["native_index_status"] == "indexed" for item in updates) if durable else 0,
         "held": (
@@ -1881,6 +3136,7 @@ def reconcile_canonical_index(app) -> dict[str, object]:
         ),
         "durable": durable,
     }
+    return result
 
 
 def optimize_native_index(
@@ -1973,10 +3229,51 @@ def _canonical_error_code(exc: Exception) -> str:
     return "unexpected"
 
 
+def _canonical_ab_metrics(
+    native_metrics: object, duration_ms: int, profile: Mapping[str, object],
+) -> tuple[dict[str, object], dict[str, object]]:
+    """Map the current cycle's native aggregates; never include stderr or rows."""
+    bounded = _bounded_native_metrics(native_metrics) or _native_metrics()
+    statuses = bounded["voyage_status_counts"]
+    return {
+        "http_429": statuses.get("429", 0),
+        "http_5xx": sum(count for code, count in statuses.items() if 500 <= int(code) <= 599),
+        "transport_errors": statuses.get("0", 0),
+        "requests": bounded["voyage_requests"],
+        "retries": bounded["voyage_retries"],
+        "tokens": bounded["voyage_token_usage"],
+        "request_duration_ms": bounded["voyage_duration_ms"],
+        "pacer_wait_ms": bounded["voyage_pacer_wait_ms"],
+        "backoff_ms": bounded["voyage_backoff_ms"],
+        "duration_ms": duration_ms,
+        **{key: profile[key] for key in ("batch_size", "request_rows", "max_chars", "concurrency")},
+    }, bounded["phase_ms"]
+
+
+def _finish_canonical_ab_cycle(
+    app, controller, profile, result, started, *, error: str | None = None,
+) -> None:
+    if controller is None or profile is None:
+        return
+    duration_ms = max(0, round((time.monotonic() - started) * 1000))
+    state = canonical_reconcile_state(app)
+    metrics, phase_ms = _canonical_ab_metrics(state.get("last_metrics"), duration_ms, profile)
+    controller.finish_cycle(
+        result=result, duration_ms=duration_ms, metrics=metrics, phase_ms=phase_ms,
+        profile=profile, error=error,
+    )
+
+
 def _canonical_reconcile_background(app) -> None:
     app.restore_done.wait()
     while not app.canonical_index_stop.is_set():
+        controller = getattr(app, "canonical_ab", None)
+        cycle_profile = controller.begin_cycle() if controller is not None else None
         started = time.monotonic()
+        if cycle_profile is not None:
+            # A baseline cycle that completed before this run must never be
+            # attributed to the A/B token, including its last metrics snapshot.
+            _set_canonical_reconcile_state(app, last_metrics=None, failure_counts={})
         _set_canonical_reconcile_state(
             app,
             active=True,
@@ -1986,8 +3283,15 @@ def _canonical_reconcile_background(app) -> None:
             _started_monotonic=started,
         )
         try:
-            result = reconcile_canonical_index(app)
+            if cycle_profile is None:
+                # Keep the original call shape for ordinary callers/test doubles.
+                result = reconcile_canonical_index(app)
+            else:
+                result = reconcile_canonical_index(app, profile_override=cycle_profile)
         except Exception as exc:
+            _finish_canonical_ab_cycle(
+                app, controller, cycle_profile, None, started, error=_canonical_error_code(exc),
+            )
             wait_seconds = CANONICAL_INDEX_INTERVAL
             state = canonical_reconcile_state(app)
             failures = int(state.get("consecutive_failures") or 0) + 1
@@ -2008,6 +3312,8 @@ def _canonical_reconcile_background(app) -> None:
             # Retry state remains in the encrypted source store. Never log raw
             # rows, exception text, subprocess output, provider payloads, or credentials.
         else:
+            _finish_canonical_ab_cycle(app, controller, cycle_profile, result, started)
+            _maybe_maintain_canonical_index(app, result)
             safe_result = {
                 key: result.get(key)
                 for key in ("attempted", "indexed", "held", "durable")
@@ -2024,11 +3330,21 @@ def _canonical_reconcile_background(app) -> None:
                 )
             else:
                 wait_seconds = CANONICAL_INDEX_INTERVAL
-            failures = (
-                0
-                if durable
-                else int(state.get("consecutive_failures") or 0) + 1
-            )
+            raw_failure_counts = state.get("failure_counts")
+            failure_counts = {}
+            if isinstance(raw_failure_counts, dict):
+                for key, value in raw_failure_counts.items():
+                    if isinstance(key, str) and isinstance(value, int) and value > 0:
+                        failure_counts[key] = value
+            if durable and failure_counts:
+                last_error = next(iter(sorted(failure_counts)), "native_failure")
+                failures = int(state.get("consecutive_failures") or 0) + 1
+            elif durable:
+                last_error = None
+                failures = 0
+            else:
+                last_error = "status_not_durable"
+                failures = int(state.get("consecutive_failures") or 0) + 1
             changes: dict[str, object] = {
                 "active": False,
                 "phase": "sleeping",
@@ -2038,10 +3354,16 @@ def _canonical_reconcile_background(app) -> None:
                     0, round((time.monotonic() - started) * 1000)
                 ),
                 "last_result": safe_result,
-                "last_error": None if durable else "status_not_durable",
+                "last_error": last_error,
                 "consecutive_failures": failures,
                 "wait_seconds": wait_seconds,
             }
+            if failure_counts:
+                changes["failure_counts"] = failure_counts
+            else:
+                # Do not retain a stale category after a later successful
+                # cycle; the field is intentionally absent when there is none.
+                changes["failure_counts"] = {}
             if durable and (
                 int(result.get("indexed") or 0) > 0
                 or int(result.get("held") or 0) > 0
@@ -2053,10 +3375,12 @@ def _canonical_reconcile_background(app) -> None:
 
 
 def start_canonical_reconciler(app) -> None:
-    if not index_memory() or getattr(app, "canonical_index_thread", None) is not None:
+    if getattr(app, "canonical_index_thread", None) is not None:
+        return
+    _initialize_canonical_reconcile_state(app)
+    if not index_memory():
         return
     app.canonical_index_stop = threading.Event()
-    _initialize_canonical_reconcile_state(app)
     app.canonical_index_thread = threading.Thread(
         target=_canonical_reconcile_background,
         args=(app,),
@@ -2064,6 +3388,33 @@ def start_canonical_reconciler(app) -> None:
         daemon=True,
     )
     app.canonical_index_thread.start()
+
+
+def canonical_ab_payload(action: str) -> tuple[int, dict[str, object]]:
+    """Control only the existing reconciler; these calls never create a writer."""
+    app = source_app()
+    controller = getattr(app, "canonical_ab", None)
+    if app is None or controller is None:
+        return 503, {"ok": False, "error": "canonical_index_unavailable"}
+    if action == "start":
+        if app.syncer.restore_failed:
+            return 503, {"ok": False, "error": "restore_failed"}
+        restored = getattr(app, "restore_done", None)
+        if app.syncer.restoring or restored is None or not restored.is_set() or not app.syncer.restored:
+            return 503, {"ok": False, "error": "restore_in_progress"}
+        thread = getattr(app, "canonical_index_thread", None)
+        stop = getattr(app, "canonical_index_stop", None)
+        if not index_memory() or thread is None or not thread.is_alive() or stop is None or stop.is_set():
+            return 503, {"ok": False, "error": "canonical_index_disabled"}
+        try:
+            status = controller.start()
+        except RuntimeError:
+            return 409, {"ok": False, "error": "canonical_ab_already_running"}
+    elif action == "abort":
+        status = controller.abort()
+    else:
+        status = controller.status()
+    return 200, {"ok": True, **status}
 
 
 def stop_canonical_reconciler(app) -> None:
@@ -2135,6 +3486,57 @@ def structured_native_hits(result: object, limit: int) -> list[dict]:
     ]
 
 
+def _source_filter_timestamp(value: object) -> datetime:
+    """Parse ISO dates/times; a date or naive datetime denotes UTC midnight/time."""
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("expected an ISO 8601 date or datetime")
+    timestamp = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=timezone.utc)
+    return timestamp.astimezone(timezone.utc)
+
+
+def _native_source_filter_bounds(filters: dict[str, object]) -> dict[str, datetime]:
+    """Validate only the PG post-filter route, without changing SQLite semantics."""
+    for name in ("source_agent", "source_type", "project", "repo", "device_id", "role", "content_type"):
+        if name in filters and (not isinstance(filters[name], str) or not filters[name].strip()):
+            raise ValueError(f"{name} must be a non-empty string")
+    if "source_missing" in filters and not isinstance(filters["source_missing"], bool):
+        raise ValueError("source_missing must be a boolean")
+    bounds = {}
+    for name in ("since", "until"):
+        if name in filters:
+            try:
+                bounds[name] = _source_filter_timestamp(filters[name])
+            except (ValueError, OverflowError) as exc:
+                raise ValueError(f"{name} must be an ISO 8601 date or datetime") from exc
+    if "since" in bounds and "until" in bounds and bounds["since"] > bounds["until"]:
+        raise ValueError("since must be on or before until")
+    return bounds
+
+
+def _matches_native_source_filters(
+    item: dict, filters: dict[str, object], bounds: dict[str, datetime]
+) -> bool:
+    """Use current source metadata, never native snippets or retrieval shadows."""
+    for name in ("source_agent", "source_type", "project", "repo", "device_id", "role", "content_type"):
+        if name in filters and item.get(name) != filters[name]:
+            return False
+    if "source_missing" in filters and item.get("source_missing") != filters["source_missing"]:
+        return False
+    if bounds:
+        try:
+            timestamp = _source_filter_timestamp(item.get("timestamp"))
+        except (ValueError, OverflowError):
+            # Missing/malformed source metadata cannot prove a date constraint.
+            return False
+        if "since" in bounds and timestamp < bounds["since"]:
+            return False
+        if "until" in bounds and timestamp > bounds["until"]:
+            return False
+    return True
+
+
 def materialize_native_results(
     output: str,
     app,
@@ -2143,18 +3545,59 @@ def materialize_native_results(
     deadline: float | None = None,
     structured_hits: list[dict] | None = None,
     allow_sidecar: bool = True,
+    require_source_batch: bool = False,
 ) -> list[dict]:
     """Resolve native rank coordinates to raw sidecar documents or sessions."""
     if structured_hits is not None:
         return structured_hits[:limit]
     if not allow_sidecar:
         raise NativeMcpError("native MCP structured hits unavailable")
+    ids = native_result_ids(output)[:limit]
+    store = getattr(app, "store", None)
+    if require_source_batch and not callable(getattr(store, "get_many", None)):
+        raise RuntimeError("source batch hydration unavailable")
+    cached_items: dict[str, dict] = {}
+    if ids and store is not None and callable(getattr(store, "get_many", None)):
+        lookup_ids = [canonical_reference_identity(i) or i for i in ids]
+        try:
+            for it in store.get_many(lookup_ids):
+                if isinstance(it, dict):
+                    if it.get("source_identity"):
+                        cached_items[str(it["source_identity"])] = it
+                    if not require_source_batch and it.get("id") is not None:
+                        cached_items[str(it["id"])] = it
+        except Exception as exc:
+            if require_source_batch:
+                # No repeated point reads or native text fallback on PG failure.
+                # Normalize dependency ValueError too: only request validation
+                # may return a 400 with a human-readable error.
+                syncer = getattr(app, "syncer", None)
+                check_ready = getattr(syncer, "check_ready", None)
+                if (
+                    getattr(syncer, "backend", None) == "postgres"
+                    and callable(check_ready)
+                ):
+                    try:
+                        # Repair the primary connection for the next request;
+                        # this request stays fail-closed and is never replayed.
+                        check_ready()
+                    except Exception:
+                        pass
+                raise RuntimeError("source batch hydration failed") from exc
     results = []
-    for identity in native_result_ids(output)[:limit]:
+    for identity in ids:
         is_canonical_reference = identity.startswith(CANONICAL_REF_PREFIX)
         canonical_identity = canonical_reference_identity(identity)
         lookup_identity = canonical_identity or identity
-        item = app.store.get(lookup_identity) if app is not None else None
+        item = cached_items.get(lookup_identity)
+        if require_source_batch and (
+            item is None or not isinstance(item.get("raw_text"), str)
+        ):
+            # Only identities backed by current PG raw/metadata are filterable.
+            # Missing rows are not an excuse to expose native retrieval_text.
+            continue
+        if item is None and store is not None:
+            item = store.get(lookup_identity)
         if item is not None:
             public = _public_source_item(item)
             public["retrieval_backend"] = "native_funes"
@@ -2183,12 +3626,83 @@ class NativeMcpError(subprocess.SubprocessError):
     """A native MCP failure without carrying process output into logs or HTTP responses."""
 
 
+class NativeMcpProtocolError(NativeMcpError):
+    """A JSON-RPC/MCP error returned by an otherwise live child process."""
+
+
 class NativeMcpBusyError(NativeMcpError):
     """The single native read worker is occupied; callers should retry shortly."""
 
 
 class NativeMcpTimeoutError(NativeMcpError):
     """A native request exhausted its complete caller-owned time budget."""
+
+
+_NATIVE_DIAGNOSTIC_LOCK = threading.Lock()
+_NATIVE_LAST_FAILURE: dict[str, object] = {
+    "category": "",
+    "at": None,
+    "read_metrics": [],
+}
+
+
+def _native_failure_category(error: BaseException) -> str:
+    """Map native failures to a safe, stable category without exposing details."""
+    if isinstance(error, NativeMcpTimeoutError):
+        return "timeout"
+    if isinstance(error, NativeMcpProtocolError):
+        return "protocol_error"
+    message = str(error).lower()
+    if "process exited" in message or "closed stdout" in message:
+        return "process_exit"
+    if "write failed" in message or "stdin unavailable" in message:
+        return "io"
+    if "request failed" in message or "tool failed" in message or "malformed" in message:
+        return "protocol"
+    if "warming" in message or "unavailable" in message:
+        return "unavailable"
+    return "native_error"
+
+
+def _record_native_failure(error: BaseException) -> None:
+    with _NATIVE_DIAGNOSTIC_LOCK:
+        _NATIVE_LAST_FAILURE.update(
+            category=_native_failure_category(error),
+            at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        )
+
+
+def native_worker_status() -> dict[str, object]:
+    """Return safe worker liveness/config diagnostics for readiness and status."""
+    expected = _native_worker_config()
+    with _MCP_WORKER_LOCK:
+        worker = MCP_WORKER
+        configured = worker is not None
+        config_match = configured and _MCP_WORKER_CONFIG == expected
+        process = getattr(worker, "process", None) if configured else None
+        if process is None:
+            alive = False
+        else:
+            try:
+                alive = process.poll() is None
+            except (AttributeError, OSError):
+                alive = False
+    with _NATIVE_DIAGNOSTIC_LOCK:
+        failure = dict(_NATIVE_LAST_FAILURE)
+    worker_metrics = []
+    if configured and isinstance(worker, NativeMcpWorker):
+        worker_metrics = list(worker._read_metrics)
+    if worker_metrics:
+        # ``_read_metrics`` is already the bounded, redacted dict form emitted
+        # by ``_snapshot_read_metrics``.  Do not feed it back through the
+        # stderr-line parser: stringifying dicts would discard every metric.
+        failure["read_metrics"] = worker_metrics
+    return {
+        "configured": configured,
+        "config_match": bool(config_match),
+        "alive": alive,
+        "last_failure": failure,
+    }
 
 
 class NativeMcpWorker:
@@ -2211,6 +3725,13 @@ class NativeMcpWorker:
         self._process = None
         self._next_id = 1
         self._lock = threading.RLock()
+        self._stderr_thread: threading.Thread | None = None
+        self._stderr_stop = threading.Event()
+        self._stderr_lines: deque[str] = deque(maxlen=32)
+        self._read_metrics: list[dict[str, object]] = []
+        # Set only after a replacement child has completed its warm recall.
+        # Handshake alone does not prove that the active Lance snapshot is open.
+        self._snapshot_opened_after: float | None = None
 
     @property
     def process(self):
@@ -2221,10 +3742,37 @@ class NativeMcpWorker:
         with self._lock:
             self._stop_locked()
 
+    def reset_read_metrics(self) -> None:
+        self._read_metrics = []
+        self._stderr_lines.clear()
+
+    def _drain_stderr(self, stream) -> None:
+        """Drain child stderr continuously so metrics cannot block the child."""
+        try:
+            while not self._stderr_stop.is_set():
+                line = stream.readline()
+                if line in ("", b""):
+                    break
+                if isinstance(line, bytes):
+                    line = line.decode("utf-8", "replace")
+                if len(line) <= 8192 and line.startswith("funes_metric "):
+                    self._stderr_lines.append(line.strip())
+        except (OSError, ValueError):
+            pass
+
+    def _snapshot_read_metrics(self) -> list[dict[str, object]]:
+        self._read_metrics = _safe_recall_metrics(list(self._stderr_lines))
+        return list(self._read_metrics)
+
     def _environment(self) -> dict[str, str]:
         # Keep HF_TOKEN/HF_HOME and any other caller-provided Hub settings.  Only
         # FUNES_HOME is pinned to the Space's durable warm-cache directory.
-        return native_environment(self.home)
+        env = native_environment(self.home)
+        # Read-stage metrics belong only to the long-lived MCP read worker.  Do
+        # not enable them in ingest/backfill subprocesses, where they add noise
+        # and can obscure the bounded ingest diagnostics.
+        env["FUNES_RECALL_METRICS"] = os.getenv("FUNES_RECALL_METRICS", "1") or "1"
+        return env
 
     @staticmethod
     def _alive(process) -> bool:
@@ -2254,6 +3802,7 @@ class NativeMcpWorker:
         self._process = None
         if process is None:
             return
+        self._stderr_stop.set()
         if self._alive(process):
             try:
                 process.terminate()
@@ -2284,6 +3833,11 @@ class NativeMcpWorker:
                         pass
         self._close_stream(getattr(process, "stdin", None))
         self._close_stream(getattr(process, "stdout", None))
+        self._close_stream(getattr(process, "stderr", None))
+        thread = self._stderr_thread
+        self._stderr_thread = None
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=0.5)
 
     def _start_locked(self, deadline: float | None = None) -> None:
         args = [self.binary, "mcp"]
@@ -2294,7 +3848,7 @@ class NativeMcpWorker:
                 args,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
                 text=True,
                 bufsize=1,
                 env=self._environment(),
@@ -2302,6 +3856,17 @@ class NativeMcpWorker:
         except OSError as exc:
             raise NativeMcpError("native MCP unavailable") from exc
         self._process = process
+        self._stderr_stop.clear()
+        self._stderr_lines.clear()
+        stderr = getattr(process, "stderr", None)
+        if stderr is not None:
+            self._stderr_thread = threading.Thread(
+                target=self._drain_stderr,
+                args=(stderr,),
+                name="funes-native-mcp-stderr",
+                daemon=True,
+            )
+            self._stderr_thread.start()
         # JSON-RPC ids are local to one child.  Resetting here also makes a
         # restarted worker interoperable with strict fake/native servers.
         self._next_id = 1
@@ -2397,7 +3962,7 @@ class NativeMcpWorker:
             if not isinstance(message, dict) or message.get("id") != request_id:
                 continue
             if message.get("error") is not None:
-                raise NativeMcpError("native MCP request failed")
+                raise NativeMcpProtocolError("native MCP request failed")
             return message.get("result")
 
     def _call(self, method: str, params: dict, *, timeout: float | None = None) -> object:
@@ -2413,11 +3978,23 @@ class NativeMcpWorker:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         raise NativeMcpTimeoutError("native MCP request timed out")
+                    self.reset_read_metrics()
                     return self._request_locked(method, params, remaining)
-                except NativeMcpTimeoutError:
+                except NativeMcpTimeoutError as exc:
+                    read_metrics = self._snapshot_read_metrics()
+                    with _NATIVE_DIAGNOSTIC_LOCK:
+                        _NATIVE_LAST_FAILURE["read_metrics"] = read_metrics
+                    _record_native_failure(exc)
                     self._stop_locked(deadline)
                     raise
+                except NativeMcpProtocolError as exc:
+                    # JSON-RPC errors are application-level failures. Keep
+                    # the child alive instead of converting a valid tool
+                    # error into a worker outage and restart churn.
+                    _record_native_failure(exc)
+                    raise
                 except NativeMcpError as exc:
+                    _record_native_failure(exc)
                     last_error = exc
                     self._stop_locked(deadline)
                     if attempt == 0 and time.monotonic() < deadline:
@@ -2581,10 +4158,8 @@ def _native_worker_config() -> tuple[object, ...]:
 
 
 def _native_search_serviceable(warm: dict[str, object]) -> bool:
-    """Return whether search can use the ready worker or a live replacement predecessor."""
-    if warm.get("state") == "ready":
-        return True
-    if warm.get("state") != "warming":
+    """Return whether search has a live worker matching the current config."""
+    if warm.get("state") not in {"ready", "warming"}:
         return False
     expected = _native_worker_config()
     with _MCP_WORKER_LOCK:
@@ -2643,6 +4218,9 @@ def _refresh_native_worker() -> None:
     """Warm a replacement child and atomically swap it with the active one."""
     global MCP_WORKER, _MCP_WORKER_CONFIG
     config = _native_worker_config()
+    # A maintenance commit may complete while the warm probe is running.
+    # Use a conservative lower bound on snapshot open, not probe completion.
+    opened_at = time.monotonic()
     candidate = NativeMcpWorker(
         FUNES_BIN,
         REMOTE,
@@ -2654,6 +4232,7 @@ def _refresh_native_worker() -> None:
         probe = candidate.recall("memory", k=1, candidates=1, half_life=0, neighbors=0)
         if probe.startswith("recall error:"):
             raise NativeMcpError("native recall failed")
+        candidate._snapshot_opened_after = opened_at
     except Exception:
         candidate.close()
         raise
@@ -2781,6 +4360,7 @@ def _http_native_results(
     deadline: float,
     *,
     native_only: bool = False,
+    require_source_batch: bool = False,
 ) -> list[dict]:
     """Recall and materialize raw text within one hard HTTP deadline."""
 
@@ -2801,7 +4381,10 @@ def _http_native_results(
             )
         output = recall(query, k=limit, timeout=remaining, **tuning)
         return (
-            materialize_native_results(output, app, limit, deadline=deadline)
+            materialize_native_results(
+                output, app, limit, deadline=deadline,
+                require_source_batch=require_source_batch,
+            )
             if output
             else []
         )
@@ -2836,10 +4419,18 @@ def _ready_payload(
     sources = source_readiness_state()
     warm = warm_state()
     source_ok = not sources.get("configured") or bool(sources.get("ready"))
+    needs_recovery = (
+        warm.get("state") in {"error", "not_started"}
+        or (
+            allow_active_search
+            and warm.get("state") == "ready"
+            and not _native_search_serviceable(warm)
+        )
+    )
     if (
         REMOTE
         and (source_ok or not require_source)
-        and warm.get("state") in {"error", "not_started"}
+        and needs_recovery
     ):
         # A failed initial warm must not leave Codex/Pi polling a permanent
         # 503. `request_warm` atomically reserves `warming`, so concurrent
@@ -2859,7 +4450,11 @@ def _ready_payload(
             else str(sources.get("error", "source_store_unavailable"))
         )
     elif not warm_ok:
-        error = "native_warm_" + str(warm.get("state", "unavailable"))
+        error = (
+            "native_mcp_unavailable"
+            if warm.get("state") == "ready"
+            else "native_warm_" + str(warm.get("state", "unavailable"))
+        )
     else:
         error = ""
     ok = bool(REMOTE) and (source_ok or not require_source) and warm_ok
@@ -2871,6 +4466,7 @@ def _ready_payload(
             "status": "",
             "error": error,
             "native_warm": warm,
+            "native_worker": native_worker_status(),
             "source_store": sources,
             "embedding_profile": embedding_profile(),
         },
@@ -2911,9 +4507,46 @@ def sync_status_payload() -> tuple[int, dict[str, object]]:
             "status": "",
             "error": "restore_in_progress",
             "native_warm": warm_state(),
+            "native_worker": native_worker_status(),
             "source_store": source_readiness,
             "embedding_profile": embedding_profile(),
         }
+    app = SOURCE_APP if SOURCE_APP is not None else source_app()
+    is_postgres = (
+        bool(os.getenv("FUNES_POSTGRES_DSN"))
+        or getattr(getattr(app, "syncer", None), "backend", None) == "postgres"
+        or hasattr(getattr(app, "store", None), "status_snapshot")
+    )
+    if is_postgres:
+        warm = warm_state()
+        sources = source_state()
+        source_ok = not sources.get("configured") or bool(sources.get("ready"))
+        warm_ok = _native_search_serviceable(warm)
+        ok = source_ok and warm_ok
+        error = ""
+        if not source_ok:
+            error = str(sources.get("error") or "source_store_unavailable")
+        elif not warm_ok:
+            error = (
+                "native_memory_warming"
+                if warm.get("state") == "warming"
+                else "native_mcp_unavailable"
+            )
+        return (
+            200 if ok else 503,
+            {
+                "ok": ok,
+                "remote": REMOTE,
+                "status": "",
+                "diagnostic": "not_run",
+                "native_status": "deferred",
+                "error": error,
+                "native_warm": warm,
+                "native_worker": native_worker_status(),
+                "source_store": sources,
+                "embedding_profile": embedding_profile(),
+            },
+        )
     try:
         code, out, err = run("status", REMOTE, timeout=30)
     except subprocess.TimeoutExpired:
@@ -2922,14 +4555,26 @@ def sync_status_payload() -> tuple[int, dict[str, object]]:
         code, out, err = 1, "", "native_status_unavailable"
     sources = source_state()
     source_ok = not sources.get("configured") or bool(sources.get("ready"))
+    ok = code == 0 and source_ok
+    if not source_ok:
+        error = (
+            "restore_in_progress"
+            if sources.get("restoring")
+            else str(sources.get("error") or "source_store_unavailable")
+        )
+    elif code != 0:
+        error = err[-500:] or f"native_status_failed_{code}"
+    else:
+        error = ""
     return (
-        200 if code == 0 and source_ok else 503,
+        200 if ok else 503,
         {
-            "ok": code == 0 and source_ok,
+            "ok": ok,
             "remote": REMOTE,
             "status": out[-2000:],
-            "error": err[-500:],
+            "error": error,
             "native_warm": warm_state(),
+            "native_worker": native_worker_status(),
             "source_store": sources,
             "embedding_profile": embedding_profile(),
         },
@@ -2986,6 +4631,12 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/health":
             self.send_json(200, {"ok": True, "service": "funes"})
             return
+        if self.path == "/admin/canonical-ab/status":
+            if not auth_ok(self):
+                self.send_json(401, {"error": "unauthorized"})
+                return
+            self.send_json(*canonical_ab_payload("status"))
+            return
         operation_prefix = "/ingest/operations/"
         if self.path.startswith(operation_prefix):
             if not auth_ok(self):
@@ -3010,6 +4661,7 @@ class Handler(BaseHTTPRequestHandler):
                 code, payload = ready_payload()
             else:
                 code, payload = sync_status_payload()
+            payload["hub_cache"] = hub_cache_status()
             self.send_json(code, payload)
             return
         self.send_json(404, {"error": "not found"})
@@ -3020,8 +4672,15 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             obj = self.body()
+            if self.path in ("/admin/canonical-ab/start", "/admin/canonical-ab/abort"):
+                if obj:
+                    self.send_json(400, {"error": "canonical_ab_accepts_no_parameters"})
+                    return
+                self.send_json(*canonical_ab_payload(self.path.rsplit("/", 1)[-1]))
+                return
             if self.path == "/sync/status":
                 code, payload = sync_status_payload()
+                payload["hub_cache"] = hub_cache_status()
                 self.send_json(code, payload)
                 return
             if self.path == "/sources/check":
@@ -3052,6 +4711,10 @@ class Handler(BaseHTTPRequestHandler):
                     result = app.syncer.upload()
                     result["ok"] = bool(result.get("durable"))
                     self.send_json(200 if result["ok"] else 503, result)
+                    return
+                if os.getenv("FUNES_POSTGRES_DSN"):
+                    self.send_json(503, {"ok": False, "durable": False,
+                                         "error": "postgres_unavailable"})
                     return
                 if not REMOTE:
                     self.send_json(503, {"ok": False, "durable": False, "error": "FUNES_MEMORY is not configured"})
@@ -3160,9 +4823,48 @@ class Handler(BaseHTTPRequestHandler):
                         return
                 if (
                     embedding_provider == "voyage"
+                    and "source_type" in filters
+                    and not sidecar_authoritative
+                    and not source_restore_error
+                    and not _source_type_prefilter_ready(app)
+                ):
+                    self.send_json(
+                        503,
+                        {
+                            "ok": False,
+                            "results": [],
+                            "results_text": "",
+                            "error": "native_filter_index_warming",
+                            "retrieval_backend": "unavailable",
+                            "embedding_profile": profile,
+                        },
+                    )
+                    return
+                pg_native_post_filter = bool(
+                    os.getenv("FUNES_POSTGRES_DSN")
+                    and embedding_provider == "voyage"
                     and not source_restore_error
                     and not sidecar_fts_ready
                     and unsupported_native_filters
+                    and unsupported_native_filters <= NATIVE_SOURCE_POST_FILTERS
+                )
+                post_filter_bounds = (
+                    _native_source_filter_bounds(filters) if pg_native_post_filter else {}
+                )
+                if pg_native_post_filter and not callable(
+                    getattr(getattr(app, "store", None), "get_many", None)
+                ):
+                    self.send_json(
+                        503,
+                        {"ok": False, "results": [], "results_text": "", "error": "postgres_unavailable"},
+                    )
+                    return
+                if (
+                    embedding_provider == "voyage"
+                    and not source_restore_error
+                    and not sidecar_fts_ready
+                    and unsupported_native_filters
+                    and not pg_native_post_filter
                 ):
                     self.send_json(
                         503,
@@ -3209,6 +4911,7 @@ class Handler(BaseHTTPRequestHandler):
                         )
                         return
                     if not _native_search_serviceable(warm_state()):
+                        request_native_recovery()
                         self.send_json(
                             503,
                             {
@@ -3333,16 +5036,28 @@ class Handler(BaseHTTPRequestHandler):
                     # raise the cap with FUNES_HTTP_MAX_CANDIDATES.
                     requested_candidates = int(tuning.get("candidates", max(2, limit * 2)))
                     tuning["candidates"] = min(HTTP_MAX_CANDIDATES, requested_candidates)
+                    native_limit = limit
+                    if pg_native_post_filter:
+                        # One ANN/BM25 window only: no pagination, retries, source
+                        # scan, or promise of exhaustive filtered recall. Even
+                        # a huge operator/request value cannot lift the hard cap.
+                        native_limit = min(
+                            HTTP_MAX_CANDIDATES,
+                            PG_POST_FILTER_MAX_CANDIDATES,
+                            limit * PG_POST_FILTER_OVERFETCH,
+                        )
+                        tuning["candidates"] = native_limit
                     tuning.setdefault("neighbors", 0)
                     tuning.setdefault("half_life", 0)
                     if native_allowed and voyage_hot_path:
                         results = _http_native_results(
                             query,
                             app,
-                            limit,
+                            native_limit,
                             tuning,
                             native_deadline,
                             native_only=bool(source_restore_error),
+                            require_source_batch=pg_native_post_filter,
                         )
                     else:
                         out = (
@@ -3503,6 +5218,11 @@ class Handler(BaseHTTPRequestHandler):
                         if results
                         else sidecar_results
                     )
+                if pg_native_post_filter:
+                    results = [
+                        item for item in results
+                        if _matches_native_source_filters(item, filters, post_filter_bounds)
+                    ][:limit]
                 results_text = "\n\n".join(
                     str(item.get("raw_text", ""))
                     for item in results
@@ -3706,10 +5426,16 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(504, {"error": "native_timeout"})
         except (OSError, subprocess.SubprocessError):
             self.send_json(500, {"error": "native_process_error"})
+        except Exception:
+            if not os.getenv("FUNES_POSTGRES_DSN"):
+                raise
+            self.send_json(503, {"ok": False, "durable": False,
+                                 "error": "postgres_unavailable"})
 
 
 def serve(host: str = "0.0.0.0", port: int = PORT) -> None:
     (HOME / "sources").mkdir(parents=True, exist_ok=True)
+    start_hub_cache()
     source_app()
     request_warm()
     ThreadingHTTPServer((host, port), Handler).serve_forever()

@@ -1,0 +1,2202 @@
+{
+  "source_commit": "49390fe",
+  "space_revision": "4d5a40f70ca658901e4543559bf49a1c588356f9",
+  "historical_release_03xx": {
+    "source_commit": "be256128add230476ec08a9e2ec5b9fa07ddcfd4",
+    "space_revision": "8f34235a11d6156b3bba73d36e3273abbc518bf7"
+  },
+  "hint_bootstrap": {
+    "applied_at": "2026-10-04T03:02:01.542236+00:00",
+    "repo": "bolikoto/funes-memory-voyage",
+    "parent_commit": "ad635fb2bc81cda5040e486619da1416296e1b01",
+    "commit": "3b17946deac9ede2919453a9224a46096eb4c603",
+    "changed_paths": [
+      "__funes_shards__/v1/a1/chunks.lance/_versions/latest_version_hint.json"
+    ],
+    "read_back": {
+      "version": 12755
+    },
+    "existing_objects_unchanged": 40791,
+    "space_restarted": false,
+    "voyage_requests": 0
+  },
+  "hint_audit": {
+    "audited_at": "2026-10-04T02:59:23.176295+00:00",
+    "repo": "bolikoto/funes-memory-voyage",
+    "parent_commit": "ad635fb2bc81cda5040e486619da1416296e1b01",
+    "siblings": 40791,
+    "manifest_objects": 12755,
+    "unique_versions": 12755,
+    "max_version": 12755,
+    "max_manifests": [
+      {
+        "path": "__funes_shards__/v1/18/chunks.lance/_versions/18446744073709538860.manifest",
+        "bytes": 1574197,
+        "sha256": "20f714088d0ab74ddd92d476554a7c3ec421a056c74bdfeb054c8a31cc96b498"
+      }
+    ],
+    "sharded_hint_present": false,
+    "hint_path": "__funes_shards__/v1/a1/chunks.lance/_versions/latest_version_hint.json",
+    "new_hint": {
+      "version": 12755
+    },
+    "unknown_version_paths": [],
+    "manifest_schemes": {
+      "V1": {
+        "objects": 0,
+        "min": null,
+        "max": null
+      },
+      "V2": {
+        "objects": 12755,
+        "min": 1,
+        "max": 12755
+      }
+    }
+  },
+  "hint_after_backfill": {
+    "at": "2026-10-04T03:21:50.922276+00:00",
+    "http": 200,
+    "path": "__funes_shards__/v1/a1/chunks.lance/_versions/latest_version_hint.json",
+    "hint": {
+      "version": 12757
+    },
+    "repo_commit": "ea95d912a64cc3a3ff08ca7ba913f8427693ecc1",
+    "seconds": 1.104
+  },
+  "samples": [
+    {
+      "sample_utc": "20261004T030516Z",
+      "documents": 4362864,
+      "canonical": {
+        "eligible": 1921970,
+        "indexed": 644518,
+        "pending": 1277287,
+        "held": 165,
+        "invalid": 0,
+        "checkpoint_current": true,
+        "complete": false,
+        "cutover_ready": false
+      },
+      "warm": {
+        "state": "warming",
+        "started_at": "2026-10-04T02:57:55Z",
+        "finished_at": null,
+        "refresh_pending": false
+      },
+      "worker": {
+        "configured": true,
+        "config_match": true,
+        "alive": false,
+        "last_failure": {
+          "category": "timeout",
+          "at": "2026-10-04T02:57:55Z"
+        }
+      },
+      "reconciler": {
+        "phase": "sleeping",
+        "last_started_at": "2026-10-04T02:34:45.619118+00:00",
+        "last_finished_at": "2026-10-04T03:04:49.635789+00:00",
+        "last_progress_at": null,
+        "last_duration_ms": 1804017,
+        "last_result": {
+          "attempted": 32,
+          "indexed": 0,
+          "held": 0,
+          "durable": true
+        },
+        "failure_counts": {
+          "TimeoutExpired": 32
+        },
+        "consecutive_failures": 1
+      },
+      "metrics": {
+        "voyage_requests": 0,
+        "voyage_input_count": 0,
+        "voyage_token_usage": 0,
+        "voyage_token_usage_known": 0,
+        "voyage_status_counts": {},
+        "voyage_pacer_wait_ms": 0.0,
+        "voyage_backoff_ms": 0.0,
+        "phase_ms": {
+          "remote_open": 1381113.18,
+          "revision_lookup": 161604.78,
+          "secret_scan": 2932.83
+        }
+      }
+    },
+    {
+      "sample_utc": "20261004T030638Z",
+      "documents": 4362880,
+      "canonical": {
+        "eligible": 1921970,
+        "indexed": 644518,
+        "pending": 1277287,
+        "held": 165,
+        "invalid": 0,
+        "checkpoint_current": true,
+        "complete": false,
+        "cutover_ready": false
+      },
+      "warm": {
+        "state": "warming",
+        "started_at": "2026-10-04T02:57:55Z",
+        "finished_at": null,
+        "refresh_pending": false
+      },
+      "worker": {
+        "configured": true,
+        "config_match": true,
+        "alive": false,
+        "last_failure": {
+          "category": "timeout",
+          "at": "2026-10-04T02:57:55Z"
+        }
+      },
+      "reconciler": {
+        "phase": "sleeping",
+        "last_started_at": "2026-10-04T02:34:45.619118+00:00",
+        "last_finished_at": "2026-10-04T03:04:49.635789+00:00",
+        "last_progress_at": null,
+        "last_duration_ms": 1804017,
+        "last_result": {
+          "attempted": 32,
+          "indexed": 0,
+          "held": 0,
+          "durable": true
+        },
+        "failure_counts": {
+          "TimeoutExpired": 32
+        },
+        "consecutive_failures": 1
+      },
+      "metrics": {
+        "voyage_requests": 0,
+        "voyage_input_count": 0,
+        "voyage_token_usage": 0,
+        "voyage_token_usage_known": 0,
+        "voyage_status_counts": {},
+        "voyage_pacer_wait_ms": 0.0,
+        "voyage_backoff_ms": 0.0,
+        "phase_ms": {
+          "remote_open": 1381113.18,
+          "revision_lookup": 161604.78,
+          "secret_scan": 2932.83
+        }
+      }
+    },
+    {
+      "sample_utc": "20261004T030759Z",
+      "documents": 4362944,
+      "canonical": {
+        "eligible": 1921976,
+        "indexed": 644518,
+        "pending": 1277293,
+        "held": 165,
+        "invalid": 0,
+        "checkpoint_current": true,
+        "complete": false,
+        "cutover_ready": false
+      },
+      "warm": {
+        "state": "warming",
+        "started_at": "2026-10-04T03:07:57Z",
+        "finished_at": null,
+        "refresh_pending": false
+      },
+      "worker": {
+        "configured": true,
+        "config_match": true,
+        "alive": false,
+        "last_failure": {
+          "category": "timeout",
+          "at": "2026-10-04T03:07:55Z"
+        }
+      },
+      "reconciler": {
+        "phase": "sleeping",
+        "last_started_at": "2026-10-04T02:34:45.619118+00:00",
+        "last_finished_at": "2026-10-04T03:04:49.635789+00:00",
+        "last_progress_at": null,
+        "last_duration_ms": 1804017,
+        "last_result": {
+          "attempted": 32,
+          "indexed": 0,
+          "held": 0,
+          "durable": true
+        },
+        "failure_counts": {
+          "TimeoutExpired": 32
+        },
+        "consecutive_failures": 1
+      },
+      "metrics": {
+        "voyage_requests": 0,
+        "voyage_input_count": 0,
+        "voyage_token_usage": 0,
+        "voyage_token_usage_known": 0,
+        "voyage_status_counts": {},
+        "voyage_pacer_wait_ms": 0.0,
+        "voyage_backoff_ms": 0.0,
+        "phase_ms": {
+          "remote_open": 1381113.18,
+          "revision_lookup": 161604.78,
+          "secret_scan": 2932.83
+        }
+      }
+    },
+    {
+      "sample_utc": "20261004T030921Z",
+      "documents": 4362944,
+      "canonical": {
+        "eligible": 1921976,
+        "indexed": 644518,
+        "pending": 1277293,
+        "held": 165,
+        "invalid": 0,
+        "checkpoint_current": true,
+        "complete": false,
+        "cutover_ready": false
+      },
+      "warm": {
+        "state": "warming",
+        "started_at": "2026-10-04T03:07:57Z",
+        "finished_at": null,
+        "refresh_pending": false
+      },
+      "worker": {
+        "configured": true,
+        "config_match": true,
+        "alive": false,
+        "last_failure": {
+          "category": "timeout",
+          "at": "2026-10-04T03:07:55Z"
+        }
+      },
+      "reconciler": {
+        "phase": "sleeping",
+        "last_started_at": "2026-10-04T02:34:45.619118+00:00",
+        "last_finished_at": "2026-10-04T03:04:49.635789+00:00",
+        "last_progress_at": null,
+        "last_duration_ms": 1804017,
+        "last_result": {
+          "attempted": 32,
+          "indexed": 0,
+          "held": 0,
+          "durable": true
+        },
+        "failure_counts": {
+          "TimeoutExpired": 32
+        },
+        "consecutive_failures": 1
+      },
+      "metrics": {
+        "voyage_requests": 0,
+        "voyage_input_count": 0,
+        "voyage_token_usage": 0,
+        "voyage_token_usage_known": 0,
+        "voyage_status_counts": {},
+        "voyage_pacer_wait_ms": 0.0,
+        "voyage_backoff_ms": 0.0,
+        "phase_ms": {
+          "remote_open": 1381113.18,
+          "revision_lookup": 161604.78,
+          "secret_scan": 2932.83
+        }
+      }
+    },
+    {
+      "sample_utc": "20261004T031042Z",
+      "documents": 4363095,
+      "canonical": {
+        "eligible": 1921985,
+        "indexed": 644518,
+        "pending": 1277302,
+        "held": 165,
+        "invalid": 0,
+        "checkpoint_current": true,
+        "complete": false,
+        "cutover_ready": false
+      },
+      "warm": {
+        "state": "warming",
+        "started_at": "2026-10-04T03:07:57Z",
+        "finished_at": null,
+        "refresh_pending": false
+      },
+      "worker": {
+        "configured": true,
+        "config_match": true,
+        "alive": false,
+        "last_failure": {
+          "category": "timeout",
+          "at": "2026-10-04T03:07:55Z"
+        }
+      },
+      "reconciler": {
+        "phase": "native_ingest",
+        "last_started_at": "2026-10-04T03:09:49.635936+00:00",
+        "last_finished_at": "2026-10-04T03:04:49.635789+00:00",
+        "last_progress_at": null,
+        "last_duration_ms": 1804017,
+        "last_result": {
+          "attempted": 32,
+          "indexed": 0,
+          "held": 0,
+          "durable": true
+        },
+        "failure_counts": {
+          "TimeoutExpired": 32
+        },
+        "consecutive_failures": 1
+      },
+      "metrics": {
+        "voyage_requests": 0,
+        "voyage_input_count": 0,
+        "voyage_token_usage": 0,
+        "voyage_token_usage_known": 0,
+        "voyage_status_counts": {},
+        "voyage_pacer_wait_ms": 0.0,
+        "voyage_backoff_ms": 0.0,
+        "phase_ms": {
+          "remote_open": 1381113.18,
+          "revision_lookup": 161604.78,
+          "secret_scan": 2932.83
+        }
+      }
+    },
+    {
+      "sample_utc": "20261004T031203Z",
+      "documents": 4363142,
+      "canonical": {
+        "eligible": 1921991,
+        "indexed": 644518,
+        "pending": 1277308,
+        "held": 165,
+        "invalid": 0,
+        "checkpoint_current": true,
+        "complete": false,
+        "cutover_ready": false
+      },
+      "warm": {
+        "state": "warming",
+        "started_at": "2026-10-04T03:07:57Z",
+        "finished_at": null,
+        "refresh_pending": false
+      },
+      "worker": {
+        "configured": true,
+        "config_match": true,
+        "alive": false,
+        "last_failure": {
+          "category": "timeout",
+          "at": "2026-10-04T03:07:55Z"
+        }
+      },
+      "reconciler": {
+        "phase": "native_ingest",
+        "last_started_at": "2026-10-04T03:09:49.635936+00:00",
+        "last_finished_at": "2026-10-04T03:04:49.635789+00:00",
+        "last_progress_at": null,
+        "last_duration_ms": 1804017,
+        "last_result": {
+          "attempted": 32,
+          "indexed": 0,
+          "held": 0,
+          "durable": true
+        },
+        "failure_counts": {
+          "TimeoutExpired": 32
+        },
+        "consecutive_failures": 1
+      },
+      "metrics": {
+        "voyage_requests": 0,
+        "voyage_input_count": 0,
+        "voyage_token_usage": 0,
+        "voyage_token_usage_known": 0,
+        "voyage_status_counts": {},
+        "voyage_pacer_wait_ms": 0.0,
+        "voyage_backoff_ms": 0.0,
+        "phase_ms": {
+          "remote_open": 1381113.18,
+          "revision_lookup": 161604.78,
+          "secret_scan": 2932.83
+        }
+      }
+    },
+    {
+      "sample_utc": "20261004T031325Z",
+      "documents": 4363142,
+      "canonical": {
+        "eligible": 1921991,
+        "indexed": 644518,
+        "pending": 1277308,
+        "held": 165,
+        "invalid": 0,
+        "checkpoint_current": true,
+        "complete": false,
+        "cutover_ready": false
+      },
+      "warm": {
+        "state": "ready",
+        "started_at": "2026-10-04T03:07:57Z",
+        "finished_at": "2026-10-04T03:12:41Z",
+        "refresh_pending": false
+      },
+      "worker": {
+        "configured": true,
+        "config_match": true,
+        "alive": true,
+        "last_failure": {
+          "category": "timeout",
+          "at": "2026-10-04T03:07:55Z"
+        }
+      },
+      "reconciler": {
+        "phase": "native_ingest",
+        "last_started_at": "2026-10-04T03:09:49.635936+00:00",
+        "last_finished_at": "2026-10-04T03:04:49.635789+00:00",
+        "last_progress_at": null,
+        "last_duration_ms": 1804017,
+        "last_result": {
+          "attempted": 32,
+          "indexed": 0,
+          "held": 0,
+          "durable": true
+        },
+        "failure_counts": {
+          "TimeoutExpired": 32
+        },
+        "consecutive_failures": 1
+      },
+      "metrics": {
+        "voyage_requests": 0,
+        "voyage_input_count": 0,
+        "voyage_token_usage": 0,
+        "voyage_token_usage_known": 0,
+        "voyage_status_counts": {},
+        "voyage_pacer_wait_ms": 0.0,
+        "voyage_backoff_ms": 0.0,
+        "phase_ms": {
+          "remote_open": 1381113.18,
+          "revision_lookup": 161604.78,
+          "secret_scan": 2932.83
+        }
+      }
+    },
+    {
+      "sample_utc": "20261004T031447Z",
+      "documents": 4363284,
+      "canonical": {
+        "eligible": 1922085,
+        "indexed": 644550,
+        "pending": 1277370,
+        "held": 165,
+        "invalid": 0,
+        "checkpoint_current": true,
+        "complete": false,
+        "cutover_ready": false
+      },
+      "warm": {
+        "state": "warming",
+        "started_at": "2026-10-04T03:14:14Z",
+        "finished_at": null,
+        "refresh_pending": false
+      },
+      "worker": {
+        "configured": true,
+        "config_match": true,
+        "alive": true,
+        "last_failure": {
+          "category": "timeout",
+          "at": "2026-10-04T03:07:55Z"
+        }
+      },
+      "reconciler": {
+        "phase": "native_ingest",
+        "last_started_at": "2026-10-04T03:14:17.815623+00:00",
+        "last_finished_at": "2026-10-04T03:14:16.815438+00:00",
+        "last_progress_at": "2026-10-04T03:14:16.815450+00:00",
+        "last_duration_ms": 267180,
+        "last_result": {
+          "attempted": 32,
+          "indexed": 32,
+          "held": 0,
+          "durable": true
+        },
+        "failure_counts": {},
+        "consecutive_failures": 0
+      },
+      "metrics": {
+        "voyage_requests": 24,
+        "voyage_input_count": 188,
+        "voyage_token_usage": 155881,
+        "voyage_token_usage_known": 24,
+        "voyage_status_counts": {
+          "200": 24
+        },
+        "voyage_pacer_wait_ms": 118371.1,
+        "voyage_backoff_ms": 0.0,
+        "phase_ms": {
+          "captured_files": 0.02,
+          "embedding": 61867.81,
+          "hf_commit_chunk": 1987.15,
+          "lance_append": 219.22,
+          "lance_write_commit": 2290.79,
+          "remote_open": 243.03,
+          "revision_lookup": 166553.86,
+          "secret_scan": 3069.82,
+          "vector_reuse": 28822.2,
+          "write_ops": 0.82
+        }
+      }
+    },
+    {
+      "sample_utc": "20261004T031609Z",
+      "documents": 4363326,
+      "canonical": {
+        "eligible": 1922095,
+        "indexed": 644550,
+        "pending": 1277380,
+        "held": 165,
+        "invalid": 0,
+        "checkpoint_current": true,
+        "complete": false,
+        "cutover_ready": false
+      },
+      "warm": {
+        "state": "ready",
+        "started_at": "2026-10-04T03:15:14Z",
+        "finished_at": "2026-10-04T03:16:06Z",
+        "refresh_pending": false
+      },
+      "worker": {
+        "configured": true,
+        "config_match": true,
+        "alive": true,
+        "last_failure": {
+          "category": "timeout",
+          "at": "2026-10-04T03:15:14Z"
+        }
+      },
+      "reconciler": {
+        "phase": "native_ingest",
+        "last_started_at": "2026-10-04T03:14:17.815623+00:00",
+        "last_finished_at": "2026-10-04T03:14:16.815438+00:00",
+        "last_progress_at": "2026-10-04T03:14:16.815450+00:00",
+        "last_duration_ms": 267180,
+        "last_result": {
+          "attempted": 32,
+          "indexed": 32,
+          "held": 0,
+          "durable": true
+        },
+        "failure_counts": {},
+        "consecutive_failures": 0
+      },
+      "metrics": {
+        "voyage_requests": 24,
+        "voyage_input_count": 188,
+        "voyage_token_usage": 155881,
+        "voyage_token_usage_known": 24,
+        "voyage_status_counts": {
+          "200": 24
+        },
+        "voyage_pacer_wait_ms": 118371.1,
+        "voyage_backoff_ms": 0.0,
+        "phase_ms": {
+          "captured_files": 0.02,
+          "embedding": 61867.81,
+          "hf_commit_chunk": 1987.15,
+          "lance_append": 219.22,
+          "lance_write_commit": 2290.79,
+          "remote_open": 243.03,
+          "revision_lookup": 166553.86,
+          "secret_scan": 3069.82,
+          "vector_reuse": 28822.2,
+          "write_ops": 0.82
+        }
+      }
+    },
+    {
+      "sample_utc": "20261004T031730Z",
+      "documents": 4363326,
+      "canonical": {
+        "eligible": 1922095,
+        "indexed": 644582,
+        "pending": 1277348,
+        "held": 165,
+        "invalid": 0,
+        "checkpoint_current": true,
+        "complete": false,
+        "cutover_ready": false
+      },
+      "warm": {
+        "state": "ready",
+        "started_at": "2026-10-04T03:15:14Z",
+        "finished_at": "2026-10-04T03:16:06Z",
+        "refresh_pending": false
+      },
+      "worker": {
+        "configured": true,
+        "config_match": true,
+        "alive": true,
+        "last_failure": {
+          "category": "timeout",
+          "at": "2026-10-04T03:15:14Z"
+        }
+      },
+      "reconciler": {
+        "phase": "native_ingest",
+        "last_started_at": "2026-10-04T03:16:14.945377+00:00",
+        "last_finished_at": "2026-10-04T03:16:13.945220+00:00",
+        "last_progress_at": "2026-10-04T03:16:13.945230+00:00",
+        "last_duration_ms": 116130,
+        "last_result": {
+          "attempted": 32,
+          "indexed": 32,
+          "held": 0,
+          "durable": true
+        },
+        "failure_counts": {},
+        "consecutive_failures": 0
+      },
+      "metrics": {
+        "voyage_requests": 24,
+        "voyage_input_count": 187,
+        "voyage_token_usage": 155561,
+        "voyage_token_usage_known": 24,
+        "voyage_status_counts": {
+          "200": 24
+        },
+        "voyage_pacer_wait_ms": 117557.28,
+        "voyage_backoff_ms": 0.0,
+        "phase_ms": {
+          "captured_files": 0.02,
+          "embedding": 64713.51,
+          "hf_commit_chunk": 1934.29,
+          "lance_append": 234.6,
+          "lance_write_commit": 2240.52,
+          "remote_open": 293.58,
+          "revision_lookup": 16293.8,
+          "secret_scan": 3066.04,
+          "vector_reuse": 25667.12,
+          "write_ops": 0.84
+        }
+      }
+    },
+    {
+      "sample_utc": "20261004T031852Z",
+      "documents": 4363491,
+      "canonical": {
+        "eligible": 1922193,
+        "indexed": 644582,
+        "pending": 1277446,
+        "held": 165,
+        "invalid": 0,
+        "checkpoint_current": true,
+        "complete": false,
+        "cutover_ready": false
+      },
+      "warm": {
+        "state": "ready",
+        "started_at": "2026-10-04T03:15:14Z",
+        "finished_at": "2026-10-04T03:16:06Z",
+        "refresh_pending": false
+      },
+      "worker": {
+        "configured": true,
+        "config_match": true,
+        "alive": true,
+        "last_failure": {
+          "category": "timeout",
+          "at": "2026-10-04T03:15:14Z"
+        }
+      },
+      "reconciler": {
+        "phase": "native_ingest",
+        "last_started_at": "2026-10-04T03:16:14.945377+00:00",
+        "last_finished_at": "2026-10-04T03:16:13.945220+00:00",
+        "last_progress_at": "2026-10-04T03:16:13.945230+00:00",
+        "last_duration_ms": 116130,
+        "last_result": {
+          "attempted": 32,
+          "indexed": 32,
+          "held": 0,
+          "durable": true
+        },
+        "failure_counts": {},
+        "consecutive_failures": 0
+      },
+      "metrics": {
+        "voyage_requests": 24,
+        "voyage_input_count": 187,
+        "voyage_token_usage": 155561,
+        "voyage_token_usage_known": 24,
+        "voyage_status_counts": {
+          "200": 24
+        },
+        "voyage_pacer_wait_ms": 117557.28,
+        "voyage_backoff_ms": 0.0,
+        "phase_ms": {
+          "captured_files": 0.02,
+          "embedding": 64713.51,
+          "hf_commit_chunk": 1934.29,
+          "lance_append": 234.6,
+          "lance_write_commit": 2240.52,
+          "remote_open": 293.58,
+          "revision_lookup": 16293.8,
+          "secret_scan": 3066.04,
+          "vector_reuse": 25667.12,
+          "write_ops": 0.84
+        }
+      }
+    },
+    {
+      "sample_utc": "20261004T032013Z",
+      "documents": 4363547,
+      "canonical": {
+        "eligible": 1922199,
+        "indexed": 644582,
+        "pending": 1277452,
+        "held": 165,
+        "invalid": 0,
+        "checkpoint_current": true,
+        "complete": false,
+        "cutover_ready": false
+      },
+      "warm": {
+        "state": "warming",
+        "started_at": "2026-10-04T03:19:33Z",
+        "finished_at": null,
+        "refresh_pending": true
+      },
+      "worker": {
+        "configured": true,
+        "config_match": true,
+        "alive": false,
+        "last_failure": {
+          "category": "timeout",
+          "at": "2026-10-04T03:19:41Z"
+        }
+      },
+      "reconciler": {
+        "phase": "native_ingest",
+        "last_started_at": "2026-10-04T03:16:14.945377+00:00",
+        "last_finished_at": "2026-10-04T03:16:13.945220+00:00",
+        "last_progress_at": "2026-10-04T03:16:13.945230+00:00",
+        "last_duration_ms": 116130,
+        "last_result": {
+          "attempted": 32,
+          "indexed": 32,
+          "held": 0,
+          "durable": true
+        },
+        "failure_counts": {},
+        "consecutive_failures": 0
+      },
+      "metrics": {
+        "voyage_requests": 24,
+        "voyage_input_count": 187,
+        "voyage_token_usage": 155561,
+        "voyage_token_usage_known": 24,
+        "voyage_status_counts": {
+          "200": 24
+        },
+        "voyage_pacer_wait_ms": 117557.28,
+        "voyage_backoff_ms": 0.0,
+        "phase_ms": {
+          "captured_files": 0.02,
+          "embedding": 64713.51,
+          "hf_commit_chunk": 1934.29,
+          "lance_append": 234.6,
+          "lance_write_commit": 2240.52,
+          "remote_open": 293.58,
+          "revision_lookup": 16293.8,
+          "secret_scan": 3066.04,
+          "vector_reuse": 25667.12,
+          "write_ops": 0.84
+        }
+      }
+    },
+    {
+      "sample_utc": "20261004T033206Z",
+      "documents": 4363945,
+      "canonical": {
+        "eligible": 1922329,
+        "indexed": 644653,
+        "pending": 1277511,
+        "held": 165,
+        "invalid": 0,
+        "checkpoint_current": true,
+        "complete": false,
+        "cutover_ready": false
+      },
+      "warm": {
+        "state": "warming",
+        "started_at": "2026-10-04T03:32:01Z",
+        "finished_at": null,
+        "refresh_pending": false
+      },
+      "worker": {
+        "configured": true,
+        "config_match": true,
+        "alive": true,
+        "last_failure": {
+          "category": "timeout",
+          "at": "2026-10-04T03:22:14Z"
+        }
+      },
+      "reconciler": {
+        "phase": "validating_status",
+        "last_started_at": "2026-10-04T03:26:04.643193+00:00",
+        "last_finished_at": "2026-10-04T03:26:03.643011+00:00",
+        "last_progress_at": "2026-10-04T03:26:03.643024+00:00",
+        "last_duration_ms": 130991,
+        "last_result": {
+          "attempted": 36,
+          "indexed": 36,
+          "held": 0,
+          "durable": true
+        },
+        "failure_counts": {},
+        "consecutive_failures": 0,
+        "last_metrics": {
+          "phase_ms": {
+            "captured_files": 0.02,
+            "embedding": 61178.32,
+            "hf_commit_chunk": 1890.57,
+            "lance_append": 307.01,
+            "lance_write_commit": 2274.63,
+            "remote_open": 401.08,
+            "revision_lookup": 33736.7,
+            "secret_scan": 3492.22,
+            "vector_reuse": 15356.82,
+            "write_ops": 0.79
+          },
+          "voyage_requests": 24,
+          "voyage_input_count": 192,
+          "voyage_token_usage": 155803,
+          "voyage_token_usage_known": 24,
+          "voyage_status_counts": {
+            "200": 24
+          },
+          "voyage_pacer_wait_ms": 117921.66,
+          "voyage_backoff_ms": 0.0
+        }
+      }
+    },
+    {
+      "sample_utc": "20261004T1312Z",
+      "timestamp_precision": "minute",
+      "evidence_source": "coordinator_provided_production_sample",
+      "documents": 4394131,
+      "canonical": {
+        "eligible": 1942124,
+        "indexed": 656928,
+        "pending": 1285013,
+        "held": 183,
+        "invalid": 0,
+        "checkpoint_current": true,
+        "complete": false,
+        "cutover_ready": false
+      },
+      "reconciler": {
+        "last_duration_ms": 72888,
+        "last_result": {
+          "attempted": 35,
+          "indexed": 35
+        },
+        "voyage_requests": 24,
+        "voyage_token_usage": 154507,
+        "voyage_status_counts": {
+          "200": 24
+        },
+        "voyage_pacer_wait_ms": 117422.96,
+        "voyage_backoff_ms": 0.0,
+        "phase_ms": {
+          "embedding": 62126.63
+        },
+        "pacer_wait_is_concurrent_cumulative_not_wall_time": true
+      }
+    },
+    {
+      "sample_utc": "2026-10-04T13:51:19.374346+00:00",
+      "evidence_path": "/tmp/funes-bitmap-live-summary-20261004.json",
+      "runtime_sha": "0a8ee555234349aaf747b215fb77348a0eb9deaf",
+      "documents": 4397670,
+      "canonical": {
+        "provider": "voyage",
+        "model": "voyage-4-lite",
+        "dimensions": 1024,
+        "schema_version": 2,
+        "revision": 2621037,
+        "eligible": 1945305,
+        "indexed": 657345,
+        "pending": 1287777,
+        "held": 183,
+        "invalid": 0,
+        "checkpoint_current": true,
+        "complete": false,
+        "cutover_ready": false
+      },
+      "warm": {
+        "state": "warming",
+        "started_at": "2026-10-04T13:49:07Z",
+        "finished_at": null,
+        "refresh_pending": false
+      },
+      "health_http": 200,
+      "ready_http": 503,
+      "sync_status_http": 503,
+      "reconciler": {
+        "phase": "index_maintenance",
+        "last_finished_at": null,
+        "last_result": null,
+        "last_duration_ms": null,
+        "last_error": null
+      },
+      "metrics": {
+        "phase_ms": {
+          "remote_open": 487.16,
+          "revision_lookup": 631677.86,
+          "secret_scan": 3006.62
+        },
+        "voyage_requests": 0,
+        "voyage_retries": 0,
+        "voyage_duration_ms": 0.0,
+        "voyage_input_count": 0,
+        "voyage_token_usage": 0,
+        "voyage_token_usage_known": 0,
+        "voyage_pacer_wait_ms": 0.0,
+        "voyage_backoff_ms": 0.0
+      },
+      "maintenance": {
+        "enabled": true,
+        "active": true,
+        "pending_documents": 35,
+        "last_started_at": "2026-10-04T13:38:23.265915+00:00",
+        "last_finished_at": null,
+        "last_success_at": null,
+        "last_duration_ms": null,
+        "last_error": null,
+        "successes": 0,
+        "failures": 0
+      }
+    },
+    {
+      "sample_utc": "2026-10-04T14:44:00.952122+00:00",
+      "evidence_path": "/tmp/funes-bitmap-runtime-detail-20261004.json",
+      "runtime_sha": "0a8ee555234349aaf747b215fb77348a0eb9deaf",
+      "documents": 4400191,
+      "canonical": {
+        "provider": "voyage",
+        "model": "voyage-4-lite",
+        "dimensions": 1024,
+        "schema_version": 2,
+        "revision": 2623714,
+        "eligible": 1946863,
+        "indexed": 658462,
+        "pending": 1288216,
+        "held": 185,
+        "invalid": 0,
+        "checkpoint_current": true,
+        "complete": false,
+        "cutover_ready": false,
+        "index_fingerprint": "93601d04e054b5e790503c959fcbae546190d7c2a5359d3d458b984b3a339340"
+      },
+      "warm": {
+        "state": "ready",
+        "started_at": "2026-10-04T14:38:27Z",
+        "finished_at": "2026-10-04T14:38:30Z",
+        "refresh_pending": false
+      },
+      "health_http": 200,
+      "ready_http": 200,
+      "sync_status_http": 200,
+      "worker": {
+        "configured": true,
+        "config_match": true,
+        "alive": true,
+        "last_failure": {
+          "category": "timeout",
+          "at": "2026-10-04T14:17:52Z",
+          "timeout_stage": "recall_vector",
+          "note": "Vector timeout at 14:17:52Z; earlier had FTS timeout; both preserved and indicate slow stage localization, not proof of OOM or I/O contention"
+        }
+      },
+      "reconciler": {
+        "phase": "native_ingest",
+        "last_finished_at": "2026-10-04T14:43:15.853715+00:00",
+        "last_duration_ms": 70772,
+        "last_result": {
+          "attempted": 36,
+          "indexed": 36,
+          "held": 0,
+          "durable": true
+        },
+        "last_error": null
+      },
+      "metrics": {
+        "phase_ms": {
+          "captured_files": 0.01,
+          "embedding": 60879.7,
+          "hf_commit_chunk": 1378.87,
+          "lance_append": 204.5,
+          "lance_write_commit": 1663.85,
+          "remote_open": 732.75,
+          "revision_lookup": 442.86,
+          "secret_scan": 3179.11,
+          "vector_reuse": 39.99,
+          "write_ops": 0.89
+        },
+        "voyage_requests": 24,
+        "voyage_retries": 0,
+        "voyage_duration_ms": 4810.14,
+        "voyage_input_count": 191,
+        "voyage_token_usage": 153766,
+        "voyage_token_usage_known": 24,
+        "voyage_pacer_wait_ms": 118361.62,
+        "voyage_backoff_ms": 0.0
+      },
+      "maintenance": {
+        "enabled": true,
+        "active": false,
+        "pending_documents": 138,
+        "historical_long_run": {
+          "last_started_at": "2026-10-04T13:38:23.265915+00:00",
+          "last_finished_at": "2026-10-04T14:07:24.959662+00:00",
+          "duration_ms": 1741694,
+          "duration_note": "29m 2s long maintenance success"
+        },
+        "latest_short_run": {
+          "last_started_at": "2026-10-04T14:38:18.729695+00:00",
+          "last_finished_at": "2026-10-04T14:38:27.222798+00:00",
+          "last_duration_ms": 8493,
+          "duration_note": "8.493s maintenance success"
+        },
+        "successes": 2,
+        "failures": 0
+      }
+    }
+  ],
+  "maintenance_08xx": {
+    "maintenance_run": {
+      "observed_at": "2026-10-04T08:37:11.940594+00:00",
+      "summary_at": "2026-10-04T08:36:23.293227+00:00",
+      "stage": "RUNNING",
+      "runtime_sha": "4d5a40f70ca658901e4543559bf49a1c588356f9",
+      "phase": "native_ingest",
+      "active": false,
+      "successes": 1,
+      "failures": 0,
+      "pending_documents": 0,
+      "last_started_at": "2026-10-04T08:28:19.117000+00:00",
+      "last_finished_at": "2026-10-04T08:36:24.977319+00:00",
+      "last_success_at": "2026-10-04T08:36:24.977367+00:00",
+      "duration_ms": 485860,
+      "has_error": false,
+      "outcome": "maintenance_success"
+    },
+    "manifest_meta": {
+      "repo": "bolikoto/funes-memory-voyage",
+      "revision": "91fa1cd946dcf6edf53467c47e9b104737e8c416",
+      "version": 12866,
+      "logical_manifest": "chunks.lance/_versions/18446744073709538749.manifest",
+      "bytes": 1620103,
+      "sha256": "8f7c05f8a27765cf6287bda286bba31e0974fefa1c25c51e1397d6fd1f56c9b2",
+      "at": "2026-10-04T08:37:59.845154+00:00"
+    },
+    "coverage_comparison": {
+      "baseline": {
+        "version": 12849,
+        "live_fragments": 11313,
+        "physical_rows": 1574367
+      },
+      "after": {
+        "version": 12866,
+        "live_fragments": 11326,
+        "physical_rows": 1577005
+      },
+      "four_index_union": {
+        "text_idx": {
+          "before": {
+            "covered_live_fragments": 7540,
+            "covered_physical_rows": 1232225,
+            "uncovered_live_fragments": 3773,
+            "uncovered_physical_rows": 342142
+          },
+          "after": {
+            "covered_live_fragments": 11325,
+            "covered_physical_rows": 1576810,
+            "uncovered_live_fragments": 1,
+            "uncovered_physical_rows": 195
+          },
+          "delta": {
+            "covered_live_fragments": 3785,
+            "covered_physical_rows": 344585,
+            "uncovered_live_fragments": -3772,
+            "uncovered_physical_rows": -341947
+          },
+          "uncovered_row_percentage_before": 21.732035795973875,
+          "uncovered_row_percentage_after": 0.012365211270731546
+        },
+        "vector_idx": {
+          "before": {
+            "covered_live_fragments": 7540,
+            "covered_physical_rows": 1232225,
+            "uncovered_live_fragments": 3773,
+            "uncovered_physical_rows": 342142
+          },
+          "after": {
+            "covered_live_fragments": 11325,
+            "covered_physical_rows": 1576810,
+            "uncovered_live_fragments": 1,
+            "uncovered_physical_rows": 195
+          },
+          "delta": {
+            "covered_live_fragments": 3785,
+            "covered_physical_rows": 344585,
+            "uncovered_live_fragments": -3772,
+            "uncovered_physical_rows": -341947
+          },
+          "uncovered_row_percentage_before": 21.732035795973875,
+          "uncovered_row_percentage_after": 0.012365211270731546
+        },
+        "source_identity_idx": {
+          "before": {
+            "covered_live_fragments": 7540,
+            "covered_physical_rows": 1232225,
+            "uncovered_live_fragments": 3773,
+            "uncovered_physical_rows": 342142
+          },
+          "after": {
+            "covered_live_fragments": 11325,
+            "covered_physical_rows": 1576810,
+            "uncovered_live_fragments": 1,
+            "uncovered_physical_rows": 195
+          },
+          "delta": {
+            "covered_live_fragments": 3785,
+            "covered_physical_rows": 344585,
+            "uncovered_live_fragments": -3772,
+            "uncovered_physical_rows": -341947
+          },
+          "uncovered_row_percentage_before": 21.732035795973875,
+          "uncovered_row_percentage_after": 0.012365211270731546
+        },
+        "source_agent_idx": {
+          "before": {
+            "covered_live_fragments": 7540,
+            "covered_physical_rows": 1232225,
+            "uncovered_live_fragments": 3773,
+            "uncovered_physical_rows": 342142
+          },
+          "after": {
+            "covered_live_fragments": 11325,
+            "covered_physical_rows": 1576810,
+            "uncovered_live_fragments": 1,
+            "uncovered_physical_rows": 195
+          },
+          "delta": {
+            "covered_live_fragments": 3785,
+            "covered_physical_rows": 344585,
+            "uncovered_live_fragments": -3772,
+            "uncovered_physical_rows": -341947
+          },
+          "uncovered_row_percentage_before": 21.732035795973875,
+          "uncovered_row_percentage_after": 0.012365211270731546
+        }
+      },
+      "scalar_source_type_index_present": false,
+      "physical_rows_not_source_count_note": "physical rows correspond to Lance chunks.lance rows, not source document counts"
+    },
+    "verification_boundary": "Fragment bitmap union and physical row counts only; no deletion adjustment, query latency/quality test, embedding, optimize, reindex, remote write, or checkpoint change."
+  },
+  "summary_08xx": {
+    "sampled_at": "2026-10-04T08:57:01.836250+00:00",
+    "documents": 4377681,
+    "eligible": 1930496,
+    "indexed": 649360,
+    "pending": 1280965,
+    "held": 171,
+    "invalid": 0,
+    "checkpoint_current": true,
+    "complete": false,
+    "cutover_ready": false,
+    "health_http": 200,
+    "ready_http": 200,
+    "warm": {
+      "state": "ready",
+      "started_at": "2026-10-04T08:54:11Z",
+      "finished_at": "2026-10-04T08:54:16Z",
+      "refresh_pending": false
+    },
+    "reconciler": {
+      "active": true,
+      "phase": "native_ingest",
+      "last_duration_ms": 72484,
+      "last_result": {
+        "attempted": 33,
+        "indexed": 33,
+        "held": 0,
+        "durable": true
+      },
+      "consecutive_failures": 0,
+      "voyage_requests": 24,
+      "voyage_input_count": 188,
+      "voyage_token_usage": 154063,
+      "voyage_status_counts": {
+        "200": 24
+      }
+    }
+  },
+  "local_sync_status_08xx": {
+    "observed_at": "2026-10-04T08:46:44.624643+00:00",
+    "sources": 4182,
+    "active_sources": 3856,
+    "records": 1798613,
+    "pending": 0,
+    "pending_uploads": 0,
+    "failed_uploads": 0,
+    "discovered": {
+      "codex_sessions": 3428,
+      "pi_sessions": 9,
+      "claude_sessions": 280,
+      "memory_files": 139
+    },
+    "parsed": {
+      "codex_sessions": 3428,
+      "pi_sessions": 9,
+      "claude_sessions": 280,
+      "memory_files": 139
+    },
+    "synced": {
+      "codex_sessions": 3428,
+      "pi_sessions": 9,
+      "claude_sessions": 280,
+      "memory_files": 139
+    },
+    "by_agent": {
+      "claude_code": 17501,
+      "codex": 1781077,
+      "pi": 34,
+      "shared": 1
+    },
+    "launch_agents": {
+      "com.funes.sync": {
+        "path": "/Users/pwd/Library/LaunchAgents/com.funes.sync.plist",
+        "installed": true,
+        "loaded": true
+      },
+      "com.funes.native-backfill": {
+        "path": "/Users/pwd/Library/LaunchAgents/com.funes.native-backfill.plist",
+        "installed": false,
+        "loaded": false
+      }
+    }
+  },
+  "real_query_probes_08xx": {
+    "codex_cpa_normal_query": {
+      "duration_ms": 5814,
+      "status": "passed",
+      "result": "raw_chinese_verified"
+    },
+    "codex_to_pi_tailscale": {
+      "duration_ms": 1698,
+      "status": "passed",
+      "result": "raw_chinese_verified"
+    },
+    "mixed_identifiers": {
+      "duration_ms": 3124,
+      "status": "passed",
+      "result": "raw_chinese_verified"
+    },
+    "get_known_identity": {
+      "endpoint": "/get",
+      "status": "passed",
+      "result": "verbatim_match_no_shadow"
+    },
+    "gemini_unfiltered": {
+      "duration_ms": 2571,
+      "status": "failed",
+      "reason": "top3_missing_high_requirement_c_failed"
+    },
+    "gemini_source_type_memory": {
+      "status": "failed",
+      "http_status": 503,
+      "error": "read_vector_timeout",
+      "timeout_at": "2026-10-04T08:48:50Z",
+      "worker_failure_at": "2026-10-04T08:48:58Z",
+      "recovery": "automatic_native_warm_recovered",
+      "scalar_source_type_index_present": false,
+      "filter_fix_status": "in_progress_do_not_record_fixed"
+    },
+    "pi_real_cli_probe": {
+      "status": "failed",
+      "elapsed_seconds": 8.377,
+      "tool_events": [],
+      "error_category": "provider_http_401",
+      "credential_redacted": true,
+      "bidirectional_recall_passed": false
+    }
+  },
+  "summary_13xx": {
+    "sampled_at": "2026-10-04T13:12Z",
+    "timestamp_precision": "minute",
+    "evidence_source": "coordinator_provided_production_sample",
+    "documents": 4394131,
+    "eligible": 1942124,
+    "indexed": 656928,
+    "pending": 1285013,
+    "held": 183,
+    "invalid": 0,
+    "checkpoint_current": true,
+    "complete": false,
+    "cutover_ready": false,
+    "reconciler": {
+      "last_duration_ms": 72888,
+      "last_result": {
+        "attempted": 35,
+        "indexed": 35
+      },
+      "voyage_requests": 24,
+      "voyage_token_usage": 154507,
+      "voyage_status_counts": {
+        "200": 24
+      },
+      "voyage_pacer_wait_ms": 117422.96,
+      "voyage_backoff_ms": 0.0,
+      "phase_ms": {
+        "embedding": 62126.63
+      },
+      "pacer_wait_is_concurrent_cumulative_not_wall_time": true
+    }
+  },
+  "maintenance_13xx": {
+    "evidence_source": "coordinator_provided_production_sample",
+    "successes": 9,
+    "failures": 0,
+    "last_finished_at": "2026-10-04T12:56:04Z",
+    "last_duration_ms": 7309
+  },
+  "real_query_probes_recovery_09xx": {
+    "pi_to_codex_real_cli": {
+      "evidence_path": "/tmp/pi-daili-cross-recall-attempt2-20261004.json",
+      "started_at": "2026-10-04T09:37:06.832282+00:00",
+      "elapsed_seconds": 57.442,
+      "exit_code": 0,
+      "status": "passed",
+      "exact_requested_call_observed": true,
+      "tool_event_count": 2,
+      "tool_result_ok": true,
+      "result_count": 3,
+      "retrieval_backend": "voyage_lance_bm25_rrf",
+      "embedding_profile": {
+        "provider": "voyage",
+        "model": "voyage-4-lite",
+        "dimensions": 1024,
+        "schema_version": 2
+      },
+      "results": [
+        {
+          "record_id": 98101,
+          "source_agent": "codex",
+          "source_type": "session",
+          "content_type": "user_message",
+          "raw_text_length": 76,
+          "raw_chinese_present": true,
+          "cpa_anchor_present": true,
+          "previous_response_id_anchor_present": true
+        },
+        {
+          "record_id": 91597,
+          "source_agent": "codex",
+          "source_type": "session",
+          "content_type": "user_message",
+          "raw_text_length": 76,
+          "raw_chinese_present": true,
+          "cpa_anchor_present": true,
+          "previous_response_id_anchor_present": true
+        },
+        {
+          "record_id": 95854,
+          "source_agent": "codex",
+          "source_type": "session",
+          "content_type": "user_message",
+          "raw_text_length": 76,
+          "raw_chinese_present": true,
+          "cpa_anchor_present": true,
+          "previous_response_id_anchor_present": true
+        }
+      ],
+      "ephemeral_session": true,
+      "builtin_tools_disabled": true,
+      "auto_recall_disabled": true,
+      "settings_changed": false,
+      "extension_unchanged": true,
+      "credential_redacted": true
+    },
+    "pi_provider_probe": {
+      "evidence_path": "/tmp/pi-daili-provider-test-20261004.json",
+      "http": 200,
+      "valid_message": true,
+      "elapsed_seconds": 12.42
+    },
+    "codex_to_pi_success_evidence": "real_query_probes_08xx.codex_to_pi_tailscale",
+    "both_directions_have_success_evidence": true,
+    "historical_08xx_provider_401_is_current_blocker": false,
+    "verification_boundary": "Individual real-call success, not post-backfill final acceptance or all-provider health; original Pi file started_at is 09:37 UTC, not an unverified 12:xx timestamp."
+  },
+  "local_validation_and_artifact": {
+    "deployment_status": "not_deployed",
+    "new_changes": [
+      "source_type_bitmap",
+      "snapshot_warm_guard",
+      "canonical_ab_runner"
+    ],
+    "python_full_dependencies": {
+      "evidence_path": "/tmp/funes-full-python-20261004.log",
+      "passed": 907,
+      "skipped": 39,
+      "warnings": 4,
+      "subtests_passed": 16,
+      "elapsed_seconds": 118.12,
+      "status": "passed",
+      "verification_boundary": "Full run preceded final snapshot warm timing fix; not a final post-fix full-suite rerun."
+    },
+    "python_focused_after_warm_fix": {
+      "evidence_path": "/tmp/funes-final-focused-20261004.log",
+      "passed": 324,
+      "skipped": 1,
+      "elapsed_seconds": 58.01,
+      "status": "passed"
+    },
+    "rust_alice": {
+      "evidence_source": "coordinator_report_of_alice_logs",
+      "passed": 335,
+      "status": "passed",
+      "clippy_default": "passed",
+      "clippy_onnx": "passed",
+      "local_rerun": false
+    },
+    "linux_artifact": {
+      "binary_sha256": "11183d5d4418b4d81bddff53e92859301d681158f7d17a57a27065ff87a02512",
+      "binary_sha256_evidence_source": "coordinator_report",
+      "zstd_path": "/tmp/funes-bitmap-release-20261004.bin.zst",
+      "zstd_sha256": "aa504f22a41c18ab1b0e1d230d0921a009bc2e8fbd876f3440262a0f48b7ba87",
+      "zstd_bytes": 66158972,
+      "zstd_hash_and_size_locally_verified": true,
+      "runtime_smoke": {
+        "environment": "Trixie chroot",
+        "glibc_version": "2.41",
+        "version": "passed",
+        "help": "passed",
+        "evidence_source": "coordinator_report"
+      },
+      "new_hf_space_revision": null,
+      "deployed": false
+    }
+  },
+  "current_acceptance_13xx": {
+    "state_3_complete": false,
+    "state_4_accepted": false,
+    "full_backfill_complete": false,
+    "gemini_requirement_c_accepted": false,
+    "production_filter_fix_accepted": false,
+    "production_filter_fix_deployed": false,
+    "production_ab_measured": false,
+    "pi_real_cli_recovery_passed": true,
+    "historical_top_level_release_identity_note": "source_commit and space_revision retain the 08xx evidence; no new deployment identity is claimed.",
+    "next_required_action": "Deploy and verify new HF/runtime identity before real filter/requirement-C/controlled-A-B acceptance; preserve existing data and held records."
+  },
+  "atomic_deployment_13xx": {
+    "source_commit": "2a96c9864211e86f7d1f055f4a29497e19a7d1dd",
+    "asset_commit": "3ba7c9620fc0199968d2b0d68ea818f97b8dbf32",
+    "binary_sha256": "11183d5d4418b4d81bddff53e92859301d681158f7d17a57a27065ff87a02512",
+    "archive_sha256": "aa504f22a41c18ab1b0e1d230d0921a009bc2e8fbd876f3440262a0f48b7ba87",
+    "utc": "2026-10-04T13:26:03.880466+00:00",
+    "parent": "4d5a40f70ca658901e4543559bf49a1c588356f9",
+    "changed_paths": [
+      "Dockerfile",
+      "server.py",
+      "space/server.py",
+      "space/canonical_ab.py",
+      "space/bin/funes-x86_64-linux.bin.zst.sha256",
+      "space/bin/funes-x86_64-linux.sha256",
+      "space/bin/funes-x86_64-linux.archive.sha256",
+      "space/bin/funes-x86_64-linux.commit",
+      "space/bin/funes-x86_64-linux.version"
+    ],
+    "preserves_environment": true,
+    "secrets_changed": false,
+    "source_store_changed": false,
+    "indexes_cleared": false,
+    "space_commit": "0a8ee555234349aaf747b215fb77348a0eb9deaf",
+    "readback_verified": true,
+    "evidence_path": "/tmp/funes-bitmap-atomic-deploy-20261004-result.json",
+    "current_repo_head": "06bbc7da9e7109f7aa3223ca69748ba47db7017b",
+    "current_repo_head_equals_deployment_source_commit": false,
+    "ci_current_head": {
+      "status": "all_success",
+      "evidence_source": "coordinator_report",
+      "source_commit": "06bbc7da9e7109f7aa3223ca69748ba47db7017b"
+    },
+    "deployment_entrypoint_regression": {
+      "passed": 7,
+      "elapsed_seconds": 0.34,
+      "evidence_source": "coordinator_report"
+    }
+  },
+  "deployment_live_summary_13xx": {
+    "sampled_at": "2026-10-04T13:51:19.374346+00:00",
+    "evidence_path": "/tmp/funes-bitmap-live-summary-20261004.json",
+    "runtime_sha": "0a8ee555234349aaf747b215fb77348a0eb9deaf",
+    "expected_runtime_sha": "0a8ee555234349aaf747b215fb77348a0eb9deaf",
+    "runtime_identity_matches": true,
+    "stage": "RUNNING",
+    "health_http": 200,
+    "ready_http": 503,
+    "sync_status_http": 503,
+    "documents": 4397670,
+    "warm": {
+      "state": "warming",
+      "started_at": "2026-10-04T13:49:07Z",
+      "finished_at": null,
+      "refresh_pending": false
+    },
+    "canonical": {
+      "provider": "voyage",
+      "model": "voyage-4-lite",
+      "dimensions": 1024,
+      "schema_version": 2,
+      "revision": 2621037,
+      "eligible": 1945305,
+      "indexed": 657345,
+      "pending": 1287777,
+      "held": 183,
+      "invalid": 0,
+      "checkpoint_current": true,
+      "complete": false,
+      "cutover_ready": false
+    },
+    "optimize_status": "pending",
+    "cycle": {
+      "phase": "index_maintenance",
+      "last_finished_at": null,
+      "last_result": null,
+      "last_duration_ms": null,
+      "last_error": null
+    },
+    "first_observed_cycle_metrics": {
+      "phase_ms": {
+        "remote_open": 487.16,
+        "revision_lookup": 631677.86,
+        "secret_scan": 3006.62
+      },
+      "voyage_requests": 0,
+      "voyage_retries": 0,
+      "voyage_duration_ms": 0.0,
+      "voyage_input_count": 0,
+      "voyage_token_usage": 0,
+      "voyage_token_usage_known": 0,
+      "voyage_pacer_wait_ms": 0.0,
+      "voyage_backoff_ms": 0.0
+    },
+    "maintenance": {
+      "enabled": true,
+      "active": true,
+      "pending_documents": 35,
+      "last_started_at": "2026-10-04T13:38:23.265915+00:00",
+      "last_finished_at": null,
+      "last_success_at": null,
+      "last_duration_ms": null,
+      "last_error": null,
+      "successes": 0,
+      "failures": 0
+    },
+    "deployment_service_gate_passed": false
+  },
+  "deployment_runtime_detail_13xx": {
+    "sampled_at": "2026-10-04T13:35:42.316218+00:00",
+    "evidence_path": "/tmp/funes-bitmap-runtime-detail-20261004.json",
+    "health_http": 200,
+    "ready_http": 503,
+    "sync_status_http": 503,
+    "warm": {
+      "state": "warming",
+      "started_at": "2026-10-04T13:27:41Z",
+      "finished_at": null,
+      "refresh_pending": true
+    },
+    "worker": {
+      "configured": false,
+      "config_match": false,
+      "alive": false
+    },
+    "source_store": {
+      "configured": true,
+      "ready": true,
+      "restoring": false,
+      "restored": 0
+    },
+    "documents": 4396546,
+    "canonical": {
+      "eligible": 1944350,
+      "indexed": 657345,
+      "pending": 1286822,
+      "held": 183,
+      "invalid": 0,
+      "checkpoint_current": true,
+      "complete": false,
+      "cutover_ready": false
+    },
+    "canonical_ab": {
+      "http": 200,
+      "ok": true,
+      "run_id": null,
+      "phase": "idle",
+      "error_reason": null,
+      "total_cycles": 12,
+      "completed_cycles": 0,
+      "in_flight_cycles": 0,
+      "elapsed_seconds": 0.0,
+      "deadline_seconds": 1200.0
+    },
+    "verification_boundary": "Earlier 13:35 runtime observation; not the newer 13:51 summary and not a completed AB run."
+  },
+  "local_sync_status_13xx": {
+    "evidence_path": "/tmp/funes-bitmap-local-status-20261004.json",
+    "sampled_at": null,
+    "sampled_at_note": "Source file has no sampling UTC; coordinator describes 13:40 local snapshot. File mtime is not sampling time.",
+    "file_mtime_utc": "2026-10-04T13:41:16.308838+00:00",
+    "last_successful_sync": "2026-10-04T13:40:21.936312+00:00",
+    "sources": 4189,
+    "active_sources": 3861,
+    "records": 1803851,
+    "pending": 0,
+    "pending_uploads": 0,
+    "failed_uploads": 0,
+    "discovered": {
+      "codex_sessions": 3435,
+      "pi_sessions": 9,
+      "claude_sessions": 280,
+      "memory_files": 137
+    },
+    "parsed": {
+      "codex_sessions": 3435,
+      "pi_sessions": 9,
+      "claude_sessions": 280,
+      "memory_files": 137
+    },
+    "synced": {
+      "codex_sessions": 3435,
+      "pi_sessions": 9,
+      "claude_sessions": 280,
+      "memory_files": 137
+    },
+    "by_agent": {
+      "claude_code": 17501,
+      "codex": 1786315,
+      "pi": 34,
+      "shared": 1
+    },
+    "remote_ready": false,
+    "backfill": {
+      "initial_backfill_complete": true,
+      "source_schema_complete": true,
+      "zero_record_repair_complete": true,
+      "automation_identity_complete": true,
+      "remote_source_reconciliation": {
+        "complete": true,
+        "cursor_saved": false
+      }
+    },
+    "launch_agents": {
+      "com.funes.sync": {
+        "installed": true,
+        "loaded": true
+      },
+      "com.funes.native-backfill": {
+        "installed": false,
+        "loaded": false
+      }
+    },
+    "verification_boundary": "Local discovery/upload queue and initial backfill completion do not prove remote Lance vector backfill or readiness."
+  },
+  "current_acceptance_deployment_13xx": {
+    "sampled_at": "2026-10-04T13:51:19.374346+00:00",
+    "new_revision_deployed": true,
+    "runtime_revision_verified": true,
+    "production_filter_fix_deployed": true,
+    "canonical_ab_runner_deployed": true,
+    "deployment_service_gate_passed": false,
+    "ready_http": 503,
+    "warm_state": "warming",
+    "maintenance_active": true,
+    "state_3_complete": false,
+    "state_4_accepted": false,
+    "full_backfill_complete": false,
+    "gemini_requirement_c_accepted": false,
+    "production_filter_fix_accepted": false,
+    "production_ab_measured": false,
+    "next_required_action": "Wait for current warming/maintenance to finish and readiness to pass before real filtered recall/requirement-C/controlled-AB acceptance; preserve data."
+  },
+  "historical_evidence_timeline_labels": {
+    "source_commit": "Top-level value retains 08xx evidence; current deployment identity is atomic_deployment_13xx.",
+    "space_revision": "Top-level value retains 08xx evidence; new runtime identity is deployment_live_summary_13xx.",
+    "local_validation_and_artifact": "13:12 pre-deployment historical evidence; not_deployed fields describe that time, not current deployment.",
+    "current_acceptance_13xx": "13:12 pre-deployment acceptance snapshot; latest acceptance is current_acceptance_deployment_13xx.",
+    "summary_13xx": "13:12 pre-deployment production sample; latest is deployment_live_summary_13xx.",
+    "maintenance_13xx": "Pre-deployment cumulative 9/0; new-process live summary 0/0 does not erase prior successful maintenance.",
+    "deployment_runtime_detail_1444_utc": "14:44 UTC post-warm post-maintenance production runtime detail with ready=200, 2 successful maintenance cycles, and vector timeout failure localization from 14:17.",
+    "production_budgets_14xx": "14:29 UTC read-only configuration confirming FUNES_VOYAGE_NATIVE_TIMEOUT=7 and FUNES_HTTP_NATIVE_TIMEOUT=12.",
+    "gemini_memory_gate_14xx": "14:38 UTC single-probe pass for source_type=memory (7.983s) with exact hash match; does not constitute stability signoff.",
+    "lance_post_maintenance_v13127": "v13127 Lance manifest state confirming presence of source_type_idx alongside other 4 indexes with 99.946% coverage.",
+    "local_sync_status_14xx": "14:15/14:44 local status confirming queue=0, initial backfill complete, and remote_ready=true.",
+    "current_acceptance_1444_utc": "14:44 UTC acceptance boundary: service gate and single Gemini memory gate passed, but stability and 12-cycle A/B pending; cutover false."
+  },
+  "production_budgets_14xx": {
+    "utc": "2026-10-04T14:29:13.658178+00:00",
+    "stage": "RUNNING",
+    "sha": "0a8ee555234349aaf747b215fb77348a0eb9deaf",
+    "hardware": "cpu-basic",
+    "variables": {
+      "FUNES_HTTP_NATIVE_TIMEOUT": "12",
+      "FUNES_HTTP_MAX_CANDIDATES": "6",
+      "FUNES_VOYAGE_NATIVE_TIMEOUT": "7",
+      "FUNES_CANONICAL_INDEX_REQUEST_ROWS": "128",
+      "FUNES_CANONICAL_INDEX_MAX_CHARS": "192000",
+      "FUNES_VOYAGE_CONCURRENCY": "4",
+      "FUNES_MCP_TIMEOUT": "600"
+    },
+    "budget_comparison_note": "Voyage native timeout is actually 7 seconds (not 12s as previously presumed), while HTTP native timeout is 12 seconds."
+  },
+  "gemini_memory_gate_14xx": {
+    "utc": "2026-10-04T14:38:30.537758+00:00",
+    "evidence_path": "/tmp/funes-memory-get-single-followup-20261004.json",
+    "probes": [
+      {
+        "args": {
+          "query": "Gemini 默认 reasoning 配置是什么？",
+          "source_type": "memory",
+          "limit": 5
+        },
+        "http": 200,
+        "ok": true,
+        "error": "",
+        "backend": "voyage_lance_bm25_rrf",
+        "degraded": null,
+        "seconds": 7.983,
+        "passed": true,
+        "top_result": {
+          "id": 588433,
+          "source_identity": "1ec68d121d583b5194602b16218dc489881957d42154cc1d44c22e5e10db1df2",
+          "source_agent": "pi",
+          "source_type": "memory",
+          "raw_bytes": 161,
+          "raw_sha256": "e9ca646698f99dcab1008f45c74d482a2205d78dc8d61afe7ae27f83c75f9ad2",
+          "has_chinese": true,
+          "anchors": {
+            "Gemini": true,
+            "High": true,
+            "high": false,
+            "reasoning": true,
+            "previous_response_id": false,
+            "chatcmpl-*": false,
+            "Codex": false,
+            "CPA": false
+          }
+        },
+        "get_verification": {
+          "http": 200,
+          "ok": true,
+          "raw_sha256": "e9ca646698f99dcab1008f45c74d482a2205d78dc8d61afe7ae27f83c75f9ad2",
+          "raw_exact_match": true,
+          "source_agent": "pi",
+          "source_type": "memory"
+        }
+      }
+    ],
+    "passed": true,
+    "verification_boundary": "Single memory-probe success (7.983s) with exact hash match on Pi Chinese Gemini High reasoning context. Single success does not equal stability pass; A/B testing remains pending."
+  },
+  "lance_post_maintenance_v13127": {
+    "manifest_file": "/tmp/funes-current.manifest",
+    "evidence_path": "/tmp/funes-source-type-post-maintenance-20261004.json",
+    "bytes": 1623229,
+    "version": 13127,
+    "live_fragments": 11546,
+    "physical_rows": 1619614,
+    "index_section_offset": 0,
+    "indexes_present": [
+      "text_idx",
+      "vector_idx",
+      "source_identity_idx",
+      "source_agent_idx",
+      "source_type_idx"
+    ],
+    "scalar_source_type_index_present": true,
+    "coverage_union": {
+      "text_idx": {
+        "covered_live_fragments": 11542,
+        "covered_physical_rows": 1618738,
+        "uncovered_live_fragments": 4,
+        "uncovered_physical_rows": 876
+      },
+      "vector_idx": {
+        "covered_live_fragments": 11542,
+        "covered_physical_rows": 1618738,
+        "uncovered_live_fragments": 4,
+        "uncovered_physical_rows": 876
+      },
+      "source_identity_idx": {
+        "covered_live_fragments": 11542,
+        "covered_physical_rows": 1618738,
+        "uncovered_live_fragments": 4,
+        "uncovered_physical_rows": 876
+      },
+      "source_agent_idx": {
+        "covered_live_fragments": 11542,
+        "covered_physical_rows": 1618738,
+        "uncovered_live_fragments": 4,
+        "uncovered_physical_rows": 876
+      },
+      "source_type_idx": {
+        "covered_live_fragments": 11542,
+        "covered_physical_rows": 1618738,
+        "uncovered_live_fragments": 4,
+        "uncovered_physical_rows": 876
+      }
+    },
+    "physical_row_coverage_ratio": 0.999459,
+    "coverage_percentage": "99.946%",
+    "contrast_with_08xx_boundary": "In 08xx baseline, scalar_source_type_index_present was false; in post-maintenance v13127, source_type_idx is present and matches all 4 other indexes with 99.946% coverage."
+  },
+  "local_sync_status_14xx": {
+    "evidence_path": "/tmp/funes-local-status-followup-20261004.json",
+    "last_successful_sync": "2026-10-04T14:15:10.329646+00:00",
+    "sources": 4191,
+    "active_sources": 3863,
+    "records": 1804796,
+    "pending": 0,
+    "pending_uploads": 0,
+    "failed_uploads": 0,
+    "discovered": {
+      "codex_sessions": 3437,
+      "pi_sessions": 9,
+      "claude_sessions": 280,
+      "memory_files": 137
+    },
+    "parsed": {
+      "codex_sessions": 3437,
+      "pi_sessions": 9,
+      "claude_sessions": 280,
+      "memory_files": 137
+    },
+    "synced": {
+      "codex_sessions": 3437,
+      "pi_sessions": 9,
+      "claude_sessions": 280,
+      "memory_files": 137
+    },
+    "by_agent": {
+      "claude_code": 17501,
+      "codex": 1787260,
+      "pi": 34,
+      "shared": 1
+    },
+    "remote_url": "https://bolikoto-funes-memory.hf.space",
+    "remote_ready": true,
+    "device_id": "dev-2d3a7c5a945bc933f7b9",
+    "interval": 300,
+    "launch_agents": {
+      "com.funes.sync": {
+        "path": "/Users/pwd/Library/LaunchAgents/com.funes.sync.plist",
+        "installed": true,
+        "loaded": true
+      },
+      "com.funes.native-backfill": {
+        "path": "/Users/pwd/Library/LaunchAgents/com.funes.native-backfill.plist",
+        "installed": false,
+        "loaded": false
+      }
+    },
+    "backfill": {
+      "initial_backfill_complete": true,
+      "source_schema_complete": true,
+      "zero_record_repair_complete": true,
+      "automation_identity_complete": true,
+      "remote_source_reconciliation": {
+        "complete": true,
+        "cursor_saved": false
+      }
+    }
+  },
+  "deployment_runtime_detail_1444_utc": {
+    "sampled_at": "2026-10-04T14:44:00.952122+00:00",
+    "evidence_path": "/tmp/funes-bitmap-runtime-detail-20261004.json",
+    "health_http": 200,
+    "ready_http": 200,
+    "sync_status_http": 200,
+    "warm": {
+      "state": "ready",
+      "started_at": "2026-10-04T14:38:27Z",
+      "finished_at": "2026-10-04T14:38:30Z",
+      "refresh_pending": false
+    },
+    "worker": {
+      "configured": true,
+      "config_match": true,
+      "alive": true,
+      "last_failure": {
+        "category": "timeout",
+        "at": "2026-10-04T14:17:52Z",
+        "timeout_stage": "recall_vector",
+        "metrics": [
+          {
+            "stage": "recall_open",
+            "state": "done",
+            "duration_ms": 219.17
+          },
+          {
+            "stage": "recall_models",
+            "state": "done",
+            "duration_ms": 8.5
+          },
+          {
+            "stage": "recall_embed",
+            "state": "done",
+            "duration_ms": 133.81
+          },
+          {
+            "stage": "recall_vector",
+            "state": "start",
+            "duration_ms": 0.0
+          }
+        ],
+        "note": "Timeout occurred at recall_vector stage. Earlier observation included FTS timeout. Both preserved as stage localization indicators, not proof of OOM or I/O contention."
+      }
+    },
+    "source_store": {
+      "configured": true,
+      "ready": true,
+      "restoring": false,
+      "restored": 0
+    },
+    "documents": 4400191,
+    "canonical": {
+      "provider": "voyage",
+      "model": "voyage-4-lite",
+      "dimensions": 1024,
+      "schema_version": 2,
+      "revision": 2623714,
+      "eligible": 1946863,
+      "indexed": 658462,
+      "pending": 1288216,
+      "held": 185,
+      "invalid": 0,
+      "checkpoint_current": true,
+      "complete": false,
+      "cutover_ready": false,
+      "index_fingerprint": "93601d04e054b5e790503c959fcbae546190d7c2a5359d3d458b984b3a339340"
+    },
+    "reconciler": {
+      "active": true,
+      "phase": "native_ingest",
+      "last_started_at": "2026-10-04T14:43:16.853861+00:00",
+      "last_finished_at": "2026-10-04T14:43:15.853715+00:00",
+      "last_duration_ms": 70772,
+      "last_result": {
+        "attempted": 36,
+        "indexed": 36,
+        "held": 0,
+        "durable": true
+      },
+      "voyage_requests": 24,
+      "voyage_token_usage": 153766,
+      "voyage_status_counts": {
+        "200": 24
+      },
+      "voyage_pacer_wait_ms": 118361.62,
+      "voyage_backoff_ms": 0.0,
+      "phase_ms": {
+        "embedding": 60879.7,
+        "lance_append": 204.5,
+        "lance_write_commit": 1663.85,
+        "remote_open": 732.75,
+        "revision_lookup": 442.86,
+        "secret_scan": 3179.11,
+        "vector_reuse": 39.99
+      }
+    },
+    "maintenance": {
+      "enabled": true,
+      "active": false,
+      "pending_documents": 138,
+      "historical_run_1": {
+        "started_at": "2026-10-04T13:38:23.265915+00:00",
+        "finished_at": "2026-10-04T14:07:24.959662+00:00",
+        "duration_ms": 1741694,
+        "duration_note": "29m 2s (1741.694s) long maintenance run succeeded"
+      },
+      "recent_run_2": {
+        "started_at": "2026-10-04T14:38:18.729695+00:00",
+        "finished_at": "2026-10-04T14:38:27.222798+00:00",
+        "duration_ms": 8493,
+        "duration_note": "8.493s maintenance run succeeded"
+      },
+      "successes": 2,
+      "failures": 0
+    },
+    "canonical_ab": {
+      "total_cycles": 12,
+      "completed_cycles": 0,
+      "phase": "idle",
+      "deadline_seconds": 1200.0,
+      "note": "Root coordinator running deployed 12-cycle A/B; results pending, do not forge pass"
+    }
+  },
+  "current_acceptance_1444_utc": {
+    "sampled_at": "2026-10-04T14:44:00.952122+00:00",
+    "deployment_service_gate_passed": true,
+    "ready_http": 200,
+    "health_http": 200,
+    "sync_status_http": 200,
+    "warm_state": "ready",
+    "worker_alive": true,
+    "gemini_memory_single_gate_passed": true,
+    "gemini_stability_gate_accepted": false,
+    "canonical_ab_completed": false,
+    "canonical_ab_phase": "idle",
+    "cutover_ready": false,
+    "full_backfill_complete": false,
+    "pending_documents": 1288216,
+    "state_3_complete": false,
+    "state_4_accepted": false,
+    "next_required_action": "Wait for root coordinator 12-cycle A/B benchmark results; maintain backfill progress; assess filtered query stability across repeated trials; do not forge pass."
+  },
+  "current_acceptance_1508_utc": {
+    "utc": "2026-10-04T15:08:29.138716+00:00",
+    "space_revision": "0a8ee555234349aaf747b215fb77348a0eb9deaf",
+    "stage": "RUNNING",
+    "health_http": 200,
+    "ready_http": 503,
+    "sync_status_http": 503,
+    "ready_reason": "native_warm_warming",
+    "warm": {
+      "state": "warming",
+      "started_at": "2026-10-04T15:01:50Z",
+      "finished_at": null,
+      "refresh_pending": true
+    },
+    "documents": 4402146,
+    "eligible": 1948205,
+    "indexed": 659072,
+    "pending": 1288947,
+    "held": 186,
+    "invalid": 0,
+    "checkpoint_current": true,
+    "complete": false,
+    "cutover_ready": false,
+    "last_cycle": {
+      "attempted": 37,
+      "indexed": 37,
+      "held": 0,
+      "durable": true,
+      "duration_ms": 80857,
+      "finished_at": "2026-10-04T15:01:54.097764+00:00"
+    },
+    "last_metrics": {
+      "embedding_ms": 70555.23,
+      "voyage_requests": 24,
+      "voyage_status_counts": {
+        "200": 24
+      },
+      "voyage_retries": 0
+    },
+    "interpretation": "Worker warm replacement is active; this snapshot does not indicate a new ingest failure. Do not declare service ready until warm completes."
+  },
+  "current_ab_aggregate_1508_utc": {
+    "run_id": "run_1",
+    "phase": "completed",
+    "completed_cycles": 12,
+    "total_indexed": 268,
+    "total_requests": 192,
+    "all_durable": true,
+    "http_429": 0,
+    "http_5xx": 0,
+    "retries": 0,
+    "profiles": {
+      "baseline_c2_r64": {
+        "indexed": 68,
+        "cycle_seconds": 44.063,
+        "rows_per_second_cycle_only": 1.5432448993,
+        "tokens": 299784
+      },
+      "c4_r64": {
+        "indexed": 66,
+        "cycle_seconds": 39.725,
+        "rows_per_second_cycle_only": 1.6614222782,
+        "tokens": 310458
+      },
+      "c4_r128": {
+        "indexed": 134,
+        "cycle_seconds": 289.144,
+        "rows_per_second_cycle_only": 0.4634369034,
+        "tokens": 618788,
+        "pacer_wait_seconds": 471.06771
+      }
+    },
+    "limit_diagnosis": {
+      "tokens_per_minute": 120000,
+      "window_seconds": 60,
+      "candidate": "c4_r64",
+      "status": "fastest short sample only; not promoted to production because process-local pacer resets between cycles"
+    }
+  },
+  "current_acceptance_1517_utc": {
+    "utc": "2026-10-04T15:17:19.782813+00:00",
+    "space_revision": "0a8ee555234349aaf747b215fb77348a0eb9deaf",
+    "stage": "RUNNING",
+    "health_http": 200,
+    "ready_http": 200,
+    "sync_status_http": 200,
+    "warm": {
+      "state": "ready",
+      "started_at": "2026-10-04T15:16:45Z",
+      "finished_at": "2026-10-04T15:16:49Z",
+      "refresh_pending": false
+    },
+    "documents": 4403063,
+    "eligible": 1949091,
+    "indexed": 659106,
+    "pending": 1289799,
+    "held": 186,
+    "invalid": 0,
+    "checkpoint_current": true,
+    "complete": false,
+    "cutover_ready": false,
+    "last_cycle": {
+      "attempted": 34,
+      "indexed": 34,
+      "held": 0,
+      "durable": true,
+      "duration_ms": 890273,
+      "finished_at": "2026-10-04T15:01:54.097764+00:00"
+    },
+    "last_metrics": {
+      "revision_lookup_ms": 814471.51,
+      "embedding_ms": 60966.69,
+      "voyage_requests": 24,
+      "voyage_token_usage": 153189,
+      "voyage_status_counts": {
+        "200": 24
+      },
+      "voyage_pacer_wait_ms": 118069.84,
+      "voyage_retries": 0
+    },
+    "interpretation": "Warm replacement completed and service is ready. The latest long cycle includes a separate remote revision_lookup outlier; embedding still shows the 120k TPM process-local pacer."
+  }
+}

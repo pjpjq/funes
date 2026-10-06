@@ -86,6 +86,11 @@ fn round_ms(duration: Duration) -> f64 {
     ((duration.as_secs_f64() * 1000.0) * 100.0).round() / 100.0
 }
 
+fn write_metric(writer: &mut impl std::io::Write, json: &str) -> std::io::Result<()> {
+    // A failed upload leaves the progress bar unterminated: start a machine-readable line.
+    writeln!(writer, "\nfunes_metric {json}")
+}
+
 fn emit_phase_metric(stage: &'static str, duration: Duration) {
     if !ingest_metrics_enabled() {
         return;
@@ -95,7 +100,7 @@ fn emit_phase_metric(stage: &'static str, duration: Duration) {
         duration_ms: round_ms(duration),
     };
     if let Ok(json) = serde_json::to_string(&metric) {
-        eprintln!("funes_metric {json}");
+        let _ = write_metric(&mut std::io::stderr().lock(), &json);
     }
 }
 
@@ -734,7 +739,7 @@ where
                 limit_kind,
             };
             if let Ok(json) = serde_json::to_string(&metric) {
-                eprintln!("funes_metric {json}");
+                let _ = write_metric(&mut std::io::stderr().lock(), &json);
             }
         }
         match wait {
@@ -1477,6 +1482,36 @@ mod tests {
                 self.store.clone()
             }
         }
+    }
+
+    #[test]
+    fn metric_lines_survive_unterminated_upload_progress() {
+        let mut output = "\r    committing…       ".as_bytes().to_vec();
+        for (attempt, status_code) in [(1, 429), (2, 200)] {
+            let metric = HfCommitMetric {
+                stage: "hf_commit_attempt",
+                duration_ms: 1.0,
+                attempt,
+                status_code,
+                phase: "commit",
+                retry_after_ms: None,
+                backoff_ms: 0.0,
+                retrying: attempt == 1,
+                limit_kind: "unknown",
+            };
+            write_metric(&mut output, &serde_json::to_string(&metric).unwrap()).unwrap();
+        }
+        let text = String::from_utf8(output).unwrap();
+        assert!(text.starts_with("\r    committing…       \n"));
+        let metrics: Vec<serde_json::Value> = text
+            .lines()
+            .filter_map(|line| line.strip_prefix("funes_metric "))
+            .map(|json| serde_json::from_str(json).unwrap())
+            .collect();
+        assert_eq!(metrics.len(), 2);
+        assert_eq!(metrics[0]["status_code"], 429);
+        assert_eq!(metrics[1]["status_code"], 200);
+        assert_eq!(metrics[1]["attempt"], 2);
     }
 
     #[test]

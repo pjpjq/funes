@@ -768,11 +768,7 @@ async fn hybrid_candidates(
     let vector = vector_candidates(ds, qv, candidates, filter).await?;
     emit_recall_metric("recall_vector", "done", round_ms(t_vec.elapsed()));
 
-    let fts = best_effort_fts(
-        fts_candidates(ds, query, candidates, filter),
-        Duration::from_secs(3),
-    )
-    .await;
+    let fts = best_effort_fts(fts_candidates(ds, query, candidates, filter), Duration::from_secs(3)).await;
 
     Ok(rrf_fuse(vector, fts, candidates))
 }
@@ -1747,12 +1743,9 @@ mod tests {
             let _guard = guard;
             std::future::pending::<Result<Vec<(u64, Hit)>>>().await
         };
-        let fts = tokio::time::timeout(
-            Duration::from_secs(1),
-            best_effort_fts(scan, Duration::from_millis(10)),
-        )
-        .await
-        .expect("optional FTS must not consume the caller's whole deadline");
+        let fts = tokio::time::timeout(Duration::from_secs(1), best_effort_fts(scan, Duration::from_millis(10)))
+            .await
+            .expect("optional FTS must not consume the caller's whole deadline");
         assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
         let fused = rrf_fuse(vec![(1, hit("vector-only"))], fts, 1);
         assert_eq!(fused.len(), 1);

@@ -768,12 +768,30 @@ async fn hybrid_candidates(
     let vector = vector_candidates(ds, qv, candidates, filter).await?;
     emit_recall_metric("recall_vector", "done", round_ms(t_vec.elapsed()));
 
-    emit_recall_metric("recall_fts", "start", 0.0);
-    let t_fts = Instant::now();
-    let fts = fts_candidates(ds, query, candidates, filter).await.unwrap_or_default();
-    emit_recall_metric("recall_fts", "done", round_ms(t_fts.elapsed()));
+    let fts = best_effort_fts(
+        fts_candidates(ds, query, candidates, filter),
+        Duration::from_secs(3),
+    )
+    .await;
 
     Ok(rrf_fuse(vector, fts, candidates))
+}
+
+async fn best_effort_fts(
+    scan: impl std::future::Future<Output = Result<Vec<(u64, Hit)>>>,
+    budget: Duration,
+) -> Vec<(u64, Hit)> {
+    emit_recall_metric("recall_fts", "start", 0.0);
+    let started = Instant::now();
+    // Bound the optional scan without spawning a detached task or discarding vector hits.
+    // shortcut: cancellation is cooperative; isolate the scan if profiling finds non-yielding CPU work.
+    let (hits, state) = match tokio::time::timeout(budget, scan).await {
+        Ok(Ok(hits)) => (hits, "done"),
+        Ok(Err(_)) => (Vec::new(), "error"),
+        Err(_) => (Vec::new(), "timeout"),
+    };
+    emit_recall_metric("recall_fts", state, round_ms(started.elapsed()));
+    hits
 }
 
 /// Top-`limit` rows by vector distance, each with its `_rowid` (the fusion key).
@@ -1693,6 +1711,52 @@ mod tests {
             harness: String::new(),
             neighbors: Vec::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn fts_deadline_preserves_successful_hybrid_fusion() {
+        let fts = best_effort_fts(
+            async { Ok(vec![(2, hit("shared")), (3, hit("fts-only"))]) },
+            Duration::from_secs(1),
+        )
+        .await;
+        let fused = rrf_fuse(vec![(1, hit("vector-only")), (2, hit("shared"))], fts, 3);
+        assert_eq!(fused[0].0.text, "shared");
+        assert_eq!(fused.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn fts_deadline_keeps_vector_hits_on_scan_error() {
+        let fts = best_effort_fts(async { Err(anyhow!("missing FTS index")) }, Duration::from_secs(1)).await;
+        let fused = rrf_fuse(vec![(1, hit("vector-only"))], fts, 1);
+        assert_eq!(fused.len(), 1);
+        assert_eq!(fused[0].0.text, "vector-only");
+    }
+
+    #[tokio::test]
+    async fn fts_deadline_drops_stalled_scan_and_keeps_vector_hits() {
+        struct DropFlag(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let guard = DropFlag(dropped.clone());
+        let scan = async move {
+            let _guard = guard;
+            std::future::pending::<Result<Vec<(u64, Hit)>>>().await
+        };
+        let fts = tokio::time::timeout(
+            Duration::from_secs(1),
+            best_effort_fts(scan, Duration::from_millis(10)),
+        )
+        .await
+        .expect("optional FTS must not consume the caller's whole deadline");
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+        let fused = rrf_fuse(vec![(1, hit("vector-only"))], fts, 1);
+        assert_eq!(fused.len(), 1);
+        assert_eq!(fused[0].0.text, "vector-only");
     }
 
     #[test]

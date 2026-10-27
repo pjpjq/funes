@@ -15,6 +15,11 @@ remain available to the lexical branch; RRF combines its rank with the vector br
 their incomparable raw scores. What comes back is the **actual passage from the actual turn**, not a
 summary written about it.
 
+The BM25/FTS leg is best-effort: a scan error or a three-second scan timeout retains the vector
+results rather than failing the whole recall. Both legs keep the same metadata filters. A timed-out
+scan can omit keyword-only hits; with `FUNES_RECALL_METRICS=1`, `recall_fts` reports `timeout` or
+`error` instead of `done`. This budget does not reset the index or regenerate document embeddings.
+
 The embedding provider is selected at runtime with `FUNES_EMBEDDING_PROVIDER=local|voyage`.
 `local` preserves the existing pinned BGE behavior. `voyage` sends original multilingual passages
 with `input_type=document` at index time and the original query with `input_type=query` at recall

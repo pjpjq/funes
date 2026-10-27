@@ -6143,6 +6143,19 @@ def test_safe_recall_metrics_is_bounded_and_redacted():
     assert all(set(item) == {"stage", "state", "duration_ms"} for item in safe)
 
 
+def test_safe_recall_metrics_keeps_fts_fallback_without_payload():
+    lines = [
+        'funes_metric {"stage":"recall_fts","state":"timeout","duration_ms":3000.12,"raw":"secret"}',
+        'funes_metric {"stage":"recall_fts","state":"error","duration_ms":1.25,"error":"private"}',
+        'funes_metric {"stage":"recall_vector","state":"timeout","duration_ms":3000}',
+        'funes_metric {"stage":"recall_fts","state":"private","duration_ms":1}',
+    ]
+    assert bridge._safe_recall_metrics(lines) == [
+        {"stage": "recall_fts", "state": "timeout", "duration_ms": 3000.12},
+        {"stage": "recall_fts", "state": "error", "duration_ms": 1.25},
+    ]
+
+
 def test_ingest_canonical_subset_catches_timeout_and_accumulates_partial_metrics(
     monkeypatch, tmp_path
 ):

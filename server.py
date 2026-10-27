@@ -1688,7 +1688,10 @@ def _safe_recall_metrics(lines: Sequence[str] | None) -> list[dict[str, object]]
             not isinstance(stage, str)
             or stage not in RECALL_METRIC_STAGES
             or not isinstance(state, str)
-            or state not in {"start", "done"}
+            or (
+                state not in {"start", "done"}
+                and not (stage == "recall_fts" and state in {"timeout", "error"})
+            )
             or isinstance(duration, bool)
         ):
             continue

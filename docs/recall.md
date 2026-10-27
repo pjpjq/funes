@@ -20,6 +20,11 @@ languages a memory's sessions are written in.
 Passages are searchable by their words as soon as their text is indexed, even while embeddings
 are pending. If text search fails, recall reports an error.
 
+The BM25/FTS leg is best-effort: a scan error or a three-second scan timeout retains the vector
+results rather than failing the whole recall. Both legs keep the same metadata filters. A timed-out
+scan can omit keyword-only hits; with `FUNES_RECALL_METRICS=1`, `recall_fts` reports `timeout` or
+`error` instead of `done`. This budget does not reset the index or regenerate document embeddings.
+
 The embedding provider is selected at runtime with `FUNES_EMBEDDING_PROVIDER=local|voyage`.
 `local` uses the stored BGE or multilingual E5 model. `voyage` sends original multilingual passages
 with `input_type=document` at index time and the original query with `input_type=query` at recall

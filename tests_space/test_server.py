@@ -5563,6 +5563,82 @@ def test_voyage_native_recall_succeeds_within_new_budget(monkeypatch):
     assert body["results"] == [hit]
 
 
+@pytest.mark.parametrize(
+    ("hydration_delay", "expected_status"),
+    ((0.12, 200), (None, 503)),
+)
+def test_voyage_raw_hydration_uses_http_deadline(
+    monkeypatch, hydration_delay, expected_status
+):
+    hit = {
+        "source_identity": "hydration-row",
+        "source_type": "memory",
+        "raw_text": "保持完整的中文原文，不返回检索预览。",
+    }
+    release = threading.Event()
+    finished = threading.Event()
+    native_timeouts = []
+    recovery_calls = []
+
+    def get_many(identities):
+        assert identities == [hit["source_identity"]]
+        try:
+            if hydration_delay is None:
+                release.wait(2)
+            else:
+                time.sleep(hydration_delay)
+            return [hit]
+        finally:
+            finished.set()
+
+    def native_recall(_query, **kwargs):
+        native_timeouts.append(kwargs["timeout"])
+        time.sleep(0.02)
+        reference = bridge.canonical_reference(hit["source_identity"])
+        return f"retrieval preview\n  → get {reference} --from 0 --to 0"
+
+    app = SimpleNamespace(
+        store=SimpleNamespace(get_many=get_many),
+        syncer=SimpleNamespace(restoring=False, restore_failed=False),
+    )
+    monkeypatch.setattr(bridge, "SOURCE_APP", app)
+    monkeypatch.setattr(bridge, "TOKEN", "test-token")
+    monkeypatch.setenv("FUNES_EMBEDDING_PROVIDER", "voyage")
+    monkeypatch.setattr(bridge, "VOYAGE_NATIVE_TIMEOUT", 0.08)
+    monkeypatch.setattr(bridge, "VOYAGE_HTTP_TIMEOUT", 0.35)
+    monkeypatch.setattr(bridge, "recall", native_recall)
+    monkeypatch.setattr(
+        bridge, "request_native_recovery", lambda: recovery_calls.append(True)
+    )
+    server = ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    started = time.monotonic()
+    try:
+        status, body = _post(server, "/recall", {"query": "raw hydration", "limit": 3})
+        elapsed = time.monotonic() - started
+    finally:
+        release.set()
+        finished.wait(1)
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert status == expected_status, (status, body.get("error"))
+    assert len(native_timeouts) == 1
+    assert 0 < native_timeouts[0] <= 0.08
+    assert elapsed < 0.7
+    if expected_status == 200:
+        assert body["results"][0]["raw_text"] == hit["raw_text"]
+        assert body["results"][0]["source_identity"] == hit["source_identity"]
+        assert "retrieval preview" not in body["results_text"]
+        assert recovery_calls == []
+    else:
+        assert elapsed >= 0.3, elapsed
+        assert body["error"] == "native_mcp_unavailable"
+        assert body["results"] == []
+
+
 def test_voyage_native_timeout_skips_bm25_and_requests_recovery(monkeypatch):
     """(b) A NativeMcpTimeoutError skips SQLite BM25 fallback and calls asynchronous recovery."""
     search_calls = []

@@ -20,6 +20,13 @@ results rather than failing the whole recall. Both legs keep the same metadata f
 scan can omit keyword-only hits; with `FUNES_RECALL_METRICS=1`, `recall_fts` reports `timeout` or
 `error` instead of `done`. This budget does not reset the index or regenerate document embeddings.
 
+When a Space restores its Hub cache from `FUNES_HUB_CACHE_MOUNT`, a restored blob is initially a
+link to the remote Bucket, not local file contents. Native reads materialize each touched blob in
+the local Hub cache before serving ranges; a per-blob file lock shares that work across query and
+maintenance processes. Failed downloads preserve the old link. This copies existing immutable
+index/data files, not embeddings, and does not wait for the backfill to finish. First access still
+requires downloading the touched files and enough local disk space to hold them.
+
 The embedding provider is selected at runtime with `FUNES_EMBEDDING_PROVIDER=local|voyage`.
 `local` preserves the existing pinned BGE behavior. `voyage` sends original multilingual passages
 with `input_type=document` at index time and the original query with `input_type=query` at recall

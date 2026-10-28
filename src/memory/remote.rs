@@ -1133,13 +1133,26 @@ struct HubFetcher {
 #[async_trait]
 impl FileFetcher for HubFetcher {
     async fn fetch(&self, filename: &str) -> Result<PathBuf> {
-        self.repo
+        let path = self
+            .repo
             .download_file()
             .filename(filename)
             .revision(self.revision.clone())
             .send()
             .await
-            .with_context(|| format!("caching {filename}@{}", self.revision))
+            .with_context(|| format!("caching {filename}@{}", self.revision))?;
+        let mount = std::env::var_os("FUNES_HUB_CACHE_MOUNT").map(PathBuf::from);
+        localize_restored_blob(path, mount.as_deref(), || async {
+            self.repo
+                .download_file()
+                .filename(filename)
+                .revision(self.revision.clone())
+                .force_download(true)
+                .send()
+                .await
+                .with_context(|| format!("materializing {filename}@{}", self.revision))
+        })
+        .await
     }
 
     /// A cache entry links to a blob named by the object's expected hash rather than by the bytes
@@ -1155,6 +1168,50 @@ impl FileFetcher for HubFetcher {
         }
         Ok(())
     }
+}
+
+/// Resolve only the two local links installed by the Bucket restore, without statting the mount.
+fn restored_blob(path: &Path, mount: Option<&Path>) -> Option<PathBuf> {
+    let mount = mount.filter(|root| root.is_absolute())?;
+    let target = std::fs::read_link(path).ok()?;
+    let blob = if target.is_relative() {
+        path.parent()?.join(target)
+    } else {
+        target
+    };
+    let remote = std::fs::read_link(&blob).ok()?;
+    (remote.is_absolute()
+        && remote.starts_with(mount)
+        && !remote.components().any(|part| part == std::path::Component::ParentDir))
+    .then_some(blob)
+}
+
+async fn localize_restored_blob<F, Fut>(path: PathBuf, mount: Option<&Path>, download: F) -> Result<PathBuf>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<PathBuf>>,
+{
+    let Some(blob) = restored_blob(&path, mount) else {
+        return Ok(path);
+    };
+    // Bucket links are remote I/O, not a local cache. Coalesce across readers and maintenance;
+    // hf-hub atomically replaces the link only after its whole-file download succeeds.
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(blob.with_extension("funes-local.lock"))?;
+    loop {
+        match lock.try_lock() {
+            Ok(()) => break,
+            Err(std::fs::TryLockError::WouldBlock) => tokio::time::sleep(Duration::from_millis(25)).await,
+            Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
+        }
+    }
+    if restored_blob(&path, mount).is_none() {
+        return Ok(path);
+    }
+    download().await
 }
 
 /// Installs a [`FetchStore`] backed by a [`HubFetcher`] in front of the store Lance built for a
@@ -1217,6 +1274,143 @@ mod tests {
     use lance_index::scalar::{InvertedIndexParams, ScalarIndexParams};
     use lance_index::IndexType;
     use object_store::ObjectStoreExt;
+
+    #[cfg(unix)]
+    mod restored_cache {
+        use super::*;
+        use std::os::unix::fs::symlink;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Fixture {
+            _dir: tempfile::TempDir,
+            mount: PathBuf,
+            origin: PathBuf,
+            blob: PathBuf,
+            snapshot: PathBuf,
+        }
+
+        impl Fixture {
+            fn new() -> Self {
+                let dir = tempfile::tempdir().unwrap();
+                let mount = dir.path().join("bucket");
+                let cache = dir.path().join("cache");
+                std::fs::create_dir(&mount).unwrap();
+                std::fs::create_dir_all(cache.join("blobs")).unwrap();
+                std::fs::create_dir_all(cache.join("snapshots/revision")).unwrap();
+                let origin = mount.join("blob");
+                let blob = cache.join("blobs/hash");
+                let snapshot = cache.join("snapshots/revision/index.lance");
+                std::fs::write(&origin, b"immutable index bytes").unwrap();
+                symlink(&origin, &blob).unwrap();
+                symlink("../../blobs/hash", &snapshot).unwrap();
+                Self {
+                    _dir: dir,
+                    mount,
+                    origin,
+                    blob,
+                    snapshot,
+                }
+            }
+
+            fn finish_download(&self) -> Result<PathBuf> {
+                let incomplete = self.blob.with_extension("incomplete");
+                std::fs::write(&incomplete, b"immutable index bytes")?;
+                std::fs::rename(incomplete, &self.blob)?;
+                Ok(self.snapshot.clone())
+            }
+        }
+
+        #[test]
+        fn detects_only_configured_bucket_links_without_reading_them() {
+            let fixture = Fixture::new();
+            assert!(restored_blob(&fixture.snapshot, Some(&fixture.mount)).is_some());
+            assert!(restored_blob(&fixture.snapshot, None).is_none());
+            assert!(restored_blob(&fixture.snapshot, Some(Path::new("bucket"))).is_none());
+            assert!(restored_blob(&fixture.snapshot, Some(&fixture.mount.join("other"))).is_none());
+            std::fs::remove_file(&fixture.origin).unwrap();
+            assert!(restored_blob(&fixture.snapshot, Some(&fixture.mount)).is_some());
+            std::fs::remove_file(&fixture.blob).unwrap();
+            symlink(fixture.mount.join("../outside"), &fixture.blob).unwrap();
+            assert!(restored_blob(&fixture.snapshot, Some(&fixture.mount)).is_none());
+        }
+
+        #[tokio::test]
+        async fn local_blob_and_disabled_mount_do_not_download() {
+            let fixture = Fixture::new();
+            let path = localize_restored_blob(fixture.snapshot.clone(), None, || async {
+                panic!("disabled cache must not download")
+            })
+            .await
+            .unwrap();
+            assert_eq!(path, fixture.snapshot);
+            fixture.finish_download().unwrap();
+            localize_restored_blob(fixture.snapshot.clone(), Some(&fixture.mount), || async {
+                panic!("local cache hit must not download")
+            })
+            .await
+            .unwrap();
+        }
+
+        #[tokio::test]
+        async fn concurrent_ranges_materialize_once_and_preserve_origin() {
+            let fixture = Fixture::new();
+            let calls = AtomicUsize::new(0);
+            let results = futures::future::join_all((0..8).map(|_| {
+                localize_restored_blob(fixture.snapshot.clone(), Some(&fixture.mount), || async {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(60)).await;
+                    fixture.finish_download()
+                })
+            }))
+            .await;
+            assert!(results.iter().all(Result::is_ok));
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert!(!fixture.blob.is_symlink());
+            assert_eq!(std::fs::read(&fixture.snapshot).unwrap(), b"immutable index bytes");
+            assert_eq!(std::fs::read(&fixture.origin).unwrap(), b"immutable index bytes");
+        }
+
+        #[tokio::test]
+        async fn failed_download_preserves_link_and_allows_retry() {
+            let fixture = Fixture::new();
+            let result = localize_restored_blob(fixture.snapshot.clone(), Some(&fixture.mount), || async {
+                anyhow::bail!("download failed")
+            })
+            .await;
+            assert!(result.is_err());
+            assert!(fixture.blob.is_symlink());
+            assert_eq!(std::fs::read(&fixture.snapshot).unwrap(), b"immutable index bytes");
+            localize_restored_blob(fixture.snapshot.clone(), Some(&fixture.mount), || async {
+                fixture.finish_download()
+            })
+            .await
+            .unwrap();
+            assert!(!fixture.blob.is_symlink());
+        }
+
+        #[tokio::test]
+        async fn cancelled_download_releases_lock_and_preserves_link() {
+            let fixture = Fixture::new();
+            let result = tokio::time::timeout(
+                Duration::from_millis(30),
+                localize_restored_blob(fixture.snapshot.clone(), Some(&fixture.mount), || {
+                    std::future::pending()
+                }),
+            )
+            .await;
+            assert!(result.is_err());
+            assert!(fixture.blob.is_symlink());
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                localize_restored_blob(fixture.snapshot.clone(), Some(&fixture.mount), || async {
+                    fixture.finish_download()
+                }),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        }
+    }
 
     // Real hf-hub errors, without network credentials or Hub/Voyage calls.
     fn mock_commit_repo(

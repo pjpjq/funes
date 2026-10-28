@@ -286,9 +286,8 @@ impl Funes {
         filter: recall::FacetFilter,
         budget_ms: Option<u64>,
     ) -> Result<recall::RecallResult> {
-        let deadline = budget_ms.map(|ms| {
-            std::time::Instant::now() + std::time::Duration::from_millis(ms.min(600_000))
-        });
+        let deadline =
+            budget_ms.map(|ms| std::time::Instant::now() + std::time::Duration::from_millis(ms.min(600_000)));
         if self.pins_recall(&memory) {
             let cache = self
                 .pinned_recall
@@ -299,7 +298,14 @@ impl Funes {
             recall::recall_filtered_pinned(pinned, query, k, candidates, half_life, neighbors, filter, deadline).await
         } else {
             recall::recall_filtered_result(
-                self.memory(memory), query, k, candidates, half_life, neighbors, filter, deadline,
+                self.memory(memory),
+                query,
+                k,
+                candidates,
+                half_life,
+                neighbors,
+                filter,
+                deadline,
             )
             .await
         }
@@ -587,7 +593,9 @@ mod tests {
         let supplied: RecallRequest =
             serde_json::from_value(serde_json::json!({"query": "原文", "budget_ms": 6750})).unwrap();
         assert_eq!(supplied.budget_ms, Some(6750));
-        assert!(serde_json::from_value::<RecallRequest>(serde_json::json!({"query": "原文", "budget_ms": -1})).is_err());
+        assert!(
+            serde_json::from_value::<RecallRequest>(serde_json::json!({"query": "原文", "budget_ms": -1})).is_err()
+        );
     }
 
     #[test]

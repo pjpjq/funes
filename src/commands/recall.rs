@@ -535,7 +535,15 @@ pub(crate) async fn recall_filtered_result(
     deadline: Option<Instant>,
 ) -> Result<RecallResult> {
     let (note, memory_label, hits) = recall_hits_filtered_deadline(
-        memory, query, k, candidates, half_life, neighbors, filter, &|_| (), deadline,
+        memory,
+        query,
+        k,
+        candidates,
+        half_life,
+        neighbors,
+        filter,
+        &|_| (),
+        deadline,
     )
     .await?;
     Ok(recall_result(note, memory_label, hits))
@@ -628,7 +636,10 @@ pub async fn recall_hits_filtered(
     filter: FacetFilter,
     progress: &(dyn Fn(&str) + Sync),
 ) -> Result<(String, Option<String>, Vec<(Hit, f64)>)> {
-    recall_hits_filtered_deadline(memory, query, k, candidates, half_life, neighbors, filter, progress, None).await
+    recall_hits_filtered_deadline(
+        memory, query, k, candidates, half_life, neighbors, filter, progress, None,
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -648,7 +659,10 @@ async fn recall_hits_filtered_deadline(
     let t0 = Instant::now();
     let read = open_read(&memory).await?;
     emit_recall_metric("recall_open", "done", round_ms(t0.elapsed()));
-    recall_hits_filtered_read(&read, query, k, candidates, half_life, neighbors, filter, progress, deadline).await
+    recall_hits_filtered_read(
+        &read, query, k, candidates, half_life, neighbors, filter, progress, deadline,
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1749,10 +1763,16 @@ mod tests {
     #[test]
     fn fts_budget_uses_only_the_callers_remaining_time() {
         assert_eq!(fts_budget(None), Duration::from_secs(3));
-        assert_eq!(fts_budget(Some(Instant::now() + Duration::from_secs(10))), Duration::from_secs(3));
+        assert_eq!(
+            fts_budget(Some(Instant::now() + Duration::from_secs(10))),
+            Duration::from_secs(3)
+        );
         let remaining = fts_budget(Some(Instant::now() + Duration::from_millis(500)));
         assert!(remaining <= Duration::from_millis(250));
-        assert_eq!(fts_budget(Some(Instant::now() + Duration::from_millis(100))), Duration::ZERO);
+        assert_eq!(
+            fts_budget(Some(Instant::now() + Duration::from_millis(100))),
+            Duration::ZERO
+        );
         assert_eq!(fts_budget(Some(Instant::now())), Duration::ZERO);
     }
 
@@ -1799,9 +1819,12 @@ mod tests {
             let _guard = guard;
             std::future::pending::<Result<Vec<(u64, Hit)>>>().await
         };
-        let fts = tokio::time::timeout(Duration::from_secs(1), best_effort_fts(scan, fts_budget(Some(Instant::now() + Duration::from_millis(260)))))
-            .await
-            .expect("optional FTS must not consume the caller's whole deadline");
+        let fts = tokio::time::timeout(
+            Duration::from_secs(1),
+            best_effort_fts(scan, fts_budget(Some(Instant::now() + Duration::from_millis(260)))),
+        )
+        .await
+        .expect("optional FTS must not consume the caller's whole deadline");
         assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
         let fused = rrf_fuse(vec![(1, hit("vector-only"))], fts, 1);
         assert_eq!(fused.len(), 1);

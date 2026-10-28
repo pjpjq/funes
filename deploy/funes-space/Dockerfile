@@ -1,6 +1,6 @@
 FROM python:3.12-slim-trixie
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
-ARG FUNES_SOURCE_REV=d411f266853270b7d608cb1374bf1e898c3f8c3c
+ARG FUNES_SOURCE_REV=6228bfd728258703bf0f8e66d67c9550e8963608
 ARG FUNES_BINARY_SHA256=c99ea64c56cdf25012294988cdcd1c8f2c53e00c3b5159e24a35d36e58406071
 ARG FUNES_ARCHIVE_SHA256=9141ae08a6387614e0af5d2f63e83fed6f31b0e29adc9a5f08b4fa3d6cedde27
 ARG FUNES_BINARY_URL=https://raw.githubusercontent.com/pjpjq/funes/5c79cb504737e3d89dcea6e17f37402fdc9e0fe7/space/bin/funes-x86_64-linux.bin.zst

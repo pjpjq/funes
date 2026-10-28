@@ -33,6 +33,9 @@ after a full Space rebuild, a new worker still has to complete its first warm su
 
 Batch hydration of canonical raw text uses the same short-lived committed reader as single-record
 `get`, rather than sharing the backfill writer lock. Query deadlines and metadata filters are unchanged.
+The native RPC retains its configured timeout; hydration uses the remaining overall HTTP budget,
+not the shorter native deadline. The overall request cap remains at most 14 seconds, without
+resetting its deadline between stages.
 
 The embedding provider is selected at runtime with `FUNES_EMBEDDING_PROVIDER=local|voyage`.
 `local` preserves the existing pinned BGE behavior. `voyage` sends original multilingual passages

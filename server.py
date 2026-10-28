@@ -4343,7 +4343,7 @@ def _run_before_deadline(invoke, deadline: float, *, thread_name: str):
                     if _DEADLINE_RUNS.get(thread_name) is state:
                         _DEADLINE_RUNS.pop(thread_name, None)
 
-        # NativeMcpWorker receives the same deadline and terminates its
+        # NativeMcpWorker receives its bounded deadline and terminates its
         # subprocess on timeout. This is the final HTTP safeguard for a
         # wedged Python call or dependency that ignores its timeout.
         threading.Thread(target=runner, name=thread_name, daemon=True).start()
@@ -4363,13 +4363,14 @@ def _http_native_results(
     tuning: dict[str, object],
     deadline: float,
     *,
+    response_deadline: float,
     native_only: bool = False,
     require_source_batch: bool = False,
 ) -> list[dict]:
-    """Recall and materialize raw text within one hard HTTP deadline."""
+    """Keep the native cap while hydrating within the remaining HTTP budget."""
 
     def invoke() -> list[dict]:
-        remaining = deadline - time.monotonic()
+        remaining = min(deadline, response_deadline) - time.monotonic()
         if remaining <= 0:
             raise NativeMcpTimeoutError("native MCP request timed out")
         if native_only:
@@ -4379,14 +4380,14 @@ def _http_native_results(
                 "",
                 None,
                 limit,
-                deadline=deadline,
+                deadline=response_deadline,
                 structured_hits=hits,
                 allow_sidecar=False,
             )
         output = recall(query, k=limit, timeout=remaining, **tuning)
         return (
             materialize_native_results(
-                output, app, limit, deadline=deadline,
+                output, app, limit, deadline=response_deadline,
                 require_source_batch=require_source_batch,
             )
             if output
@@ -4396,7 +4397,7 @@ def _http_native_results(
     try:
         result = _run_before_deadline(
             invoke,
-            deadline,
+            response_deadline,
             thread_name="funes-http-native-recall",
         )
     except _DeadlineRunBusyError as exc:
@@ -5060,6 +5061,7 @@ class Handler(BaseHTTPRequestHandler):
                             native_limit,
                             tuning,
                             native_deadline,
+                            response_deadline=voyage_deadline,
                             native_only=bool(source_restore_error),
                             require_source_batch=pg_native_post_filter,
                         )

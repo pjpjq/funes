@@ -102,6 +102,28 @@ def test_sync_status_uses_single_committed_join_and_closes_reader():
     store._read_connection.assert_called_once_with(connect_timeout=3, statement_timeout=3)
 
 
+def test_get_many_reads_committed_rows_without_waiting_for_writer_lock():
+    store = object.__new__(PostgresStore)
+    store.lock = threading.RLock()
+    store.conn = mock.Mock()
+    reader = mock.Mock()
+    reader.execute.return_value.fetchall.return_value = [
+        {"source_identity": "first", "raw_text": "原始中文"},
+        {"source_identity": "second", "raw_text": "second raw"},
+    ]
+    store._read_connection = mock.Mock(return_value=reader)
+    store._row = lambda row: dict(row)
+    rows = finish_while_locked(
+        [store.lock], lambda: store.get_many(["second", "first", "second", ""])
+    )
+    assert [row["source_identity"] for row in rows] == ["second", "first"]
+    assert rows[1]["raw_text"] == "原始中文"
+    assert reader.execute.call_args.args[1] == ["second", "first"]
+    reader.close.assert_called_once_with()
+    store._read_connection.assert_called_once_with()
+    assert not store.conn.mock_calls
+
+
 @pytest.mark.parametrize("missing", [True, False])
 def test_sync_status_closes_reader_on_missing_marker_or_query_error(missing):
     store = object.__new__(PostgresStore)

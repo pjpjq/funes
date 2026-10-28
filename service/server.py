@@ -1545,12 +1545,15 @@ class Store:
     def get_many(self, identities: list[str]) -> list[dict[str, Any]]:
         """Return canonical stored rows without exceeding SQLite's bind limit."""
         unique = list(dict.fromkeys(str(value) for value in identities if value))
+        if not unique:
+            return []
         found: dict[str, dict[str, Any]] = {}
-        with self.lock:
+        # Recall hydration must not queue behind the backfill writer, just like get().
+        with closing(self._read_connection()) as reader:
             for begin in range(0, len(unique), 500):
                 current = unique[begin : begin + 500]
                 placeholders = ",".join("?" for _ in current)
-                rows = self.conn.execute(
+                rows = reader.execute(
                     f"SELECT * FROM memories WHERE source_identity IN ({placeholders})",
                     current,
                 ).fetchall()

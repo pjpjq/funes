@@ -2064,6 +2064,26 @@ mod tests {
         assert_eq!(fused[0].0.text, "vector-only");
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn blocking_fts_must_not_hold_the_vector_response_past_its_budget() {
+        let started = Instant::now();
+        let fts = best_effort_fts(
+            async {
+                std::thread::sleep(Duration::from_millis(400));
+                Ok(vec![(2, hit("late-fts"))])
+            },
+            Duration::from_millis(20),
+        )
+        .await;
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "blocking FTS held the query task beyond its deadline"
+        );
+        assert!(fts.is_empty());
+        let fused = rrf_fuse(vec![(1, hit("vector-only"))], fts, 1);
+        assert_eq!(fused[0].0.text, "vector-only");
+    }
+
     #[test]
     fn age_picks_the_coarsest_readable_unit() {
         let now = Utc.with_ymd_and_hms(2026, 7, 9, 12, 0, 0).unwrap();

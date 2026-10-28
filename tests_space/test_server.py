@@ -1025,14 +1025,16 @@ def test_search_ready_stays_200_while_source_is_unavailable(
     assert responses["/ready"][1]["error"] == source_error
 
 
-def test_search_ready_stays_200_during_active_worker_replacement(monkeypatch):
+@pytest.mark.parametrize("warm_state", ["warming", "error"])
+def test_search_ready_stays_200_during_active_worker_replacement(monkeypatch, warm_state):
     process = SimpleNamespace(poll=lambda: None)
     monkeypatch.setattr(bridge, "REMOTE", "owner/memory")
     monkeypatch.delenv("FUNES_STORAGE_REPO", raising=False)
     monkeypatch.setattr(bridge, "SOURCE_APP", None)
     monkeypatch.setattr(bridge, "MCP_WORKER", SimpleNamespace(process=process))
     monkeypatch.setattr(bridge, "_MCP_WORKER_CONFIG", bridge._native_worker_config())
-    monkeypatch.setattr(bridge, "warm_state", lambda: {"state": "warming"})
+    monkeypatch.setattr(bridge, "warm_state", lambda: {"state": warm_state})
+    monkeypatch.setattr(bridge, "request_warm", lambda *, force: {"state": warm_state})
 
     search_code, search = bridge.search_ready_payload()
     ingest_code, ingest = bridge.ready_payload()
@@ -1040,9 +1042,9 @@ def test_search_ready_stays_200_during_active_worker_replacement(monkeypatch):
     assert search_code == 200
     assert search["ok"] is True
     assert search["error"] == ""
-    assert search["native_warm"]["state"] == "warming"
+    assert search["native_warm"]["state"] == warm_state
     assert ingest_code == 503
-    assert ingest["error"] == "native_warm_warming"
+    assert ingest["error"] == "native_warm_" + warm_state
 
     monkeypatch.setattr(bridge, "_MCP_WORKER_CONFIG", ("stale",))
     assert bridge.search_ready_payload()[0] == 503
@@ -1051,18 +1053,20 @@ def test_search_ready_stays_200_during_active_worker_replacement(monkeypatch):
     assert bridge.search_ready_payload()[0] == 503
 
 
-def test_search_ready_stays_503_during_initial_warm_without_active_worker(monkeypatch):
+@pytest.mark.parametrize("warm_state", ["warming", "error"])
+def test_search_ready_stays_503_during_initial_warm_without_active_worker(monkeypatch, warm_state):
     monkeypatch.setattr(bridge, "REMOTE", "owner/memory")
     monkeypatch.delenv("FUNES_STORAGE_REPO", raising=False)
     monkeypatch.setattr(bridge, "SOURCE_APP", None)
     monkeypatch.setattr(bridge, "MCP_WORKER", None)
-    monkeypatch.setattr(bridge, "warm_state", lambda: {"state": "warming"})
+    monkeypatch.setattr(bridge, "warm_state", lambda: {"state": warm_state})
+    monkeypatch.setattr(bridge, "request_warm", lambda *, force: {"state": warm_state})
 
     code, payload = bridge.search_ready_payload()
 
     assert code == 503
     assert payload["ok"] is False
-    assert payload["error"] == "native_warm_warming"
+    assert payload["error"] == "native_warm_" + warm_state
 
 
 def test_search_ready_rejects_false_ready_without_live_worker(monkeypatch):

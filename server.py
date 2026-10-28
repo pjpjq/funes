@@ -4162,7 +4162,8 @@ def _native_worker_config() -> tuple[object, ...]:
 
 def _native_search_serviceable(warm: dict[str, object]) -> bool:
     """Return whether search has a live worker matching the current config."""
-    if warm.get("state") not in {"ready", "warming"}:
+    # A failed replacement must not withdraw the still-healthy active snapshot.
+    if warm.get("state") not in {"ready", "warming", "error"}:
         return False
     expected = _native_worker_config()
     with _MCP_WORKER_LOCK:

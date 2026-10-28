@@ -27,6 +27,10 @@ maintenance processes. Failed downloads preserve the old link. This copies exist
 index/data files, not embeddings, and does not wait for the backfill to finish. First access still
 requires downloading the touched files and enough local disk space to hold them.
 
+A failed background worker refresh leaves the matching, live old worker available for search.
+This does not waive source-filter index readiness or make a missing/dead worker serviceable;
+after a full Space rebuild, a new worker still has to complete its first warm successfully.
+
 The embedding provider is selected at runtime with `FUNES_EMBEDDING_PROVIDER=local|voyage`.
 `local` preserves the existing pinned BGE behavior. `voyage` sends original multilingual passages
 with `input_type=document` at index time and the original query with `input_type=query` at recall

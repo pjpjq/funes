@@ -1244,6 +1244,7 @@ class ServiceTests(unittest.TestCase):
         def read_while_writer_is_active():
             result["get"] = store.get("read-target")
             result["search"] = store.search("independent-reader-marker")
+            result["get_many"] = store.get_many(["read-target", "read-target", "missing"])
             read_done.set()
 
         writer = threading.Thread(target=hold_uncommitted_write)
@@ -1254,7 +1255,7 @@ class ServiceTests(unittest.TestCase):
         try:
             self.assertTrue(
                 read_done.wait(2),
-                "read-only get/search waited behind the writer Python lock",
+                "read-only get/search/get_many waited behind the writer Python lock",
             )
         finally:
             release_writer.set()
@@ -1265,6 +1266,35 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(
             result["search"][0]["source_identity"], "read-target"
         )
+        self.assertEqual(
+            [item["source_identity"] for item in result["get_many"]], ["read-target"]
+        )
+
+    def test_get_many_preserves_order_chunking_and_closes_reader_on_failure(self):
+        store = Store(self.tmp.name)
+        try:
+            store.ingest([
+                {"source_identity": "first", "raw_text": "原始中文"},
+                {"source_identity": "second", "raw_text": "second raw"},
+            ])
+            identities = ["second", "first", "second", ""] + [f"missing-{i}" for i in range(501)]
+            statements = []
+            with self.trace_read_connections(store, statements):
+                rows = store.get_many(identities)
+            self.assertEqual([row["source_identity"] for row in rows], ["second", "first"])
+            self.assertEqual(rows[1]["raw_text"], "原始中文")
+            queries = [sql for sql in statements if "SELECT * FROM memories WHERE source_identity IN" in sql]
+            self.assertEqual(len(queries), 2)
+            reader = mock.Mock()
+            reader.execute.side_effect = sqlite3.OperationalError("fixture query failure")
+            with mock.patch.object(store, "_read_connection", return_value=reader):
+                with self.assertRaisesRegex(sqlite3.OperationalError, "fixture query failure"):
+                    store.get_many(["first"])
+            reader.close.assert_called_once_with()
+            with mock.patch.object(store, "_read_connection", side_effect=AssertionError("empty lookup")):
+                self.assertEqual(store.get_many([]), [])
+        finally:
+            store.close()
 
     def test_existing_identities_is_ordered_chunked_and_selects_no_raw_payload(self):
         store = Store(self.tmp.name)

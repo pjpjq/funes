@@ -31,6 +31,9 @@ A failed background worker refresh leaves the matching, live old worker availabl
 This does not waive source-filter index readiness or make a missing/dead worker serviceable;
 after a full Space rebuild, a new worker still has to complete its first warm successfully.
 
+Batch hydration of canonical raw text uses the same short-lived committed reader as single-record
+`get`, rather than sharing the backfill writer lock. Query deadlines and metadata filters are unchanged.
+
 The embedding provider is selected at runtime with `FUNES_EMBEDDING_PROVIDER=local|voyage`.
 `local` preserves the existing pinned BGE behavior. `voyage` sends original multilingual passages
 with `input_type=document` at index time and the original query with `input_type=query` at recall

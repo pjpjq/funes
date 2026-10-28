@@ -3610,7 +3610,9 @@ def materialize_native_results(
             # A canonical native reference without its encrypted sidecar raw is
             # unsafe to render: native get would expose retrieval_text.
             continue
-        remaining = None if deadline is None else deadline - time.monotonic()
+        remaining = (
+            None if deadline is None else min(HTTP_NATIVE_TIMEOUT, deadline - time.monotonic())
+        )
         if remaining is not None and remaining <= 0:
             raise NativeMcpTimeoutError("native MCP request timed out")
         session = get(identity, timeout=remaining)

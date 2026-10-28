@@ -19,6 +19,11 @@ The BM25/FTS leg is best-effort: a scan error or a three-second scan timeout ret
 results rather than failing the whole recall. Both legs keep the same metadata filters. A timed-out
 scan can omit keyword-only hits; with `FUNES_RECALL_METRICS=1`, `recall_fts` reports `timeout` or
 `error` instead of `done`. This budget does not reset the index or regenerate document embeddings.
+The HTTP bridge passes its remaining native-call budget as MCP `budget_ms`, after reserving 250ms
+for transport. Native recall anchors that budget before opening the memory and embedding; FTS uses
+at most three seconds or the time still left after another 250ms response reserve, whichever is
+shorter. If none remains, FTS is skipped without polling the scan and the filtered vector hits are
+retained. CLI calls without this transport budget keep the existing three-second FTS cap.
 
 When a Space restores its Hub cache from `FUNES_HUB_CACHE_MOUNT`, a restored blob is initially a
 link to the remote Bucket, not local file contents. Native reads materialize each touched blob in

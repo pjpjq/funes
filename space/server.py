@@ -3994,7 +3994,17 @@ class NativeMcpWorker:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         raise NativeMcpTimeoutError("native MCP request timed out")
-                    return self._request_locked(method, params, remaining)
+                    request_params = params
+                    if method == "tools/call" and operation == "recall":
+                        # Reserve transport time; native FTS shares this call's remaining budget.
+                        request_params = {
+                            **params,
+                            "arguments": {
+                                **params["arguments"],
+                                "budget_ms": max(0, int((remaining - 0.25) * 1000)),
+                            },
+                        }
+                    return self._request_locked(method, request_params, remaining)
                 except NativeMcpTimeoutError as exc:
                     _record_native_failure(exc, self, operation, total_timeout, started_at)
                     self._stop_locked(deadline)

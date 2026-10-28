@@ -545,8 +545,13 @@ pub(crate) async fn recall_filtered_result(
     candidates: usize,
     neighbors: i64,
     filter: RecallFilter,
+    deadline: Option<Instant>,
 ) -> Result<RecallResult> {
-    let (note, hits) = recall_hits(target, query, k, candidates, neighbors, filter, &|_| ()).await?;
+    let progress = &|_: &str| ();
+    let mut search = Search::new(query, candidates, filter)?;
+    search.deadline = deadline;
+    let pools = target.into().candidates(&search, progress).await?;
+    let (note, hits) = search.rank(pools, k, neighbors, progress).await?;
     Ok(recall_result(note, hits))
 }
 
@@ -564,11 +569,13 @@ pub(crate) async fn recall_filtered_pinned(
     candidates: usize,
     neighbors: i64,
     filter: RecallFilter,
+    deadline: Option<Instant>,
 ) -> Result<RecallResult> {
     emit_recall_metric("recall_open", "start", 0.0);
     emit_recall_metric("recall_open", "done", 0.0);
     let progress = &|_: &str| ();
-    let search = Search::new(query, candidates, filter)?;
+    let mut search = Search::new(query, candidates, filter)?;
+    search.deadline = deadline;
     let mut pool = search
         .candidates_read(pinned.read.clone(), &pinned.requested_label, progress)
         .await?;
@@ -665,6 +672,7 @@ pub struct Search {
     query: String,
     qv: OnceCell<(String, Vec<f32>)>,
     candidates: usize,
+    deadline: Option<Instant>,
     /// The columns `where_clause` reads that a migration added, which an older memory lacks.
     migrated: Vec<&'static str>,
     canonical_columns: Vec<&'static str>,
@@ -727,6 +735,7 @@ impl Search {
             query,
             qv: OnceCell::new(),
             candidates,
+            deadline: None,
         })
     }
 
@@ -783,7 +792,15 @@ impl Search {
             );
         }
         progress(&format!("searching {label}…"));
-        let hits = hybrid_candidates(&read.ds, qv, &self.query, self.candidates, self.where_clause.as_deref()).await?;
+        let hits = hybrid_candidates(
+            &read.ds,
+            qv,
+            &self.query,
+            self.candidates,
+            self.where_clause.as_deref(),
+            self.deadline,
+        )
+        .await?;
         Ok(Candidates {
             ds: read.ds,
             note: read.note.unwrap_or_default(),
@@ -887,15 +904,27 @@ async fn hybrid_candidates(
     query: &str,
     candidates: usize,
     filter: Option<&str>,
+    deadline: Option<Instant>,
 ) -> Result<Vec<Hit>> {
     emit_recall_metric("recall_vector", "start", 0.0);
     let started = Instant::now();
     let vector = vector_candidates(ds, qv, candidates, filter).await?;
     emit_recall_metric("recall_vector", "done", round_ms(started.elapsed()));
 
-    let fts = best_effort_fts(fts_candidates(ds, query, candidates, filter), Duration::from_secs(3)).await;
+    let fts = best_effort_fts(fts_candidates(ds, query, candidates, filter), fts_budget(deadline)).await;
 
     Ok(rrf_fuse(vector, fts, candidates))
+}
+
+fn fts_budget(deadline: Option<Instant>) -> Duration {
+    let cap = Duration::from_secs(3);
+    deadline.map_or(cap, |deadline| {
+        cap.min(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .saturating_sub(Duration::from_millis(250)),
+        )
+    })
 }
 
 async fn best_effort_fts(
@@ -904,6 +933,10 @@ async fn best_effort_fts(
 ) -> Vec<(u64, Hit)> {
     emit_recall_metric("recall_fts", "start", 0.0);
     let started = Instant::now();
+    if budget.is_zero() {
+        emit_recall_metric("recall_fts", "timeout", 0.0);
+        return Vec::new();
+    }
     // Bound the optional scan without spawning a detached task or discarding vector hits.
     // shortcut: cancellation is cooperative; isolate the scan if profiling finds non-yielding CPU work.
     let (hits, state) = match tokio::time::timeout(budget, scan).await {
@@ -1960,6 +1993,31 @@ mod tests {
         }
     }
 
+    #[test]
+    fn fts_budget_uses_only_the_callers_remaining_time() {
+        assert_eq!(fts_budget(None), Duration::from_secs(3));
+        assert_eq!(
+            fts_budget(Some(Instant::now() + Duration::from_secs(10))),
+            Duration::from_secs(3)
+        );
+        let remaining = fts_budget(Some(Instant::now() + Duration::from_millis(500)));
+        assert!(remaining <= Duration::from_millis(250));
+        assert_eq!(
+            fts_budget(Some(Instant::now() + Duration::from_millis(100))),
+            Duration::ZERO
+        );
+        assert_eq!(fts_budget(Some(Instant::now())), Duration::ZERO);
+    }
+
+    #[tokio::test]
+    async fn exhausted_fts_budget_never_polls_the_scan_or_loses_vector_hits() {
+        let scan = async { panic!("an exhausted optional scan must not be polled") };
+        let fts = best_effort_fts(scan, fts_budget(Some(Instant::now()))).await;
+        let fused = rrf_fuse(vec![(1, hit("vector-only"))], fts, 1);
+        assert_eq!(fused.len(), 1);
+        assert_eq!(fused[0].0.text, "vector-only");
+    }
+
     #[tokio::test]
     async fn fts_deadline_preserves_successful_hybrid_fusion() {
         let fts = best_effort_fts(
@@ -1994,9 +2052,12 @@ mod tests {
             let _guard = guard;
             std::future::pending::<Result<Vec<(u64, Hit)>>>().await
         };
-        let fts = tokio::time::timeout(Duration::from_secs(1), best_effort_fts(scan, Duration::from_millis(10)))
-            .await
-            .expect("optional FTS must not consume the caller's whole deadline");
+        let fts = tokio::time::timeout(
+            Duration::from_secs(1),
+            best_effort_fts(scan, fts_budget(Some(Instant::now() + Duration::from_millis(260)))),
+        )
+        .await
+        .expect("optional FTS must not consume the caller's whole deadline");
         assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
         let fused = rrf_fuse(vec![(1, hit("vector-only"))], fts, 1);
         assert_eq!(fused.len(), 1);
@@ -2046,7 +2107,7 @@ mod tests {
         .await;
         let qv = vec![1.0; dataset::DIM as usize];
         assert_eq!(vector_candidates(&ds, &qv, 5, None).await.unwrap().len(), 1);
-        let hits = hybrid_candidates(&ds, &qv, "narwhal", 5, None).await.unwrap();
+        let hits = hybrid_candidates(&ds, &qv, "narwhal", 5, None, None).await.unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].text, "A narwhal parses transcripts.");
     }

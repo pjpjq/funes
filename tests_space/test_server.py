@@ -401,6 +401,30 @@ def test_native_mcp_timeout_is_not_retried_with_a_second_full_budget(monkeypatch
     assert 0 < request_timeouts[0] <= 12
 
 
+@pytest.mark.parametrize("remaining", [2.0, 0.125])
+@pytest.mark.parametrize("operation", ["recall", "get"])
+def test_native_recall_forwards_remaining_budget_without_mutating_arguments(
+    monkeypatch, tmp_path, remaining, operation
+):
+    worker = bridge.NativeMcpWorker("fake-funes", "owner/memory", tmp_path)
+    clock = [100.0]
+    monkeypatch.setattr(bridge.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(worker, "_ensure_started_locked", lambda _deadline: clock.__setitem__(0, 100.5))
+    calls = []
+    monkeypatch.setattr(worker, "_request_locked", lambda method, params, timeout: calls.append((params, timeout)))
+    arguments = {"query": "中文原文", "source_agent": "codex", "budget_ms": 999999}
+    params = {"name": operation, "arguments": arguments}
+
+    worker._call("tools/call", params, timeout=remaining + 0.5)
+
+    sent, timeout = calls[0]
+    expected = max(0, int((remaining - 0.25) * 1000)) if operation == "recall" else 999999
+    assert sent["arguments"] == {**arguments, "budget_ms": expected}
+    assert timeout == remaining
+    assert arguments["budget_ms"] == 999999
+    assert params["arguments"] is arguments
+
+
 def test_native_lock_wait_is_deducted_from_call_budget(monkeypatch):
     clock = [100.0]
     acquired = []

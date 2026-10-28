@@ -80,6 +80,10 @@ pub struct RecallRequest {
     )]
     pub query: String,
     #[schemars(
+        description = "Caller remaining native budget in milliseconds, capped at 600000. Bounds optional FTS within the caller's deadline; does not replace the caller's timeout."
+    )]
+    pub budget_ms: Option<u64>,
+    #[schemars(
         description = "Hits returned (default 8). Each is a verbatim passage of a few hundred tokens, so `k` is what a call costs to read."
     )]
     pub k: Option<usize>,
@@ -302,7 +306,10 @@ impl Funes {
         candidates: usize,
         neighbors: i64,
         filter: recall::RecallFilter,
+        budget_ms: Option<u64>,
     ) -> Result<recall::RecallResult> {
+        let deadline =
+            budget_ms.map(|ms| std::time::Instant::now() + std::time::Duration::from_millis(ms.min(600_000)));
         if self.pins_recall(&memory) {
             let cache = self
                 .pinned_recall
@@ -311,9 +318,10 @@ impl Funes {
             let server_memory =
                 crate::memory::Memory::parse(self.memory.as_deref().expect("pinned memory is explicit"));
             let pinned = cache.get_or_try_init(|| recall::pin_read(server_memory)).await?;
-            recall::recall_filtered_pinned(pinned, query, k, candidates, neighbors, filter).await
+            recall::recall_filtered_pinned(pinned, query, k, candidates, neighbors, filter, deadline).await
         } else {
-            recall::recall_filtered_result(self.target(memory)?, query, k, candidates, neighbors, filter).await
+            recall::recall_filtered_result(self.target(memory)?, query, k, candidates, neighbors, filter, deadline)
+                .await
         }
     }
 
@@ -325,6 +333,7 @@ impl Funes {
         Parameters(RecallRequest {
             query,
             k,
+            budget_ms,
             neighbors,
             candidates,
             block_type,
@@ -371,6 +380,7 @@ impl Funes {
                     content_type,
                     source_missing,
                 },
+                budget_ms,
             )
             .await
         {
@@ -583,8 +593,8 @@ mod tests {
         let clone = server.clone();
 
         let (first, concurrent) = tokio::join!(
-            server.recall_with_memory(None, "unused".to_string(), 1, 1, 0, absent_facet()),
-            clone.recall_with_memory(None, "unused".to_string(), 1, 1, 0, absent_facet())
+            server.recall_with_memory(None, "unused".to_string(), 1, 1, 0, absent_facet(), None),
+            clone.recall_with_memory(None, "unused".to_string(), 1, 1, 0, absent_facet(), Some(0))
         );
         let first = first.unwrap();
         let concurrent = concurrent.unwrap();
@@ -598,19 +608,39 @@ mod tests {
         // handle, while an explicit call-level override must take the ordinary fresh-open path.
         std::fs::remove_dir_all(memory.path().join("chunks.lance")).unwrap();
         let second = server
-            .recall_with_memory(None, "unused".to_string(), 1, 1, 0, absent_facet())
+            .recall_with_memory(None, "unused".to_string(), 1, 1, 0, absent_facet(), Some(u64::MAX))
             .await
             .unwrap();
         assert_eq!(second.text, recall::rendered("", &[]));
 
         let override_error = server
-            .recall_with_memory(Some(spec.clone()), "unused".to_string(), 1, 1, 0, absent_facet())
+            .recall_with_memory(
+                Some(spec.clone()),
+                "unused".to_string(),
+                1,
+                1,
+                0,
+                absent_facet(),
+                Some(1),
+            )
             .await
             .err()
             .expect("an explicit override must open afresh");
         assert_eq!(
             override_error.to_string(),
             crate::memory::Memory::parse(&spec).empty_error().to_string()
+        );
+    }
+
+    #[test]
+    fn recall_budget_is_optional_and_rejects_negative_values() {
+        let absent: RecallRequest = serde_json::from_value(serde_json::json!({"query": "原文"})).unwrap();
+        assert_eq!(absent.budget_ms, None);
+        let supplied: RecallRequest =
+            serde_json::from_value(serde_json::json!({"query": "原文", "budget_ms": 6750})).unwrap();
+        assert_eq!(supplied.budget_ms, Some(6750));
+        assert!(
+            serde_json::from_value::<RecallRequest>(serde_json::json!({"query": "原文", "budget_ms": -1})).is_err()
         );
     }
 

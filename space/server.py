@@ -3669,11 +3669,19 @@ def _native_failure_category(error: BaseException) -> str:
     return "native_error"
 
 
-def _record_native_failure(error: BaseException) -> None:
+def _record_native_failure(
+    error: BaseException, worker: "NativeMcpWorker", operation: str, timeout: float, started_at: float
+) -> None:
+    read_metrics = worker._snapshot_read_metrics()
     with _NATIVE_DIAGNOSTIC_LOCK:
         _NATIVE_LAST_FAILURE.update(
             category=_native_failure_category(error),
             at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            worker_role="active" if worker is MCP_WORKER else "candidate",
+            operation=operation if operation in ("recall", "get") else "other",
+            budget_ms=round(timeout * 1000, 2),
+            elapsed_ms=round(max(0.0, time.monotonic() - started_at) * 1000, 2),
+            read_metrics=read_metrics,
         )
 
 
@@ -3697,7 +3705,7 @@ def native_worker_status() -> dict[str, object]:
     worker_metrics = []
     if configured and isinstance(worker, NativeMcpWorker):
         worker_metrics = list(worker._read_metrics)
-    if worker_metrics:
+    if worker_metrics and not failure["category"]:
         # ``_read_metrics`` is already the bounded, redacted dict form emitted
         # by ``_snapshot_read_metrics``.  Do not feed it back through the
         # stderr-line parser: stringifying dicts would discard every metric.
@@ -3975,31 +3983,30 @@ class NativeMcpWorker:
         # the retry also covers a child that exits during initialization.
         last_error = None
         total_timeout = self.timeout if timeout is None else max(0.001, float(timeout))
-        deadline = time.monotonic() + total_timeout
+        started_at = time.monotonic()
+        deadline = started_at + total_timeout
+        operation = params.get("name", "") if method == "tools/call" else method
         with self._lock:
             for attempt in range(2):
                 try:
+                    self.reset_read_metrics()
                     self._ensure_started_locked(deadline)
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         raise NativeMcpTimeoutError("native MCP request timed out")
-                    self.reset_read_metrics()
                     return self._request_locked(method, params, remaining)
                 except NativeMcpTimeoutError as exc:
-                    read_metrics = self._snapshot_read_metrics()
-                    with _NATIVE_DIAGNOSTIC_LOCK:
-                        _NATIVE_LAST_FAILURE["read_metrics"] = read_metrics
-                    _record_native_failure(exc)
+                    _record_native_failure(exc, self, operation, total_timeout, started_at)
                     self._stop_locked(deadline)
                     raise
                 except NativeMcpProtocolError as exc:
                     # JSON-RPC errors are application-level failures. Keep
                     # the child alive instead of converting a valid tool
                     # error into a worker outage and restart churn.
-                    _record_native_failure(exc)
+                    _record_native_failure(exc, self, operation, total_timeout, started_at)
                     raise
                 except NativeMcpError as exc:
-                    _record_native_failure(exc)
+                    _record_native_failure(exc, self, operation, total_timeout, started_at)
                     last_error = exc
                     self._stop_locked(deadline)
                     if attempt == 0 and time.monotonic() < deadline:

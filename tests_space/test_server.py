@@ -1102,10 +1102,46 @@ def test_native_worker_status_preserves_already_parsed_recall_metrics(monkeypatc
     worker._process = SimpleNamespace(poll=lambda: None)
     monkeypatch.setattr(bridge, "MCP_WORKER", worker)
     monkeypatch.setattr(bridge, "_MCP_WORKER_CONFIG", bridge._native_worker_config())
+    monkeypatch.setattr(bridge, "_NATIVE_LAST_FAILURE", {"category": "", "at": None, "read_metrics": []})
 
     status = bridge.native_worker_status()
 
     assert status["last_failure"]["read_metrics"] == parsed
+
+
+@pytest.mark.parametrize("active", [True, False])
+@pytest.mark.parametrize("error_name", ["NativeMcpTimeoutError", "NativeMcpProtocolError"])
+def test_native_failure_keeps_origin_budget_and_own_metrics(monkeypatch, tmp_path, active, error_name):
+    worker = bridge.NativeMcpWorker("fake-funes", "owner/memory", tmp_path)
+    previous = bridge.NativeMcpWorker("fake-funes", "owner/memory", tmp_path)
+    clock = [100.0]
+    monkeypatch.setattr(bridge.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(bridge, "MCP_WORKER", worker if active else previous)
+    monkeypatch.setattr(bridge, "_NATIVE_LAST_FAILURE", {"category": "", "at": None, "read_metrics": []})
+    monkeypatch.setattr(worker, "_ensure_started_locked", lambda _deadline=None: None)
+    monkeypatch.setattr(worker, "_stop_locked", lambda *_args: None)
+    metric = {"stage": "recall_vector", "state": "start", "duration_ms": 0.0}
+
+    def fail(_method, _params, _timeout):
+        worker._stderr_lines.append("funes_metric " + json.dumps({"event": "recall_stage", **metric}))
+        clock[0] += 0.25
+        raise getattr(bridge, error_name)("private-query-and-token")
+
+    monkeypatch.setattr(worker, "_request_locked", fail)
+    with pytest.raises(getattr(bridge, error_name)):
+        worker.recall("private-query-and-token", timeout=7 if active else 600)
+    failure = bridge.native_worker_status()["last_failure"]
+    assert failure["worker_role"] == ("active" if active else "candidate")
+    assert failure["operation"] == "recall"
+    assert failure["budget_ms"] == (7000 if active else 600000)
+    assert failure["elapsed_ms"] == 250
+    assert failure["read_metrics"] == [metric]
+    assert "private-query-and-token" not in json.dumps(failure)
+
+    # A replacement's later metrics must not overwrite the failed request's stages.
+    previous._read_metrics = [{"stage": "recall_fts", "state": "done", "duration_ms": 1.0}]
+    monkeypatch.setattr(bridge, "MCP_WORKER", previous)
+    assert bridge.native_worker_status()["last_failure"] == failure
 
 
 def test_sync_status_non_postgres_reports_safe_error(monkeypatch):

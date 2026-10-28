@@ -37,6 +37,11 @@ The native RPC retains its configured timeout; hydration uses the remaining over
 not the shorter native deadline. The overall request cap remains at most 14 seconds, without
 resetting its deadline between stages.
 
+Native failure diagnostics retain the failed call's own stage metrics, worker role (active or
+candidate), allowlisted operation, budget and elapsed milliseconds. A later worker refresh does not
+replace that failure snapshot with unrelated stages. Query text, arguments and exception details
+are excluded; a candidate failure alone is not evidence of an HTTP search failure.
+
 The embedding provider is selected at runtime with `FUNES_EMBEDDING_PROVIDER=local|voyage`.
 `local` preserves the existing pinned BGE behavior. `voyage` sends original multilingual passages
 with `input_type=document` at index time and the original query with `input_type=query` at recall

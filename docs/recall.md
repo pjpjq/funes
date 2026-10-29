@@ -56,6 +56,11 @@ A verified worker retains its source-type filter readiness while a later mainten
 replacement warms. Unverified snapshots still fail closed; normal refresh timing is unchanged.
 PostgreSQL source-type queries recheck hydrated current metadata before returning raw passages,
 so an older native hit cannot return a source row whose type or requested facets have changed.
+Pinned native workers also report the source-type bitmap capability from their own snapshot's
+index metadata at open time. A matching index name, column ID and bitmap type permit cold-start
+filtering without waiting for another maintenance run; this does not assert zero unindexed rows
+or skip residual-tail search. Unknown metadata fails closed, and older workers retain the
+maintenance-proof path. The bridge clears this capability whenever the child stops.
 
 The embedding provider is selected at runtime with `FUNES_EMBEDDING_PROVIDER=local|voyage`.
 `local` preserves the existing pinned BGE behavior. `voyage` sends original multilingual passages

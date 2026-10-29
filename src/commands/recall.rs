@@ -66,6 +66,7 @@ pub struct Hit {
 pub(crate) struct RecallResult {
     pub text: String,
     pub hits: Vec<(Hit, f64)>,
+    pub source_type_index_ready: Option<bool>,
 }
 
 /// Matching blocks `scan` lists before it stops. What the cap dropped is always reported.
@@ -280,6 +281,7 @@ struct Read {
 pub(crate) struct PinnedRead {
     read: Read,
     requested_label: String,
+    source_type_index_ready: bool,
 }
 
 /// What a read verb does about the memory's state: query it, degrade to the local index, or point a
@@ -353,8 +355,17 @@ pub(crate) async fn pin_read(memory: Memory) -> Result<PinnedRead> {
     emit_recall_metric("recall_open", "start", 0.0);
     let t0 = Instant::now();
     let read = open_read(&memory).await?;
+    let source_type_index_ready = read.note.is_none()
+        && read.memory_label.as_deref() == Some(requested_label.as_str())
+        && crate::memory::dataset::source_type_index_ready(&read.ds)
+            .await
+            .unwrap_or(false);
     emit_recall_metric("recall_open", "done", round_ms(t0.elapsed()));
-    Ok(PinnedRead { read, requested_label })
+    Ok(PinnedRead {
+        read,
+        requested_label,
+        source_type_index_ready,
+    })
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
@@ -579,7 +590,9 @@ pub(crate) async fn recall_filtered_pinned(
         deadline,
     )
     .await?;
-    Ok(recall_result(note, memory_label, hits))
+    let mut result = recall_result(note, memory_label, hits);
+    result.source_type_index_ready = Some(pinned.source_type_index_ready);
+    Ok(result)
 }
 
 fn recall_result(note: String, memory_label: Option<String>, hits: Vec<(Hit, f64)>) -> RecallResult {
@@ -588,7 +601,11 @@ fn recall_result(note: String, memory_label: Option<String>, hits: Vec<(Hit, f64
     } else {
         crate::ui::render::recall_agent(&note, &memory_hint(memory_label.as_deref()), &hits)
     };
-    RecallResult { text, hits }
+    RecallResult {
+        text,
+        hits,
+        source_type_index_ready: None,
+    }
 }
 
 /// Run the recall pipeline over one memory: hybrid retrieval → rerank → recency reweight →

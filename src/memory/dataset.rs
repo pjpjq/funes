@@ -277,6 +277,25 @@ pub fn has_column(ds: &Dataset, column: &str) -> bool {
     Schema::from(ds.schema()).column_with_name(column).is_some()
 }
 
+/// Prove snapshot bitmap capability from metadata only, not complete coverage of appended rows.
+pub(crate) async fn source_type_index_ready(ds: &Dataset) -> Result<bool> {
+    let Some(field_id) = ds.schema().field("source_type").map(|field| field.id) else {
+        return Ok(false);
+    };
+    let indexes = ds
+        .load_indices()
+        .await
+        .context("reading source type index capability")?;
+    Ok(indexes.iter().any(|index| {
+        index.name == SOURCE_TYPE_INDEX_NAME
+            && index.fields.as_slice() == [field_id]
+            && index
+                .index_details
+                .as_ref()
+                .is_some_and(|details| details.type_url.ends_with("BitmapIndexDetails"))
+    }))
+}
+
 /// The memory's schema, metadata included, as a value to hand back to a write.
 pub fn schema_of(ds: &Dataset) -> Arc<Schema> {
     Arc::new(Schema::from(ds.schema()))
@@ -2369,7 +2388,9 @@ mod tests {
         .await
         .unwrap();
 
+        assert!(!source_type_index_ready(&ds).await.unwrap());
         build_indexes(&mut ds, |_| {}).await.unwrap();
+        assert!(source_type_index_ready(&ds).await.unwrap());
         assert!(!indexes_need_rebuild(&ds).await.unwrap());
         let original = ds.load_indices().await.unwrap();
         let source_type = original
@@ -2387,8 +2408,10 @@ mod tests {
         let schema = Schema::from(ds.schema());
 
         ds.drop_index(SOURCE_TYPE_INDEX_NAME).await.unwrap();
+        assert!(!source_type_index_ready(&ds).await.unwrap());
         assert!(indexes_need_rebuild(&ds).await.unwrap());
         assert!(ensure_required_indexes(&mut ds, |_| {}).await.unwrap());
+        assert!(source_type_index_ready(&ds).await.unwrap());
         assert!(!indexes_need_rebuild(&ds).await.unwrap());
         assert!(!ensure_required_indexes(&mut ds, |_| {}).await.unwrap());
 
@@ -2409,18 +2432,48 @@ mod tests {
         )
         .await
         .unwrap();
-        let mut options = OptimizeOptions::append();
-        options.index_names = Some(vec![
-            TEXT_INDEX_NAME.to_string(),
-            SOURCE_IDENTITY_INDEX_NAME.to_string(),
-            SOURCE_AGENT_INDEX_NAME.to_string(),
-        ]);
-        ds.optimize_indices(&options).await.unwrap();
+        assert!(source_type_index_ready(&ds).await.unwrap());
+        for index in [FTS_INDEX, SOURCE_IDENTITY_INDEX_NAME, SOURCE_AGENT_INDEX_NAME] {
+            optimize_index(&mut ds, index, 1, |_| {}).await.unwrap();
+        }
         assert!(indexes_need_rebuild(&ds).await.unwrap());
-        let mut options = OptimizeOptions::append();
-        options.index_names = Some(vec![SOURCE_TYPE_INDEX_NAME.to_string()]);
-        ds.optimize_indices(&options).await.unwrap();
+        optimize_index(&mut ds, SOURCE_TYPE_INDEX_NAME, 1, |_| {})
+            .await
+            .unwrap();
         assert!(!indexes_need_rebuild(&ds).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn source_type_capability_rejects_wrong_field_and_wrong_index_type() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().join("chunks.lance");
+        let mut ds = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(indexable_batch(0, 8))].into_iter(), indexable_schema()),
+            uri.to_str().unwrap(),
+            None,
+        )
+        .await
+        .unwrap();
+        for (column, kind, params) in [
+            (
+                "text",
+                IndexType::Bitmap,
+                ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap),
+            ),
+            ("source_type", IndexType::BTree, ScalarIndexParams::default()),
+        ] {
+            ds.create_index(
+                &[column],
+                kind,
+                Some(SOURCE_TYPE_INDEX_NAME.to_string()),
+                &params,
+                false,
+            )
+            .await
+            .unwrap();
+            assert!(!source_type_index_ready(&ds).await.unwrap());
+            ds.drop_index(SOURCE_TYPE_INDEX_NAME).await.unwrap();
+        }
     }
 
     #[tokio::test]

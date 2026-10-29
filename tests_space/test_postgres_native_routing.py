@@ -49,6 +49,78 @@ def test_source_type_filter_gate_rejects_wrong_maintenance_target(monkeypatch):
     assert bridge._source_type_prefilter_ready(app) is False
 
 
+@pytest.mark.parametrize("proof,alive,matching,expected", [
+    (True, True, True, True),
+    (False, True, True, False),
+    (None, True, True, False),
+    ("true", True, True, False),
+    (1, True, True, False),
+    (True, False, True, False),
+    (True, True, False, False),
+])
+def test_source_type_native_proof_is_bound_to_live_current_worker(
+    monkeypatch, proof, alive, matching, expected,
+):
+    app = SimpleNamespace(index_maintenance_lock=threading.Lock(), index_maintenance_state={
+        "memory": None, "profile": None, "_last_success": None,
+    })
+    worker = bridge.NativeMcpWorker("/unused", "owner/active", "/tmp/unused")
+    worker._source_type_index_ready = proof
+    worker._process = SimpleNamespace(poll=lambda: None if alive else 1)
+    monkeypatch.setattr(bridge, "_native_worker_config", lambda: ("matching",))
+    monkeypatch.setattr(bridge, "_MCP_WORKER_CONFIG", ("matching" if matching else "other",))
+    monkeypatch.setattr(bridge, "MCP_WORKER", worker)
+    assert bridge._source_type_prefilter_ready(app) is expected
+    worker._process = None
+
+
+@pytest.mark.parametrize("operation,extra,proof,is_error,expected", [
+    ("recall", {}, True, False, True),
+    ("get", {}, True, False, None),
+    ("recall", {"memory": "owner/other"}, True, False, None),
+    ("recall", {}, False, False, False),
+    ("recall", {}, None, False, False),
+    ("recall", {}, "true", False, False),
+    ("recall", {}, 1, False, False),
+    ("recall", {}, True, True, False),
+])
+def test_native_filter_proof_requires_successful_default_recall(
+    monkeypatch, operation, extra, proof, is_error, expected,
+):
+    worker = bridge.NativeMcpWorker("/unused", "owner/active", "/tmp/unused")
+    result = {"content": [{"type": "text", "text": "probe ok"}], "isError": is_error,
+              "structuredContent": {"hits": [], "source_type_index_ready": proof}}
+    monkeypatch.setattr(worker, "_ensure_started_locked", lambda _deadline: None)
+    monkeypatch.setattr(worker, "_request_locked", lambda *_args: result)
+    assert worker._call("tools/call", {
+        "name": operation, "arguments": {"query": "memory", "k": 1, **extra},
+    }) == result
+    assert worker._source_type_index_ready is expected
+
+
+def test_native_filter_proof_is_cleared_when_child_stops():
+    worker = bridge.NativeMcpWorker("/unused", "owner/active", "/tmp/unused")
+    worker._source_type_index_ready = True
+    worker._snapshot_opened_after = 200.0
+    worker.close()
+    assert worker._source_type_index_ready is None
+    assert worker._snapshot_opened_after is None
+
+
+@pytest.mark.parametrize("initial_proof", [None, True])
+def test_native_filter_response_without_proof_preserves_snapshot_state(monkeypatch, initial_proof):
+    worker = bridge.NativeMcpWorker("/unused", "owner/active", "/tmp/unused")
+    if initial_proof is not None:
+        worker._source_type_index_ready = initial_proof
+    monkeypatch.setattr(worker, "_ensure_started_locked", lambda _deadline: None)
+    monkeypatch.setattr(worker, "_request_locked", lambda *_args: {
+        "content": [{"type": "text", "text": "recall error: temporary"}],
+    })
+    with pytest.raises(bridge.NativeMcpError):
+        worker.recall("memory")
+    assert worker._source_type_index_ready is initial_proof
+
+
 @pytest.mark.parametrize(
     "maintenance_before,maintenance_success,expected",
     [(99.0, 99.0, True), (99.0, 100.5, True), (None, 100.5, False)],
@@ -443,12 +515,17 @@ def test_pg_source_type_warming_rejected_before_native_recall(
     assert state["recall_calls"] == []
 
 
+@pytest.mark.parametrize("proof_source", ["maintenance", "native"])
 def test_pg_verified_source_type_snapshot_survives_hot_swap_and_rechecks_metadata(
-    pg_filtered_search, monkeypatch,
+    pg_filtered_search, monkeypatch, proof_source,
 ):
     server, store, state, app = pg_filtered_search
-    bridge.MCP_WORKER._source_type_maintenance_success = 200.0
-    app.index_maintenance_state["_last_success"] = 300.0
+    if proof_source == "maintenance":
+        bridge.MCP_WORKER._source_type_maintenance_success = 200.0
+        app.index_maintenance_state["_last_success"] = 300.0
+    else:
+        bridge.MCP_WORKER._source_type_index_ready = True
+        app.index_maintenance_state["_last_success"] = None
     monkeypatch.setattr(bridge, "warm_state", lambda: {"state": "warming"})
     _native_fixture_results(store, state, [
         {"source_identity": "changed-type", "source_agent": "codex", "source_type": "session",
@@ -471,6 +548,22 @@ def test_pg_verified_source_type_snapshot_survives_hot_swap_and_rechecks_metadat
     tuning = state["recall_calls"][0][1]
     assert tuning["k"] == 3 and tuning["candidates"] == 6
     assert tuning["source_agent"] == "codex" and tuning["source_type"] == "memory"
+
+
+def test_pg_cold_source_type_requires_current_source_batch(pg_filtered_search):
+    _server, _store, _state, app = pg_filtered_search
+    bridge.MCP_WORKER._source_type_index_ready = True
+    app.index_maintenance_state["_last_success"] = None
+    test_pg_native_post_filter_batch_failure_is_fail_closed(
+        pg_filtered_search, {"source_type": "memory"},
+    )
+
+
+def test_native_denial_cannot_be_overridden_by_maintenance(pg_filtered_search):
+    _server, _store, _state, app = pg_filtered_search
+    for proof in (False, "true", 1):
+        bridge.MCP_WORKER._source_type_index_ready = proof
+        assert bridge._source_type_prefilter_ready(app) is False
 
 
 @pytest.mark.parametrize("filters,rejected_metadata", [

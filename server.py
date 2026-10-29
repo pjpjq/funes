@@ -517,13 +517,15 @@ def _source_type_prefilter_ready(app) -> bool:
     """Return whether the active native snapshot can authoritatively filter source_type.
 
     The source-type bitmap is maintained alongside the canonical Lance snapshot.
+    Native metadata proves this capability on that exact snapshot at cold start.
+    Legacy workers without that proof use the maintenance evidence below.
     Never serve a stale snapshot as an apparently valid filtered result: require
     a successful maintenance run for the active memory/profile and a live worker
     that was opened after that run completed.
     This proof belongs to the immutable snapshot, not to later maintenance runs.
     """
     last_success = _source_type_maintenance_success(app)
-    if last_success is None:
+    if app is None:
         return False
     expected_config = _native_worker_config()
     with _MCP_WORKER_LOCK:
@@ -538,10 +540,14 @@ def _source_type_prefilter_ready(app) -> bool:
                 return False
         except (AttributeError, OSError):
             return False
+        native_proof = getattr(worker, "_source_type_index_ready", None)
+        if native_proof is not None:
+            return native_proof is True
         opened_after = getattr(worker, "_snapshot_opened_after", None)
         maintained_at_open = getattr(worker, "_source_type_maintenance_success", last_success)
     return (
-        maintained_at_open is not None
+        last_success is not None
+        and maintained_at_open is not None
         and opened_after is not None
         and opened_after >= maintained_at_open
     )
@@ -3759,6 +3765,7 @@ class NativeMcpWorker:
         # Set only after a replacement child has completed its warm recall.
         # Handshake alone does not prove that the active Lance snapshot is open.
         self._snapshot_opened_after: float | None = None
+        self._source_type_index_ready: bool | None = None
 
     @property
     def process(self):
@@ -3827,6 +3834,8 @@ class NativeMcpWorker:
     def _stop_locked(self, deadline: float | None = None) -> None:
         process = self._process
         self._process = None
+        self._source_type_index_ready = None
+        self._snapshot_opened_after = None
         if process is None:
             return
         self._stderr_stop.set()
@@ -4018,7 +4027,16 @@ class NativeMcpWorker:
                                 "budget_ms": max(0, int((remaining - 0.25) * 1000)),
                             },
                         }
-                    return self._request_locked(method, request_params, remaining)
+                    result = self._request_locked(method, request_params, remaining)
+                    if method == "tools/call" and operation == "recall" and not params["arguments"].get("memory"):
+                        # Read proof under the child lock; another memory cannot certify this snapshot.
+                        metadata = result.get("structuredContent") if isinstance(result, dict) else None
+                        # Only absent proof is legacy; explicit denial cannot inherit old maintenance.
+                        if isinstance(metadata, dict) and "source_type_index_ready" in metadata:
+                            self._source_type_index_ready = (
+                                not result.get("isError") and metadata["source_type_index_ready"] is True
+                            )
+                    return result
                 except NativeMcpTimeoutError as exc:
                     _record_native_failure(exc, self, operation, total_timeout, started_at)
                     self._stop_locked(deadline)

@@ -24,6 +24,11 @@ for transport. Native recall anchors that budget before opening the memory and e
 at most three seconds or the time still left after another 250ms response reserve, whichever is
 shorter. If none remains, FTS is skipped without polling the scan and the filtered vector hits are
 retained. CLI calls without this transport budget keep the existing three-second FTS cap.
+The optional scan runs on an isolated thread/runtime so non-yielding FTS work cannot hold the
+query's timer. Each native worker admits one FTS scan with no queue; an occupied slot falls back to
+the same filtered vector results. Cancellation remains cooperative: a timed-out scan keeps the
+slot until its work and runtime cleanup finish, and its late result is discarded. Healthy scans
+still contribute keyword hits to the same RRF fusion; no index or checkpoint is replaced.
 
 When a Space restores its Hub cache from `FUNES_HUB_CACHE_MOUNT`, a restored blob is initially a
 link to the remote Bucket, not local file contents. Native reads materialize each touched blob in

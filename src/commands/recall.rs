@@ -18,8 +18,9 @@ use lance_index::scalar::FullTextSearchQuery;
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as _;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
-use tokio::sync::{Mutex, OnceCell};
+use tokio::sync::{oneshot, Mutex, OnceCell, Semaphore};
 
 /// Columns a [`Hit`] needs from a search scan.
 const HIT_COLS: &[&str] = &[
@@ -804,7 +805,15 @@ async fn hybrid_candidates(
     let vector = vector_candidates(ds, qv, candidates, filter).await?;
     emit_recall_metric("recall_vector", "done", round_ms(t_vec.elapsed()));
 
-    let fts = best_effort_fts(fts_candidates(ds, query, candidates, filter), fts_budget(deadline)).await;
+    let ds = ds.clone();
+    let query = query.to_owned();
+    let filter = filter.map(str::to_owned);
+    let fts = best_effort_fts(
+        async move { fts_candidates(&ds, &query, candidates, filter.as_deref()).await },
+        fts_budget(deadline),
+        FTS_SCAN_SLOT.clone(),
+    )
+    .await;
 
     Ok(rrf_fuse(vector, fts, candidates))
 }
@@ -820,9 +829,12 @@ fn fts_budget(deadline: Option<Instant>) -> Duration {
     })
 }
 
+static FTS_SCAN_SLOT: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(1)));
+
 async fn best_effort_fts(
-    scan: impl std::future::Future<Output = Result<Vec<(u64, Hit)>>>,
+    scan: impl std::future::Future<Output = Result<Vec<(u64, Hit)>>> + Send + 'static,
     budget: Duration,
+    slot: Arc<Semaphore>,
 ) -> Vec<(u64, Hit)> {
     emit_recall_metric("recall_fts", "start", 0.0);
     let started = Instant::now();
@@ -830,13 +842,46 @@ async fn best_effort_fts(
         emit_recall_metric("recall_fts", "timeout", 0.0);
         return Vec::new();
     }
+    let Ok(permit) = slot.try_acquire_owned() else {
+        emit_recall_metric("recall_fts", "error", 0.0);
+        return Vec::new();
+    };
+    let (cancel, cancelled) = oneshot::channel::<()>();
+    let (sender, receiver) = oneshot::channel();
+    // The slot follows the scan and runtime cleanup, not the caller's shorter wait.
+    // shortcut: a stuck native scan keeps one slot; use process isolation if it never returns.
+    let worker = std::thread::Builder::new().name("funes-fts".into()).spawn(move || {
+        let _permit = permit;
+        let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                let _ = sender.send(Err(anyhow::Error::from(error)));
+                return;
+            }
+        };
+        let result = runtime.block_on(async move {
+            tokio::select! {
+                biased;
+                _ = cancelled => Ok(Vec::new()),
+                result = scan => result,
+            }
+        });
+        let _ = sender.send(result);
+    });
+    if worker.is_err() {
+        emit_recall_metric("recall_fts", "error", round_ms(started.elapsed()));
+        return Vec::new();
+    }
+    // Original inline approach, retained to document why isolation is required:
     // Bound the optional scan without spawning a detached task or discarding vector hits.
     // shortcut: cancellation is cooperative; isolate the scan if profiling finds non-yielding CPU work.
-    let (hits, state) = match tokio::time::timeout(budget, scan).await {
-        Ok(Ok(hits)) => (hits, "done"),
-        Ok(Err(_)) => (Vec::new(), "error"),
+    let deadline = tokio::time::Instant::from_std(started + budget);
+    let (hits, state) = match tokio::time::timeout_at(deadline, receiver).await {
+        Ok(Ok(Ok(hits))) => (hits, "done"),
+        Ok(_) => (Vec::new(), "error"),
         Err(_) => (Vec::new(), "timeout"),
     };
+    drop(cancel);
     emit_recall_metric("recall_fts", state, round_ms(started.elapsed()));
     hits
 }
@@ -1779,7 +1824,7 @@ mod tests {
     #[tokio::test]
     async fn exhausted_fts_budget_never_polls_the_scan_or_loses_vector_hits() {
         let scan = async { panic!("an exhausted optional scan must not be polled") };
-        let fts = best_effort_fts(scan, fts_budget(Some(Instant::now()))).await;
+        let fts = best_effort_fts(scan, fts_budget(Some(Instant::now())), Arc::new(Semaphore::new(1))).await;
         let fused = rrf_fuse(vec![(1, hit("vector-only"))], fts, 1);
         assert_eq!(fused.len(), 1);
         assert_eq!(fused[0].0.text, "vector-only");
@@ -1790,6 +1835,7 @@ mod tests {
         let fts = best_effort_fts(
             async { Ok(vec![(2, hit("shared")), (3, hit("fts-only"))]) },
             Duration::from_secs(1),
+            Arc::new(Semaphore::new(1)),
         )
         .await;
         let fused = rrf_fuse(vec![(1, hit("vector-only")), (2, hit("shared"))], fts, 3);
@@ -1799,7 +1845,12 @@ mod tests {
 
     #[tokio::test]
     async fn fts_deadline_keeps_vector_hits_on_scan_error() {
-        let fts = best_effort_fts(async { Err(anyhow!("missing FTS index")) }, Duration::from_secs(1)).await;
+        let fts = best_effort_fts(
+            async { Err(anyhow!("missing FTS index")) },
+            Duration::from_secs(1),
+            Arc::new(Semaphore::new(1)),
+        )
+        .await;
         let fused = rrf_fuse(vec![(1, hit("vector-only"))], fts, 1);
         assert_eq!(fused.len(), 1);
         assert_eq!(fused[0].0.text, "vector-only");
@@ -1807,13 +1858,13 @@ mod tests {
 
     #[tokio::test]
     async fn fts_deadline_drops_stalled_scan_and_keeps_vector_hits() {
-        struct DropFlag(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        struct DropFlag(Arc<tokio::sync::Notify>);
         impl Drop for DropFlag {
             fn drop(&mut self) {
-                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+                self.0.notify_one();
             }
         }
-        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let dropped = Arc::new(tokio::sync::Notify::new());
         let guard = DropFlag(dropped.clone());
         let scan = async move {
             let _guard = guard;
@@ -1821,11 +1872,17 @@ mod tests {
         };
         let fts = tokio::time::timeout(
             Duration::from_secs(1),
-            best_effort_fts(scan, fts_budget(Some(Instant::now() + Duration::from_millis(260)))),
+            best_effort_fts(
+                scan,
+                fts_budget(Some(Instant::now() + Duration::from_millis(260))),
+                Arc::new(Semaphore::new(1)),
+            ),
         )
         .await
         .expect("optional FTS must not consume the caller's whole deadline");
-        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+        tokio::time::timeout(Duration::from_secs(1), dropped.notified())
+            .await
+            .expect("a yielding scan must observe cancellation");
         let fused = rrf_fuse(vec![(1, hit("vector-only"))], fts, 1);
         assert_eq!(fused.len(), 1);
         assert_eq!(fused[0].0.text, "vector-only");
@@ -1833,6 +1890,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn blocking_fts_must_not_hold_the_vector_response_past_its_budget() {
+        let slot = Arc::new(Semaphore::new(1));
         let started = Instant::now();
         let fts = best_effort_fts(
             async {
@@ -1840,6 +1898,7 @@ mod tests {
                 Ok(vec![(2, hit("late-fts"))])
             },
             Duration::from_millis(20),
+            slot.clone(),
         )
         .await;
         assert!(
@@ -1849,6 +1908,183 @@ mod tests {
         assert!(fts.is_empty());
         let fused = rrf_fuse(vec![(1, hit("vector-only"))], fts, 1);
         assert_eq!(fused[0].0.text, "vector-only");
+        drop(
+            tokio::time::timeout(Duration::from_secs(2), slot.acquire())
+                .await
+                .expect("the blocking scan must finish")
+                .unwrap(),
+        );
+    }
+
+    #[tokio::test]
+    async fn blocking_fts_child_cannot_starve_the_query_runtime() {
+        let slot = Arc::new(Semaphore::new(1));
+        let started = Instant::now();
+        let fts = best_effort_fts(
+            async {
+                tokio::spawn(async {
+                    std::thread::sleep(Duration::from_millis(400));
+                    Ok(vec![(2, hit("late-child"))])
+                })
+                .await?
+            },
+            Duration::from_millis(20),
+            slot.clone(),
+        )
+        .await;
+        assert!(started.elapsed() < Duration::from_millis(200));
+        assert!(fts.is_empty());
+        drop(
+            tokio::time::timeout(Duration::from_secs(2), slot.acquire())
+                .await
+                .expect("the blocking child must finish")
+                .unwrap(),
+        );
+    }
+
+    #[tokio::test]
+    async fn timed_out_fts_keeps_its_slot_and_discards_late_results() {
+        let slot = Arc::new(Semaphore::new(1));
+        let worker_slot = slot.clone();
+        let (started, started_rx) = oneshot::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let first = tokio::spawn(async move {
+            best_effort_fts(
+                async move {
+                    started.send(()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                    Ok(vec![(1, hit("stale"))])
+                },
+                Duration::from_millis(100),
+                worker_slot,
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(first.await.unwrap().is_empty());
+        assert_eq!(slot.available_permits(), 0);
+        assert!(best_effort_fts(
+            async { panic!("a busy slot must not poll another scan") },
+            Duration::from_secs(1),
+            slot.clone(),
+        )
+        .await
+        .is_empty());
+        release.send(()).unwrap();
+        drop(
+            tokio::time::timeout(Duration::from_secs(1), slot.acquire())
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+        let fresh = best_effort_fts(async { Ok(vec![(2, hit("fresh"))]) }, Duration::from_secs(1), slot).await;
+        assert_eq!(fresh.len(), 1);
+        assert_eq!(fresh[0].1.text, "fresh");
+    }
+
+    #[tokio::test]
+    async fn fts_slot_covers_blocking_child_runtime_cleanup() {
+        let slot = Arc::new(Semaphore::new(1));
+        let (started, started_rx) = oneshot::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let fts = best_effort_fts(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    started.send(()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                });
+                started_rx.await?;
+                Ok(vec![(1, hit("ready"))])
+            },
+            Duration::from_secs(1),
+            slot.clone(),
+        )
+        .await;
+        assert_eq!(fts.len(), 1);
+        assert_eq!(slot.available_permits(), 0);
+        release.send(()).unwrap();
+        drop(
+            tokio::time::timeout(Duration::from_secs(1), slot.acquire())
+                .await
+                .expect("runtime cleanup must release the slot")
+                .unwrap(),
+        );
+    }
+
+    #[tokio::test]
+    async fn isolated_fts_keeps_real_keyword_hits_and_filters_across_calls() {
+        use arrow_array::{ArrayRef, RecordBatchIterator};
+        use arrow_schema::{DataType, Field, Schema};
+        use lance::index::DatasetIndexExt;
+        use lance_index::{scalar::InvertedIndexParams, IndexType};
+
+        let memory = tempfile::tempdir().unwrap();
+        let schema = Arc::new(Schema::new(
+            HIT_COLS
+                .iter()
+                .map(|name| {
+                    Field::new(
+                        *name,
+                        if *name == "seq" {
+                            DataType::Int64
+                        } else {
+                            DataType::Utf8
+                        },
+                        false,
+                    )
+                })
+                .collect::<Vec<_>>(),
+        ));
+        let columns = HIT_COLS
+            .iter()
+            .map(|name| -> ArrayRef {
+                match *name {
+                    "seq" => Arc::new(Int64Array::from(vec![0, 1])),
+                    "text" => Arc::new(StringArray::from(vec!["needle target", "needle excluded"])),
+                    "harness" => Arc::new(StringArray::from(vec!["codex", "pi"])),
+                    _ => Arc::new(StringArray::from(vec!["fixture", "fixture"])),
+                }
+            })
+            .collect();
+        let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
+        let mut ds = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            dataset::table_uri(memory.path().to_str().unwrap()).as_str(),
+            None,
+        )
+        .await
+        .unwrap();
+        ds.create_index(
+            &["text"],
+            IndexType::Inverted,
+            None,
+            &InvertedIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+        let slot = Arc::new(Semaphore::new(1));
+        for _ in 0..2 {
+            let ds = ds.clone();
+            let hits = best_effort_fts(
+                async move { fts_candidates(&ds, "needle", 2, Some("harness = 'codex'")).await },
+                Duration::from_secs(3),
+                slot.clone(),
+            )
+            .await;
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].1.text, "needle target");
+            assert_eq!(hits[0].1.harness, "codex");
+            drop(
+                tokio::time::timeout(Duration::from_secs(1), slot.acquire())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
     }
 
     #[test]

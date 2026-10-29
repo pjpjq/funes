@@ -49,13 +49,16 @@ def test_source_type_filter_gate_rejects_wrong_maintenance_target(monkeypatch):
     assert bridge._source_type_prefilter_ready(app) is False
 
 
-@pytest.mark.parametrize("maintenance_success,expected", [(99.0, True), (100.5, False)])
+@pytest.mark.parametrize(
+    "maintenance_before,maintenance_success,expected",
+    [(99.0, 99.0, True), (99.0, 100.5, True), (None, 100.5, False)],
+)
 def test_refresh_snapshot_gate_handles_maintenance_during_warm_probe(
-    monkeypatch, tmp_path, maintenance_success, expected,
+    monkeypatch, tmp_path, maintenance_before, maintenance_success, expected,
 ):
     clock = {"now": 100.0}
     app = SimpleNamespace(index_maintenance_lock=threading.Lock(), index_maintenance_state={
-        "memory": "owner/active", "profile": "profile", "_last_success": 99.0,
+        "memory": "owner/active", "profile": "profile", "_last_success": maintenance_before,
     })
 
     class FakeWorker:
@@ -72,6 +75,7 @@ def test_refresh_snapshot_gate_handles_maintenance_during_warm_probe(
             pass
 
     monkeypatch.setattr(bridge, "HOME", tmp_path)
+    monkeypatch.setattr(bridge, "SOURCE_APP", app)
     monkeypatch.setattr(bridge, "REMOTE", "owner/active")
     monkeypatch.setattr(bridge, "embedding_profile", lambda: {"fingerprint": "profile"})
     monkeypatch.setattr(bridge, "_native_worker_config", lambda: ("matching",))
@@ -313,6 +317,7 @@ def test_supported_canonical_filters_passed_to_native_tuning_without_false_503(m
         doc_id: {
             "source_identity": doc_id,
             "raw_text": "Filtered content",
+            "source_agent": "codex",
             "source_type": "doc",
             "project": "funes",
             "repo": "funes-repo",
@@ -364,6 +369,7 @@ def test_supported_canonical_filters_passed_to_native_tuning_without_false_503(m
 
     assert status == 200
     assert body["ok"] is True
+    assert [item["source_identity"] for item in body["results"]] == [doc_id]
     assert len(recall_calls) == 1
     query, kwargs = recall_calls[0]
     assert query == "test query"
@@ -435,6 +441,36 @@ def test_pg_source_type_warming_rejected_before_native_recall(
     assert body["results"] == []
     assert body["results_text"] == ""
     assert state["recall_calls"] == []
+
+
+def test_pg_verified_source_type_snapshot_survives_hot_swap_and_rechecks_metadata(
+    pg_filtered_search, monkeypatch,
+):
+    server, store, state, app = pg_filtered_search
+    bridge.MCP_WORKER._source_type_maintenance_success = 200.0
+    app.index_maintenance_state["_last_success"] = 300.0
+    monkeypatch.setattr(bridge, "warm_state", lambda: {"state": "warming"})
+    _native_fixture_results(store, state, [
+        {"source_identity": "changed-type", "source_agent": "codex", "source_type": "session",
+         "raw_text": "CHANGED_TYPE"},
+        {"source_identity": "changed-agent", "source_agent": "pi", "source_type": "memory",
+         "raw_text": "CHANGED_AGENT"},
+        {"source_identity": "accepted", "source_agent": "codex", "source_type": "memory",
+         "raw_text": "保留的中文原文", "retrieval_text": "DERIVED_SHADOW"},
+    ])
+    status, body = _post(server, "/search", {
+        "query": "Gemini 记忆", "source_agent": "codex", "source_type": "memory", "limit": 3,
+    })
+    assert status == 200
+    assert [item["source_identity"] for item in body["results"]] == ["accepted"]
+    assert body["results_text"] == "保留的中文原文"
+    assert not any(text in json.dumps(body) for text in ("CHANGED_TYPE", "CHANGED_AGENT", "DERIVED_SHADOW"))
+    assert store.get_many_calls == [["changed-type", "changed-agent", "accepted"]]
+    assert store.get_calls == []
+    assert len(state["recall_calls"]) == 1
+    tuning = state["recall_calls"][0][1]
+    assert tuning["k"] == 3 and tuning["candidates"] == 6
+    assert tuning["source_agent"] == "codex" and tuning["source_type"] == "memory"
 
 
 @pytest.mark.parametrize("filters,rejected_metadata", [
@@ -574,13 +610,14 @@ def test_pg_native_post_filters_missing_source_never_uses_native_text(pg_filtere
     assert store.get_calls == []
 
 
-def test_pg_native_post_filter_batch_failure_is_fail_closed(pg_filtered_search):
+@pytest.mark.parametrize("filters", [{"role": "user"}, {"source_type": "memory"}])
+def test_pg_native_post_filter_batch_failure_is_fail_closed(pg_filtered_search, filters):
     server, store, state, _app = pg_filtered_search
     _native_fixture_results(store, state, [
         {"source_identity": "present", "role": "user", "raw_text": "MUST_NOT_FALL_BACK"},
     ])
     store.fail_get_many = True
-    status, body = _post(server, "/search", {"query": "test query", "role": "user"})
+    status, body = _post(server, "/search", {"query": "test query", **filters})
     assert status == 503
     assert body["error"] == "postgres_unavailable"
     assert "MUST_NOT_FALL_BACK" not in json.dumps(body)

@@ -52,6 +52,11 @@ candidate), allowlisted operation, budget and elapsed milliseconds. A later work
 replace that failure snapshot with unrelated stages. Query text, arguments and exception details
 are excluded; a candidate failure alone is not evidence of an HTTP search failure.
 
+A verified worker retains its source-type filter readiness while a later maintenance result's
+replacement warms. Unverified snapshots still fail closed; normal refresh timing is unchanged.
+PostgreSQL source-type queries recheck hydrated current metadata before returning raw passages,
+so an older native hit cannot return a source row whose type or requested facets have changed.
+
 The embedding provider is selected at runtime with `FUNES_EMBEDDING_PROVIDER=local|voyage`.
 `local` preserves the existing pinned BGE behavior. `voyage` sends original multilingual passages
 with `input_type=document` at index time and the original query with `input_type=query` at recall

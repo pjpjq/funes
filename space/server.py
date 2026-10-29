@@ -492,6 +492,27 @@ def source_fts_ready(app) -> bool:
     return bool(ready()) if callable(ready) else True
 
 
+def _source_type_maintenance_success(app) -> float | None:
+    """Return applicable maintenance evidence without looking at the active worker."""
+    lock = getattr(app, "index_maintenance_lock", None)
+    state = getattr(app, "index_maintenance_state", None)
+    if lock is None or state is None:
+        return None
+    with lock:
+        memory = state.get("memory")
+        profile = state.get("profile")
+        last_success = state.get("_last_success")
+    if not memory or memory != REMOTE or last_success is None:
+        return None
+    try:
+        expected_profile = embedding_profile()["fingerprint"]
+    except (KeyError, TypeError):
+        return None
+    if profile != expected_profile:
+        return None
+    return last_success
+
+
 def _source_type_prefilter_ready(app) -> bool:
     """Return whether the active native snapshot can authoritatively filter source_type.
 
@@ -499,22 +520,10 @@ def _source_type_prefilter_ready(app) -> bool:
     Never serve a stale snapshot as an apparently valid filtered result: require
     a successful maintenance run for the active memory/profile and a live worker
     that was opened after that run completed.
+    This proof belongs to the immutable snapshot, not to later maintenance runs.
     """
-    lock = getattr(app, "index_maintenance_lock", None)
-    state = getattr(app, "index_maintenance_state", None)
-    if lock is None or state is None:
-        return False
-    with lock:
-        memory = state.get("memory")
-        profile = state.get("profile")
-        last_success = state.get("_last_success")
-    if not memory or memory != REMOTE or last_success is None:
-        return False
-    try:
-        expected_profile = embedding_profile()["fingerprint"]
-    except (KeyError, TypeError):
-        return False
-    if profile != expected_profile:
+    last_success = _source_type_maintenance_success(app)
+    if last_success is None:
         return False
     expected_config = _native_worker_config()
     with _MCP_WORKER_LOCK:
@@ -530,7 +539,12 @@ def _source_type_prefilter_ready(app) -> bool:
         except (AttributeError, OSError):
             return False
         opened_after = getattr(worker, "_snapshot_opened_after", None)
-    return opened_after is not None and opened_after >= last_success
+        maintained_at_open = getattr(worker, "_source_type_maintenance_success", last_success)
+    return (
+        maintained_at_open is not None
+        and opened_after is not None
+        and opened_after >= maintained_at_open
+    )
 
 
 def source_state() -> dict[str, object]:
@@ -4241,6 +4255,7 @@ def _refresh_native_worker() -> None:
     """Warm a replacement child and atomically swap it with the active one."""
     global MCP_WORKER, _MCP_WORKER_CONFIG
     config = _native_worker_config()
+    maintained_at_open = _source_type_maintenance_success(SOURCE_APP)
     # A maintenance commit may complete while the warm probe is running.
     # Use a conservative lower bound on snapshot open, not probe completion.
     opened_at = time.monotonic()
@@ -4256,6 +4271,7 @@ def _refresh_native_worker() -> None:
         if probe.startswith("recall error:"):
             raise NativeMcpError("native recall failed")
         candidate._snapshot_opened_after = opened_at
+        candidate._source_type_maintenance_success = maintained_at_open
     except Exception:
         candidate.close()
         raise
@@ -4864,18 +4880,23 @@ class Handler(BaseHTTPRequestHandler):
                         },
                     )
                     return
-                pg_native_post_filter = bool(
+                pg_native_filters = bool(
                     os.getenv("FUNES_POSTGRES_DSN")
                     and embedding_provider == "voyage"
                     and not source_restore_error
                     and not sidecar_fts_ready
-                    and unsupported_native_filters
+                )
+                pg_native_post_filter = bool(
+                    pg_native_filters and unsupported_native_filters
                     and unsupported_native_filters <= NATIVE_SOURCE_POST_FILTERS
                 )
-                post_filter_bounds = (
-                    _native_source_filter_bounds(filters) if pg_native_post_filter else {}
+                validate_source_filters = pg_native_post_filter or (
+                    pg_native_filters and "source_type" in filters
                 )
-                if pg_native_post_filter and not callable(
+                post_filter_bounds = (
+                    _native_source_filter_bounds(filters) if validate_source_filters else {}
+                )
+                if validate_source_filters and not callable(
                     getattr(getattr(app, "store", None), "get_many", None)
                 ):
                     self.send_json(
@@ -5082,7 +5103,7 @@ class Handler(BaseHTTPRequestHandler):
                             native_deadline,
                             response_deadline=voyage_deadline,
                             native_only=bool(source_restore_error),
-                            require_source_batch=pg_native_post_filter,
+                            require_source_batch=validate_source_filters,
                         )
                     else:
                         out = (
@@ -5243,7 +5264,7 @@ class Handler(BaseHTTPRequestHandler):
                         if results
                         else sidecar_results
                     )
-                if pg_native_post_filter:
+                if validate_source_filters:
                     results = [
                         item for item in results
                         if _matches_native_source_filters(item, filters, post_filter_bounds)

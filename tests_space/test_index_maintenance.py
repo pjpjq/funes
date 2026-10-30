@@ -31,7 +31,7 @@ def setup(monkeypatch):
     monkeypatch.setattr(bridge, "index_embedding_profile", lambda: {"fingerprint": "active"})
     monkeypatch.setattr(bridge, "embedding_profile", lambda: {"fingerprint": "active"})
     calls, refreshes = [], []
-    monkeypatch.setattr(bridge, "optimize_native_index", lambda memory, profile: calls.append((memory, profile)) or True)
+    monkeypatch.setattr(bridge, "optimize_native_index", lambda memory, profile, **kwargs: calls.append((memory, profile)) or True)
     monkeypatch.setattr(bridge, "_request_canonical_refresh", lambda app, **kwargs: refreshes.append(kwargs))
     return app, clock, calls, refreshes
 
@@ -87,7 +87,7 @@ def test_time_below_threshold_preserves_dirty_documents(setup):
 
 def test_failed_attempt_cools_from_finish_and_keeps_all_dirty_rows(setup, monkeypatch):
     app, clock, calls, refreshes = setup
-    def fail(*_args):
+    def fail(*_args, **_kwargs):
         clock[0] += 900
         return False
     monkeypatch.setattr(bridge, "optimize_native_index", fail)
@@ -98,7 +98,7 @@ def test_failed_attempt_cools_from_finish_and_keeps_all_dirty_rows(setup, monkey
     assert state["last_error"] == "native_optimize_failed"
     assert state["last_duration_ms"] == 900000
     assert not refreshes
-    monkeypatch.setattr(bridge, "optimize_native_index", lambda *_: calls.append(True) or True)
+    monkeypatch.setattr(bridge, "optimize_native_index", lambda *_, **kwargs: calls.append(True) or True)
     clock[0] += 299
     assert not cycle(app, 2)
     assert not calls
@@ -111,7 +111,7 @@ def test_failed_attempt_cools_from_finish_and_keeps_all_dirty_rows(setup, monkey
 
 def test_exception_is_redacted_and_retryable(setup, monkeypatch):
     app, _, _, refreshes = setup
-    def fail(*_args):
+    def fail(*_args, **_kwargs):
         raise RuntimeError("secret-raw-session")
     monkeypatch.setattr(bridge, "optimize_native_index", fail)
     assert not cycle(app, 5)
@@ -164,7 +164,7 @@ def test_build_target_mismatch_does_not_refresh_active_worker(setup, monkeypatch
 def test_native_writes_serialized_but_raw_write_lock_is_free(setup, monkeypatch):
     app, _, _, _ = setup
     observed = []
-    def optimize(*_args):
+    def optimize(*_args, **_kwargs):
         def probe():
             raw = bridge.WRITE_LOCK.acquire(timeout=0.05)
             native = bridge.NATIVE_WRITE_LOCK.acquire(timeout=0.05)
@@ -191,7 +191,7 @@ def test_background_invokes_maintenance_after_durable_reconcile(setup, monkeypat
     def reconcile(_app):
         order.append("durable_reconcile")
         return {"attempted": 7, "indexed": 7, "held": 0, "durable": True}
-    def optimize(*_args):
+    def optimize(*_args, **_kwargs):
         order.append("maintenance")
         app.canonical_index_stop.set()
         return True
@@ -223,3 +223,56 @@ def test_settings_defaults_and_invalid_values():
         "FUNES_CANONICAL_MAINTENANCE_ROWS": "bad",
     })["enabled"] is False
     assert bridge._index_maintenance_settings({"FUNES_CANONICAL_MAINTENANCE_ROWS": "bad"})["document_threshold"] == 2048
+
+
+def test_optimize_diagnostics_are_bounded_and_preserve_bool_contract(monkeypatch):
+    for code, stderr, expected in [
+        (1, "Error: No space left on device /private/raw-session hf_secret", "disk_full"),
+        (1, "http_status=429 private-provider-response", "hf_http_429"),
+        (-9, "private-session-output", "native_signal_9"),
+        (1, "private-unrecognized-error", "native_exit"),
+        (0, "private-success-output", None),
+    ]:
+        monkeypatch.setattr(bridge, "run", lambda *args, **kwargs: (code, "private-stdout", stderr))
+        diagnostics = {"stale": "private-old-diagnostic"}
+        assert bridge.optimize_native_index("owner/memory", {"fingerprint": "active"}, diagnostics=diagnostics) is (code == 0)
+        assert diagnostics == {"exit_code": code, "error": expected}
+
+
+def test_optimize_exception_diagnostics_never_include_arguments(monkeypatch):
+    for error, expected in [
+        (bridge.subprocess.TimeoutExpired(["native", "private-memory"], 3600, output="private-output", stderr="private-stderr"), "native_timeout"),
+        (OSError("private-path hf_secret"), "native_process_error"),
+    ]:
+        def fail(*args, **kwargs):
+            raise error
+        monkeypatch.setattr(bridge, "run", fail)
+        diagnostics = {}
+        assert bridge.optimize_native_index("owner/memory", {"fingerprint": "active"}, diagnostics=diagnostics) is False
+        assert diagnostics == {"exit_code": None, "error": expected}
+
+
+def test_maintenance_exposes_safe_native_failure_and_keeps_dirty_rows(setup, monkeypatch):
+    app, _, _, refreshes = setup
+    monkeypatch.setattr(bridge, "optimize_native_index", ORIGINAL_OPTIMIZE)
+    monkeypatch.setattr(bridge, "run", lambda *args, **kwargs: (1, "private-stdout", "No space left on device /private/raw hf_secret"))
+    assert not cycle(app, 10)
+    state = bridge.index_maintenance_state(app)
+    assert state["last_error"] == "disk_full"
+    assert state["last_diagnostics"] == {"exit_code": 1, "error": "disk_full"}
+    assert state["pending_documents"] == 10 and state["failures"] == 1
+    assert not refreshes and "private" not in str(state)
+
+
+def test_maintenance_target_change_clears_previous_diagnostics(setup):
+    app, _, calls, _ = setup
+    app.index_maintenance_state.update(
+        memory="owner/old", profile="old", pending_documents=10,
+        last_diagnostics={"exit_code": 1, "error": "disk_full"},
+    )
+    assert not cycle(app, 0)
+    assert bridge.index_maintenance_state(app)["last_diagnostics"] is None
+    assert not calls
+
+
+ORIGINAL_OPTIMIZE = bridge.optimize_native_index

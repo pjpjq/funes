@@ -62,6 +62,10 @@ filtering without waiting for another maintenance run; this does not assert zero
 or skip residual-tail search. Unknown metadata fails closed, and older workers retain the
 maintenance-proof path. The bridge clears this capability whenever the child stops.
 
+Authenticated sync status includes maintenance `last_diagnostics`: the native exit code and a
+bounded failure category, never stdout, stderr, paths or credentials. Maintenance failures retain
+dirty work and the existing retry cooldown; they do not clear source checkpoints or stop queries.
+
 The embedding provider is selected at runtime with `FUNES_EMBEDDING_PROVIDER=local|voyage`.
 `local` preserves the existing pinned BGE behavior. `voyage` sends original multilingual passages
 with `input_type=document` at index time and the original query with `input_type=query` at recall

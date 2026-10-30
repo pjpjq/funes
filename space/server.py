@@ -2705,6 +2705,7 @@ def _initialize_canonical_reconcile_state(app) -> None:
         "last_duration_ms": None,
         "last_error": None,
         "successes": 0,
+        "last_diagnostics": None,
         "failures": 0,
         "_last_attempt": None,
         "_last_success": None,
@@ -2759,6 +2760,7 @@ def _maybe_maintain_canonical_index(app, result: dict[str, object]) -> bool:
             state.update(
                 memory=memory, profile=profile["fingerprint"], pending_documents=0,
                 _last_attempt=None, _last_success=None, last_error=None,
+                last_diagnostics=None,
             )
         state["pending_documents"] += max(0, indexed)
         pending = state["pending_documents"]
@@ -2775,13 +2777,14 @@ def _maybe_maintain_canonical_index(app, result: dict[str, object]) -> bool:
         state.update(active=True, last_started_at=utc_now(), _last_attempt=now)
     _canonical_reconcile_phase(app, "index_maintenance")
     error = None
+    diagnostics: dict[str, object] = {}
     try:
         # No WRITE_LOCK: PostgreSQL/raw ingestion remains available while the
         # native command processes stored vectors (no embedding generation).
         with NATIVE_WRITE_LOCK:
-            optimized = optimize_native_index(memory, profile)
+            optimized = optimize_native_index(memory, profile, diagnostics=diagnostics)
         if not optimized:
-            error = "native_optimize_failed"
+            error = diagnostics.get("error") or "native_optimize_failed"
     except Exception as exc:
         optimized = False
         error = _canonical_error_code(exc)
@@ -2790,6 +2793,7 @@ def _maybe_maintain_canonical_index(app, result: dict[str, object]) -> bool:
         state.update(
             active=False, last_finished_at=utc_now(),
             last_duration_ms=max(0, round((finished - now) * 1000)), last_error=error,
+            last_diagnostics=diagnostics or None,
         )
         if optimized:
             state.update(
@@ -3165,19 +3169,31 @@ def _reconcile_canonical_index_body(
 def optimize_native_index(
     memory: str | None = None,
     profile: dict[str, object] | None = None,
+    *,
+    diagnostics: dict[str, object] | None = None,
 ) -> bool:
     """Optimize the committed remote index without rebuilding local fallback state."""
     memory = memory or index_memory()
     profile = profile or index_embedding_profile()
+    if diagnostics is not None:
+        diagnostics.clear()
     try:
-        code, _, _ = run(
+        code, _, stderr = run(
             "optimize-index",
             memory,
             timeout=CANONICAL_OPTIMIZE_TIMEOUT,
             profile=profile,
         )
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError) as exc:
+        if diagnostics is not None:
+            diagnostics.update(exit_code=None, error=_canonical_error_code(exc))
         return False
+    if diagnostics is not None:
+        # Keep only bounded labels and the exit status, never native output.
+        error = None if code == 0 else (
+            f"native_signal_{-code}" if code < 0 else _native_failure_code(stderr)
+        )
+        diagnostics.update(exit_code=code, error=error)
     return code == 0
 
 

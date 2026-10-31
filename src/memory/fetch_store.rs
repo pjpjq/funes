@@ -19,7 +19,9 @@
 //! forwarded by hand, intercepting only the reads.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock};
+use std::time::Instant;
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -42,6 +44,105 @@ pub(crate) trait FileFetcher: std::fmt::Debug + Send + Sync {
     async fn discard(&self, path: &Path) -> anyhow::Result<()>;
 }
 
+#[derive(Default)]
+struct ReadIoCounter {
+    active: AtomicU64,
+    calls: AtomicU64,
+    elapsed_ms: AtomicU64,
+}
+
+static READ_IO_ENABLED: LazyLock<bool> = LazyLock::new(|| {
+    matches!(
+        std::env::var("FUNES_RECALL_METRICS")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+});
+static FETCH_IO: LazyLock<ReadIoCounter> = LazyLock::new(ReadIoCounter::default);
+static CACHE_WAIT_IO: LazyLock<ReadIoCounter> = LazyLock::new(ReadIoCounter::default);
+static MATERIALIZE_IO: LazyLock<ReadIoCounter> = LazyLock::new(ReadIoCounter::default);
+static FALLBACK_IO: LazyLock<ReadIoCounter> = LazyLock::new(ReadIoCounter::default);
+static REQUESTED_BYTES: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) enum ReadIoKind {
+    Fetch,
+    CacheWait,
+    Materialize,
+    Fallback,
+}
+
+pub(crate) struct ReadIoGuard<'a> {
+    counter: &'a ReadIoCounter,
+    started: Instant,
+}
+
+impl ReadIoCounter {
+    fn enter(&self) -> ReadIoGuard<'_> {
+        self.active.fetch_add(1, Ordering::Relaxed);
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        ReadIoGuard {
+            counter: self,
+            started: Instant::now(),
+        }
+    }
+}
+
+impl Drop for ReadIoGuard<'_> {
+    fn drop(&mut self) {
+        let elapsed = self.started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+        self.counter.elapsed_ms.fetch_add(elapsed, Ordering::Relaxed);
+        self.counter.active.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+pub(crate) fn track_read_io(kind: ReadIoKind) -> Option<ReadIoGuard<'static>> {
+    if !*READ_IO_ENABLED {
+        return None;
+    }
+    let counter: &ReadIoCounter = match kind {
+        ReadIoKind::Fetch => &FETCH_IO,
+        ReadIoKind::CacheWait => &CACHE_WAIT_IO,
+        ReadIoKind::Materialize => &MATERIALIZE_IO,
+        ReadIoKind::Fallback => &FALLBACK_IO,
+    };
+    Some(counter.enter())
+}
+
+/// Process aggregates, not per-query attribution; completed intervals may overlap.
+#[derive(serde::Serialize)]
+pub(crate) struct ReadIoSnapshot {
+    fetch_active: u64,
+    fetch_calls: u64,
+    fetch_ms: u64,
+    cache_wait_active: u64,
+    cache_wait_ms: u64,
+    materialize_active: u64,
+    materialize_ms: u64,
+    fallback_active: u64,
+    fallback_calls: u64,
+    fallback_ms: u64,
+    requested_bytes: u64,
+}
+
+pub(crate) fn read_io_snapshot() -> ReadIoSnapshot {
+    ReadIoSnapshot {
+        fetch_active: FETCH_IO.active.load(Ordering::Relaxed),
+        fetch_calls: FETCH_IO.calls.load(Ordering::Relaxed),
+        fetch_ms: FETCH_IO.elapsed_ms.load(Ordering::Relaxed),
+        cache_wait_active: CACHE_WAIT_IO.active.load(Ordering::Relaxed),
+        cache_wait_ms: CACHE_WAIT_IO.elapsed_ms.load(Ordering::Relaxed),
+        materialize_active: MATERIALIZE_IO.active.load(Ordering::Relaxed),
+        materialize_ms: MATERIALIZE_IO.elapsed_ms.load(Ordering::Relaxed),
+        fallback_active: FALLBACK_IO.active.load(Ordering::Relaxed),
+        fallback_calls: FALLBACK_IO.calls.load(Ordering::Relaxed),
+        fallback_ms: FALLBACK_IO.elapsed_ms.load(Ordering::Relaxed),
+        requested_bytes: REQUESTED_BYTES.load(Ordering::Relaxed),
+    }
+}
+
 /// Reads are served from the whole file `fetcher` supplies for the key; every other method delegates
 /// to `inner` (also the live fallback when a fetch fails).
 #[derive(Debug)]
@@ -56,16 +157,26 @@ impl FetchStore {
         Self { inner, fetcher }
     }
 
+    async fn fetch(&self, location: &OPath) -> anyhow::Result<PathBuf> {
+        let _read = track_read_io(ReadIoKind::Fetch);
+        self.fetcher.fetch(location.as_ref()).await
+    }
+
+    async fn fallback(&self, location: &OPath, options: GetOptions) -> OSResult<GetResult> {
+        let _read = track_read_io(ReadIoKind::Fallback);
+        self.inner.get_opts(location, options).await
+    }
+
     /// Serve `location` from a copy obtained after discarding `corrupt`, at most one discard per read.
     async fn repair(&self, corrupt: &Path, location: &OPath, options: GetOptions) -> OSResult<GetResult> {
         if self.fetcher.discard(corrupt).await.is_ok() {
-            if let Ok(fresh) = self.fetcher.fetch(location.as_ref()).await {
+            if let Ok(fresh) = self.fetch(location).await {
                 if let Ok(result) = serve_from_file(&fresh, location, &options) {
                     return Ok(result);
                 }
             }
         }
-        self.inner.get_opts(location, options).await
+        self.fallback(location, options).await
     }
 }
 
@@ -79,13 +190,13 @@ impl std::fmt::Display for FetchStore {
 impl OSObjectStore for FetchStore {
     async fn get_opts(&self, location: &OPath, options: GetOptions) -> OSResult<GetResult> {
         // A transient fetch or read failure falls back to the inner store, so it never breaks a read.
-        let Ok(path) = self.fetcher.fetch(location.as_ref()).await else {
-            return self.inner.get_opts(location, options).await;
+        let Ok(path) = self.fetch(location).await else {
+            return self.fallback(location, options).await;
         };
         match serve_from_file(&path, location, &options) {
             Ok(result) => Ok(result),
             Err(Unservable::Corrupt) => self.repair(&path, location, options).await,
-            Err(Unservable::Unreadable) => self.inner.get_opts(location, options).await,
+            Err(Unservable::Unreadable) => self.fallback(location, options).await,
         }
     }
 
@@ -146,6 +257,9 @@ fn serve_from_file(path: &Path, location: &OPath, options: &GetOptions) -> Resul
         Some(requested) => requested.as_range(total).map_err(|_| Unservable::Corrupt)?,
     };
     let file = std::fs::File::open(path).map_err(|_| Unservable::Unreadable)?;
+    if *READ_IO_ENABLED {
+        REQUESTED_BYTES.fetch_add(range.end - range.start, Ordering::Relaxed);
+    }
     Ok(GetResult {
         payload: GetResultPayload::File(file, path.to_path_buf()),
         meta,
@@ -173,6 +287,33 @@ mod tests {
     use object_store::memory::InMemory;
     use object_store::GetRange;
     use tempfile::TempDir;
+
+    #[test]
+    fn read_io_guard_releases_active_count_without_resetting_totals() {
+        let counter = ReadIoCounter::default();
+        let first = counter.enter();
+        let second = counter.enter();
+        assert_eq!(counter.active.load(Ordering::Relaxed), 2);
+        drop(first);
+        assert_eq!(counter.active.load(Ordering::Relaxed), 1);
+        drop(second);
+        assert_eq!(counter.active.load(Ordering::Relaxed), 0);
+        assert_eq!(counter.calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn cancelled_read_future_releases_diagnostic_guard() {
+        let counter = ReadIoCounter::default();
+        let read = async {
+            let _guard = counter.enter();
+            std::future::pending::<()>().await;
+        };
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(5), read)
+            .await
+            .is_err());
+        assert_eq!(counter.active.load(Ordering::Relaxed), 0);
+        assert_eq!(counter.calls.load(Ordering::Relaxed), 1);
+    }
 
     /// A fake fetcher: writes each requested file to a temp dir from a fixed body and returns its
     /// path, counting fetches so a test can assert how often the fetch path was taken. A filename not

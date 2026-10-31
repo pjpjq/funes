@@ -335,7 +335,85 @@ def test_mcp_recall_returns_null_instead_of_json_rpc_error_when_unavailable(
 
     response = json.loads(stdout.getvalue())
     assert "error" not in response
-    assert response["result"]["content"][0]["text"] == "null"
+    assert response["result"]["isError"] is True
+    assert response["result"]["content"][0]["text"] == "Funes remote connection failed"
+
+
+def test_mcp_recall_returns_is_error_when_remote_returns_200_null(monkeypatch):
+    monkeypatch.setenv("FUNES_REMOTE_URL", "https://memory.example")
+    monkeypatch.setenv("FUNES_API_TOKEN", "api-token")
+    for name in (
+        "FUNES_REMOTE_TIMEOUT",
+        "FUNES_REMOTE_ATTEMPTS",
+        "FUNES_REMOTE_ATTEMPT_TIMEOUT",
+        "FUNES_REMOTE_READY_TIMEOUT",
+        "FUNES_REMOTE_READY_POLLS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(
+        bridge, "_open_remote", lambda _req, timeout: _Response(None, status=200)
+    )
+    monkeypatch.setattr(bridge.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        bridge.sys,
+        "stdin",
+        io.StringIO(
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "recall",
+                        "arguments": {"query": "previous decision"},
+                    },
+                }
+            )
+            + chr(10)
+        ),
+    )
+    stdout = io.StringIO()
+    monkeypatch.setattr(bridge.sys, "stdout", stdout)
+
+    bridge.serve(SimpleNamespace())
+
+    response = json.loads(stdout.getvalue())
+    assert "error" not in response
+    assert response["result"]["isError"] is True
+    assert (
+        response["result"]["content"][0]["text"]
+        == "Funes remote returned invalid null response"
+    )
+
+
+def test_remote_search_returns_none_when_remote_returns_200_null(monkeypatch):
+    monkeypatch.setenv("FUNES_REMOTE_URL", "https://memory.example")
+    monkeypatch.setenv("FUNES_API_TOKEN", "api-token")
+    for name in (
+        "FUNES_REMOTE_TIMEOUT",
+        "FUNES_REMOTE_ATTEMPTS",
+        "FUNES_REMOTE_ATTEMPT_TIMEOUT",
+        "FUNES_REMOTE_READY_TIMEOUT",
+        "FUNES_REMOTE_READY_POLLS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    calls = []
+
+    def fake_urlopen(req, timeout):
+        calls.append((req.full_url, req.method, timeout))
+        return _Response(None, status=200)
+
+    monkeypatch.setattr(bridge, "_open_remote", fake_urlopen)
+    monkeypatch.setattr(bridge.time, "sleep", lambda _seconds: None)
+
+    result = bridge._remote_call("/search", {"query": "previous"})
+    assert result is None
+    last_err = bridge._get_last_recall_error()
+    assert isinstance(last_err, RuntimeError)
+    assert (
+        bridge._sanitize_recall_error(last_err)
+        == "Funes remote returned invalid null response"
+    )
 
 
 def test_remote_call_does_not_retry_auth_failure(monkeypatch):

@@ -37,6 +37,21 @@ One publish per memory at a time on a machine: a push that starts while another 
 says so and stops, and the next one picks up what it left. The hooks [`funes add`](add.md) installs
 run this at session boundaries automatically; see [automation.md](automation.md).
 
+### Hub file layout and compatibility
+
+New files appended to an existing remote Lance table are stored under
+`__funes_shards__/v1/<bucket>/<logical-path>`, with a deterministic SHA-256 bucket. Funes presents
+the original logical paths to Lance, merging these new files with the unchanged flat history.
+This avoids the Hub's per-directory file limit without deleting old manifests, transactions, or
+vectors. Data uploads still precede the manifest, transaction, and version-hint activation commit.
+
+The first publish remains a standard flat Lance dataset. After a sharded append, readers need a
+Funes version that understands this layout (including the deployed HTTP/MCP bridge). A plain
+Lance client or older Funes binary can only see the last flat snapshot; rolling back to such a
+binary does not roll back the underlying data. Keep the sharded reader when restoring or
+rebuilding derived indexes. No local-only shard inventory is required for recovery: it is
+reconstructed from the pinned Hub revision.
+
 ## Keeping secrets out: the gate and `funes scrub`
 
 When TruffleHog is available, indexing redacts detected credentials before storing a session. That

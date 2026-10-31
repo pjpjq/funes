@@ -311,16 +311,76 @@ def _retry_after(exc, attempt, recall=False):
     return exponential
 
 
+_RECALL_STATE = threading.local()
+
+
+def _set_last_recall_error(exc: BaseException | None) -> None:
+    _RECALL_STATE.last_error = exc
+
+
+def _get_last_recall_error() -> BaseException | None:
+    return getattr(_RECALL_STATE, "last_error", None)
+
+
+def _clear_last_recall_error() -> None:
+    _RECALL_STATE.last_error = None
+
+
+def _sanitize_recall_error(exc: BaseException | None) -> str:
+    if exc is None:
+        return "Funes remote request failed"
+    if isinstance(exc, error.HTTPError):
+        if exc.code in (401, 403):
+            return f"Funes remote authentication failed (HTTP {exc.code})"
+        if exc.code == 429:
+            return "Funes remote rate limited the request (HTTP 429)"
+        if exc.code == 408:
+            return "Funes remote request timed out (HTTP 408)"
+        if exc.code >= 500:
+            return f"Funes remote unavailable (HTTP {exc.code})"
+        return f"Funes remote request failed (HTTP {exc.code})"
+    if isinstance(exc, TimeoutError):
+        return "Funes remote request timed out"
+    if isinstance(exc, error.URLError):
+        reason = getattr(exc, "reason", None)
+        if isinstance(reason, TimeoutError) or "timed out" in str(reason).lower():
+            return "Funes remote request timed out"
+        return "Funes remote connection failed"
+    if isinstance(exc, RuntimeError):
+        msg = str(exc)
+        if msg in ("remote returned invalid null response", "remote returned an empty response"):
+            return f"Funes {msg}"
+        if "warming" in msg.lower():
+            return "Funes remote is still warming"
+        if "not configured" in msg.lower():
+            return msg
+        return "Funes remote request failed"
+    if isinstance(exc, ValueError):
+        return "Funes remote returned invalid JSON"
+    if isinstance(exc, OSError):
+        if "timed out" in str(exc).lower():
+            return "Funes remote request timed out"
+        return "Funes remote connection failed"
+    return "Funes remote request failed"
+
+
 def _remote_call(path, payload):
     config = Config.load()
     base=(os.environ.get("FUNES_REMOTE_URL") or config.remote_url).rstrip("/")
     token=os.environ.get("FUNES_API_TOKEN", "") or _keychain("funes-api-token")
     hub_token=os.environ.get("FUNES_HF_TOKEN", "") or os.environ.get("HF_TOKEN", "") or _keychain("funes-hf-token")
+    recall = path in ("/search", "/recall")
+    if recall:
+        _clear_last_recall_error()
     if not base or not token:
+        if recall:
+            if not base:
+                _set_last_recall_error(RuntimeError("Funes remote URL is not configured"))
+            else:
+                _set_last_recall_error(RuntimeError("Funes remote API token is not configured"))
         return None
     _validated_url(base)
     headers = _auth_headers(token, hub_token)
-    recall = path in ("/search", "/recall")
     if recall:
         total = _first_float_env(
             ["FUNES_REMOTE_RECALL_TIMEOUT", "FUNES_REMOTE_SEARCH_TIMEOUT"],
@@ -364,12 +424,15 @@ def _remote_call(path, payload):
             base, headers, deadline, default_timeout=2, default_polls=1
         )
         if state == "warming" and time.monotonic() >= deadline:
+            _set_last_recall_error(RuntimeError("Funes remote is still warming"))
             return None
 
     last = None
     for attempt in range(attempts):
         remaining = deadline - time.monotonic()
         if remaining <= 0:
+            if last is None:
+                last = TimeoutError("Funes remote request timed out")
             break
         req=request.Request(
             base+path,
@@ -382,7 +445,10 @@ def _remote_call(path, payload):
                 raw = resp.read()
             if not raw:
                 raise RuntimeError("remote returned an empty response")
-            return json.loads(raw)
+            value = json.loads(raw)
+            if value is None:
+                raise RuntimeError("remote returned invalid null response")
+            return value
         except error.HTTPError as exc:
             # Authentication and malformed requests are caller errors; retry
             # only transient gateway/provider failures.
@@ -396,6 +462,7 @@ def _remote_call(path, payload):
             if delay:
                 time.sleep(delay)
     if recall:
+        _set_last_recall_error(last)
         return None
     raise RuntimeError("remote request failed after retries") from last
 
@@ -412,13 +479,25 @@ def serve(store=None):
             elif method=="tools/call":
                 name=p.get("name"); args=p.get("arguments") or {}
                 if remote:
-                    if name=="recall": val=_remote_call("/search", args)
-                    elif name=="get": val=_remote_call("/get", {"source_identity":args.get("record_id","")})
-                    elif name=="status": val=_remote_call("/sync/status", {})
-                    else: val={"error":"unknown_tool"}
+                    if name=="recall":
+                        val=_remote_call("/search", args)
+                        if val is None:
+                            err_msg=_sanitize_recall_error(_get_last_recall_error())
+                            result={"content":[{"type":"text","text":err_msg}],"isError":True}
+                        else:
+                            result={"content":[{"type":"text","text":json.dumps(val,ensure_ascii=False)}]}
+                    elif name=="get":
+                        val=_remote_call("/get", {"source_identity":args.get("record_id","")})
+                        result={"content":[{"type":"text","text":json.dumps(val,ensure_ascii=False)}]}
+                    elif name=="status":
+                        val=_remote_call("/sync/status", {})
+                        result={"content":[{"type":"text","text":json.dumps(val,ensure_ascii=False)}]}
+                    else:
+                        val={"error":"unknown_tool"}
+                        result={"content":[{"type":"text","text":json.dumps(val,ensure_ascii=False)}]}
                 else:
                     val=store.search(args.get("query", "")) if name=="recall" else store.get(args.get("record_id", ""))
-                result={"content":[{"type":"text","text":json.dumps(val,ensure_ascii=False)}]}
+                    result={"content":[{"type":"text","text":json.dumps(val,ensure_ascii=False)}]}
             else: result={}
             if ident is not None: print(json.dumps({"jsonrpc":"2.0","id":ident,"result":result}),flush=True)
         except Exception as e:

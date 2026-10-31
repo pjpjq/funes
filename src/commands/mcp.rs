@@ -16,6 +16,8 @@ use tokio::sync::OnceCell;
 #[derive(serde::Serialize)]
 struct StructuredRecall {
     hits: Vec<StructuredHit>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_type_index_ready: Option<bool>,
 }
 
 #[derive(serde::Serialize)]
@@ -63,8 +65,13 @@ fn recall_tool_result(result: recall::RecallResult) -> CallToolResult {
         })
         .collect();
     let mut response = CallToolResult::success(vec![Content::text(result.text)]);
-    response.structured_content =
-        Some(serde_json::to_value(StructuredRecall { hits }).expect("recall hits contain only JSON-compatible values"));
+    response.structured_content = Some(
+        serde_json::to_value(StructuredRecall {
+            hits,
+            source_type_index_ready: result.source_type_index_ready,
+        })
+        .expect("recall hits contain only JSON-compatible values"),
+    );
     response
 }
 
@@ -78,6 +85,10 @@ pub struct RecallRequest {
     pub query: String,
     #[schemars(description = "Number of results to return")]
     pub k: Option<usize>,
+    #[schemars(
+        description = "Caller remaining native budget in milliseconds, capped at 600000. Bounds optional FTS within the caller's deadline; does not replace the caller's timeout."
+    )]
+    pub budget_ms: Option<u64>,
     #[schemars(
         description = "Recency half-life in days: a hit that old keeps half its score. Pass 0 to weigh every age alike, for a memory spanning months or an answer that may be old."
     )]
@@ -280,7 +291,10 @@ impl Funes {
         half_life: f64,
         neighbors: i64,
         filter: recall::FacetFilter,
+        budget_ms: Option<u64>,
     ) -> Result<recall::RecallResult> {
+        let deadline =
+            budget_ms.map(|ms| std::time::Instant::now() + std::time::Duration::from_millis(ms.min(600_000)));
         if self.pins_recall(&memory) {
             let cache = self
                 .pinned_recall
@@ -288,10 +302,19 @@ impl Funes {
                 .expect("pins_recall requires a configured cache");
             let server_memory = self.memory(None);
             let pinned = cache.get_or_try_init(|| recall::pin_read(server_memory)).await?;
-            recall::recall_filtered_pinned(pinned, query, k, candidates, half_life, neighbors, filter).await
+            recall::recall_filtered_pinned(pinned, query, k, candidates, half_life, neighbors, filter, deadline).await
         } else {
-            recall::recall_filtered_result(self.memory(memory), query, k, candidates, half_life, neighbors, filter)
-                .await
+            recall::recall_filtered_result(
+                self.memory(memory),
+                query,
+                k,
+                candidates,
+                half_life,
+                neighbors,
+                filter,
+                deadline,
+            )
+            .await
         }
     }
 
@@ -303,6 +326,7 @@ impl Funes {
         Parameters(RecallRequest {
             query,
             k,
+            budget_ms,
             half_life,
             neighbors,
             candidates,
@@ -345,6 +369,7 @@ impl Funes {
                     content_type,
                     source_missing,
                 },
+                budget_ms,
             )
             .await
         {
@@ -494,31 +519,52 @@ pub async fn run(memory: Option<String>) -> Result<()> {
 mod tests {
     use super::*;
     use arrow_array::types::Float32Type;
-    use arrow_array::{ArrayRef, FixedSizeListArray, RecordBatch, RecordBatchIterator};
+    use arrow_array::{ArrayRef, FixedSizeListArray, RecordBatch, RecordBatchIterator, StringArray};
     use arrow_schema::{DataType, Field, Schema};
     use lance::dataset::Dataset;
+    use lance::index::DatasetIndexExt;
+    use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
+    use lance_index::IndexType;
 
-    async fn legacy_memory() -> tempfile::TempDir {
+    async fn memory_fixture(source_type_index: bool) -> tempfile::TempDir {
         let memory = tempfile::tempdir().unwrap();
         let dimension = crate::memory::dataset::DIM;
-        let schema = Arc::new(Schema::new(vec![Field::new(
+        let mut fields = vec![Field::new(
             "vector",
             DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), dimension),
             true,
-        )]));
+        )];
         let vectors: ArrayRef = Arc::new(FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
             [Some(vec![Some(0.0); dimension as usize])],
             dimension,
         ));
-        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![vectors]).unwrap();
+        let mut columns = vec![vectors];
+        if source_type_index {
+            fields.push(Field::new("source_type", DataType::Utf8, false));
+            columns.push(Arc::new(StringArray::from(vec!["memory"])));
+        }
+        let schema = Arc::new(Schema::new(fields));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), columns).unwrap();
         let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
-        let dataset = Dataset::write(
+        let mut dataset = Dataset::write(
             reader,
             crate::memory::dataset::table_uri(memory.path().to_str().unwrap()).as_str(),
             None,
         )
         .await
         .unwrap();
+        if source_type_index {
+            dataset
+                .create_index(
+                    &["source_type"],
+                    IndexType::Bitmap,
+                    Some("source_type_idx".to_string()),
+                    &ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap),
+                    false,
+                )
+                .await
+                .unwrap();
+        }
         drop(dataset);
         memory
     }
@@ -532,14 +578,14 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_and_sequential_default_recalls_open_once_but_an_override_opens_fresh() {
-        let memory = legacy_memory().await;
+        let memory = memory_fixture(false).await;
         let spec = memory.path().to_string_lossy().into_owned();
         let server = Funes::new_with_pin(Some(spec.clone()), true);
         let clone = server.clone();
 
         let (first, concurrent) = tokio::join!(
-            server.recall_with_memory(None, "unused".to_string(), 1, 1, 0.0, 0, absent_facet()),
-            clone.recall_with_memory(None, "unused".to_string(), 1, 1, 0.0, 0, absent_facet())
+            server.recall_with_memory(None, "unused".to_string(), 1, 1, 0.0, 0, absent_facet(), None),
+            clone.recall_with_memory(None, "unused".to_string(), 1, 1, 0.0, 0, absent_facet(), Some(0))
         );
         let first = first.unwrap();
         let concurrent = concurrent.unwrap();
@@ -548,24 +594,80 @@ mod tests {
         let pinned_json = serde_json::to_value(recall_tool_result(first)).unwrap();
         assert_eq!(pinned_json["content"][0]["text"], "no results");
         assert_eq!(pinned_json["structuredContent"]["hits"], serde_json::json!([]));
+        assert_eq!(pinned_json["structuredContent"]["source_type_index_ready"], false);
+
+        let explicit = server
+            .recall_with_memory(
+                Some(spec.clone()),
+                "unused".to_string(),
+                1,
+                1,
+                0.0,
+                0,
+                absent_facet(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(explicit.source_type_index_ready, None);
 
         // Make a second Dataset::open impossible. The same server still recalls from its cached
         // handle, while an explicit call-level override must take the ordinary fresh-open path.
         std::fs::remove_dir_all(memory.path().join("chunks.lance")).unwrap();
         let second = server
-            .recall_with_memory(None, "unused".to_string(), 1, 1, 0.0, 0, absent_facet())
+            .recall_with_memory(None, "unused".to_string(), 1, 1, 0.0, 0, absent_facet(), Some(u64::MAX))
             .await
             .unwrap();
         assert_eq!(second.text, "no results");
 
         let override_result = server
-            .recall_with_memory(Some(spec), "unused".to_string(), 1, 1, 0.0, 0, absent_facet())
+            .recall_with_memory(Some(spec), "unused".to_string(), 1, 1, 0.0, 0, absent_facet(), Some(1))
             .await;
         let override_error = match override_result {
             Err(error) => error,
             Ok(_) => panic!("an explicit override must open the removed dataset afresh"),
         };
         assert!(override_error.to_string().contains("no index found"));
+    }
+
+    #[tokio::test]
+    async fn source_type_proof_belongs_to_the_pinned_snapshot_not_the_latest_manifest() {
+        let memory = memory_fixture(true).await;
+        let spec = memory.path().to_string_lossy().into_owned();
+        let server = Funes::new_with_pin(Some(spec.clone()), true);
+        let first = server
+            .recall_with_memory(None, "unused".to_string(), 1, 1, 0.0, 0, absent_facet(), None)
+            .await
+            .unwrap();
+        assert_eq!(first.source_type_index_ready, Some(true));
+        let response = serde_json::to_value(recall_tool_result(first)).unwrap();
+        assert_eq!(response["content"][0]["text"], "no results");
+        assert_eq!(response["structuredContent"]["source_type_index_ready"], true);
+
+        let mut latest = Dataset::open(&crate::memory::dataset::table_uri(&spec)).await.unwrap();
+        latest.drop_index("source_type_idx").await.unwrap();
+        let old_snapshot = server
+            .recall_with_memory(None, "unused".to_string(), 1, 1, 0.0, 0, absent_facet(), None)
+            .await
+            .unwrap();
+        assert_eq!(old_snapshot.source_type_index_ready, Some(true));
+        let fresh = Funes::new_with_pin(Some(spec), true)
+            .recall_with_memory(None, "unused".to_string(), 1, 1, 0.0, 0, absent_facet(), None)
+            .await
+            .unwrap();
+        assert_eq!(fresh.source_type_index_ready, Some(false));
+    }
+
+    #[test]
+    fn recall_budget_is_optional_and_rejects_negative_values() {
+        let absent: RecallRequest = serde_json::from_value(serde_json::json!({"query": "原文"})).unwrap();
+        assert_eq!(absent.budget_ms, None);
+        let supplied: RecallRequest =
+            serde_json::from_value(serde_json::json!({"query": "原文", "budget_ms": 6750})).unwrap();
+        assert_eq!(supplied.budget_ms, Some(6750));
+        assert!(
+            serde_json::from_value::<RecallRequest>(serde_json::json!({"query": "原文", "budget_ms": -1})).is_err()
+        );
     }
 
     #[test]
@@ -617,10 +719,12 @@ mod tests {
         let response = recall_tool_result(recall::RecallResult {
             text: text.clone(),
             hits,
+            source_type_index_ready: None,
         });
         let json = serde_json::to_value(response).unwrap();
 
         assert_eq!(json["content"][0]["text"], text);
+        assert!(json["structuredContent"].get("source_type_index_ready").is_none());
         assert_eq!(
             json["structuredContent"]["hits"][0]["raw_text"],
             "complete raw hit\nwith a second line"

@@ -7,6 +7,7 @@
 use crate::chunk;
 use crate::inference::{self, Embedder, EmbeddingProfile, RerankScoreKind, Reranker};
 use crate::memory::dataset;
+use crate::memory::fetch_store::{read_io_snapshot, ReadIoSnapshot};
 use crate::memory::{Memory, MemoryState};
 use crate::traces::harness::Harness;
 use anyhow::{anyhow, bail, Result};
@@ -15,9 +16,12 @@ use chrono::{DateTime, Utc};
 use futures::TryStreamExt;
 use lance::dataset::{Dataset, ROW_ID};
 use lance_index::scalar::FullTextSearchQuery;
+use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as _;
-use tokio::sync::{Mutex, OnceCell};
+use std::sync::{Arc, LazyLock};
+use std::time::{Duration, Instant};
+use tokio::sync::{oneshot, Mutex, OnceCell, Semaphore};
 
 /// Columns a [`Hit`] needs from a search scan.
 const HIT_COLS: &[&str] = &[
@@ -63,6 +67,7 @@ pub struct Hit {
 pub(crate) struct RecallResult {
     pub text: String,
     pub hits: Vec<(Hit, f64)>,
+    pub source_type_index_ready: Option<bool>,
 }
 
 /// Matching blocks `scan` lists before it stops. What the cap dropped is always reported.
@@ -277,6 +282,7 @@ struct Read {
 pub(crate) struct PinnedRead {
     read: Read,
     requested_label: String,
+    source_type_index_ready: bool,
 }
 
 /// What a read verb does about the memory's state: query it, degrade to the local index, or point a
@@ -347,8 +353,86 @@ async fn open_read(memory: &Memory) -> Result<Read> {
 /// every call and therefore resolve a remote's current head.
 pub(crate) async fn pin_read(memory: Memory) -> Result<PinnedRead> {
     let requested_label = memory.label();
+    emit_recall_metric("recall_open", "start", 0.0);
+    let t0 = Instant::now();
     let read = open_read(&memory).await?;
-    Ok(PinnedRead { read, requested_label })
+    let source_type_index_ready = read.note.is_none()
+        && read.memory_label.as_deref() == Some(requested_label.as_str())
+        && crate::memory::dataset::source_type_index_ready(&read.ds)
+            .await
+            .unwrap_or(false);
+    emit_recall_metric("recall_open", "done", round_ms(t0.elapsed()));
+    Ok(PinnedRead {
+        read,
+        requested_label,
+        source_type_index_ready,
+    })
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq)]
+struct RecallPhaseMetric {
+    stage: &'static str,
+    state: &'static str,
+    duration_ms: f64,
+}
+
+fn recall_metrics_enabled_from(value: Option<&str>) -> bool {
+    matches!(
+        value.map(|val| val.trim().to_ascii_lowercase()).as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
+}
+
+fn recall_metrics_enabled() -> bool {
+    recall_metrics_enabled_from(std::env::var("FUNES_RECALL_METRICS").ok().as_deref())
+}
+
+fn round_ms(duration: Duration) -> f64 {
+    ((duration.as_secs_f64() * 1000.0) * 100.0).round() / 100.0
+}
+
+fn format_recall_metric(stage: &'static str, state: &'static str, duration_ms: f64) -> Option<String> {
+    let metric = RecallPhaseMetric {
+        stage,
+        state,
+        duration_ms,
+    };
+    serde_json::to_string(&metric)
+        .ok()
+        .map(|json| format!("funes_metric {json}"))
+}
+
+fn emit_recall_metric(stage: &'static str, state: &'static str, duration_ms: f64) {
+    if !recall_metrics_enabled() {
+        return;
+    }
+    if let Some(line) = format_recall_metric(stage, state, duration_ms) {
+        eprintln!("{line}");
+    }
+}
+
+fn format_read_io_metric(state: &'static str, duration_ms: f64, io: &ReadIoSnapshot) -> String {
+    format!(
+        "funes_metric {}",
+        serde_json::json!({"stage": "recall_vector_io", "state": state, "duration_ms": duration_ms, "io": io})
+    )
+}
+
+async fn sample_vector_read<T>(
+    read: impl std::future::Future<Output = T>,
+    mut sample: impl FnMut(),
+    period: Duration,
+) -> T {
+    tokio::pin!(read);
+    // Keep polling the same scan; sampling must not cancel or replay a read.
+    for _ in 0..16 {
+        tokio::select! {
+            biased;
+            result = &mut read => return result,
+            _ = tokio::time::sleep(period) => sample(),
+        }
+    }
+    read.await
 }
 
 fn native_fallback_enabled() -> bool {
@@ -468,7 +552,7 @@ pub async fn recall_filtered(
     filter: FacetFilter,
 ) -> Result<String> {
     Ok(
-        recall_filtered_result(memory, query, k, candidates, half_life, neighbors, filter)
+        recall_filtered_result(memory, query, k, candidates, half_life, neighbors, filter, None)
             .await?
             .text,
     )
@@ -485,9 +569,20 @@ pub(crate) async fn recall_filtered_result(
     half_life: f64,
     neighbors: i64,
     filter: FacetFilter,
+    deadline: Option<Instant>,
 ) -> Result<RecallResult> {
-    let (note, memory_label, hits) =
-        recall_hits_filtered(memory, query, k, candidates, half_life, neighbors, filter, &|_| ()).await?;
+    let (note, memory_label, hits) = recall_hits_filtered_deadline(
+        memory,
+        query,
+        k,
+        candidates,
+        half_life,
+        neighbors,
+        filter,
+        &|_| (),
+        deadline,
+    )
+    .await?;
     Ok(recall_result(note, memory_label, hits))
 }
 
@@ -502,7 +597,10 @@ pub(crate) async fn recall_filtered_pinned(
     half_life: f64,
     neighbors: i64,
     filter: FacetFilter,
+    deadline: Option<Instant>,
 ) -> Result<RecallResult> {
+    emit_recall_metric("recall_open", "start", 0.0);
+    emit_recall_metric("recall_open", "done", 0.0);
     let progress = &|_: &str| ();
     progress(&format!("searching {}…", pinned.requested_label));
     let (note, memory_label, hits) = recall_hits_filtered_read(
@@ -514,9 +612,12 @@ pub(crate) async fn recall_filtered_pinned(
         neighbors,
         filter,
         progress,
+        deadline,
     )
     .await?;
-    Ok(recall_result(note, memory_label, hits))
+    let mut result = recall_result(note, memory_label, hits);
+    result.source_type_index_ready = Some(pinned.source_type_index_ready);
+    Ok(result)
 }
 
 fn recall_result(note: String, memory_label: Option<String>, hits: Vec<(Hit, f64)>) -> RecallResult {
@@ -525,7 +626,11 @@ fn recall_result(note: String, memory_label: Option<String>, hits: Vec<(Hit, f64
     } else {
         crate::ui::render::recall_agent(&note, &memory_hint(memory_label.as_deref()), &hits)
     };
-    RecallResult { text, hits }
+    RecallResult {
+        text,
+        hits,
+        source_type_index_ready: None,
+    }
 }
 
 /// Run the recall pipeline over one memory: hybrid retrieval → rerank → recency reweight →
@@ -574,9 +679,33 @@ pub async fn recall_hits_filtered(
     filter: FacetFilter,
     progress: &(dyn Fn(&str) + Sync),
 ) -> Result<(String, Option<String>, Vec<(Hit, f64)>)> {
+    recall_hits_filtered_deadline(
+        memory, query, k, candidates, half_life, neighbors, filter, progress, None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn recall_hits_filtered_deadline(
+    memory: Memory,
+    query: String,
+    k: usize,
+    candidates: usize,
+    half_life: f64,
+    neighbors: i64,
+    filter: FacetFilter,
+    progress: &(dyn Fn(&str) + Sync),
+    deadline: Option<Instant>,
+) -> Result<(String, Option<String>, Vec<(Hit, f64)>)> {
     progress(&format!("searching {}…", memory.label()));
+    emit_recall_metric("recall_open", "start", 0.0);
+    let t0 = Instant::now();
     let read = open_read(&memory).await?;
-    recall_hits_filtered_read(&read, query, k, candidates, half_life, neighbors, filter, progress).await
+    emit_recall_metric("recall_open", "done", round_ms(t0.elapsed()));
+    recall_hits_filtered_read(
+        &read, query, k, candidates, half_life, neighbors, filter, progress, deadline,
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -589,6 +718,7 @@ async fn recall_hits_filtered_read(
     neighbors: i64,
     mut filter: FacetFilter,
     progress: &(dyn Fn(&str) + Sync),
+    deadline: Option<Instant>,
 ) -> Result<(String, Option<String>, Vec<(Hit, f64)>)> {
     // `--harness` accepts the same spellings as `index`/`add` (claude|codex|pi); normalize to the
     // stored facet (Claude's is `claude_code`) so `--harness claude` filters instead of silently
@@ -622,19 +752,25 @@ async fn recall_hits_filtered_read(
     // Validate the memory before loading/calling any provider. This both fails fast on a profile
     // mismatch and ensures a Voyage query vector is never sent to a local-BGE memory.
     progress("loading embedding provider…");
+    emit_recall_metric("recall_models", "start", 0.0);
+    let t_models = Instant::now();
     let mut guard = models(&profile).await?.lock().await;
+    emit_recall_metric("recall_models", "done", round_ms(t_models.elapsed()));
     if guard.profile_fingerprint != profile.fingerprint {
         return Err(anyhow!(
             "embedding profile changed while the process was running; restart before recalling"
         ));
     }
     let Models { embedder, reranker, .. } = &mut *guard;
+    emit_recall_metric("recall_embed", "start", 0.0);
+    let t_embed = Instant::now();
     let qv = embedder.embed_query(query.as_str())?;
+    emit_recall_metric("recall_embed", "done", round_ms(t_embed.elapsed()));
 
     // Hybrid retrieval: a vector ANN scan and a BM25 scan, fused by reciprocal rank. The FTS index
     // can be absent (it's best-effort at index time), so the FTS leg is skipped when it errors —
     // recall then falls back to vector-only.
-    let hits = hybrid_candidates(ds, &qv, &query, candidates, where_clause.as_deref()).await?;
+    let hits = hybrid_candidates(ds, &qv, &query, candidates, where_clause.as_deref(), deadline).await?;
     if hits.is_empty() {
         return Ok((note, read.memory_label.clone(), Vec::new()));
     }
@@ -652,7 +788,11 @@ async fn recall_hits_filtered_read(
         let docs: Vec<&str> = hits.iter().map(|(hit, _)| hit.text.as_str()).collect();
         let score_kind = reranker.score_kind();
         progress(&format!("reranking {} candidates…", docs.len()));
-        match reranker.rerank(query.as_str(), &docs) {
+        emit_recall_metric("recall_rerank", "start", 0.0);
+        let t_rerank = Instant::now();
+        let rerank_res = reranker.rerank(query.as_str(), &docs);
+        emit_recall_metric("recall_rerank", "done", round_ms(t_rerank.elapsed()));
+        match rerank_res {
             Ok(scores) if scores.len() == hits.len() => scores
                 .iter()
                 .enumerate()
@@ -683,7 +823,10 @@ async fn recall_hits_filtered_read(
     if neighbors > 0 {
         progress("expanding neighbors…");
         let mut refs: Vec<&mut Hit> = top.iter_mut().map(|(h, _)| h).collect();
+        emit_recall_metric("recall_neighbors", "start", 0.0);
+        let t_neigh = Instant::now();
         attach_neighbors(ds, &mut refs, neighbors).await?;
+        emit_recall_metric("recall_neighbors", "done", round_ms(t_neigh.elapsed()));
     }
 
     Ok((note, read.memory_label.clone(), top))
@@ -697,10 +840,113 @@ async fn hybrid_candidates(
     query: &str,
     candidates: usize,
     filter: Option<&str>,
+    deadline: Option<Instant>,
 ) -> Result<Vec<(Hit, f64)>> {
-    let vector = vector_candidates(ds, qv, candidates, filter).await?;
-    let fts = fts_candidates(ds, query, candidates, filter).await.unwrap_or_default();
+    emit_recall_metric("recall_vector", "start", 0.0);
+    let t_vec = Instant::now();
+    let read = vector_candidates(ds, qv, candidates, filter);
+    let vector = if recall_metrics_enabled() {
+        eprintln!("{}", format_read_io_metric("start", 0.0, &read_io_snapshot()));
+        let result = sample_vector_read(
+            read,
+            || {
+                eprintln!(
+                    "{}",
+                    format_read_io_metric("sample", round_ms(t_vec.elapsed()), &read_io_snapshot())
+                )
+            },
+            Duration::from_secs(1),
+        )
+        .await;
+        eprintln!(
+            "{}",
+            format_read_io_metric("done", round_ms(t_vec.elapsed()), &read_io_snapshot())
+        );
+        result?
+    } else {
+        read.await?
+    };
+    emit_recall_metric("recall_vector", "done", round_ms(t_vec.elapsed()));
+
+    let ds = ds.clone();
+    let query = query.to_owned();
+    let filter = filter.map(str::to_owned);
+    let fts = best_effort_fts(
+        async move { fts_candidates(&ds, &query, candidates, filter.as_deref()).await },
+        fts_budget(deadline),
+        FTS_SCAN_SLOT.clone(),
+    )
+    .await;
+
     Ok(rrf_fuse(vector, fts, candidates))
+}
+
+fn fts_budget(deadline: Option<Instant>) -> Duration {
+    let cap = Duration::from_secs(3);
+    deadline.map_or(cap, |deadline| {
+        cap.min(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .saturating_sub(Duration::from_millis(250)),
+        )
+    })
+}
+
+static FTS_SCAN_SLOT: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(1)));
+
+async fn best_effort_fts(
+    scan: impl std::future::Future<Output = Result<Vec<(u64, Hit)>>> + Send + 'static,
+    budget: Duration,
+    slot: Arc<Semaphore>,
+) -> Vec<(u64, Hit)> {
+    emit_recall_metric("recall_fts", "start", 0.0);
+    let started = Instant::now();
+    if budget.is_zero() {
+        emit_recall_metric("recall_fts", "timeout", 0.0);
+        return Vec::new();
+    }
+    let Ok(permit) = slot.try_acquire_owned() else {
+        emit_recall_metric("recall_fts", "error", 0.0);
+        return Vec::new();
+    };
+    let (cancel, cancelled) = oneshot::channel::<()>();
+    let (sender, receiver) = oneshot::channel();
+    // The slot follows the scan and runtime cleanup, not the caller's shorter wait.
+    // shortcut: a stuck native scan keeps one slot; use process isolation if it never returns.
+    let worker = std::thread::Builder::new().name("funes-fts".into()).spawn(move || {
+        let _permit = permit;
+        let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                let _ = sender.send(Err(anyhow::Error::from(error)));
+                return;
+            }
+        };
+        let result = runtime.block_on(async move {
+            tokio::select! {
+                biased;
+                _ = cancelled => Ok(Vec::new()),
+                result = scan => result,
+            }
+        });
+        let _ = sender.send(result);
+    });
+    if worker.is_err() {
+        emit_recall_metric("recall_fts", "error", round_ms(started.elapsed()));
+        return Vec::new();
+    }
+    // Original inline approach, retained to document why isolation is required:
+    // Bound the optional scan without spawning a detached task or discarding vector hits.
+    // shortcut: cancellation is cooperative; isolate the scan if profiling finds non-yielding CPU work.
+    let deadline = tokio::time::Instant::from_std(started + budget);
+    let (hits, state) = match tokio::time::timeout_at(deadline, receiver).await {
+        Ok(Ok(Ok(hits))) => (hits, "done"),
+        Ok(_) => (Vec::new(), "error"),
+        Err(_) => (Vec::new(), "timeout"),
+    };
+    drop(cancel);
+    emit_recall_metric("recall_fts", state, round_ms(started.elapsed()));
+    hits
 }
 
 /// Top-`limit` rows by vector distance, each with its `_rowid` (the fusion key).
@@ -717,7 +963,7 @@ async fn vector_candidates(ds: &Dataset, qv: &[f32], limit: usize, filter: Optio
     }
     scan.project(&hit_cols(ds))?;
     scan.with_row_id();
-    collect_hits(scan).await
+    collect_hits(scan, true).await
 }
 
 /// Top-`limit` rows by BM25 score, each with its `_rowid`. Errors if the memory has no FTS index.
@@ -732,7 +978,7 @@ async fn fts_candidates(ds: &Dataset, query: &str, limit: usize, filter: Option<
     scan.project(&hit_cols(ds))?;
     scan.with_row_id();
     scan.limit(Some(limit as i64), None)?;
-    collect_hits(scan).await
+    collect_hits(scan, false).await
 }
 
 /// Whether the dataset carries `name`. Projecting a column a memory predates errors, so every
@@ -778,8 +1024,17 @@ fn hit_cols(ds: &Dataset) -> Vec<&'static str> {
 }
 
 /// Drain a scan into `(rowid, Hit)` rows, preserving the scan's order (its rank).
-async fn collect_hits(scan: lance::dataset::scanner::Scanner) -> Result<Vec<(u64, Hit)>> {
+async fn collect_hits(scan: lance::dataset::scanner::Scanner, vector: bool) -> Result<Vec<(u64, Hit)>> {
+    let started = Instant::now();
+    if vector {
+        emit_recall_metric("recall_vector_stream", "start", 0.0);
+    }
     let mut stream = scan.try_into_stream().await?;
+    if vector {
+        emit_recall_metric("recall_vector_stream", "done", round_ms(started.elapsed()));
+        emit_recall_metric("recall_vector_collect", "start", 0.0);
+    }
+    let started = Instant::now();
     let mut out = Vec::new();
     while let Some(batch) = stream.try_next().await? {
         let rowid = batch
@@ -812,6 +1067,9 @@ async fn collect_hits(scan: lance::dataset::scanner::Scanner) -> Result<Vec<(u64
                 },
             ));
         }
+    }
+    if vector {
+        emit_recall_metric("recall_vector_collect", "done", round_ms(started.elapsed()));
     }
     Ok(out)
 }
@@ -1623,6 +1881,288 @@ mod tests {
     }
 
     #[test]
+    fn fts_budget_uses_only_the_callers_remaining_time() {
+        assert_eq!(fts_budget(None), Duration::from_secs(3));
+        assert_eq!(
+            fts_budget(Some(Instant::now() + Duration::from_secs(10))),
+            Duration::from_secs(3)
+        );
+        let remaining = fts_budget(Some(Instant::now() + Duration::from_millis(500)));
+        assert!(remaining <= Duration::from_millis(250));
+        assert_eq!(
+            fts_budget(Some(Instant::now() + Duration::from_millis(100))),
+            Duration::ZERO
+        );
+        assert_eq!(fts_budget(Some(Instant::now())), Duration::ZERO);
+    }
+
+    #[tokio::test]
+    async fn exhausted_fts_budget_never_polls_the_scan_or_loses_vector_hits() {
+        let scan = async { panic!("an exhausted optional scan must not be polled") };
+        let fts = best_effort_fts(scan, fts_budget(Some(Instant::now())), Arc::new(Semaphore::new(1))).await;
+        let fused = rrf_fuse(vec![(1, hit("vector-only"))], fts, 1);
+        assert_eq!(fused.len(), 1);
+        assert_eq!(fused[0].0.text, "vector-only");
+    }
+
+    #[tokio::test]
+    async fn fts_deadline_preserves_successful_hybrid_fusion() {
+        let fts = best_effort_fts(
+            async { Ok(vec![(2, hit("shared")), (3, hit("fts-only"))]) },
+            Duration::from_secs(1),
+            Arc::new(Semaphore::new(1)),
+        )
+        .await;
+        let fused = rrf_fuse(vec![(1, hit("vector-only")), (2, hit("shared"))], fts, 3);
+        assert_eq!(fused[0].0.text, "shared");
+        assert_eq!(fused.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn fts_deadline_keeps_vector_hits_on_scan_error() {
+        let fts = best_effort_fts(
+            async { Err(anyhow!("missing FTS index")) },
+            Duration::from_secs(1),
+            Arc::new(Semaphore::new(1)),
+        )
+        .await;
+        let fused = rrf_fuse(vec![(1, hit("vector-only"))], fts, 1);
+        assert_eq!(fused.len(), 1);
+        assert_eq!(fused[0].0.text, "vector-only");
+    }
+
+    #[tokio::test]
+    async fn fts_deadline_drops_stalled_scan_and_keeps_vector_hits() {
+        struct DropFlag(Arc<tokio::sync::Notify>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.notify_one();
+            }
+        }
+        let dropped = Arc::new(tokio::sync::Notify::new());
+        let guard = DropFlag(dropped.clone());
+        let scan = async move {
+            let _guard = guard;
+            std::future::pending::<Result<Vec<(u64, Hit)>>>().await
+        };
+        let fts = tokio::time::timeout(
+            Duration::from_secs(1),
+            best_effort_fts(
+                scan,
+                fts_budget(Some(Instant::now() + Duration::from_millis(260))),
+                Arc::new(Semaphore::new(1)),
+            ),
+        )
+        .await
+        .expect("optional FTS must not consume the caller's whole deadline");
+        tokio::time::timeout(Duration::from_secs(1), dropped.notified())
+            .await
+            .expect("a yielding scan must observe cancellation");
+        let fused = rrf_fuse(vec![(1, hit("vector-only"))], fts, 1);
+        assert_eq!(fused.len(), 1);
+        assert_eq!(fused[0].0.text, "vector-only");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn blocking_fts_must_not_hold_the_vector_response_past_its_budget() {
+        let slot = Arc::new(Semaphore::new(1));
+        let started = Instant::now();
+        let fts = best_effort_fts(
+            async {
+                std::thread::sleep(Duration::from_millis(400));
+                Ok(vec![(2, hit("late-fts"))])
+            },
+            Duration::from_millis(20),
+            slot.clone(),
+        )
+        .await;
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "blocking FTS held the query task beyond its deadline"
+        );
+        assert!(fts.is_empty());
+        let fused = rrf_fuse(vec![(1, hit("vector-only"))], fts, 1);
+        assert_eq!(fused[0].0.text, "vector-only");
+        drop(
+            tokio::time::timeout(Duration::from_secs(2), slot.acquire())
+                .await
+                .expect("the blocking scan must finish")
+                .unwrap(),
+        );
+    }
+
+    #[tokio::test]
+    async fn blocking_fts_child_cannot_starve_the_query_runtime() {
+        let slot = Arc::new(Semaphore::new(1));
+        let started = Instant::now();
+        let fts = best_effort_fts(
+            async {
+                tokio::spawn(async {
+                    std::thread::sleep(Duration::from_millis(400));
+                    Ok(vec![(2, hit("late-child"))])
+                })
+                .await?
+            },
+            Duration::from_millis(20),
+            slot.clone(),
+        )
+        .await;
+        assert!(started.elapsed() < Duration::from_millis(200));
+        assert!(fts.is_empty());
+        drop(
+            tokio::time::timeout(Duration::from_secs(2), slot.acquire())
+                .await
+                .expect("the blocking child must finish")
+                .unwrap(),
+        );
+    }
+
+    #[tokio::test]
+    async fn timed_out_fts_keeps_its_slot_and_discards_late_results() {
+        let slot = Arc::new(Semaphore::new(1));
+        let worker_slot = slot.clone();
+        let (started, started_rx) = oneshot::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let first = tokio::spawn(async move {
+            best_effort_fts(
+                async move {
+                    started.send(()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                    Ok(vec![(1, hit("stale"))])
+                },
+                Duration::from_millis(100),
+                worker_slot,
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(first.await.unwrap().is_empty());
+        assert_eq!(slot.available_permits(), 0);
+        assert!(best_effort_fts(
+            async { panic!("a busy slot must not poll another scan") },
+            Duration::from_secs(1),
+            slot.clone(),
+        )
+        .await
+        .is_empty());
+        release.send(()).unwrap();
+        drop(
+            tokio::time::timeout(Duration::from_secs(1), slot.acquire())
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+        let fresh = best_effort_fts(async { Ok(vec![(2, hit("fresh"))]) }, Duration::from_secs(1), slot).await;
+        assert_eq!(fresh.len(), 1);
+        assert_eq!(fresh[0].1.text, "fresh");
+    }
+
+    #[tokio::test]
+    async fn fts_slot_covers_blocking_child_runtime_cleanup() {
+        let slot = Arc::new(Semaphore::new(1));
+        let (started, started_rx) = oneshot::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let fts = best_effort_fts(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    started.send(()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                });
+                started_rx.await?;
+                Ok(vec![(1, hit("ready"))])
+            },
+            Duration::from_secs(1),
+            slot.clone(),
+        )
+        .await;
+        assert_eq!(fts.len(), 1);
+        assert_eq!(slot.available_permits(), 0);
+        release.send(()).unwrap();
+        drop(
+            tokio::time::timeout(Duration::from_secs(1), slot.acquire())
+                .await
+                .expect("runtime cleanup must release the slot")
+                .unwrap(),
+        );
+    }
+
+    #[tokio::test]
+    async fn isolated_fts_keeps_real_keyword_hits_and_filters_across_calls() {
+        use arrow_array::{ArrayRef, RecordBatchIterator};
+        use arrow_schema::{DataType, Field, Schema};
+        use lance::index::DatasetIndexExt;
+        use lance_index::{scalar::InvertedIndexParams, IndexType};
+
+        let memory = tempfile::tempdir().unwrap();
+        let schema = Arc::new(Schema::new(
+            HIT_COLS
+                .iter()
+                .map(|name| {
+                    Field::new(
+                        *name,
+                        if *name == "seq" {
+                            DataType::Int64
+                        } else {
+                            DataType::Utf8
+                        },
+                        false,
+                    )
+                })
+                .collect::<Vec<_>>(),
+        ));
+        let columns = HIT_COLS
+            .iter()
+            .map(|name| -> ArrayRef {
+                match *name {
+                    "seq" => Arc::new(Int64Array::from(vec![0, 1])),
+                    "text" => Arc::new(StringArray::from(vec!["needle target", "needle excluded"])),
+                    "harness" => Arc::new(StringArray::from(vec!["codex", "pi"])),
+                    _ => Arc::new(StringArray::from(vec!["fixture", "fixture"])),
+                }
+            })
+            .collect();
+        let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
+        let mut ds = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            dataset::table_uri(memory.path().to_str().unwrap()).as_str(),
+            None,
+        )
+        .await
+        .unwrap();
+        ds.create_index(
+            &["text"],
+            IndexType::Inverted,
+            None,
+            &InvertedIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+        let slot = Arc::new(Semaphore::new(1));
+        for _ in 0..2 {
+            let ds = ds.clone();
+            let hits = best_effort_fts(
+                async move { fts_candidates(&ds, "needle", 2, Some("harness = 'codex'")).await },
+                Duration::from_secs(3),
+                slot.clone(),
+            )
+            .await;
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].1.text, "needle target");
+            assert_eq!(hits[0].1.harness, "codex");
+            drop(
+                tokio::time::timeout(Duration::from_secs(1), slot.acquire())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+    }
+
+    #[test]
     fn is_scaffolding_flags_wrappers_and_headings() {
         assert!(is_scaffolding("<ide_opened_file>/foo/bar.rs</ide_opened_file>"));
         assert!(is_scaffolding("<environment_context>\n  <cwd>/w</cwd>"));
@@ -1739,5 +2279,113 @@ mod tests {
     fn reranker_score_contract_only_sigmoids_local_logits() {
         assert!((rerank_relevance(RerankScoreKind::Logit, 0.0) - 0.5).abs() < f64::EPSILON);
         assert!((rerank_relevance(RerankScoreKind::Relevance, 0.1) - 0.1).abs() < 1e-7);
+    }
+
+    #[tokio::test]
+    async fn vector_sampler_keeps_one_read_and_stops_after_sixteen_samples() {
+        let (sender, receiver) = oneshot::channel();
+        let mut starts = 0;
+        let read = async {
+            starts += 1;
+            receiver.await.unwrap()
+        };
+        let mut sender = Some(sender);
+        let mut samples = 0;
+        let result = sample_vector_read(
+            read,
+            || {
+                samples += 1;
+                if samples == 16 {
+                    sender.take().unwrap().send(Err::<usize, _>("fixture failure")).unwrap();
+                }
+            },
+            Duration::from_millis(1),
+        )
+        .await;
+        assert_eq!(result, Err("fixture failure"));
+        assert_eq!(starts, 1);
+        assert_eq!(samples, 16);
+    }
+
+    #[test]
+    fn vector_io_metric_contains_only_static_labels_and_numeric_counters() {
+        let line = format_read_io_metric("sample", 1000.0, &read_io_snapshot());
+        let value: serde_json::Value = serde_json::from_str(line.strip_prefix("funes_metric ").unwrap()).unwrap();
+        let object = value.as_object().unwrap();
+        assert_eq!(object.len(), 4);
+        assert_eq!(value["stage"], "recall_vector_io");
+        assert_eq!(value["state"], "sample");
+        let io = value["io"].as_object().unwrap();
+        assert_eq!(io.len(), 11);
+        assert!(io.values().all(serde_json::Value::is_u64));
+        assert!(io.contains_key("cache_wait_active"));
+        assert!(io.contains_key("requested_bytes"));
+    }
+
+    #[test]
+    fn recall_metrics_env_gating() {
+        assert!(recall_metrics_enabled_from(Some("1")));
+        assert!(recall_metrics_enabled_from(Some("true")));
+        assert!(recall_metrics_enabled_from(Some("TRUE")));
+        assert!(recall_metrics_enabled_from(Some("yes")));
+        assert!(recall_metrics_enabled_from(Some("YES")));
+        assert!(recall_metrics_enabled_from(Some("on")));
+        assert!(recall_metrics_enabled_from(Some("ON")));
+        assert!(recall_metrics_enabled_from(Some(" 1 ")));
+
+        assert!(!recall_metrics_enabled_from(Some("0")));
+        assert!(!recall_metrics_enabled_from(Some("false")));
+        assert!(!recall_metrics_enabled_from(Some("no")));
+        assert!(!recall_metrics_enabled_from(Some("off")));
+        assert!(!recall_metrics_enabled_from(Some("")));
+        assert!(!recall_metrics_enabled_from(Some("random")));
+        assert!(!recall_metrics_enabled_from(None));
+    }
+
+    #[test]
+    fn recall_metrics_deterministic_serialization_and_redaction() {
+        let stages = [
+            "recall_open",
+            "recall_models",
+            "recall_embed",
+            "recall_vector",
+            "recall_vector_stream",
+            "recall_vector_collect",
+            "recall_fts",
+            "recall_rerank",
+            "recall_neighbors",
+        ];
+
+        for stage in stages {
+            let start_line = format_recall_metric(stage, "start", 0.0).expect("metric line");
+            assert_eq!(
+                start_line,
+                format!(r#"funes_metric {{"stage":"{stage}","state":"start","duration_ms":0.0}}"#)
+            );
+
+            let done_line = format_recall_metric(stage, "done", 12.34).expect("metric line");
+            assert_eq!(
+                done_line,
+                format!(r#"funes_metric {{"stage":"{stage}","state":"done","duration_ms":12.34}}"#)
+            );
+
+            let json_str = done_line.strip_prefix("funes_metric ").expect("prefix");
+            let raw: serde_json::Value = serde_json::from_str(json_str).expect("raw json");
+            assert_eq!(raw["stage"], stage);
+            assert_eq!(raw["state"], "done");
+            assert!((raw["duration_ms"].as_f64().expect("duration_ms") - 12.34).abs() < 1e-6);
+
+            // Redaction & schema check: only 3 static allowlisted fields, no sensitive payload.
+            let map = raw.as_object().expect("json object");
+            assert_eq!(map.len(), 3);
+            assert!(map.contains_key("stage"));
+            assert!(map.contains_key("state"));
+            assert!(map.contains_key("duration_ms"));
+        }
+
+        assert_eq!(round_ms(Duration::from_millis(0)), 0.0);
+        assert_eq!(round_ms(Duration::from_millis(150)), 150.0);
+        assert_eq!(round_ms(Duration::from_micros(12345)), 12.35);
+        assert_eq!(round_ms(Duration::from_micros(12344)), 12.34);
     }
 }

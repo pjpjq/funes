@@ -19,6 +19,7 @@ pub mod dataset;
 pub mod fetch_store;
 pub mod lock;
 pub mod remote;
+pub mod shard_store;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

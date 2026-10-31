@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -117,13 +118,45 @@ def _project_for(path: Path, scan_root: Path) -> str:
             break
     return str(scan_root)
 
+def _pi_project_for(path: Path) -> str:
+    """Use Pi's session header, never guess an ambiguous encoded directory."""
+    if path.suffix.lower() == ".jsonl":
+        try:
+            with path.open("r", encoding="utf-8") as stream:
+                header = json.loads(stream.readline(16384))
+            cwd = header.get("cwd") if isinstance(header, dict) and header.get("type") == "session" else None
+            if isinstance(cwd, str) and Path(cwd).is_absolute():
+                directory = Path(cwd)
+                for parent in (directory, *directory.parents):
+                    if (parent / ".git").exists():
+                        return str(parent)
+                return str(directory)
+        except (OSError, UnicodeError, ValueError):
+            pass
+    for parent in path.parents:
+        if (parent / ".git").exists():
+            return str(parent)
+    return ""
+
+
 def discover_sources(cfg: Config|None=None) -> list[Source]:
-    cfg = cfg or Config.load(); h=cfg.home; out=[]; seen=set()
+    cfg = cfg or Config.load(); h=cfg.home; out=[]; seen=set(); seen_keys=set()
     def add(kind,p,project=""):
-        try: p=Path(p)
-        except TypeError: return
-        if p.is_file() and p not in seen:
-            seen.add(p); out.append(_source(kind,p,cfg,project))
+        try:
+            p = Path(p)
+            if not p.is_file():
+                return
+            resolved = p.resolve()
+            if resolved in seen:
+                return
+            source = _source(kind, p, cfg, project)
+        except (TypeError, OSError, RuntimeError):
+            return
+        if source.source_key in seen_keys:
+            return
+        seen.add(resolved)
+        seen_keys.add(source.source_key)
+        out.append(source)
     codex = Path(os.environ.get("CODEX_HOME", h/".codex")).expanduser()
     if cfg.source_codex:
         for root in (codex/"sessions", codex/"archived_sessions", codex/"subagents", codex/"sessions"/"archive"):
@@ -144,16 +177,18 @@ def discover_sources(cfg: Config|None=None) -> list[Source]:
     pi_roots += [h/".pi/agent/sessions", h/".pi/sessions"]
     if cfg.source_pi:
         for root in pi_roots:
-            for p in _files(root,("**/*.jsonl",)): add("pi",p)
+            for p in _files(root,("**/*.jsonl",)): add("pi", p, _pi_project_for(p))
         # Older pi releases allowed a session directory directly under ~/.pi;
         # retain that fallback for existing installations and test fixtures.
         for p in _files(h/".pi", ("**/*.jsonl",)):
-            add("pi", p)
+            add("pi", p, _pi_project_for(p))
         for root in (h/".pi/agent", h/".pi"):
-            for p in _files(root,("**/*.md",)): add("pi_memory",p)
+            for p in _files(root,("**/*.md",)): add("pi_memory", p, _pi_project_for(p))
     claude = Path(os.environ.get("CLAUDE_CONFIG_DIR", h/".claude")).expanduser()
     for root in (claude/"projects", claude/"history"):
         for p in _files(root,("**/*.jsonl",)): add("claude",p)
+    for p in (claude/"history.jsonl", h/".claude"/"history.jsonl"):
+        add("claude", p)
     for root in (claude/"memory", claude/"memories"):
         for p in _files(root,("**/*.md",)): add("claude_memory",p)
     for p in (claude/"CLAUDE.md", h/"CLAUDE.md", h/"MEMORY.md", h/"memory.md"):

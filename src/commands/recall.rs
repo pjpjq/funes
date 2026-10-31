@@ -9,6 +9,7 @@ use super::target::Target;
 use crate::chunk;
 use crate::inference::{self, Embedder, EmbeddingProfile, RerankScoreKind, Reranker};
 use crate::memory::dataset::{self, RecordBatch};
+use crate::memory::fetch_store::{read_io_snapshot, ReadIoSnapshot};
 use crate::memory::{Memory, MemoryState};
 use crate::traces;
 use anyhow::{anyhow, bail, Context, Result};
@@ -421,6 +422,30 @@ fn emit_recall_metric(stage: &'static str, state: &'static str, duration_ms: f64
     if let Some(line) = format_recall_metric(stage, state, duration_ms) {
         eprintln!("{line}");
     }
+}
+
+fn format_read_io_metric(state: &'static str, duration_ms: f64, io: &ReadIoSnapshot) -> String {
+    format!(
+        "funes_metric {}",
+        serde_json::json!({"stage": "recall_vector_io", "state": state, "duration_ms": duration_ms, "io": io})
+    )
+}
+
+async fn sample_vector_read<T>(
+    read: impl std::future::Future<Output = T>,
+    mut sample: impl FnMut(),
+    period: Duration,
+) -> T {
+    tokio::pin!(read);
+    // Keep polling the same scan; sampling must not cancel or replay a read.
+    for _ in 0..16 {
+        tokio::select! {
+            biased;
+            result = &mut read => return result,
+            _ = tokio::time::sleep(period) => sample(),
+        }
+    }
+    read.await
 }
 
 fn native_fallback_enabled() -> bool {
@@ -926,7 +951,28 @@ async fn hybrid_candidates(
 ) -> Result<Vec<Hit>> {
     emit_recall_metric("recall_vector", "start", 0.0);
     let started = Instant::now();
-    let vector = vector_candidates(ds, qv, candidates, filter).await?;
+    let read = vector_candidates(ds, qv, candidates, filter);
+    let vector = if recall_metrics_enabled() {
+        eprintln!("{}", format_read_io_metric("start", 0.0, &read_io_snapshot()));
+        let result = sample_vector_read(
+            read,
+            || {
+                eprintln!(
+                    "{}",
+                    format_read_io_metric("sample", round_ms(started.elapsed()), &read_io_snapshot())
+                )
+            },
+            Duration::from_secs(1),
+        )
+        .await;
+        eprintln!(
+            "{}",
+            format_read_io_metric("done", round_ms(started.elapsed()), &read_io_snapshot())
+        );
+        result?
+    } else {
+        read.await?
+    };
     emit_recall_metric("recall_vector", "done", round_ms(started.elapsed()));
 
     let ds = ds.clone();
@@ -1012,7 +1058,12 @@ async fn best_effort_fts(
 
 /// Top-`limit` rows by vector distance, each with its `_rowid` (the fusion key).
 async fn vector_candidates(ds: &Dataset, qv: &[f32], limit: usize, filter: Option<&str>) -> Result<Vec<(u64, Hit)>> {
-    hits_of(&dataset::nearest(ds, qv, limit, filter, &hit_cols(ds)).await?)
+    hits_of(
+        &dataset::nearest_with_progress(ds, qv, limit, filter, &hit_cols(ds), |stage, state, elapsed| {
+            emit_recall_metric(stage, state, round_ms(elapsed));
+        })
+        .await?,
+    )
 }
 
 /// Top-`limit` rows by BM25 score, each with its row id. Errors if the memory has no FTS index.
@@ -2817,6 +2868,47 @@ mod tests {
         assert!((rerank_relevance(RerankScoreKind::Relevance, 0.1) - 0.1).abs() < 1e-7);
     }
 
+    #[tokio::test]
+    async fn vector_sampler_keeps_one_read_and_stops_after_sixteen_samples() {
+        let (sender, receiver) = oneshot::channel();
+        let mut starts = 0;
+        let read = async {
+            starts += 1;
+            receiver.await.unwrap()
+        };
+        let mut sender = Some(sender);
+        let mut samples = 0;
+        let result = sample_vector_read(
+            read,
+            || {
+                samples += 1;
+                if samples == 16 {
+                    sender.take().unwrap().send(Err::<usize, _>("fixture failure")).unwrap();
+                }
+            },
+            Duration::from_millis(1),
+        )
+        .await;
+        assert_eq!(result, Err("fixture failure"));
+        assert_eq!(starts, 1);
+        assert_eq!(samples, 16);
+    }
+
+    #[test]
+    fn vector_io_metric_contains_only_static_labels_and_numeric_counters() {
+        let line = format_read_io_metric("sample", 1000.0, &read_io_snapshot());
+        let value: serde_json::Value = serde_json::from_str(line.strip_prefix("funes_metric ").unwrap()).unwrap();
+        let object = value.as_object().unwrap();
+        assert_eq!(object.len(), 4);
+        assert_eq!(value["stage"], "recall_vector_io");
+        assert_eq!(value["state"], "sample");
+        let io = value["io"].as_object().unwrap();
+        assert_eq!(io.len(), 11);
+        assert!(io.values().all(serde_json::Value::is_u64));
+        assert!(io.contains_key("cache_wait_active"));
+        assert!(io.contains_key("requested_bytes"));
+    }
+
     #[test]
     fn recall_metrics_env_gating() {
         assert!(recall_metrics_enabled_from(Some("1")));
@@ -2844,6 +2936,8 @@ mod tests {
             "recall_models",
             "recall_embed",
             "recall_vector",
+            "recall_vector_stream",
+            "recall_vector_collect",
             "recall_fts",
             "recall_rerank",
             "recall_neighbors",

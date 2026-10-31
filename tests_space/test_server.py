@@ -6354,6 +6354,52 @@ def test_safe_recall_metrics_keeps_fts_fallback_without_payload():
     ]
 
 
+def test_safe_recall_metrics_keeps_vector_io_without_private_or_unbounded_fields():
+    lines = [
+        'funes_metric {"stage":"recall_vector_stream","state":"start","duration_ms":0}',
+        'funes_metric {"stage":"recall_vector_collect","state":"done","duration_ms":12.345}',
+        'funes_metric {"stage":"recall_vector_io","state":"sample","duration_ms":1000,"io":{"fetch_active":2,"fetch_calls":12,"fetch_ms":20,"cache_wait_active":1,"cache_wait_ms":0,"materialize_active":0,"materialize_ms":0,"fallback_active":0,"fallback_calls":0,"fallback_ms":0,"requested_bytes":4096,"path":"private","query":"secret"}}',
+        'funes_metric {"stage":"recall_vector_io","state":"sample","duration_ms":2000,"io":{"fetch_active":true,"fetch_calls":-1,"fetch_ms":1.5,"cache_wait_ms":9007199254740992,"requested_bytes":"4096","token":"secret"}}',
+        'funes_metric {"stage":"recall_embed","state":"sample","duration_ms":1000}',
+    ]
+    safe = bridge._safe_recall_metrics(lines)
+    assert len(safe) == 4
+    assert safe[0]["stage"] == "recall_vector_stream"
+    assert safe[1]["duration_ms"] == 12.35
+    assert safe[2]["io"] == {
+        "fetch_active": 2, "fetch_calls": 12, "fetch_ms": 20,
+        "cache_wait_active": 1, "cache_wait_ms": 0,
+        "materialize_active": 0, "materialize_ms": 0,
+        "fallback_active": 0, "fallback_calls": 0, "fallback_ms": 0,
+        "requested_bytes": 4096,
+    }
+    assert safe[3]["io"] == {}
+    assert "secret" not in json.dumps(safe) and "private" not in json.dumps(safe)
+
+
+def test_successful_native_recall_exposes_read_diagnostics_without_erasing_failure(monkeypatch, tmp_path):
+    worker = bridge.NativeMcpWorker("unused-funes", "owner/memory", tmp_path)
+    monkeypatch.setattr(worker, "_ensure_started_locked", lambda _deadline: None)
+    monkeypatch.setattr(bridge, "MCP_WORKER", worker)
+    monkeypatch.setattr(bridge, "_MCP_WORKER_CONFIG", bridge._native_worker_config())
+    prior_failure = {"category": "timeout", "at": "before", "read_metrics": []}
+    monkeypatch.setattr(bridge, "_NATIVE_LAST_FAILURE", dict(prior_failure))
+    metric = {"stage": "recall_vector_io", "state": "done", "duration_ms": 5.0, "io": {"fetch_active": 0}}
+
+    def respond(_method, _params, _timeout):
+        worker._stderr_lines.append("funes_metric " + json.dumps(metric))
+        return {"content": [{"type": "text", "text": "safe result"}]}
+
+    monkeypatch.setattr(worker, "_request_locked", respond)
+    assert worker.recall("private query", timeout=7) == "safe result"
+    status = bridge.native_worker_status()
+    assert status["last_read"]["operation"] == "recall"
+    assert status["last_read"]["worker_role"] == "active"
+    assert status["last_read"]["read_metrics"] == [metric]
+    assert status["last_failure"] == prior_failure
+    assert "private query" not in json.dumps(status)
+
+
 def test_ingest_canonical_subset_catches_timeout_and_accumulates_partial_metrics(
     monkeypatch, tmp_path
 ):

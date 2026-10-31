@@ -1625,6 +1625,7 @@ where
         .truncate(false)
         .write(true)
         .open(blob.with_extension("funes-local.lock"))?;
+    let waiting = super::fetch_store::track_read_io(super::fetch_store::ReadIoKind::CacheWait);
     loop {
         match lock.try_lock() {
             Ok(()) => break,
@@ -1632,9 +1633,11 @@ where
             Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
         }
     }
+    drop(waiting);
     if restored_blob(&path, mount).is_none() {
         return Ok(path);
     }
+    let _download = super::fetch_store::track_read_io(super::fetch_store::ReadIoKind::Materialize);
     download().await
 }
 

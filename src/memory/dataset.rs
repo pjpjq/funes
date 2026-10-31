@@ -8,6 +8,7 @@ use crate::inference::{EmbeddingModel, EmbeddingProfile};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use arrow_array::types::Float32Type;
@@ -179,6 +180,18 @@ pub async fn nearest(
     filter: Option<&str>,
     columns: &[&str],
 ) -> Result<Vec<RecordBatch>> {
+    nearest_with_progress(ds, query, limit, filter, columns, |_, _, _| {}).await
+}
+
+/// The same search with separate stream preparation and collection timings.
+pub(crate) async fn nearest_with_progress(
+    ds: &Dataset,
+    query: &[f32],
+    limit: usize,
+    filter: Option<&str>,
+    columns: &[&str],
+    on_phase: impl Fn(&'static str, &'static str, Duration),
+) -> Result<Vec<RecordBatch>> {
     let query = Float32Array::from(query.to_vec());
     let mut scan = ds.scan();
     scan.nearest("vector", &query, limit)?;
@@ -188,7 +201,18 @@ pub async fn nearest(
     }
     scan.project(columns)?;
     scan.with_row_id();
-    collect(scan).await
+    let started = Instant::now();
+    on_phase("recall_vector_stream", "start", Duration::ZERO);
+    let mut stream = scan.try_into_stream().await?;
+    on_phase("recall_vector_stream", "done", started.elapsed());
+    on_phase("recall_vector_collect", "start", Duration::ZERO);
+    let started = Instant::now();
+    let mut batches = Vec::new();
+    while let Some(batch) = stream.try_next().await? {
+        batches.push(batch);
+    }
+    on_phase("recall_vector_collect", "done", started.elapsed());
+    Ok(batches)
 }
 
 /// The `limit` rows best matching `query` by BM25, best first, each with its row id. `filter` is

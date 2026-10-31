@@ -53,7 +53,11 @@ struct ReadIoCounter {
 
 static READ_IO_ENABLED: LazyLock<bool> = LazyLock::new(|| {
     matches!(
-        std::env::var("FUNES_RECALL_METRICS").unwrap_or_default().trim().to_ascii_lowercase().as_str(),
+        std::env::var("FUNES_RECALL_METRICS")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
         "1" | "true" | "yes" | "on"
     )
 });
@@ -79,7 +83,10 @@ impl ReadIoCounter {
     fn enter(&self) -> ReadIoGuard<'_> {
         self.active.fetch_add(1, Ordering::Relaxed);
         self.calls.fetch_add(1, Ordering::Relaxed);
-        ReadIoGuard { counter: self, started: Instant::now() }
+        ReadIoGuard {
+            counter: self,
+            started: Instant::now(),
+        }
     }
 }
 
@@ -301,7 +308,9 @@ mod tests {
             let _guard = counter.enter();
             std::future::pending::<()>().await;
         };
-        assert!(tokio::time::timeout(std::time::Duration::from_millis(5), read).await.is_err());
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(5), read)
+            .await
+            .is_err());
         assert_eq!(counter.active.load(Ordering::Relaxed), 0);
         assert_eq!(counter.calls.load(Ordering::Relaxed), 1);
     }

@@ -849,11 +849,19 @@ async fn hybrid_candidates(
         eprintln!("{}", format_read_io_metric("start", 0.0, &read_io_snapshot()));
         let result = sample_vector_read(
             read,
-            || eprintln!("{}", format_read_io_metric("sample", round_ms(t_vec.elapsed()), &read_io_snapshot())),
+            || {
+                eprintln!(
+                    "{}",
+                    format_read_io_metric("sample", round_ms(t_vec.elapsed()), &read_io_snapshot())
+                )
+            },
             Duration::from_secs(1),
         )
         .await;
-        eprintln!("{}", format_read_io_metric("done", round_ms(t_vec.elapsed()), &read_io_snapshot()));
+        eprintln!(
+            "{}",
+            format_read_io_metric("done", round_ms(t_vec.elapsed()), &read_io_snapshot())
+        );
         result?
     } else {
         read.await?

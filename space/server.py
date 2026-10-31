@@ -1877,6 +1877,7 @@ def _native_metrics() -> dict[str, object]:
     return {
         "_metric_id": next(_CANONICAL_METRIC_COUNTER),
         "phase_ms": {},
+        "native_exit_codes": {},
         "voyage_requests": 0,
         "voyage_retries": 0,
         "voyage_duration_ms": 0.0,
@@ -2129,8 +2130,19 @@ def _bounded_native_metrics(metrics: object) -> dict[str, object] | None:
                 except (TypeError, ValueError):
                     continue
 
+    native_exit_codes: dict[str, int] = {}
+    raw_exits = metrics.get("native_exit_codes")
+    if isinstance(raw_exits, dict):
+        for raw_code, count in raw_exits.items():
+            if not isinstance(raw_code, str) or re.fullmatch(r"-?[0-9]{1,3}", raw_code) is None:
+                continue
+            code = int(raw_code)
+            if -128 <= code <= 255 and code != 0 and type(count) is int and 0 < count <= 1_000_000_000:
+                native_exit_codes[str(code)] = count
+
     return {
         "phase_ms": phase_ms,
+        "native_exit_codes": native_exit_codes,
         "voyage_requests": _safe_int("voyage_requests"),
         "voyage_retries": _safe_int("voyage_retries"),
         "voyage_duration_ms": _safe_float("voyage_duration_ms"),
@@ -2453,6 +2465,10 @@ def _ingest_canonical_subset(
             )
             return left + right, left_commit or right_commit
         failure_code = _native_failure_code(error_output)
+        if metrics is not None:
+            # Count failed processes, not rows; preserve signals without retaining stderr.
+            exit_codes = metrics.setdefault("native_exit_codes", {})
+            exit_codes[str(code)] = exit_codes.get(str(code), 0) + 1
         return [
             _native_update(
                 item, "retry", None, failure_code, profile=profile, memory=memory
@@ -2586,6 +2602,7 @@ def _empty_cumulative_metrics(since: str | None = None) -> dict[str, object]:
     return {
         "since": ts,
         "process_started_at": ts,
+        "native_exit_codes": {},
         "hf_429": 0,
         "hf_send_attempts": 0,
         "hf_retries": 0,
@@ -2667,6 +2684,10 @@ def _accumulate_canonical_metrics(state: dict[str, object], raw_metrics: object)
     if isinstance(cum_hf_limits, dict) and isinstance(hf_limit_kind_counts, dict):
         for k, v in hf_limit_kind_counts.items():
             cum_hf_limits[k] = int(cum_hf_limits.get(k, 0)) + int(v)
+
+    cum_exits = cumulative.setdefault("native_exit_codes", {})
+    for code, count in bounded["native_exit_codes"].items():
+        cum_exits[code] = cum_exits.get(code, 0) + count
 
 
 def _initialize_canonical_reconcile_state(app) -> None:
@@ -2885,7 +2906,7 @@ def canonical_reconcile_state(app) -> dict[str, object]:
             cum = public.get("cumulative_metrics")
             if isinstance(cum, dict):
                 copied_cum = dict(cum)
-                for sub_k in ("hf_phase_counts", "hf_status_counts", "hf_limit_kind_counts"):
+                for sub_k in ("hf_phase_counts", "hf_status_counts", "hf_limit_kind_counts", "native_exit_codes"):
                     if isinstance(copied_cum.get(sub_k), dict):
                         copied_cum[sub_k] = dict(copied_cum[sub_k])
                 public["cumulative_metrics"] = copied_cum

@@ -66,6 +66,12 @@ Authenticated sync status includes maintenance `last_diagnostics`: the native ex
 bounded failure category, never stdout, stderr, paths or credentials. Maintenance failures retain
 dirty work and the existing retry cooldown; they do not clear source checkpoints or stop queries.
 
+Ingest `last_metrics.native_exit_codes` counts nonzero subprocess exits by numeric code, excluding
+record-validation failures. `cumulative_metrics.native_exit_codes` retains these counts across
+successful cycles in the same server process; a server restart resets them. Negative codes identify
+signals (for example `-9` is SIGKILL), not their cause: SIGKILL alone does not prove an OOM kill.
+The existing retry categories and source checkpoints are unchanged; no native output is retained.
+
 The embedding provider is selected at runtime with `FUNES_EMBEDDING_PROVIDER=local|voyage`.
 `local` preserves the existing pinned BGE behavior. `voyage` sends original multilingual passages
 with `input_type=document` at index time and the original query with `input_type=query` at recall

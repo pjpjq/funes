@@ -4300,6 +4300,64 @@ def test_canonical_failure_persists_retry_and_next_pass_succeeds(monkeypatch, tm
     assert recovered["native_index_error"] is None
 
 
+def test_canonical_exit_codes_survive_success_without_advancing_failed_rows(monkeypatch, tmp_path):
+    app = _source_app(tmp_path)
+    for identity in ("retry-one", "retry-two"):
+        _canonical_source(app.store, identity)
+    bridge._initialize_canonical_reconcile_state(app)
+    monkeypatch.setattr(bridge, "REMOTE", "owner/memory")
+    monkeypatch.setattr(bridge, "INDEX_REMOTE", "")
+    monkeypatch.setattr(bridge, "request_warm", lambda **_kwargs: None)
+    try:
+        for code, stderr, category in [
+            (-9, "private stderr hf_secret", "native_exit"),
+            (101, "private panic payload", "native_exit"),
+            (1, "http_status=429 private provider payload", "hf_http_429"),
+        ]:
+            monkeypatch.setattr(bridge, "run", lambda *_args, **_kwargs: (code, "private stdout", stderr))
+            result = bridge.reconcile_canonical_index(app)
+            assert result["indexed"] == 0 and result["attempted"] == 2
+            for identity in ("retry-one", "retry-two"):
+                failed = app.store.get(identity)
+                assert failed["native_index_status"] == "retry"
+                assert failed["native_index_error"] == category
+                assert failed["native_index_pending"] == 1
+            state = bridge.canonical_reconcile_state(app)
+            assert state["last_metrics"]["native_exit_codes"] == {str(code): 1}
+            assert "private" not in json.dumps(state) and "hf_secret" not in json.dumps(state)
+        monkeypatch.setattr(bridge, "run", lambda *_args, **_kwargs: (
+            0, "ingested sources=2 chunks=2 unchanged=0 stale=0 held=0 commit=commit1\n", "",
+        ))
+        assert bridge.reconcile_canonical_index(app)["indexed"] == 2
+        state = bridge.canonical_reconcile_state(app)
+        assert state["last_metrics"]["native_exit_codes"] == {}
+        assert state["cumulative_metrics"]["native_exit_codes"] == {"-9": 1, "101": 1, "1": 1}
+        state["cumulative_metrics"]["native_exit_codes"].clear()
+        assert bridge.canonical_reconcile_state(app)["cumulative_metrics"]["native_exit_codes"] == {
+            "-9": 1, "101": 1, "1": 1,
+        }
+        assert all(app.store.get(identity)["native_index_pending"] == 0 for identity in ("retry-one", "retry-two"))
+    finally:
+        app.store.close()
+
+
+def test_native_exit_code_metrics_are_bounded_and_accumulated_once():
+    app = SimpleNamespace()
+    bridge._initialize_canonical_reconcile_state(app)
+    metrics = bridge._native_metrics()
+    metrics["native_exit_codes"] = {
+        "-9": 1, "101": 2, "0": 1, "-999": 1, "999": 1,
+        "private hf_secret": 1, "1": "private", "2": -1, "3": 1_000_000_001,
+    }
+    bridge._set_canonical_reconcile_state(app, last_metrics=metrics)
+    bridge._set_canonical_reconcile_state(app, last_metrics=metrics)
+    state = bridge.canonical_reconcile_state(app)
+    assert state["last_metrics"]["native_exit_codes"] == {"-9": 1, "101": 2}
+    assert state["cumulative_metrics"]["native_exit_codes"] == {"-9": 1, "101": 2}
+    assert state["cumulative_metrics"]["cycles"] == 1
+    assert "private" not in json.dumps(state) and "hf_secret" not in json.dumps(state)
+
+
 def test_native_stale_report_is_retryable_not_indexed(monkeypatch, tmp_path):
     app = _source_app(tmp_path)
     _canonical_source(app.store, "stale-doc")

@@ -52,6 +52,20 @@ candidate), allowlisted operation, budget and elapsed milliseconds. A later work
 replace that failure snapshot with unrelated stages. Query text, arguments and exception details
 are excluded; a candidate failure alone is not evidence of an HTTP search failure.
 
+With read metrics enabled, vector diagnostics separate stream creation (`recall_vector_stream`)
+from batch collection/decoding (`recall_vector_collect`). `recall_vector_io` records a starting
+snapshot, at most 16 one-second samples, and a final snapshot without cancelling or replaying the
+scan. Its integer counters are worker-process aggregates: active fetches, cache-lock waits,
+materializations and fallback operations, completed-operation milliseconds, and requested range
+bytes. Requested bytes are not network-download bytes; elapsed totals can overlap, and concurrent
+FTS reads may contribute. These counters do not prove per-request causality, cache hits, OOM, or
+ANN index coverage. No paths, file IDs, queries, raw errors or credentials are emitted. A runtime
+that cannot poll the sampler may omit samples; a missing sample is not proof of zero I/O.
+Authenticated status also exposes `native_worker.last_read` for the latest completed native recall,
+including its timestamp, active/candidate role and bounded metrics, without clearing `last_failure`.
+Warm recalls can populate this field; compare its timestamp and role when correlating a real query.
+The existing 32-event/8192-byte metric bounds and all query budgets remain unchanged.
+
 A verified worker retains its source-type filter readiness while a later maintenance result's
 replacement warms. Unverified snapshots still fail closed; normal refresh timing is unchanged.
 PostgreSQL source-type queries recheck hydrated current metadata before returning raw passages,

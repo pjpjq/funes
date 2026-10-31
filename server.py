@@ -1681,11 +1681,20 @@ RECALL_METRIC_STAGES = frozenset(
         "recall_models",
         "recall_embed",
         "recall_vector",
+        "recall_vector_stream",
+        "recall_vector_collect",
+        "recall_vector_io",
         "recall_fts",
         "recall_rerank",
         "recall_neighbors",
     }
 )
+
+RECALL_IO_FIELDS = frozenset({
+    "fetch_active", "fetch_calls", "fetch_ms",
+    "cache_wait_active", "cache_wait_ms", "materialize_active", "materialize_ms",
+    "fallback_active", "fallback_calls", "fallback_ms", "requested_bytes",
+})
 
 
 def _safe_recall_metrics(lines: Sequence[str] | None) -> list[dict[str, object]]:
@@ -1711,6 +1720,7 @@ def _safe_recall_metrics(lines: Sequence[str] | None) -> list[dict[str, object]]
             or (
                 state not in {"start", "done"}
                 and not (stage == "recall_fts" and state in {"timeout", "error"})
+                and not (stage == "recall_vector_io" and state == "sample")
             )
             or isinstance(duration, bool)
         ):
@@ -1728,6 +1738,12 @@ def _safe_recall_metrics(lines: Sequence[str] | None) -> list[dict[str, object]]
                 "duration_ms": round(duration_value, 2),
             }
         )
+        if stage == "recall_vector_io":
+            io = item.get("io")
+            result[-1]["io"] = {
+                key: value for key, value in (io.items() if isinstance(io, dict) else ())
+                if key in RECALL_IO_FIELDS and type(value) is int and 0 <= value <= 2**53 - 1
+            }
         if len(result) >= 32:
             break
     return result
@@ -3772,6 +3788,7 @@ def native_worker_status() -> dict[str, object]:
         "config_match": bool(config_match),
         "alive": alive,
         "last_failure": failure,
+        "last_read": dict(worker._last_read) if isinstance(worker, NativeMcpWorker) else {},
     }
 
 
@@ -3799,6 +3816,7 @@ class NativeMcpWorker:
         self._stderr_stop = threading.Event()
         self._stderr_lines: deque[str] = deque(maxlen=32)
         self._read_metrics: list[dict[str, object]] = []
+        self._last_read: dict[str, object] = {}
         # Set only after a replacement child has completed its warm recall.
         # Handshake alone does not prove that the active Lance snapshot is open.
         self._snapshot_opened_after: float | None = None
@@ -4073,6 +4091,13 @@ class NativeMcpWorker:
                             self._source_type_index_ready = (
                                 not result.get("isError") and metadata["source_type_index_ready"] is True
                             )
+                    if method == "tools/call" and operation == "recall":
+                        self._last_read = {
+                            "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                            "operation": "recall",
+                            "worker_role": "active" if self is MCP_WORKER else "candidate",
+                            "read_metrics": self._snapshot_read_metrics(),
+                        }
                     return result
                 except NativeMcpTimeoutError as exc:
                     _record_native_failure(exc, self, operation, total_timeout, started_at)

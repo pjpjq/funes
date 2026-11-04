@@ -951,42 +951,55 @@ async fn hybrid_candidates(
     filter: Option<&str>,
     deadline: Option<Instant>,
 ) -> Result<Vec<Hit>> {
-    emit_recall_metric("recall_vector", "start", 0.0);
-    let started = Instant::now();
-    let read = vector_candidates(ds, qv, candidates, filter);
-    let vector = if recall_metrics_enabled() {
-        eprintln!("{}", format_read_io_metric("start", 0.0, &read_io_snapshot()));
-        let result = sample_vector_read(
-            read,
-            || {
-                eprintln!(
-                    "{}",
-                    format_read_io_metric("sample", round_ms(started.elapsed()), &read_io_snapshot())
-                )
-            },
-            Duration::from_secs(1),
-        )
-        .await;
-        eprintln!(
-            "{}",
-            format_read_io_metric("done", round_ms(started.elapsed()), &read_io_snapshot())
-        );
-        result?
-    } else {
-        read.await?
+    let vector = async {
+        emit_recall_metric("recall_vector", "start", 0.0);
+        let started = Instant::now();
+        let read = vector_candidates(ds, qv, candidates, filter);
+        let hits = if recall_metrics_enabled() {
+            eprintln!("{}", format_read_io_metric("start", 0.0, &read_io_snapshot()));
+            let result = sample_vector_read(
+                read,
+                || {
+                    eprintln!(
+                        "{}",
+                        format_read_io_metric("sample", round_ms(started.elapsed()), &read_io_snapshot())
+                    )
+                },
+                Duration::from_secs(1),
+            )
+            .await;
+            eprintln!(
+                "{}",
+                format_read_io_metric("done", round_ms(started.elapsed()), &read_io_snapshot())
+            );
+            result?
+        } else {
+            read.await?
+        };
+        emit_recall_metric("recall_vector", "done", round_ms(started.elapsed()));
+        Ok(hits)
     };
-    emit_recall_metric("recall_vector", "done", round_ms(started.elapsed()));
+    let fts = async {
+        let ds = ds.clone();
+        let query = query.to_owned();
+        let filter = filter.map(str::to_owned);
+        best_effort_fts(
+            async move { fts_candidates(&ds, &query, candidates, filter.as_deref()).await },
+            fts_budget(deadline),
+            FTS_SCAN_SLOT.clone(),
+        )
+        .await
+    };
+    fuse_hybrid_reads(vector, fts, candidates).await
+}
 
-    let ds = ds.clone();
-    let query = query.to_owned();
-    let filter = filter.map(str::to_owned);
-    let fts = best_effort_fts(
-        async move { fts_candidates(&ds, &query, candidates, filter.as_deref()).await },
-        fts_budget(deadline),
-        FTS_SCAN_SLOT.clone(),
-    )
-    .await;
-
+async fn fuse_hybrid_reads(
+    vector: impl std::future::Future<Output = Result<Vec<(u64, Hit)>>>,
+    fts: impl std::future::Future<Output = Vec<(u64, Hit)>>,
+    candidates: usize,
+) -> Result<Vec<Hit>> {
+    // Start optional I/O before vector reads consume its deadline; vector errors cancel it immediately.
+    let (fts, vector) = tokio::try_join!(async { Ok::<_, anyhow::Error>(fts.await) }, vector)?;
     Ok(rrf_fuse(vector, fts, candidates))
 }
 
@@ -2139,6 +2152,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hybrid_reads_start_fts_before_vector_finishes() {
+        let (fts_started, started) = oneshot::channel();
+        let vector = async {
+            started.await?;
+            Ok(vec![(1, hit("vector-only"))])
+        };
+        let fts = best_effort_fts(
+            async move {
+                fts_started.send(()).expect("vector is waiting for FTS");
+                Ok(vec![(2, hit("fts-only"))])
+            },
+            Duration::from_secs(1),
+            Arc::new(Semaphore::new(1)),
+        );
+        let fused = tokio::time::timeout(Duration::from_secs(1), fuse_hybrid_reads(vector, fts, 2))
+            .await
+            .expect("FTS must start while vector I/O is pending")
+            .expect("both reads succeed");
+        assert_eq!(fused.len(), 2);
+        assert!(fused.iter().any(|hit| hit.text == "fts-only"));
+    }
+
+    #[tokio::test]
+    async fn hybrid_reads_return_vector_errors_without_waiting_for_fts() {
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            fuse_hybrid_reads(async { Err(anyhow!("vector failed")) }, std::future::pending(), 1),
+        )
+        .await
+        .expect("a vector failure must not wait for optional FTS");
+        assert_eq!(
+            result.err().expect("vector error is preserved").to_string(),
+            "vector failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn hybrid_reads_keep_vector_hits_when_fts_times_out() {
+        let fts = best_effort_fts(
+            std::future::pending(),
+            Duration::from_millis(20),
+            Arc::new(Semaphore::new(1)),
+        );
+        let fused = fuse_hybrid_reads(async { Ok(vec![(1, hit("vector-only"))]) }, fts, 1)
+            .await
+            .expect("optional FTS timeout does not fail vector recall");
+        assert_eq!(fused.len(), 1);
+        assert_eq!(fused[0].text, "vector-only");
+    }
+
+    #[tokio::test]
     async fn exhausted_fts_budget_never_polls_the_scan_or_loses_vector_hits() {
         let scan = async { panic!("an exhausted optional scan must not be polled") };
         let fts = best_effort_fts(scan, fts_budget(Some(Instant::now())), Arc::new(Semaphore::new(1))).await;
@@ -2338,7 +2402,33 @@ mod tests {
         use lance::index::DatasetIndexExt;
         use lance_index::{scalar::InvertedIndexParams, IndexType};
 
+        // Select the scheduler in a child instead of mutating process env under parallel Tokio tests.
+        if std::env::var("FUNES_TEST_FTS_CHILD").as_deref() != Ok("1") {
+            let executable = std::env::args_os().next().expect("test executable");
+            let output = std::process::Command::new(executable)
+                .args([
+                    "--exact",
+                    "commands::recall::tests::isolated_fts_keeps_real_keyword_hits_and_filters_across_calls",
+                    "--test-threads=1",
+                ])
+                .env("FUNES_TEST_FTS_CHILD", "1")
+                .env("LANCE_USE_LITE_SCHEDULER", "true")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success(),
+                "{stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(stdout.contains("1 passed; 0 failed"), "{stdout}");
+            return;
+        }
         let memory = tempfile::tempdir().unwrap();
+        let target_text = format!(
+            "alpha {} zulu target",
+            (0..300).map(|n| format!("middle{n:03}")).collect::<Vec<_>>().join(" ")
+        );
         let schema = Arc::new(Schema::new(
             HIT_COLS
                 .iter()
@@ -2360,7 +2450,7 @@ mod tests {
             .map(|name| -> ArrayRef {
                 match *name {
                     "seq" => Arc::new(Int64Array::from(vec![0, 1])),
-                    "text" => Arc::new(StringArray::from(vec!["needle target", "needle excluded"])),
+                    "text" => Arc::new(StringArray::from(vec![target_text.as_str(), "alpha excluded"])),
                     "harness" => Arc::new(StringArray::from(vec!["codex", "pi"])),
                     _ => Arc::new(StringArray::from(vec!["fixture", "fixture"])),
                 }
@@ -2383,17 +2473,20 @@ mod tests {
         )
         .await
         .unwrap();
+        let ds = Dataset::open(&dataset::table_uri(memory.path().to_str().unwrap()))
+            .await
+            .unwrap();
         let slot = Arc::new(Semaphore::new(1));
-        for _ in 0..2 {
+        for query in ["alpha", "zulu"] {
             let ds = ds.clone();
             let hits = best_effort_fts(
-                async move { fts_candidates(&ds, "needle", 2, Some("harness = 'codex'")).await },
+                async move { fts_candidates(&ds, query, 2, Some("harness = 'codex'")).await },
                 Duration::from_secs(3),
                 slot.clone(),
             )
             .await;
             assert_eq!(hits.len(), 1);
-            assert_eq!(hits[0].1.text, "needle target");
+            assert_eq!(hits[0].1.text, target_text);
             assert_eq!(hits[0].1.harness, "codex");
             drop(
                 tokio::time::timeout(Duration::from_secs(1), slot.acquire())

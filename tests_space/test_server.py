@@ -2591,6 +2591,19 @@ def test_native_mcp_worker_environment_enables_recall_metrics_only_for_reads(
     assert worker._environment()["FUNES_RECALL_METRICS"] == "0"
 
 
+def test_native_mcp_worker_lite_scheduler_does_not_change_backfill_environment(
+    monkeypatch, tmp_path
+):
+    monkeypatch.delenv("LANCE_USE_LITE_SCHEDULER", raising=False)
+    worker = bridge.NativeMcpWorker("fake-funes", "owner/memory", tmp_path)
+    assert worker._environment()["LANCE_USE_LITE_SCHEDULER"] == "true"
+    assert "LANCE_USE_LITE_SCHEDULER" not in bridge.native_environment(tmp_path)
+
+    monkeypatch.setenv("LANCE_USE_LITE_SCHEDULER", "false")
+    assert worker._environment()["LANCE_USE_LITE_SCHEDULER"] == "true"
+    assert bridge.native_environment(tmp_path)["LANCE_USE_LITE_SCHEDULER"] == "false"
+
+
 def test_native_environment_profile_overrides_voyage_concurrency(monkeypatch, tmp_path):
     monkeypatch.delenv("FUNES_VOYAGE_CONCURRENCY", raising=False)
     profile = {

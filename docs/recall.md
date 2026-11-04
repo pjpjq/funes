@@ -31,11 +31,17 @@ finish cold index initialization instead of cancelling and restarting it on ever
 calls remain bounded by their original caller deadline. If no time remains, FTS is skipped without
 polling the scan and the filtered vector hits are retained. CLI calls without this transport budget
 keep the existing three-second FTS cap.
+Vector and FTS reads overlap within this same deadline, so vector I/O does not leave keyword search
+only the final fraction of a second. A vector error cancels the optional FTS wait immediately. Read-I/O
+counters are process-wide and can include both legs, not exclusive measurements of vector traffic.
 The optional scan runs on an isolated thread/runtime so non-yielding FTS work cannot hold the
 query's timer. Each native worker admits one FTS scan with no queue; an occupied slot falls back to
 the same filtered vector results. Cancellation remains cooperative: a timed-out scan keeps the
 slot until its work and runtime cleanup finish, and its late result is discarded. Healthy scans
 still contribute keyword hits to the same RRF fusion; no index or checkpoint is replaced.
+The HTTP bridge selects Lance's lite I/O scheduler only for its MCP read worker. Cached FTS readers
+can then survive a scan runtime ending without retaining that runtime's stopped background I/O loop.
+The ingest/backfill subprocess environment is unchanged.
 
 When a Space restores its Hub cache from `FUNES_HUB_CACHE_MOUNT`, a restored blob is initially a
 link to the remote Bucket, not local file contents. Native reads materialize each touched blob in

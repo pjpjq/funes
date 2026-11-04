@@ -7,12 +7,12 @@
 
 use funes::agents;
 use funes::commands::target::Target;
-use funes::commands::{add, ask, bind, compact, index, ingest_docs, mcp, push, recall, scrub, sketch, update};
+use funes::commands::{add, ask, bind, compact, index, ingest_docs, mcp, push, recall, scrub, sketch, sync, update};
 use funes::hub;
 use funes::memory;
 use funes::ui::banner::Banner;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 use std::io::Write;
 use std::path::PathBuf;
@@ -29,7 +29,7 @@ struct Cli {
 // surface and avoids boxing individual optional strings only to shrink this transient enum.
 #[allow(clippy::large_enum_variant)]
 enum Cmd {
-    /// Recall passages from past sessions (hybrid → reranked when the pool exceeds -k → neighbors).
+    /// Recall passages from past sessions (hybrid → optional rerank when the pool exceeds -k → neighbors).
     Recall {
         /// What to recall (free text).
         #[arg(required = true, num_args = 1..)]
@@ -37,8 +37,8 @@ enum Cmd {
         /// How many results to show. Each is a passage to read.
         #[arg(short, long, default_value_t = recall::DEFAULT_K)]
         k: usize,
-        /// Size of the fused pool the hits are cut from. Larger than -k, the pool is reranked by
-        /// the cross-encoder before the cut (seconds per call, growing with the pool). A pool of -k
+        /// Size of the fused pool the hits are cut from. Larger than -k, an enabled rerank provider
+        /// reranks before the cut (seconds per call, growing with the pool). A pool of -k
         /// rows or fewer is read whole, in the fused order.
         #[arg(long, default_value_t = recall::DEFAULT_CANDIDATES)]
         candidates: usize,
@@ -355,6 +355,25 @@ enum SyncCommand {
     Mcp,
 }
 
+impl SyncCommand {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Status => "status",
+            Self::Sources => "sources",
+            Self::Doctor => "doctor",
+            Self::Backfill => "backfill",
+            Self::Run => "run",
+            Self::Install => "install",
+            Self::Uninstall => "uninstall",
+            Self::Start => "start",
+            Self::Stop => "stop",
+            Self::Restart => "restart",
+            Self::Logs => "logs",
+            Self::Mcp => "mcp",
+        }
+    }
+}
+
 // Flattened into every ask agent so they share the question positional and the read `--memory`
 // flag; the user-facing help comes from the field docs.
 #[derive(Args)]
@@ -603,46 +622,12 @@ async fn run() -> Result<()> {
         Cmd::Bind { memory } => bind::run(&memory).await,
         Cmd::Add { agent, memory, from } => add::run(&agent, memory.memory.as_deref(), from.as_deref()).await,
         Cmd::Remove { agent } => add::remove(&agent).await,
-        Cmd::Sync { command } => run_sync_command(command),
-        Cmd::Doctor => run_sync_command(SyncCommand::Doctor),
-        Cmd::Sources => run_sync_command(SyncCommand::Sources),
+        Cmd::Sync { command } => sync::run(&[command.as_str()]),
+        Cmd::Doctor => sync::run(&[SyncCommand::Doctor.as_str()]),
+        Cmd::Sources => sync::run(&[SyncCommand::Sources.as_str()]),
         Cmd::Reindex { retrieval_text: _, all } => {
-            run_sync_args(&["reindex", if all { "--all" } else { "--retrieval-text" }])
+            sync::run(&["reindex", if all { "--all" } else { "--retrieval-text" }])
         }
-    }
-}
-
-/// Delegate the long-lived bridge to the separately testable Python package.  Keeping
-/// discovery/queue state out of the Rust Lance process means a Space restart or a
-/// client upgrade cannot strand a pending upload.
-fn run_sync_command(command: SyncCommand) -> Result<()> {
-    let name = match command {
-        SyncCommand::Status => "status",
-        SyncCommand::Sources => "sources",
-        SyncCommand::Doctor => "doctor",
-        SyncCommand::Backfill => "backfill",
-        SyncCommand::Run => "run",
-        SyncCommand::Install => "install",
-        SyncCommand::Uninstall => "uninstall",
-        SyncCommand::Start => "start",
-        SyncCommand::Stop => "stop",
-        SyncCommand::Restart => "restart",
-        SyncCommand::Logs => "logs",
-        SyncCommand::Mcp => "mcp",
-    };
-    run_sync_args(&[name])
-}
-
-fn run_sync_args(args: &[&str]) -> Result<()> {
-    let mut child = std::process::Command::new(std::env::var("FUNES_SYNC_BIN").unwrap_or_else(|_| "funes-sync".into()));
-    let status = child
-        .args(args)
-        .status()
-        .context("running funes-sync (set FUNES_SYNC_BIN to its absolute path)")?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(anyhow!("funes-sync exited with {:?}", status.code()))
     }
 }
 

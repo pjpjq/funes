@@ -841,6 +841,7 @@ pub async fn build_indexes(ds: &mut Dataset, on_event: impl Fn(IndexBuildEvent))
 }
 
 /// Create missing required indexes without discarding existing index bases.
+#[cfg(test)]
 pub(crate) async fn ensure_required_indexes(ds: &mut Dataset, on_event: impl Fn(IndexBuildEvent)) -> Result<bool> {
     let version = ds.version().version;
     build_indexes(ds, on_event).await?;
@@ -1169,6 +1170,7 @@ fn ivf_pq_params(ds: &Dataset) -> Option<VectorIndexParams> {
     ))
 }
 
+#[cfg(test)]
 pub(crate) async fn create_empty(uri: &str, model: EmbeddingModel) -> Result<Dataset> {
     create(uri, build_batch(model, &[], None)?).await
 }
@@ -1278,6 +1280,7 @@ pub(crate) async fn ensure_canonical_columns(ds: &mut Dataset) -> Result<bool> {
 }
 
 /// `None` writes every row with a null `vector`.
+#[cfg(test)]
 pub(crate) fn build_batch(
     model: EmbeddingModel,
     chunks: &[chunk::Chunk],
@@ -1877,6 +1880,29 @@ mod tests {
             .unwrap();
         let ds = fill_vectors(&ds, &[chunks[0].id.as_str()], &vectors(1)).await.unwrap();
         assert_eq!(languages(&ds), Some(counts));
+    }
+
+    #[tokio::test]
+    async fn language_metadata_preserves_voyage_profile_and_pending_vectors() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = EmbeddingProfile::voyage("voyage-4-lite", 1024).unwrap();
+        let chunks = chunk::chunks_from_turns(&turns(0, 1), true);
+        let batch = build_batch_optional_for_schema(&chunks, None, schema_for(&profile)).unwrap();
+        let mut ds = create(&table_uri(dir.path()), batch).await.unwrap();
+        let before = scan_rows(&ds, &["vector"], None, None).await.unwrap();
+        let counts = Languages {
+            rows: chunks.len() as u64,
+            counts: BTreeMap::from([("eng".to_string(), 1)]),
+        };
+        stamp_languages(&mut ds, &counts).await.unwrap();
+        let reopened = Dataset::open(&table_uri(dir.path())).await.unwrap();
+        assert_eq!(embedding_profile(&reopened).unwrap(), profile);
+        assert_eq!(languages(&reopened), Some(counts));
+        let after = scan_rows(&reopened, &["vector"], None, None).await.unwrap();
+        assert_eq!(
+            after.iter().map(RecordBatch::columns).collect::<Vec<_>>(),
+            before.iter().map(RecordBatch::columns).collect::<Vec<_>>()
+        );
     }
 
     #[tokio::test]

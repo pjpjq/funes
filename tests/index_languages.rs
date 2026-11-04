@@ -2,7 +2,7 @@
 
 use funes::commands::index;
 use funes::home;
-use funes::inference::EmbeddingModel;
+use funes::inference::{EmbeddingModel, EmbeddingProfile};
 use funes::memory::dataset::{self, Languages};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -50,7 +50,8 @@ async fn indexing_keeps_the_memory_language_counts() {
     std::env::set_var("FUNES_HOME", home.path());
     let turns = home.path().join("turns");
     std::fs::create_dir(&turns).unwrap();
-    index::ensure_local_memory(EmbeddingModel::BgeSmallEn).await.unwrap();
+    let profile = EmbeddingProfile::local_model(EmbeddingModel::BgeSmallEn);
+    index::ensure_local_memory(&profile).await.unwrap();
 
     session(&turns, "a", &[("user", PORTUGUESE), ("assistant", ENGLISH)]);
     index::run_index(&turns, false, None).await.unwrap();
@@ -65,9 +66,7 @@ async fn indexing_keeps_the_memory_language_counts() {
     let uri = dataset::table_uri(home::memory_dir());
     let ds = dataset::open(&uri, Default::default()).await.unwrap();
     let rows = dataset::scan_rows(&ds, &[], None, None).await.unwrap();
-    dataset::overwrite(&uri, rows, EmbeddingModel::BgeSmallEn)
-        .await
-        .unwrap();
+    dataset::overwrite(&uri, rows, &profile).await.unwrap();
     assert_eq!(recorded().await, None);
     index::run_index(&turns, false, None).await.unwrap();
     assert_eq!(recorded().await, counted(3, 1, 2));

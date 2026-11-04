@@ -15,8 +15,8 @@ use crate::traces;
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, NaiveDate, Utc};
 use lance::Dataset;
-use std::cmp::Reverse;
 use serde::Serialize;
+use std::cmp::Reverse;
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
@@ -588,12 +588,13 @@ pub(crate) async fn recall_filtered_result(
     let mut search = Search::new(query, candidates, filter)?;
     search.deadline = deadline;
     let pools = target.into().candidates(&search, progress).await?;
+    let languages = rephrase_languages(pools.iter().map(|pool| &pool.ds));
     let (note, hits) = search.rank(pools, k, neighbors, progress).await?;
-    Ok(recall_result(note, hits))
+    Ok(recall_result(note, hits, languages.as_deref()))
 }
 
-fn recall_result(note: String, hits: Vec<(Hit, f64)>) -> RecallResult {
-    let text = rendered(&note, &hits);
+fn recall_result(note: String, hits: Vec<(Hit, f64)>, languages: Option<&str>) -> RecallResult {
+    let text = crate::ui::render::recall_reply(&note, &hits, languages);
     RecallResult {
         text,
         hits,
@@ -623,8 +624,9 @@ pub(crate) async fn recall_filtered_pinned(
     if let Some(memory) = pinned.read.memory_label.as_deref() {
         pool.hint(memory);
     }
+    let languages = rephrase_languages([&pool.ds]);
     let (note, hits) = search.rank(vec![pool], k, neighbors, progress).await?;
-    let mut result = recall_result(note, hits);
+    let mut result = recall_result(note, hits, languages.as_deref());
     result.source_type_index_ready = Some(pinned.source_type_index_ready);
     Ok(result)
 }

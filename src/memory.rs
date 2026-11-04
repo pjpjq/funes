@@ -14,6 +14,7 @@
 //!
 //! The commands ask this module what state a memory is in; they never infer it from error shapes.
 
+pub(crate) mod canonical;
 pub mod capture_store;
 pub mod card;
 pub mod dataset;

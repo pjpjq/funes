@@ -26,7 +26,6 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{IsTerminal, Write as _};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Take the memory lock. An interactive caller (a human at `funes index`/`funes add`) waits out a
@@ -801,7 +800,7 @@ impl Indexer {
         let target_schema = self
             .ds
             .as_ref()
-            .map(|ds| Arc::new(arrow_schema::Schema::from(ds.schema())))
+            .map(dataset::schema_of)
             .unwrap_or_else(|| dataset::schema_for(&self.profile));
         let batch = dataset::build_batch_optional_for_schema(chunks, None, target_schema)?;
         if let Some(languages) = &mut self.languages {

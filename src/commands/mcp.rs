@@ -97,7 +97,7 @@ pub struct RecallRequest {
     #[schemars(description = "Adjacent chunks attached to each hit for context; 0 returns the hits alone.")]
     pub neighbors: Option<i64>,
     #[schemars(
-        description = "Size of the fused pool the hits are cut from (default 30): how far the search looks. Larger than `k`, the pool is reranked by the cross-encoder before the cut, which costs seconds and grows with the pool, so `k` can stay small while the search looks deep. A pool of `k` rows or fewer is read whole, in the fused order."
+        description = "Size of the fused pool the hits are cut from (default 30): how far the search looks. Larger than `k`, the pool is reranked before the cut when a rerank provider is enabled, which costs seconds and grows with the pool, so `k` can stay small while the search looks deep. A pool of `k` rows or fewer is read whole, in the fused order."
     )]
     pub candidates: Option<usize>,
     #[schemars(description = "Restrict to a block type: text | thinking | tool_use | tool_result")]
@@ -333,7 +333,7 @@ impl Funes {
     }
 
     #[tool(
-        description = "Semantic search over the user's past AI agent sessions: describe what you are after, get back the verbatim passages — what was decided, tried, measured or investigated. Call it when they refer to earlier work, or when you are about to re-derive something a session may already have settled. Call it too before claiming that something was never built, was dropped, or was never discussed: the code cannot show that, only the sessions can. Ranked top-k, so it gives you a foothold on a topic, not every session touching it. Ranking weighs relevance, not age: for the latest word on a topic, or one stretch of time, bound it with `since`/`until`. Each hit is a passage you will read: `k` is the token cost, `candidates` the reach, and a pool larger than `k` is reranked, at seconds of latency that grow with the pool, so the reach can grow without the reading."
+        description = "Semantic search over the user's past AI agent sessions: describe what you are after, get back the verbatim passages — what was decided, tried, measured or investigated. Call it when they refer to earlier work, or when you are about to re-derive something a session may already have settled. Call it too before claiming that something was never built, was dropped, or was never discussed: the code cannot show that, only the sessions can. Ranked top-k, so it gives you a foothold on a topic, not every session touching it. Ranking weighs relevance, not age: for the latest word on a topic, or one stretch of time, bound it with `since`/`until`. Each hit is a passage you will read: `k` is the token cost, `candidates` the reach, and a pool larger than `k` can be reranked when enabled, at seconds of latency that grow with the pool, so the reach can grow without the reading."
     )]
     async fn recall(
         &self,
@@ -626,10 +626,13 @@ mod tests {
         );
         let first = first.unwrap();
         let concurrent = concurrent.unwrap();
-        assert_eq!(first.text, recall::rendered("", &[]));
-        assert_eq!(concurrent.text, recall::rendered("", &[]));
+        assert_eq!(first.text, crate::ui::render::recall_reply("", &[], None));
+        assert_eq!(concurrent.text, crate::ui::render::recall_reply("", &[], None));
         let pinned_json = serde_json::to_value(recall_tool_result(first)).unwrap();
-        assert_eq!(pinned_json["content"][0]["text"], recall::rendered("", &[]));
+        assert_eq!(
+            pinned_json["content"][0]["text"],
+            crate::ui::render::recall_reply("", &[], None)
+        );
         assert_eq!(pinned_json["structuredContent"]["hits"], serde_json::json!([]));
         assert_eq!(pinned_json["structuredContent"]["source_type_index_ready"], false);
 
@@ -646,7 +649,7 @@ mod tests {
             .recall_with_memory(None, "unused".to_string(), 1, 1, 0, absent_facet(), Some(u64::MAX))
             .await
             .unwrap();
-        assert_eq!(second.text, recall::rendered("", &[]));
+        assert_eq!(second.text, crate::ui::render::recall_reply("", &[], None));
 
         let override_error = server
             .recall_with_memory(
@@ -671,6 +674,14 @@ mod tests {
     async fn source_type_proof_belongs_to_the_pinned_snapshot_not_the_latest_manifest() {
         let memory = memory_fixture(true).await;
         let spec = memory.path().to_string_lossy().into_owned();
+        let mut latest = Dataset::open(&crate::memory::dataset::table_uri(&spec)).await.unwrap();
+        let mut counts = crate::memory::dataset::Languages {
+            rows: 1,
+            counts: std::collections::BTreeMap::from([("cmn".to_string(), 1)]),
+        };
+        crate::memory::dataset::stamp_languages(&mut latest, &counts)
+            .await
+            .unwrap();
         let server = Funes::new_with_pin(Some(spec.clone()), true);
         let first = server
             .recall_with_memory(None, "unused".to_string(), 1, 1, 0, absent_facet(), None)
@@ -678,21 +689,35 @@ mod tests {
             .unwrap();
         assert_eq!(first.source_type_index_ready, Some(true));
         let response = serde_json::to_value(recall_tool_result(first)).unwrap();
-        assert_eq!(response["content"][0]["text"], recall::rendered("", &[]));
+        assert_eq!(
+            response["content"][0]["text"],
+            crate::ui::render::recall_reply("", &[], Some("cmn"))
+        );
         assert_eq!(response["structuredContent"]["source_type_index_ready"], true);
 
         let mut latest = Dataset::open(&crate::memory::dataset::table_uri(&spec)).await.unwrap();
         latest.drop_index("source_type_idx").await.unwrap();
+        counts.counts = std::collections::BTreeMap::from([("eng".to_string(), 1)]);
+        crate::memory::dataset::stamp_languages(&mut latest, &counts)
+            .await
+            .unwrap();
         let old_snapshot = server
             .recall_with_memory(None, "unused".to_string(), 1, 1, 0, absent_facet(), None)
             .await
             .unwrap();
         assert_eq!(old_snapshot.source_type_index_ready, Some(true));
+        assert!(old_snapshot.text.contains("cmn"));
+        let explicit = server
+            .recall_with_memory(Some(spec.clone()), "unused".to_string(), 1, 1, 0, absent_facet(), None)
+            .await
+            .unwrap();
+        assert!(!explicit.text.contains("cmn"));
         let fresh = Funes::new_with_pin(Some(spec), true)
             .recall_with_memory(None, "unused".to_string(), 1, 1, 0, absent_facet(), None)
             .await
             .unwrap();
         assert_eq!(fresh.source_type_index_ready, Some(false));
+        assert!(!fresh.text.contains("cmn"));
     }
 
     #[test]
@@ -754,7 +779,7 @@ mod tests {
             }],
         };
         let hits = vec![(hit, 0.875)];
-        let text = recall::rendered("", &hits);
+        let text = crate::ui::render::recall_reply("", &hits, None);
 
         let response = recall_tool_result(recall::RecallResult {
             text: text.clone(),

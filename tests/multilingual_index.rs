@@ -26,7 +26,9 @@ async fn a_multilingual_memory_is_created_then_kept() {
     )
     .unwrap();
 
-    index::ensure_local_memory(&EmbeddingProfile::local_model(e5)).await.unwrap();
+    index::ensure_local_memory(&EmbeddingProfile::local_model(e5))
+        .await
+        .unwrap();
     index::run_index(&turns, false, None).await.unwrap();
     let ds = memory().await;
     assert_eq!(dataset::embedding_model(&ds).unwrap(), e5);
@@ -56,7 +58,9 @@ async fn a_multilingual_memory_is_created_then_kept() {
 
     // The incremental state still records the directory as indexed.
     std::fs::remove_dir_all(home::memory_dir()).unwrap();
-    index::ensure_local_memory(&EmbeddingProfile::local_model(e5)).await.unwrap();
+    index::ensure_local_memory(&EmbeddingProfile::local_model(e5))
+        .await
+        .unwrap();
     index::run_index(&turns, false, None).await.unwrap();
     assert_eq!(memory().await.count_rows(None).await.unwrap(), 1);
 }

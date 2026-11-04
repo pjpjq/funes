@@ -14,5 +14,6 @@ pub mod push;
 pub mod recall;
 pub mod scrub;
 pub mod sketch;
+pub mod sync;
 pub mod target;
 pub mod update;

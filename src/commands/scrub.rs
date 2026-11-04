@@ -28,7 +28,7 @@ pub async fn run() -> Result<()> {
     };
     let profile = dataset::embedding_profile(&ds)?;
     crate::memory::check_compat_with_profile(&ds, &profile)?;
-    let target_schema = std::sync::Arc::new(arrow_schema::Schema::from(ds.schema()));
+    let target_schema = dataset::schema_of(&ds);
     let scanner = scan::Trufflehog::find()?;
 
     eprintln!("loading the local memory…");

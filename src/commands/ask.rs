@@ -13,15 +13,15 @@ use serde_json::Value;
 use std::io::{BufRead, BufReader, IsTerminal, Read};
 use std::process::{Command, ExitStatus, Stdio};
 
-use super::recall::{check_readable, memory_hint, recall_hits};
-use crate::memory::Memory;
+use super::recall::{check_readable, recall_hits, RecallFilter};
+use super::target::Target;
 use crate::ui::banner::{accent, band_width, Banner};
 use crate::ui::render;
 
-// Recall's CLI defaults; ask exposes no tuning of its own.
+// Recall's CLI defaults, so the pool is reranked as a default recall's is. ask exposes no tuning
+// of its own.
 const K: usize = 8;
 const CANDIDATES: usize = 30;
-const HALF_LIFE: f64 = 30.0;
 const NEIGHBORS: i64 = 1;
 
 /// The prompt must precede the flags, which would otherwise swallow it; the empty strict MCP
@@ -79,16 +79,12 @@ fn grounded_prompt(question: &str, passages: &str) -> String {
 }
 
 /// `funes ask claude`: recall in-process, then hand claude a prompt with the passages baked in.
-pub async fn claude(question: String, memory: Memory) -> Result<()> {
+pub async fn claude(question: String, target: impl Into<Target>) -> Result<()> {
     // The binary probe comes first — grounding pays for a model load.
     preflight("claude")?;
     let banner = Banner::start("recalling…");
-    let progress = |label: &str| {
-        if let Some(b) = &banner {
-            b.set(label);
-        }
-    };
-    let prompt = grounding(memory, &question, &progress).await?;
+    let progress = |label: &str| banner.set(label);
+    let prompt = grounding(target, &question, &progress).await?;
     progress("waking claude…");
     let run = run_streaming("claude", &claude_args(&prompt), claude_event, &progress)?;
     drop(banner);
@@ -96,16 +92,12 @@ pub async fn claude(question: String, memory: Memory) -> Result<()> {
 }
 
 /// `funes ask codex`: recall in-process, then hand codex a prompt with the passages baked in.
-pub async fn codex(question: String, memory: Memory) -> Result<()> {
+pub async fn codex(question: String, target: impl Into<Target>) -> Result<()> {
     // The binary probe comes first — grounding pays for a model load.
     preflight("codex")?;
     let banner = Banner::start("recalling…");
-    let progress = |label: &str| {
-        if let Some(b) = &banner {
-            b.set(label);
-        }
-    };
-    let prompt = grounding(memory, &question, &progress).await?;
+    let progress = |label: &str| banner.set(label);
+    let prompt = grounding(target, &question, &progress).await?;
     progress("waking codex…");
     let run = run_streaming("codex", &codex_args(&prompt), codex_event, &progress)?;
     drop(banner);
@@ -114,17 +106,16 @@ pub async fn codex(question: String, memory: Memory) -> Result<()> {
 
 /// The grounding for an ask. The memory is checked first: one that can't be read must fail
 /// rather than silently answer from another corpus.
-pub async fn grounding(memory: Memory, question: &str, progress: &(dyn Fn(&str) + Sync)) -> Result<String> {
-    check_readable(&memory).await?;
-    let (note, label, hits) = recall_hits(
-        memory,
+pub async fn grounding(target: impl Into<Target>, question: &str, progress: &(dyn Fn(&str) + Sync)) -> Result<String> {
+    let target = target.into();
+    check_readable(target.memory()).await?;
+    let (note, hits) = recall_hits(
+        target,
         question.to_string(),
         K,
         CANDIDATES,
-        HALF_LIFE,
         NEIGHBORS,
-        None,
-        None,
+        RecallFilter::default(),
         progress,
     )
     .await?;
@@ -135,7 +126,7 @@ pub async fn grounding(memory: Memory, question: &str, progress: &(dyn Fn(&str) 
     if hits.is_empty() {
         bail!("nothing recalled for that question — no passages to ground an answer in");
     }
-    let passages = render::recall_agent("", &memory_hint(label.as_deref()), &hits);
+    let passages = render::recall_agent("", &hits);
     Ok(grounded_prompt(question, &passages))
 }
 

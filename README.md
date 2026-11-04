@@ -28,7 +28,7 @@ verifies its tagged release checksum and version, and puts it on your PATH (`~/.
 default):
 
 ```bash
-curl -fsSL https://huggingface.co/buckets/huggingface/funes/resolve/install.sh | sh
+curl -fsSL "https://huggingface.co/buckets/huggingface/funes/resolve/install.sh?src=readme" | sh
 ```
 
 Then add it to your agent:
@@ -36,6 +36,11 @@ Then add it to your agent:
 ```bash
 funes add claude    # or codex, pi, hermes
 ```
+
+Another agent? Integrations their authors maintain are listed in
+[funes-integrations/COMMUNITY.md](https://github.com/huggingface/funes-integrations/blob/main/COMMUNITY.md),
+and `funes add <id> --from …` installs one from wherever it is published.
+To build and share your own, start with [Writing an integration](CONTRIBUTING.md#writing-an-integration).
 
 One command onboards you: your agent gets `recall` and `get` as tools, and — for Claude, Codex, and
 Hermes — funes builds your first index, installs a hook that keeps it current every turn, and (with a
@@ -56,16 +61,25 @@ The checksum detects corrupt, truncated, or mismatched release downloads. Becaus
 checksum share the same bucket, it does not authenticate the bucket itself.
 
 Already installed? **`funes update`** replaces the binary in place with the latest build for your
-platform (`--force` reinstalls the current one); `funes status` tells you when a newer release is
-out. To build it yourself, see [Building from source](#building-from-source).
+platform (`--force` reinstalls the current one), then brings your agent integrations to their newest
+release; `funes status` tells you when a newer release is out. To build it yourself, see
+[Building from source](#building-from-source).
+
+funes names itself to the Hub: the User-Agent of its Hugging Face requests carries its version and
+an anonymous install id. The id is a random UUID kept in `~/.funes/install-id`, created on the
+first run. It derives from nothing (not your hostname, user, hardware, or Hugging Face account) and
+only lets the project count installs and active installs, local-only ones included. It goes
+nowhere but the Hub. Set `DO_NOT_TRACK=1` or `FUNES_NO_TELEMETRY=1` to leave it out. Deleting the
+file starts a new one. The installer's own downloads say only which script revision and platform
+they are for.
 
 ## Works across your agents (and models)
 
 Your memory isn't tied to one tool. Because Claude Code, Codex, pi, and Hermes all index into a single
 memory, you can **switch agents without losing anything** — start a task in Claude Code, pick it up
 in Codex next week, and each one recalls the *entire* history, not just its own sessions (every hit
-shows which agent it came from). Another agent can join through a compatible `.parquet` trace
-export; [the import contract](docs/index.md#parquet-trace-format) defines the required schema.
+shows which agent it came from). Another agent can join by writing its sessions as
+[funes JSONL](docs/funes-jsonl.md) turns files.
 
 Models work the same way. funes has no generative model of its own: you reason with whatever your
 agent uses — through **pi**, any local model or one served through the Hugging Face router. Its
@@ -86,8 +100,9 @@ an agent can recall.
 Dataset repositories created by funes are **private by default**. Existing repositories retain their
 current visibility, and making a funes-created memory public is a deliberate change on the Hub.
 
-Bind a memory when you add funes to an agent and it recalls from there and keeps it current on its
-own; or run the two commands directly:
+Bind your host to a memory, `funes bind <user|org>/funes-memory` or the memory named when you add
+an agent, and every agent recalls from it and keeps it current on its own; or run the two commands
+directly:
 
 ```bash
 funes push <user|org>/funes-memory                    # publish your local memory's new chunks
@@ -121,13 +136,13 @@ workflow-oriented [documentation index](docs/README.md) for the complete guides.
 
 | Command | Docs |
 | --- | --- |
-| `funes add <agent> [memory]` / `funes remove <agent>` / `funes mcp [memory]` | [docs/add.md](docs/add.md) — supported agents, integration lifecycle, generic MCP clients, hooks, and memory binding |
-| `funes index [path]` | [docs/index.md](docs/index.md) — build/update the memory; sources, incremental, flags |
+| `funes add <agent> [memory]` / `funes bind <memory>` / `funes remove <agent>` / `funes mcp [memory]` | [docs/add.md](docs/add.md) — supported agents, integration lifecycle, memory binding, generic MCP clients, and hooks |
+| `funes index [path]` / `funes compact [memory]` | [docs/index.md](docs/index.md) — build/update the memory and compact it; sources, incremental, flags |
 | `funes recall "…"` / `funes get …` | [docs/recall.md](docs/recall.md) — recall passages and drill into them |
 | `funes sessions` / `funes sketch …` / `funes scan …` | [docs/sessions.md](docs/sessions.md) — list sessions, digest one, find a literal in one |
 | `funes ask <agent> "…"` | [docs/ask.md](docs/ask.md) — borrow an agent for a grounded answer |
 | `funes push <memory>` (+ `scrub`, `status`) | [docs/push.md](docs/push.md) — publish and share a memory |
-| `funes update` | [installation and updating](#get-funes) — replace the installed binary with a verified release |
+| `funes update` | [installation and updating](#get-funes) — replace the installed binary with a verified release, and update the agent integrations |
 
 The per-turn indexing and session-boundary publishing the hooks run are detailed in
 [docs/automation.md](docs/automation.md).
@@ -136,20 +151,21 @@ The per-turn indexing and session-boundary publishing the hooks run are detailed
 
 `funes add` runs one loop: **index** what you've done, **recall** it when it matters — and index what
 you just did, so it's recallable next time. Both halves are one deterministic pipeline: each source
-is parsed into a generic turn/block shape, chunked, embedded by the configured runtime provider, and
-written to a local Lance dataset. Recall keeps the raw query for BM25 lexical matches, combines that
-ranking with vector search through reciprocal-rank fusion (RRF), optionally reranks, and reweights
-by recency. With Voyage, original multilingual documents use `input_type=document` and the original
-query uses `input_type=query`; no translation or English shadow text is introduced in `raw` mode.
-Because everything downstream of parsing is source-agnostic, adding an agent means implementing one
-[`TraceSource`](src/source.rs) trait — not touching the indexing or query path.
+is parsed into a generic turn/block shape, chunked, written to a local Lance dataset, and embedded
+with the configured runtime provider; recall fuses vector + BM25 search, and optionally reranks a pool larger than the requested hits.
+Integrations convert each agent's transcripts into the shared [turns format](docs/funes-jsonl.md).
+Adding an agent means publishing an [integration](CONTRIBUTING.md#writing-an-integration) of your
+own; the indexing and query pipeline already reads that format.
+
+Voyage embeds original documents with `input_type=document` and queries with `input_type=query`.
+BM25 keeps the raw query; no translation or English shadow text is introduced in `raw` mode.
 
 `funes` shapes its output for agents, not people — so to put a question to a memory yourself, borrow
 an agent: `funes ask` recalls from the memory and answers grounded in what it finds, installing
 nothing. `funes recall` prints the raw ranked passages behind an answer, and `funes get` reassembles
 any cited turn in full.
 
-- [docs/index.md](docs/index.md) — the indexing pipeline, tiers, and incremental behavior.
+- [docs/index.md](docs/index.md) — sources, progress, and incremental indexing.
 - [docs/recall.md](docs/recall.md) — retrieval, drill-down with `get`, and reading a shared memory.
 - [docs/sessions.md](docs/sessions.md) — browsing a memory by session: `sessions`, `sketch`, `scan`.
 - [docs/ask.md](docs/ask.md) — borrow an agent for a grounded answer, nothing installed.
@@ -164,19 +180,15 @@ Needs a Rust toolchain and **`protoc`** — `lance`'s build scripts compile prot
 # System-wide:
 sudo apt-get install -y protobuf-compiler   # Debian/Ubuntu
 brew install protobuf                        # macOS
-
-# …or repo-local, no sudo (downloads a pinned protoc into .tools/):
-./scripts/bootstrap-protoc.sh
-export PROTOC="$PWD/.tools/protoc/bin/protoc"
 ```
 
 Then `cargo build --release` (binary at `target/release/funes`); `cargo test` runs the suite. Tests
 that exercise local inference download the embedder/reranker weights on first run.
 
-Local inference runs on a built-in backend — Accelerate on macOS, pure Rust on Linux — so the
-default build has no ML runtime dependency and runs on any glibc ≥ 2.35 (Ubuntu 22.04). A Voyage
-provider uses its native HTTP API instead. An ONNX Runtime backend is available as an opt-in local
-variant:
+Local inference (embedding + reranking) runs on a built-in backend — Accelerate on macOS, pure Rust on
+Linux — so the default build has no ML runtime dependency and runs on any glibc ≥ 2.35 (Ubuntu
+22.04). On macOS 15 or later, indexing embeds and recall reranks on the GPU through Metal, falling
+back to the CPU where no GPU starts. Voyage uses its native HTTP API. An ONNX Runtime backend is available as an opt-in variant:
 
 ```bash
 cargo build --release --no-default-features --features onnx   # ONNX backend instead

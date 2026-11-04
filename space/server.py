@@ -3861,6 +3861,8 @@ class NativeMcpWorker:
         # not enable them in ingest/backfill subprocesses, where they add noise
         # and can obscure the bounded ingest diagnostics.
         env["FUNES_RECALL_METRICS"] = os.getenv("FUNES_RECALL_METRICS", "1") or "1"
+        # Cached FTS readers must not retain an I/O loop owned by a finished scan runtime.
+        env["LANCE_USE_LITE_SCHEDULER"] = "true"
         return env
 
     @staticmethod

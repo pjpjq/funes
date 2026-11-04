@@ -5,33 +5,24 @@
 //!
 //! A unit is both the incremental-tracking granule (skipped when its [`Unit::signature`] still
 //! matches `state.json`) and the single-append granule (all of a unit's turns are written in one
-//! commit). JSONL is one session per file; a parquet dataset — or a hermes `state.db` — is many
-//! sessions in one file.
+//! commit). A turns file is a unit.
 
-use super::claude;
-use super::codex;
-use super::harness::Harness;
-use super::hermes;
+use super::funes_jsonl;
 use super::jsonl;
-use super::parquet;
-use super::pi;
 use super::Turn;
-use crate::hub;
 
-use anyhow::{Context, Result};
-use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use anyhow::{bail, Result};
+use std::os::unix::fs::MetadataExt;
+use std::path::Path;
 use std::time::UNIX_EPOCH;
 
-/// One artifact a source indexes as a unit. `key` identifies and locates it: a transcript path, an
-/// `hf://` shard uri, a `state.db` and the session inside it. A
-/// `Some` `signature` is a cheap change-stamp: the unit is skipped when it still matches what was
-/// recorded, and recorded after a successful index. `None` means "always read, never recorded" —
-/// for a bulk source whose idempotency comes from chunk-id dedup, not file stats.
+/// One artifact a source indexes as a unit. `key` identifies and locates it: a turns file's path.
+/// A `Some` `signature` is a cheap change-stamp: the unit is skipped when it still matches what
+/// was recorded, and recorded after a successful index. `None` means "always read, never recorded",
+/// for a file whose idempotency comes from chunk-id dedup, not file stats.
 pub struct Unit {
     pub key: String,
     pub signature: Option<String>,
-    pub is_subagent: bool,
 }
 
 /// A source of agent-session transcripts. `units()` is cheap (enumerate + stat, no parsing);
@@ -46,9 +37,10 @@ pub trait TraceSource {
     /// Parse one unit into turns (each [`Turn`] already carries its `session_id` and `workdir`).
     fn read(&self, unit: &Unit) -> Result<Vec<Turn>>;
 
-    /// Whether a `read` error aborts the whole index. Best-effort sources (a JSONL tree, where one
-    /// unreadable file shouldn't sink the run) return `false`; a single-artifact source (a parquet
-    /// dataset) returns `true`, so a corrupt file is a hard failure rather than a silent skip.
+    /// Whether a `read` error aborts the whole index. Best-effort sources (a directory, where one
+    /// unreadable file shouldn't sink the run) return `false`; a single-artifact source (a file
+    /// named on its own) returns `true`, so a corrupt file is a hard failure rather than a silent
+    /// skip.
     fn fatal_on_read_error(&self) -> bool {
         false
     }
@@ -62,349 +54,38 @@ pub trait TraceSource {
     fn unit_keys(&self) -> Result<Vec<String>>;
 }
 
-/// Pick the source for `path`: a `*.parquet` file is a parquet trace dataset, a hermes `state.db`
-/// (or the `~/.hermes` dir holding it) is its SQLite session store, and anything else is a JSONL
-/// transcript tree whose harness is auto-detected. `limit` caps how many sessions are read
-/// (`None` = all) — used to bound a benchmark's build time.
-pub fn open(path: &Path, limit: Option<usize>) -> Box<dyn TraceSource> {
-    open_with_harness(path, limit, None)
-}
-
-/// Like [`open`], but a `Some` `harness` forces the JSONL tree's harness (the CLI's `--harness`)
-/// instead of detecting it. A `*.parquet` path is a parquet dataset regardless.
-pub fn open_with_harness(path: &Path, limit: Option<usize>, harness: Option<Harness>) -> Box<dyn TraceSource> {
-    let is_parquet = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|e| e.eq_ignore_ascii_case("parquet"));
-    if is_parquet {
-        Box::new(ParquetDataset {
-            path: path.to_path_buf(),
-            limit,
-        })
-    } else if harness == Some(Harness::Hermes) || is_hermes_path(path) {
-        Box::new(HermesDb {
-            path: hermes_db_path(path),
-            limit,
-        })
-    } else {
-        let harness = harness.unwrap_or_else(|| detect_harness(path));
-        Box::new(JsonlTree {
-            root: path.to_path_buf(),
-            limit,
-            harness,
-            listing: OnceLock::new(),
-        })
+/// Pick the source for `path`: a `.funes.jsonl` file, or a directory holding them, is a turns
+/// store. Anything else is refused: funes reads no agent's own transcripts, its integration converts
+/// them. `limit` caps how many sessions are read (`None` = all), used to bound a benchmark's build
+/// time.
+pub fn open(path: &Path, limit: Option<usize>) -> Result<Box<dyn TraceSource>> {
+    // Listed once, here; the source keeps the listing. A directory with nothing to read is an
+    // empty turns store: a spool no integration has written into yet indexes as a no-op instead of
+    // being refused. A file is read only when it is a turns file.
+    let listing = jsonl::iter_jsonl_files(path);
+    if (listing.is_empty() && path.is_dir()) || listing.iter().any(|p| funes_jsonl::is_turns_file(p)) {
+        return Ok(Box::new(funes_jsonl::FunesJsonl::new(path, listing, limit)));
     }
-}
-
-/// Whether `path` addresses hermes' SQLite store — the `state.db` file itself, or the `~/.hermes`
-/// dir that holds it. (`--harness hermes` also forces the hermes source regardless of the path.)
-fn is_hermes_path(path: &Path) -> bool {
-    matches!(
-        path.file_name().and_then(|n| n.to_str()),
-        Some("state.db") | Some(".hermes")
+    bail!(
+        "{} holds no turns files — an agent's own transcripts are converted by its integration \
+         (`funes add <agent>`); any other producer writes the format in docs/funes-jsonl.md",
+        path.display()
     )
 }
 
-/// The `state.db` file for a hermes path: the file itself, or `<dir>/state.db` when handed the
-/// `~/.hermes` directory.
-fn hermes_db_path(path: &Path) -> PathBuf {
-    if path.file_name().and_then(|n| n.to_str()) == Some("state.db") {
-        path.to_path_buf()
-    } else {
-        path.join("state.db")
-    }
-}
-
-/// Detect a JSONL tree's harness: a known session dir wins (a cheap tail match), else sniff the
-/// first transcript's first record — only then is the tree walked (see [`Harness::detect`]).
-fn detect_harness(root: &Path) -> Harness {
-    if let Some(h) = Harness::from_known_dir(root) {
-        return h;
-    }
-    let first = jsonl::iter_jsonl_files(root)
-        .first()
-        .and_then(|p| jsonl::first_record(p));
-    Harness::detect(root, first.as_ref())
-}
-
-/// "size:mtime_secs" for a file's incremental change-stamp, or `None` if it can't be stat'd.
+/// A file's incremental change-stamp, or `None` if it can't be stat'd.
 pub(crate) fn file_sig(p: &Path) -> Option<String> {
     let md = std::fs::metadata(p).ok()?;
-    let mtime = md.modified().ok()?.duration_since(UNIX_EPOCH).ok()?.as_secs();
-    Some(format!("{}:{}", md.len(), mtime))
-}
-
-/// A directory tree of `*.jsonl` transcripts for one `harness` — one session per file, indexed
-/// incrementally (each file skipped while unchanged). `limit` keeps the most recent N files
-/// (sessions) by mtime.
-struct JsonlTree {
-    root: PathBuf,
-    limit: Option<usize>,
-    harness: Harness,
-    listing: OnceLock<Vec<PathBuf>>,
-}
-
-impl JsonlTree {
-    /// Walked once: a readdir per project dir is the whole cost of it on a network mount.
-    fn listing(&self) -> &[PathBuf] {
-        self.listing.get_or_init(|| jsonl::iter_jsonl_files(&self.root))
-    }
-}
-
-impl TraceSource for JsonlTree {
-    fn describe(&self) -> String {
-        format!(
-            "scanning {} transcripts under {}",
-            self.harness.as_str(),
-            self.root.display()
-        )
-    }
-
-    fn units(&self) -> Result<Vec<Unit>> {
-        let mut files = self.listing().to_vec();
-        // Newest-first by mtime; `--limit` then keeps the recent N. (Default filename order is
-        // ≈ random for UUID-named sessions.)
-        files.sort_by_cached_key(|p| {
-            std::cmp::Reverse(std::fs::metadata(p).and_then(|m| m.modified()).unwrap_or(UNIX_EPOCH))
-        });
-        if let Some(n) = self.limit {
-            files.truncate(n);
-        }
-        let mut units: Vec<Unit> = files
-            .into_iter()
-            .map(|p| Unit {
-                is_subagent: jsonl::is_subagent(&jsonl::session_id_of(&p)),
-                signature: file_sig(&p),
-                key: p.to_string_lossy().into_owned(),
-            })
-            .collect();
-        // Subagents last (stable sort preserves recency within each group).
-        units.sort_by_key(|u| u.is_subagent);
-        Ok(units)
-    }
-
-    fn owns(&self, key: &str) -> bool {
-        Path::new(key).starts_with(&self.root)
-    }
-
-    fn unit_keys(&self) -> Result<Vec<String>> {
-        Ok(self
-            .listing()
-            .iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect())
-    }
-
-    fn read(&self, unit: &Unit) -> Result<Vec<Turn>> {
-        let p = Path::new(&unit.key);
-        // Each parser derives the workdir facet from the session's recorded cwd; the path-derived
-        // value is only the fallback for transcripts that never recorded one.
-        let fallback = claude::workdir_of(p);
-        let turns = match self.harness {
-            Harness::Claude => claude::turns_from_jsonl_file(p, &jsonl::session_id_of(p), &fallback)?,
-            Harness::Codex => codex::turns_from_jsonl_file(p, &fallback)?,
-            Harness::Pi => pi::turns_from_jsonl_file(p, &jsonl::session_id_of(p), &fallback)?,
-            // hermes keeps its sessions in a SQLite state.db, not a JSONL tree, so it's read by a
-            // dedicated source and never reaches here.
-            Harness::Hermes => anyhow::bail!("hermes sessions are read from state.db, not a JSONL tree"),
-        };
-        Ok(turns)
-    }
-}
-
-/// hermes' single SQLite `state.db` — many sessions in one file. Each session is a unit signed by
-/// its high-water `messages.id`, so an unchanged session is skipped and a grown one is re-read
-/// (chunk-id dedup keeps already-stored turns a no-op). `limit` keeps the most-recently-active N.
-struct HermesDb {
-    path: PathBuf,
-    limit: Option<usize>,
-}
-
-impl HermesDb {
-    /// A session id alone doesn't say which db to open.
-    fn unit_key(&self, session_id: &str) -> String {
-        format!("{}#{session_id}", self.path.display())
-    }
-
-    /// A path may contain `#`, a session id may not.
-    fn session_id(key: &str) -> &str {
-        key.rsplit_once('#').map_or(key, |(_, sid)| sid)
-    }
-}
-
-impl TraceSource for HermesDb {
-    fn describe(&self) -> String {
-        format!("scanning hermes sessions in {}", self.path.display())
-    }
-
-    fn units(&self) -> Result<Vec<Unit>> {
-        let mut sessions = hermes::sessions_with_watermark(&self.path)?;
-        // Most-recently-active first (highest high-water id); `--limit` then keeps the recent N.
-        sessions.sort_by_key(|s| std::cmp::Reverse(s.watermark));
-        if let Some(n) = self.limit {
-            sessions.truncate(n);
-        }
-        Ok(sessions
-            .into_iter()
-            .map(|s| Unit {
-                key: self.unit_key(&s.session_id),
-                signature: Some(s.watermark.to_string()),
-                is_subagent: false,
-            })
-            .collect())
-    }
-
-    fn owns(&self, key: &str) -> bool {
-        key.rsplit_once('#').is_some_and(|(db, _)| Path::new(db) == self.path)
-    }
-
-    fn unit_keys(&self) -> Result<Vec<String>> {
-        Ok(hermes::sessions_with_watermark(&self.path)?
-            .into_iter()
-            .map(|s| self.unit_key(&s.session_id))
-            .collect())
-    }
-
-    fn read(&self, unit: &Unit) -> Result<Vec<Turn>> {
-        // The workdir is derived from the session's recorded cwd inside the parser; "hermes" is only
-        // the fallback for a session that never recorded one.
-        hermes::turns_from_state_db(&self.path, Self::session_id(&unit.key), "hermes")
-    }
-}
-
-/// A parquet agent-trace dataset — many sessions in one file, indexed as a single bulk import.
-/// `signature: None` so it's never skipped on stats and never recorded: a re-run always re-reads
-/// and dedups by chunk id to a no-op, which also means a wiped memory is never silently skipped.
-/// `limit` caps how many of its sessions (rows) are read.
-struct ParquetDataset {
-    path: PathBuf,
-    limit: Option<usize>,
-}
-
-impl TraceSource for ParquetDataset {
-    fn describe(&self) -> String {
-        format!("indexing parquet dataset {}", self.path.display())
-    }
-
-    fn units(&self) -> Result<Vec<Unit>> {
-        Ok(vec![Unit {
-            key: self.path.to_string_lossy().into_owned(),
-            signature: None,
-            is_subagent: false,
-        }])
-    }
-
-    fn unit_keys(&self) -> Result<Vec<String>> {
-        Ok(vec![self.path.to_string_lossy().into_owned()])
-    }
-
-    fn read(&self, unit: &Unit) -> Result<Vec<Turn>> {
-        let p = Path::new(&unit.key);
-        // Fallback workdir for rows without a recorded cwd: the dataset's file stem.
-        let fallback = p.file_stem().and_then(|s| s.to_str()).unwrap_or("parquet").to_string();
-        parquet::turns_from_parquet(p, &fallback, self.limit)
-    }
-
-    fn fatal_on_read_error(&self) -> bool {
-        true
-    }
-}
-
-/// One pre-downloaded parquet shard of a remote trace dataset.
-struct RemoteShard {
-    /// `state.json` key: `hf://datasets/<owner>/<name>/<shard>` — stable and disjoint from any
-    /// local path, so cross-source incremental never collides.
-    key: String,
-    /// The shard downloaded whole into hf-hub's cache.
-    local: PathBuf,
-    /// Fallback workdir for rows without a recorded cwd: the shard's file stem (parity with
-    /// [`ParquetDataset`]).
-    workdir: String,
-}
-
-/// A Hub trace dataset's `refs/convert/parquet` shards, resolved and pre-downloaded by
-/// [`open_remote`]. Each shard is a unit signed with the convert-branch commit oid, so an unchanged
-/// repo is skipped without re-reading; a changed repo re-reads and chunk-id dedup keeps rows already
-/// stored a no-op.
-struct RemoteParquetDataset {
-    shards: Vec<RemoteShard>,
-    /// The convert-branch commit — every shard's incremental signature.
-    revision: String,
-    label: String,
-}
-
-/// Resolve `<owner>/<name>`'s auto-converted parquet, download its shards whole-file into hf-hub's
-/// cache, and return a source over them. Async (resolve + download happen here) so `read` stays
-/// sync — the indexer never blocks a Tokio worker on a download. `max_shards` caps how many shards
-/// are downloaded and indexed (for the gated live test); all sessions within each are read.
-pub async fn open_remote(owner: &str, name: &str, max_shards: Option<usize>) -> Result<Box<dyn TraceSource>> {
-    let token = hub::hf_token();
-    let remote = parquet::resolve_parquet(owner, name, token.as_deref()).await?;
-    let mut paths = remote.shards;
-    if let Some(n) = max_shards {
-        paths.truncate(n);
-    }
-    let mut shards = Vec::with_capacity(paths.len());
-    for shard in &paths {
-        let local = parquet::download_shard(&remote.repo, shard, &remote.revision).await?;
-        let workdir = Path::new(shard)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("parquet")
-            .to_string();
-        shards.push(RemoteShard {
-            key: format!("hf://datasets/{owner}/{name}/{shard}"),
-            local,
-            workdir,
-        });
-    }
-    Ok(Box::new(RemoteParquetDataset {
-        shards,
-        revision: remote.revision,
-        label: format!("{owner}/{name}"),
-    }))
-}
-
-impl TraceSource for RemoteParquetDataset {
-    fn describe(&self) -> String {
-        let oid8 = &self.revision[..self.revision.len().min(8)];
-        format!(
-            "indexing {} — {} parquet shard(s) @ refs/convert/parquet:{oid8}",
-            self.label,
-            self.shards.len()
-        )
-    }
-
-    fn units(&self) -> Result<Vec<Unit>> {
-        Ok(self
-            .shards
-            .iter()
-            .map(|s| Unit {
-                key: s.key.clone(),
-                signature: Some(self.revision.clone()),
-                is_subagent: false,
-            })
-            .collect())
-    }
-
-    fn unit_keys(&self) -> Result<Vec<String>> {
-        Ok(self.shards.iter().map(|s| s.key.clone()).collect())
-    }
-
-    fn read(&self, unit: &Unit) -> Result<Vec<Turn>> {
-        let shard = self
-            .shards
-            .iter()
-            .find(|s| s.key == unit.key)
-            .context("unknown remote shard")?;
-        parquet::turns_from_parquet(&shard.local, &shard.workdir, None)
-    }
-
-    fn fatal_on_read_error(&self) -> bool {
-        true
-    }
+    let mtime = md.modified().ok()?.duration_since(UNIX_EPOCH).ok()?;
+    // Length, mtime to the nanosecond, inode: a file replaced within the second at the same
+    // length still changes one of the last two.
+    Some(format!(
+        "{}:{}.{:09}:{}",
+        md.len(),
+        mtime.as_secs(),
+        mtime.subsec_nanos(),
+        md.ino()
+    ))
 }
 
 #[cfg(test)]
@@ -413,40 +94,26 @@ mod tests {
     use std::io::Write;
 
     #[test]
-    fn remote_parquet_units_are_shards_signed_by_the_convert_oid() {
-        let ds = RemoteParquetDataset {
-            shards: vec![
-                RemoteShard {
-                    key: "hf://datasets/o/n/default/train/0000.parquet".into(),
-                    local: "/tmp/a".into(),
-                    workdir: "0000".into(),
-                },
-                RemoteShard {
-                    key: "hf://datasets/o/n/default/train/0001.parquet".into(),
-                    local: "/tmp/b".into(),
-                    workdir: "0001".into(),
-                },
-            ],
-            revision: "abc123".into(),
-            label: "o/n".into(),
-        };
-        let units = ds.units().unwrap();
-        assert_eq!(units.len(), 2);
-        // Every shard is signed by the convert-branch oid, so an unchanged repo skips.
-        assert!(units.iter().all(|u| u.signature.as_deref() == Some("abc123")));
-        assert_eq!(units[0].key, "hf://datasets/o/n/default/train/0000.parquet");
-        assert!(ds.fatal_on_read_error());
-    }
-
-    #[test]
-    fn file_sig_is_len_colon_mtime() {
+    fn file_sig_is_len_mtime_to_the_nanosecond_and_inode() {
         let mut f = tempfile::NamedTempFile::new().unwrap();
         f.write_all(b"hello").unwrap();
         f.flush().unwrap();
         let sig = file_sig(f.path()).expect("stat-able file has a signature");
-        let (len, mtime) = sig.split_once(':').expect("sig is len:mtime");
-        assert_eq!(len, "5");
-        assert!(mtime.parse::<u64>().is_ok());
+        let parts: Vec<&str> = sig.split(':').collect();
+        assert_eq!(parts.len(), 3, "{sig}");
+        assert_eq!(parts[0], "5");
+        let (secs, nanos) = parts[1].split_once('.').expect("mtime is secs.nanos");
+        assert!(
+            secs.parse::<u64>().is_ok() && nanos.len() == 9 && nanos.parse::<u32>().is_ok(),
+            "{sig}"
+        );
+        assert!(parts[2].parse::<u64>().is_ok(), "{sig}");
+
+        // Replaced in place within the second, at the same length: a new inode tells them apart.
+        let replacement = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(replacement.path(), b"world").unwrap();
+        std::fs::rename(replacement.path(), f.path()).unwrap();
+        assert_ne!(file_sig(f.path()).unwrap(), sig);
     }
 
     #[test]
@@ -455,123 +122,35 @@ mod tests {
     }
 
     #[test]
-    fn open_dispatches_by_extension() {
-        assert!(open(Path::new("/x/data.parquet"), None).describe().contains("parquet"));
-        assert!(open(Path::new("/x/DATA.PARQUET"), None).describe().contains("parquet"));
-        assert!(open(Path::new("/x/projects"), None).describe().contains("transcripts"));
-    }
-
-    #[test]
-    fn jsonl_tree_units_are_files_with_signatures() {
-        // A *.jsonl file under the tree becomes a unit keyed by its path, with a size:mtime stamp;
-        // a parquet dataset is a single signature-less unit (never skipped/recorded).
+    fn a_file_that_is_no_turns_file_is_refused() {
         let dir = tempfile::tempdir().unwrap();
-        let f = dir.path().join("sess.jsonl");
-        std::fs::write(&f, b"{}\n").unwrap();
-
-        let units = open(dir.path(), None).units().unwrap();
-        assert_eq!(units.len(), 1);
-        assert_eq!(units[0].key, f.to_string_lossy());
-        assert!(units[0].signature.is_some());
-
-        let pq = open(Path::new("/x/data.parquet"), None).units().unwrap();
-        assert_eq!(pq.len(), 1);
-        assert!(pq[0].signature.is_none());
+        let file = dir.path().join("traces.parquet");
+        std::fs::write(&file, b"PAR1").unwrap();
+        let err = open(&file, None).err().expect("refused");
+        assert!(err.to_string().contains("holds no turns files"), "{err}");
     }
 
     #[test]
-    fn jsonl_tree_orders_subagents_last() {
+    fn open_routes_turns_files_and_a_directory_of_them() {
         let dir = tempfile::tempdir().unwrap();
-        for name in ["sess-a.jsonl", "agent-x.jsonl", "sess-b.jsonl", "agent-y.jsonl"] {
-            std::fs::write(dir.path().join(name), b"{}\n").unwrap();
-        }
-        let units = open(dir.path(), None).units().unwrap();
-        // Whatever the mtimes, every main precedes every subagent.
-        let first_sub = units.iter().position(|u| u.is_subagent).expect("has a subagent unit");
-        assert!(units[..first_sub].iter().all(|u| !u.is_subagent));
-        assert!(units[first_sub..].iter().all(|u| u.is_subagent));
-        assert_eq!(units.iter().filter(|u| u.is_subagent).count(), 2);
+        let file = dir.path().join("thread.funes.jsonl");
+        std::fs::write(&file, b"").unwrap();
+        assert!(open(&file, None).unwrap().describe().contains("funes JSONL"));
+        assert!(open(dir.path(), None).unwrap().describe().contains("funes JSONL"));
+        let nested = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(nested.path().join("a/b")).unwrap();
+        std::fs::write(nested.path().join("a/b/t.funes.jsonl"), b"").unwrap();
+        assert!(open(nested.path(), None).unwrap().describe().contains("funes JSONL"));
     }
 
     #[test]
-    fn jsonl_limit_caps_units() {
+    fn a_transcript_that_is_no_turns_file_is_refused_and_an_empty_root_reads_as_none() {
         let dir = tempfile::tempdir().unwrap();
-        for i in 0..5 {
-            std::fs::write(dir.path().join(format!("s{i}.jsonl")), b"{}\n").unwrap();
-        }
-        assert_eq!(open(dir.path(), Some(2)).units().unwrap().len(), 2);
-        assert_eq!(open(dir.path(), None).units().unwrap().len(), 5);
-        // The listing stays whole under a limit.
-        assert_eq!(open(dir.path(), Some(2)).unit_keys().unwrap().len(), 5);
-    }
-
-    #[test]
-    fn a_store_owns_the_keys_it_can_place() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("projects");
-        let nested = root.join("-a-project");
-        std::fs::create_dir_all(&nested).unwrap();
-
-        let wide = open_with_harness(&root, None, Some(Harness::Claude));
-        let narrow = open_with_harness(&nested, None, Some(Harness::Claude));
-        let inside = nested.join("s.jsonl").to_string_lossy().into_owned();
-        let elsewhere = root.join("-b-project/s.jsonl").to_string_lossy().into_owned();
-        assert!(wide.owns(&inside) && wide.owns(&elsewhere));
-        // A narrower root doesn't speak for the rest of the tree.
-        assert!(narrow.owns(&inside) && !narrow.owns(&elsewhere));
-
-        let db = dir.path().join("state.db");
-        let hermes = open_with_harness(&db, None, Some(Harness::Hermes));
-        assert!(hermes.owns(&format!("{}#s1", db.display())));
-        assert!(!hermes.owns(&format!("{}#s1", dir.path().join("other.db").display())));
-        assert!(!hermes.owns("s1"));
-        assert!(!open(&dir.path().join("d.parquet"), None).owns(&inside));
-    }
-
-    #[test]
-    fn open_routes_hermes_state_db_and_dir() {
-        // The state.db file, and the ~/.hermes dir that holds it, both route to the hermes source.
-        assert!(open(Path::new("/x/.hermes/state.db"), None)
-            .describe()
-            .contains("hermes"));
-        assert!(open(Path::new("/x/.hermes"), None).describe().contains("state.db"));
-        // `--harness hermes` forces the hermes source even for an unrelated-looking path.
-        assert!(open_with_harness(Path::new("/x/whatever"), None, Some(Harness::Hermes))
-            .describe()
-            .contains("hermes"));
-    }
-
-    #[test]
-    fn hermes_units_are_sessions_signed_by_watermark() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = dir.path().join("state.db");
-        let conn = rusqlite::Connection::open(&db).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE sessions (id TEXT PRIMARY KEY, cwd TEXT);
-             CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, role TEXT, \
-                content TEXT, tool_call_id TEXT, tool_calls TEXT, tool_name TEXT, timestamp REAL NOT NULL, \
-                reasoning TEXT, reasoning_content TEXT);
-             INSERT INTO sessions (id, cwd) VALUES ('s1','/w'),('s2','/w');
-             INSERT INTO messages (session_id, role, content, timestamp) VALUES
-                ('s1','user','a',1.0),('s2','user','b',2.0),('s1','assistant','c',3.0);",
-        )
-        .unwrap();
-
-        let src = open(&db, None);
-        let units = src.units().unwrap();
-        assert_eq!(units.len(), 2);
-        // Keyed by location, most-recent-activity first: s1's high-water id is 3 (ids 1,3) > s2's 2.
-        let key = |sid: &str| format!("{}#{sid}", db.display());
-        assert_eq!(units[0].key, key("s1"));
-        assert_eq!(units[0].signature.as_deref(), Some("3"));
-        assert_eq!(units[1].key, key("s2"));
-        assert_eq!(units[1].signature.as_deref(), Some("2"));
-        // read wires through to the parser (s1 has two turns).
-        let turns = src.read(&units[0]).unwrap();
-        assert_eq!(turns.len(), 2);
-        assert_eq!(turns[0].harness, "hermes");
-        // --limit keeps the recent N sessions, and leaves the listing whole.
-        assert_eq!(open(&db, Some(1)).units().unwrap().len(), 1);
-        assert_eq!(open(&db, Some(1)).unit_keys().unwrap(), vec![key("s1"), key("s2")]);
+        std::fs::write(dir.path().join("s.jsonl"), b"{\"type\":\"session_meta\"}\n").unwrap();
+        let err = open(dir.path(), None).err().expect("refused");
+        assert!(err.to_string().contains("holds no turns files"), "{err}");
+        assert!(err.to_string().contains("funes-jsonl.md"), "{err}");
+        let empty = tempfile::tempdir().unwrap();
+        assert!(open(empty.path(), None).unwrap().units().unwrap().is_empty());
     }
 }

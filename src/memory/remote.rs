@@ -477,7 +477,7 @@ pub(crate) async fn compact(
     files.retain(|path, _| !is_version_file(path));
     let staged: Vec<String> = files.keys().cloned().collect();
     let (ops, _dir) = write_ops(&files)?;
-    if let Err(e) = commit_in_parts(repo, rev, ops, &message).await {
+    if let Err(e) = commit_in_parts(repo, rev, ops, &message, None).await {
         discard(repo, rev, staged, &message).await;
         return Err(e);
     }
@@ -511,11 +511,11 @@ async fn clean(
     let head = head_oid(repo, rev).await?;
     let (ds, wrapper) = open_pinned(dataset_uri, storage_options, &head).await?;
     delete_old_versions_keeping_uploads(&ds).await?;
-    let deletes = captured_deletes(&wrapper);
+    let deletes = captured_deletes(&wrapper, repo, &head).await?;
     if !deletes.is_empty() {
         eprintln!("deleting {} old files…", deletes.len());
     }
-    commit_in_parts(repo, rev, deletes, message).await
+    commit_in_parts(repo, rev, deletes, message, Some(head)).await
 }
 
 /// Compact a remote dataset and refresh its indexes, returning the commits made after version
@@ -683,7 +683,7 @@ async fn discard(repo: &HFRepository<RepoTypeDataset>, rev: &str, staged: Vec<St
             RepoTreeEntry::Directory { .. } => None,
         }));
     }
-    let _ = commit_in_parts(repo, rev, deletes, message).await;
+    let _ = commit_in_parts(repo, rev, deletes, message, None).await;
 }
 
 /// Operations per Hub commit: the Hub checks each within a 60 s request timeout and advises 50 to
@@ -692,19 +692,30 @@ const MAX_COMMIT_OPS: usize = 100;
 
 /// Commit `ops` in parts of at most [`MAX_COMMIT_OPS`], unguarded: new files and deletes of
 /// unreferenced ones hold whatever landed meanwhile. The oid of the last part.
+/// Cleanup supplies its pinned parent instead: a changed head must invalidate the delete plan.
 async fn commit_in_parts(
     repo: &HFRepository<RepoTypeDataset>,
     rev: &str,
     ops: Vec<CommitOperation>,
     message: &str,
+    mut parent: Option<String>,
 ) -> Result<Option<String>> {
     let mut oid = None;
     let mut ops = ops.into_iter().peekable();
     while ops.peek().is_some() {
         let part = ops.by_ref().take(MAX_COMMIT_OPS).collect();
-        let info = send_commit(repo, part, None, rev, message.to_string())
+        let info = send_commit(repo, part, parent.clone(), rev, message.to_string())
             .await
             .map_err(|e| anyhow::Error::new(e).context("compaction commit failed"))?;
+        if parent.is_some() {
+            parent = Some(
+                info.commit_oid
+                    .as_ref()
+                    .filter(|oid| !oid.is_empty())
+                    .context("cleanup commit returned no oid; refusing to continue its delete plan")?
+                    .clone(),
+            );
+        }
         oid = info.commit_oid;
     }
     Ok(oid)
@@ -891,7 +902,12 @@ fn captured_files(wrapper: &CaptureWrapper) -> BTreeMap<String, Bytes> {
 /// The captured deletes as commit operations: the existing files Lance removed. The Hub lists
 /// folders as entries too, but rejects a commit deleting one, so a delete with others under it is
 /// left out: the folder goes with its last file.
-fn captured_deletes(wrapper: &CaptureWrapper) -> Vec<CommitOperation> {
+/// Resolve both layouts at the read snapshot; guessing one path can leave a shadowed copy behind.
+async fn captured_deletes(
+    wrapper: &CaptureWrapper,
+    repo: &HFRepository<RepoTypeDataset>,
+    head: &str,
+) -> Result<Vec<CommitOperation>> {
     let deleted: BTreeSet<String> = wrapper
         .captured
         .lock()
@@ -900,7 +916,7 @@ fn captured_deletes(wrapper: &CaptureWrapper) -> Vec<CommitOperation> {
         .filter(|(_, b)| b.is_none())
         .map(|(p, _)| p.to_string())
         .collect();
-    deleted
+    let candidates: BTreeSet<String> = deleted
         .iter()
         .filter(|path| {
             let folder = format!("{path}/");
@@ -909,8 +925,26 @@ fn captured_deletes(wrapper: &CaptureWrapper) -> Vec<CommitOperation> {
                 .next()
                 .is_some_and(|next| next.starts_with(&folder))
         })
-        .map(|path| CommitOperation::delete(path.clone()))
-        .collect()
+        .flat_map(|path| std::iter::once(path.clone()).chain(physical_path(path)))
+        .collect();
+    let candidates: Vec<String> = candidates.into_iter().collect();
+    let mut files = BTreeSet::new();
+    for part in candidates.chunks(MAX_COMMIT_OPS) {
+        let entries = repo
+            .get_paths_info()
+            .paths(part.to_vec())
+            .revision(head.to_string())
+            .send()
+            .await
+            .context("resolving cleanup files at the pinned revision")?;
+        for entry in entries {
+            if let RepoTreeEntry::File { path, .. } = entry {
+                ensure!(part.contains(&path), "cleanup response included an unrequested file");
+                files.insert(path);
+            }
+        }
+    }
+    Ok(files.into_iter().map(CommitOperation::delete).collect())
 }
 
 /// Cap on CAS-conflict retries (the data append, and a forced compaction) when the branch head
@@ -1869,12 +1903,16 @@ mod tests {
     }
 
     // Real hf-hub errors, without network credentials or Hub/Voyage calls.
-    fn mock_commit_repo(
-        responses: Vec<(u16, Option<u64>, &'static str)>,
+    fn mock_commit_repo<T: AsRef<str>>(
+        responses: Vec<(u16, Option<u64>, T)>,
     ) -> (HFRepository<RepoTypeDataset>, std::thread::JoinHandle<Vec<String>>) {
         use std::io::Read;
         use std::net::TcpListener;
 
+        let responses: Vec<_> = responses
+            .into_iter()
+            .map(|(status, retry_after, body)| (status, retry_after, body.as_ref().to_string()))
+            .collect();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         listener.set_nonblocking(true).unwrap();
@@ -2509,8 +2547,8 @@ mod tests {
         assert!(err.contains(e5.id()) && err.contains(bge.id()), "{err}");
     }
 
-    #[test]
-    fn captured_deletes_leave_out_the_folders() {
+    #[tokio::test]
+    async fn captured_deletes_leave_out_the_folders() {
         let wrapper = CaptureWrapper {
             captured: Captured::default(),
         };
@@ -2522,7 +2560,16 @@ mod tests {
         ] {
             wrapper.captured.lock().unwrap().insert(path.into(), None);
         }
-        let paths: Vec<String> = captured_deletes(&wrapper)
+        let body = serde_json::json!([
+            {"type":"file", "path":"m/_indices/u-2.lance", "size":1, "oid":"a"},
+            {"type":"file", "path":"m/_indices/u/a.lance", "size":1, "oid":"b"},
+            {"type":"file", "path":"m/_versions/1.manifest", "size":1, "oid":"c"}
+        ])
+        .to_string();
+        let (repo, requests) = mock_commit_repo(vec![(200, None, body)]);
+        let paths: Vec<String> = captured_deletes(&wrapper, &repo, "snapshot")
+            .await
+            .unwrap()
             .into_iter()
             .map(|op| match op {
                 CommitOperation::Delete { path_in_repo } => path_in_repo,
@@ -2533,6 +2580,177 @@ mod tests {
             paths,
             ["m/_indices/u-2.lance", "m/_indices/u/a.lance", "m/_versions/1.manifest"]
         );
+        assert_eq!(requests.join().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn cleanup_resolves_only_existing_flat_and_sharded_files_at_the_snapshot() {
+        let wrapper = CaptureWrapper {
+            captured: Captured::default(),
+        };
+        let flat = "nested/chunks.lance/data/flat.lance";
+        let sharded = "nested/chunks.lance/data/sharded.lance";
+        let both = "nested/chunks.lance/_versions/1.manifest";
+        for path in [
+            flat,
+            sharded,
+            both,
+            "nested/chunks.lance/data/missing.lance",
+            "nested/chunks.lance/_indices/empty",
+        ] {
+            wrapper.captured.lock().unwrap().insert(path.into(), None);
+        }
+        wrapper.captured.lock().unwrap().insert(
+            "nested/chunks.lance/data/new.lance".into(),
+            Some(Bytes::from_static(b"new")),
+        );
+        let expected = BTreeSet::from([
+            flat.to_string(),
+            physical_path(sharded).unwrap(),
+            both.to_string(),
+            physical_path(both).unwrap(),
+        ]);
+        let mut entries: Vec<_> = expected
+            .iter()
+            .map(|path| serde_json::json!({"type":"file", "path":path, "size":1, "oid":"blob"}))
+            .collect();
+        entries
+            .push(serde_json::json!({"type":"directory", "path":"nested/chunks.lance/_indices/empty", "oid":"tree"}));
+        let (repo, requests) = mock_commit_repo(vec![(200, None, serde_json::to_string(&entries).unwrap())]);
+        let deletes = captured_deletes(&wrapper, &repo, "pinned-sha").await.unwrap();
+        assert_eq!(
+            deletes
+                .iter()
+                .map(|op| operation_path(op).to_string())
+                .collect::<BTreeSet<_>>(),
+            expected
+        );
+        let requests = requests.join().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].starts_with("POST /api/datasets/test/memory/paths-info/pinned-sha "));
+        assert!(!requests[0].contains("new.lance"));
+    }
+
+    #[tokio::test]
+    async fn cleanup_resolution_is_bounded_and_missing_files_are_a_noop() {
+        let wrapper = CaptureWrapper {
+            captured: Captured::default(),
+        };
+        for i in 0..MAX_COMMIT_OPS + 1 {
+            wrapper
+                .captured
+                .lock()
+                .unwrap()
+                .insert(format!("chunks.lance/data/{i}.lance").into(), None);
+        }
+        let (repo, requests) = mock_commit_repo(vec![(200, None, "[]"); 3]);
+        let deletes = captured_deletes(&wrapper, &repo, "snapshot").await.unwrap();
+        assert!(deletes.is_empty());
+        assert!(
+            commit_in_parts(&repo, "main", deletes, "cleanup", Some("snapshot".into()))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let requests = requests.join().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(requests.iter().all(|request| request.contains("/paths-info/snapshot ")));
+        let (repo, requests) = mock_commit_repo(Vec::<(u16, Option<u64>, &str)>::new());
+        assert!(captured_deletes(
+            &CaptureWrapper {
+                captured: Captured::default()
+            },
+            &repo,
+            "snapshot"
+        )
+        .await
+        .unwrap()
+        .is_empty());
+        assert!(requests.join().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cleanup_resolution_fails_closed_on_errors_or_unrequested_files() {
+        let wrapper = CaptureWrapper {
+            captured: Captured::default(),
+        };
+        wrapper
+            .captured
+            .lock()
+            .unwrap()
+            .insert("chunks.lance/data/old.lance".into(), None);
+        for (status, body) in [
+            (401, r#"{"error":"unauthorized"}"#),
+            (503, r#"{"error":"unavailable"}"#),
+            (
+                200,
+                r#"[{"type":"file","path":"chunks.lance/data/active.lance","size":1,"oid":"blob"}]"#,
+            ),
+        ] {
+            let (repo, requests) = mock_commit_repo(vec![(status, None, body)]);
+            assert!(captured_deletes(&wrapper, &repo, "snapshot").await.is_err());
+            assert_eq!(requests.join().unwrap().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn cleanup_commits_chain_the_pinned_parent_and_stop_on_conflict_or_missing_oid() {
+        let deletes = || {
+            (0..MAX_COMMIT_OPS + 1)
+                .map(|i| CommitOperation::delete(format!("old-{i}")))
+                .collect()
+        };
+        let (repo, requests) = mock_commit_repo(vec![
+            (200, None, r#"{"commitOid":"first"}"#),
+            (200, None, r#"{"commitOid":"second"}"#),
+        ]);
+        assert_eq!(
+            commit_in_parts(&repo, "main", deletes(), "cleanup", Some("snapshot".into()))
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("second")
+        );
+        let requests = requests.join().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].contains("snapshot"));
+        assert!(requests[1].contains("first"));
+        for responses in [
+            vec![(412, None, r#"{"error":"head moved"}"#)],
+            vec![
+                (200, None, r#"{"commitOid":"first"}"#),
+                (412, None, r#"{"error":"head moved"}"#),
+            ],
+        ] {
+            let count = responses.len();
+            let (repo, requests) = mock_commit_repo(responses);
+            assert!(
+                commit_in_parts(&repo, "main", deletes(), "cleanup", Some("snapshot".into()))
+                    .await
+                    .is_err()
+            );
+            assert_eq!(requests.join().unwrap().len(), count);
+        }
+        for body in [r#"{}"#, r#"{"commitOid":""}"#] {
+            let (repo, requests) = mock_commit_repo(vec![
+                (200, None, body),
+                (
+                    200,
+                    None,
+                    r#"{"branches":[{"name":"main","ref":"refs/heads/main","targetCommit":"concurrent-head"}],"tags":[]}"#,
+                ),
+            ]);
+            let error = commit_in_parts(&repo, "main", deletes(), "cleanup", Some("snapshot".into()))
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("cleanup commit returned no oid"));
+            let requests = requests.join().unwrap();
+            assert_eq!(requests.len(), 2);
+            assert!(
+                requests[1].starts_with("GET "),
+                "a later head must not authorize more deletes"
+            );
+        }
     }
 
     #[tokio::test]
@@ -2874,6 +3092,105 @@ mod tests {
                     bytes
                 );
             }
+        }
+
+        // Compact and clean the mixed layout through the production decorators, without the Hub.
+        let captured = Captured::default();
+        let mut compacting = dataset::open_wrapped(
+            uri,
+            HashMap::new(),
+            Arc::new(TestStoreWrapper {
+                store: store.clone(),
+                sharded: true,
+                captured: Some(captured.clone()),
+            }),
+        )
+        .await
+        .unwrap();
+        let read = compacting.version().version;
+        refresh(&mut compacting, read, |_| {}).await.unwrap();
+        for (path, body) in captured_files(&CaptureWrapper { captured }) {
+            store.put(&OPath::from(path), body.into()).await.unwrap();
+        }
+        let staged = [
+            "chunks.lance/data/staged-flat.lance".to_string(),
+            physical_path("chunks.lance/data/staged-shard.lance").unwrap(),
+        ];
+        for path in &staged {
+            store
+                .put(&OPath::from(path.as_str()), "pending-upload".into())
+                .await
+                .unwrap();
+        }
+        let captured = Captured::default();
+        let cleaning = dataset::open_wrapped(
+            uri,
+            HashMap::new(),
+            Arc::new(TestStoreWrapper {
+                store: store.clone(),
+                sharded: true,
+                captured: Some(captured.clone()),
+            }),
+        )
+        .await
+        .unwrap();
+        let before = objects(store.as_ref()).await;
+        delete_old_versions_keeping_uploads(&cleaning).await.unwrap();
+        assert_eq!(
+            objects(store.as_ref()).await,
+            before,
+            "cleanup is captured, not forwarded"
+        );
+        let candidates: BTreeSet<String> = captured
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, body)| body.is_none())
+            .flat_map(|(path, _)| std::iter::once(path.to_string()).chain(physical_path(path.as_ref())))
+            .collect();
+        assert!(candidates.len() <= MAX_COMMIT_OPS);
+        let entries: Vec<_> = store.list(None).try_collect::<Vec<_>>().await.unwrap().into_iter()
+            .filter(|meta| candidates.contains(meta.location.as_ref()))
+            .map(|meta| serde_json::json!({"type":"file", "path":meta.location.to_string(), "size":meta.size, "oid":"blob"}))
+            .collect();
+        let (repo, requests) = mock_commit_repo(vec![(200, None, serde_json::to_string(&entries).unwrap())]);
+        let deletes = captured_deletes(&CaptureWrapper { captured }, &repo, "snapshot")
+            .await
+            .unwrap();
+        assert!(deletes
+            .iter()
+            .any(|op| operation_path(op).starts_with("__funes_shards__/")));
+        assert!(deletes
+            .iter()
+            .any(|op| !operation_path(op).starts_with("__funes_shards__/")));
+        for op in deletes {
+            let path = operation_path(&op);
+            assert!(!staged.iter().any(|staged| staged == path));
+            store.delete(&OPath::from(path)).await.unwrap();
+        }
+        assert_eq!(requests.join().unwrap().len(), 1);
+        let reopened = dataset::open_wrapped(
+            uri,
+            HashMap::new(),
+            Arc::new(TestStoreWrapper {
+                store: store.clone(),
+                sharded: true,
+                captured: None,
+            }),
+        )
+        .await
+        .unwrap();
+        reopened.validate().await.unwrap();
+        assert_eq!(reopened.count_rows(None).await.unwrap(), 3);
+        assert_eq!(reopened.versions().await.unwrap().len(), 1);
+        let mut search = reopened.scan();
+        search
+            .full_text_search(FullTextSearchQuery::new("original".to_string()))
+            .unwrap()
+            .fast_search();
+        assert_eq!(search.count_rows().await.unwrap(), 1);
+        for path in staged {
+            assert!(store.head(&OPath::from(path)).await.is_ok());
         }
     }
 }

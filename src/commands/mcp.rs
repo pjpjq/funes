@@ -87,7 +87,7 @@ pub struct RecallRequest {
     )]
     pub query: String,
     #[schemars(
-        description = "Caller remaining native budget in milliseconds, capped at 600000. Bounds optional FTS within the caller's deadline; does not replace the caller's timeout."
+        description = "Caller remaining native budget in milliseconds, capped at 600000. Optional FTS may use the remaining time, including index warmup; without a budget it is capped at three seconds. Does not replace the caller's timeout."
     )]
     pub budget_ms: Option<u64>,
     #[schemars(

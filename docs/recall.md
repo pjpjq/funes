@@ -20,15 +20,17 @@ languages a memory's sessions are written in.
 Passages are searchable by their words as soon as their text is indexed, even while embeddings
 are pending. If text search fails, recall reports an error.
 
-The BM25/FTS leg is best-effort: a scan error or a three-second scan timeout retains the vector
+The BM25/FTS leg is best-effort: a scan error or an exhausted scan budget retains the vector
 results rather than failing the whole recall. Both legs keep the same metadata filters. A timed-out
 scan can omit keyword-only hits; with `FUNES_RECALL_METRICS=1`, `recall_fts` reports `timeout` or
 `error` instead of `done`. This budget does not reset the index or regenerate document embeddings.
 The HTTP bridge passes its remaining native-call budget as MCP `budget_ms`, after reserving 250ms
 for transport. Native recall anchors that budget before opening the memory and embedding; FTS uses
-at most three seconds or the time still left after another 250ms response reserve, whichever is
-shorter. If none remains, FTS is skipped without polling the scan and the filtered vector hits are
-retained. CLI calls without this transport budget keep the existing three-second FTS cap.
+the time still left after another 250ms response reserve. This lets the existing long-budget warmup
+finish cold index initialization instead of cancelling and restarting it on every query. Interactive
+calls remain bounded by their original caller deadline. If no time remains, FTS is skipped without
+polling the scan and the filtered vector hits are retained. CLI calls without this transport budget
+keep the existing three-second FTS cap.
 The optional scan runs on an isolated thread/runtime so non-yielding FTS work cannot hold the
 query's timer. Each native worker admits one FTS scan with no queue; an occupied slot falls back to
 the same filtered vector results. Cancellation remains cooperative: a timed-out scan keeps the

@@ -991,13 +991,11 @@ async fn hybrid_candidates(
 }
 
 fn fts_budget(deadline: Option<Instant>) -> Duration {
-    let cap = Duration::from_secs(3);
-    deadline.map_or(cap, |deadline| {
-        cap.min(
-            deadline
-                .saturating_duration_since(Instant::now())
-                .saturating_sub(Duration::from_millis(250)),
-        )
+    // Warmup must be able to finish index initialization instead of repeatedly cancelling it at three seconds.
+    deadline.map_or(Duration::from_secs(3), |deadline| {
+        deadline
+            .saturating_duration_since(Instant::now())
+            .saturating_sub(Duration::from_millis(250))
     })
 }
 
@@ -2111,10 +2109,11 @@ mod tests {
     #[test]
     fn fts_budget_uses_only_the_callers_remaining_time() {
         assert_eq!(fts_budget(None), Duration::from_secs(3));
-        assert_eq!(
-            fts_budget(Some(Instant::now() + Duration::from_secs(10))),
-            Duration::from_secs(3)
-        );
+        let warm = fts_budget(Some(Instant::now() + Duration::from_secs(180)));
+        assert!(warm > Duration::from_secs(3));
+        assert!(warm <= Duration::from_millis(179_750));
+        let interactive = fts_budget(Some(Instant::now() + Duration::from_secs(7)));
+        assert!(interactive <= Duration::from_millis(6750));
         let remaining = fts_budget(Some(Instant::now() + Duration::from_millis(500)));
         assert!(remaining <= Duration::from_millis(250));
         assert_eq!(
@@ -2122,6 +2121,21 @@ mod tests {
             Duration::ZERO
         );
         assert_eq!(fts_budget(Some(Instant::now())), Duration::ZERO);
+    }
+
+    #[tokio::test]
+    async fn explicit_warm_budget_allows_fts_initialization_to_finish() {
+        let hits = best_effort_fts(
+            async {
+                tokio::time::sleep(Duration::from_millis(3100)).await;
+                Ok(vec![(1, hit("initialized-fts"))])
+            },
+            fts_budget(Some(Instant::now() + Duration::from_secs(6))),
+            Arc::new(Semaphore::new(1)),
+        )
+        .await;
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].1.text, "initialized-fts");
     }
 
     #[tokio::test]

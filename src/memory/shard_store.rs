@@ -128,7 +128,16 @@ impl OSObjectStore for ShardStore {
         let mut result = match physical_path(location.as_ref()) {
             Some(physical) => {
                 let physical = OPath::from(physical);
-                match self.inner.get_opts(&physical, options.clone()).await {
+                // A complete pinned inventory already proves which physical shard requests would miss.
+                let sharded = if self.inventory.get().is_some_and(|files| !files.contains_key(location)) {
+                    Err(object_store::Error::NotFound {
+                        path: physical.to_string(),
+                        source: "absent from pinned shard inventory".into(),
+                    })
+                } else {
+                    self.inner.get_opts(&physical, options.clone()).await
+                };
+                match sharded {
                     Ok(result) => result,
                     Err(object_store::Error::NotFound { .. }) => {
                         // The version hint is an optional derived acceleration artifact. If missing
@@ -599,6 +608,71 @@ mod tests {
         async fn copy_opts(&self, _: &OPath, _: &OPath, _: CopyOptions) -> OSResult<()> {
             Err(read_only())
         }
+    }
+
+    #[tokio::test]
+    async fn initialized_inventory_skips_missing_shards_for_flat_reads_head_and_ranges() {
+        let inner = Arc::new(InMemory::new());
+        let counts = Arc::new(CallCounts::default());
+        let path = OPath::from("chunks.lance/data/flat.lance");
+        put(&inner, path.as_ref(), b"original").await;
+        let store = ShardStore::new(Arc::new(MockCountingAndFaultStore::new(inner, counts.clone())));
+        assert!(store.inventory().await.unwrap().is_empty());
+        assert_eq!(store.get(&path).await.unwrap().bytes().await.unwrap(), "original");
+        assert_eq!(
+            store.clone().get(&path).await.unwrap().bytes().await.unwrap(),
+            "original"
+        );
+        assert_eq!(store.head(&path).await.unwrap().location, path);
+        assert_eq!(store.get_range(&path, 1..4).await.unwrap(), "rig");
+        assert_eq!(counts.get_opts.load(Ordering::SeqCst), 4);
+        assert_eq!(counts.list.load(Ordering::SeqCst), 1);
+        assert_eq!(counts.list_with_delimiter.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn initialized_inventory_never_falls_back_to_a_stale_flat_version_hint() {
+        let inner = Arc::new(InMemory::new());
+        let counts = Arc::new(CallCounts::default());
+        let path = OPath::from("chunks.lance/_versions/latest_version_hint.json");
+        put(&inner, path.as_ref(), b"stale").await;
+        let store = ShardStore::new(Arc::new(MockCountingAndFaultStore::new(inner, counts.clone())));
+        assert!(store.inventory().await.unwrap().is_empty());
+        assert!(matches!(
+            store.get(&path).await,
+            Err(object_store::Error::NotFound { .. })
+        ));
+        assert!(matches!(
+            store.head(&path).await,
+            Err(object_store::Error::NotFound { .. })
+        ));
+        assert_eq!(counts.get_opts.load(Ordering::SeqCst), 0);
+        assert_eq!(counts.list.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn initialized_inventory_preserves_physical_read_errors_without_flat_fallback() {
+        let inner = Arc::new(InMemory::new());
+        let counts = Arc::new(CallCounts::default());
+        let path = OPath::from("chunks.lance/data/both.lance");
+        let physical = OPath::from(physical_path(path.as_ref()).unwrap());
+        put(&inner, path.as_ref(), b"old").await;
+        put(&inner, physical.as_ref(), b"new").await;
+        let store = ShardStore::new(Arc::new(MockCountingAndFaultStore::with_fault(
+            inner,
+            counts.clone(),
+            physical,
+            "auth or transient failure",
+        )));
+        assert!(store.inventory().await.unwrap().contains_key(&path));
+        for _ in 0..2 {
+            assert!(matches!(
+                store.get(&path).await,
+                Err(object_store::Error::Generic { .. })
+            ));
+        }
+        assert_eq!(counts.get_opts.load(Ordering::SeqCst), 2);
+        assert_eq!(counts.list.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

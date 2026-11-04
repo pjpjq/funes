@@ -56,7 +56,6 @@ use futures::FutureExt;
 use hf_hub::progress::{Progress, ProgressEvent, ProgressHandler, UploadEvent};
 use hf_hub::repository::{CommitInfo, CommitOperation, RepoTreeEntry};
 use hf_hub::{HFError, HFRepository, RepoTypeDataset};
-use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::transaction::{Operation, Transaction};
 use lance::dataset::{ColumnAlteration, CommitBuilder, Dataset, NewColumnTransform, WriteParams};
 use lance::Error as LanceError;
@@ -192,7 +191,7 @@ pub(crate) async fn append(
 
 #[allow(clippy::too_many_arguments)] // Shared CAS append boundary for push and canonical ingestion.
 async fn append_at(
-    repo: &HFRepository<RepoTypeDataset>,
+    _repo: &HFRepository<RepoTypeDataset>,
     commit_repo: &HFRepository<RepoTypeDataset>,
     dataset_uri: &str,
     storage_options: HashMap<String, String>,
@@ -814,7 +813,7 @@ pub async fn count_languages(
 /// append run through the same capture store and land in one guarded Hub commit.
 #[allow(clippy::too_many_arguments)] // Keep the selected snapshot and CAS target explicit at this write boundary.
 pub(crate) async fn replace_documents(
-    repo: &HFRepository<RepoTypeDataset>,
+    _repo: &HFRepository<RepoTypeDataset>,
     commit_repo: &HFRepository<RepoTypeDataset>,
     dataset_uri: &str,
     storage_options: HashMap<String, String>,
@@ -2214,11 +2213,10 @@ mod tests {
     fn write_ops_and_captured_files_emit_safely_when_enabled() {
         let wrapper = CaptureWrapper {
             captured: Captured::default(),
-            fetcher: Arc::new(UnusedFetcher),
         };
         wrapper.captured.lock().unwrap().insert(
             object_store::path::Path::from("chunks.lance/data/test.lance"),
-            Bytes::from_static(b"metric_test_bytes"),
+            Some(Bytes::from_static(b"metric_test_bytes")),
         );
         let files = captured_files(&wrapper);
         assert_eq!(files.len(), 1);
@@ -2702,7 +2700,6 @@ mod tests {
     fn captured_lance_files_are_sharded_but_repo_metadata_stays_flat() {
         let wrapper = CaptureWrapper {
             captured: Captured::default(),
-            fetcher: Arc::new(UnusedFetcher),
         };
         for logical in [
             "chunks.lance/data/new.lance",
@@ -2712,7 +2709,7 @@ mod tests {
         ] {
             wrapper.captured.lock().unwrap().insert(
                 object_store::path::Path::from(logical),
-                Bytes::from_static(b"unchanged"),
+                Some(Bytes::from_static(b"unchanged")),
             );
         }
         let files = captured_files(&wrapper);
@@ -2822,10 +2819,7 @@ mod tests {
             ds.append(batch(vec![format!("new raw memory {expected_rows}")]), None)
                 .await
                 .unwrap();
-            let files = captured_files(&CaptureWrapper {
-                captured,
-                fetcher: Arc::new(UnusedFetcher),
-            });
+            let files = captured_files(&CaptureWrapper { captured });
             assert!(!files.is_empty());
             assert!(files.keys().all(|path| path.starts_with("__funes_shards__/v1/")));
             for (path, bytes) in &files {

@@ -2128,7 +2128,7 @@ mod tests {
         let fts = best_effort_fts(scan, fts_budget(Some(Instant::now())), Arc::new(Semaphore::new(1))).await;
         let fused = rrf_fuse(vec![(1, hit("vector-only"))], fts, 1);
         assert_eq!(fused.len(), 1);
-        assert_eq!(fused[0].0.text, "vector-only");
+        assert_eq!(fused[0].text, "vector-only");
     }
 
     #[tokio::test]
@@ -2140,7 +2140,7 @@ mod tests {
         )
         .await;
         let fused = rrf_fuse(vec![(1, hit("vector-only")), (2, hit("shared"))], fts, 3);
-        assert_eq!(fused[0].0.text, "shared");
+        assert_eq!(fused[0].text, "shared");
         assert_eq!(fused.len(), 3);
     }
 
@@ -2154,7 +2154,7 @@ mod tests {
         .await;
         let fused = rrf_fuse(vec![(1, hit("vector-only"))], fts, 1);
         assert_eq!(fused.len(), 1);
-        assert_eq!(fused[0].0.text, "vector-only");
+        assert_eq!(fused[0].text, "vector-only");
     }
 
     #[tokio::test]
@@ -2186,7 +2186,7 @@ mod tests {
             .expect("a yielding scan must observe cancellation");
         let fused = rrf_fuse(vec![(1, hit("vector-only"))], fts, 1);
         assert_eq!(fused.len(), 1);
-        assert_eq!(fused[0].0.text, "vector-only");
+        assert_eq!(fused[0].text, "vector-only");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2208,7 +2208,7 @@ mod tests {
         );
         assert!(fts.is_empty());
         let fused = rrf_fuse(vec![(1, hit("vector-only"))], fts, 1);
-        assert_eq!(fused[0].0.text, "vector-only");
+        assert_eq!(fused[0].text, "vector-only");
         drop(
             tokio::time::timeout(Duration::from_secs(2), slot.acquire())
                 .await
@@ -2317,7 +2317,7 @@ mod tests {
 
     #[tokio::test]
     async fn isolated_fts_keeps_real_keyword_hits_and_filters_across_calls() {
-        use arrow_array::{ArrayRef, RecordBatchIterator};
+        use arrow_array::{ArrayRef, Int64Array, RecordBatchIterator, StringArray};
         use arrow_schema::{DataType, Field, Schema};
         use lance::index::DatasetIndexExt;
         use lance_index::{scalar::InvertedIndexParams, IndexType};

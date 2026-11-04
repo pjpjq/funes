@@ -1620,7 +1620,7 @@ mod tests {
         assert_eq!(built[FTS_INDEX], 1);
         assert_eq!(built[VECTOR_INDEX], 1, "300 rows train an IVF_PQ index");
         let base: Vec<_> = ds.load_indices().await.unwrap().iter().map(|i| i.uuid).collect();
-        assert_eq!(base.len(), 2);
+        assert_eq!(base.len(), 5);
 
         let appended = embedded(&turns(TRAINABLE, 4));
         let probe = appended
@@ -2061,7 +2061,11 @@ mod tests {
                 IndexBuildEvent::MergingDeltas { index: fts, deltas: MERGE_DELTAS },
                 IndexBuildEvent::Building("text search index"),
                 IndexBuildEvent::MergingDeltas { index: vector, deltas: MERGE_DELTAS },
-            ] if fts == FTS_INDEX && vector == VECTOR_INDEX
+                IndexBuildEvent::MergingDeltas { index: identity, deltas: MERGE_DELTAS },
+                IndexBuildEvent::MergingDeltas { index: agent, deltas: MERGE_DELTAS },
+                IndexBuildEvent::MergingDeltas { index: source_type, deltas: MERGE_DELTAS },
+            ] if fts == FTS_INDEX && vector == VECTOR_INDEX && identity == SOURCE_IDENTITY_INDEX_NAME
+                && agent == SOURCE_AGENT_INDEX_NAME && source_type == SOURCE_TYPE_INDEX_NAME
         ));
         assert_eq!(
             sub_index_counts(&ds).await.unwrap()[FTS_INDEX],

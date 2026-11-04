@@ -678,7 +678,7 @@ mod tests {
             .unwrap();
         assert_eq!(first.source_type_index_ready, Some(true));
         let response = serde_json::to_value(recall_tool_result(first)).unwrap();
-        assert_eq!(response["content"][0]["text"], "no results");
+        assert_eq!(response["content"][0]["text"], recall::rendered("", &[]));
         assert_eq!(response["structuredContent"]["source_type_index_ready"], true);
 
         let mut latest = Dataset::open(&crate::memory::dataset::table_uri(&spec)).await.unwrap();

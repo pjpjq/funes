@@ -124,7 +124,7 @@ pub async fn run() -> Result<()> {
     }
     out.extend(replacement_batch);
     eprintln!("rewriting the memory…");
-    let mut ds = dataset::overwrite(&uri, out, &profile).await?;
+    let mut ds = dataset::overwrite(&uri, out, &target_schema).await?;
     dataset::build_indexes(&mut ds, ui::index_progress).await?;
     sweep(&ds).await?;
 

@@ -66,7 +66,7 @@ async fn indexing_keeps_the_memory_language_counts() {
     let uri = dataset::table_uri(home::memory_dir());
     let ds = dataset::open(&uri, Default::default()).await.unwrap();
     let rows = dataset::scan_rows(&ds, &[], None, None).await.unwrap();
-    dataset::overwrite(&uri, rows, &profile).await.unwrap();
+    dataset::overwrite(&uri, rows, &dataset::schema_of(&ds)).await.unwrap();
     assert_eq!(recorded().await, None);
     index::run_index(&turns, false, None).await.unwrap();
     assert_eq!(recorded().await, counted(3, 1, 2));

@@ -598,10 +598,12 @@ pub async fn create(uri: &str, batch: RecordBatch) -> Result<Dataset> {
         .context("creating the memory")
 }
 
-/// Rewrite the memory at `uri` as `batches`, every row re-stamped with `model`'s schema, in one
-/// commit.
-pub async fn overwrite(uri: &str, batches: Vec<RecordBatch>, profile: &EmbeddingProfile) -> Result<Dataset> {
-    let schema = schema_for(profile);
+/// Rewrite the memory at `uri` as `batches`, every row re-stamped with its existing schema, in one
+/// commit. Preserve embedding metadata; language counts must be recomputed after rows change.
+pub async fn overwrite(uri: &str, batches: Vec<RecordBatch>, target: &Arc<Schema>) -> Result<Dataset> {
+    let mut metadata = target.metadata().clone();
+    metadata.remove(LANGUAGES);
+    let schema = Arc::new(Schema::new_with_metadata(target.fields().clone(), metadata));
     let batches = restamped(&schema, batches)?;
     let params = WriteParams {
         mode: WriteMode::Overwrite,
@@ -1863,6 +1865,57 @@ mod tests {
         let ds = create_empty(&table_uri(dir.path()), e5).await.unwrap();
         assert_eq!(ds.count_rows(None).await.unwrap(), 0);
         assert_eq!(embedding_model(&ds).unwrap(), e5);
+    }
+
+    #[tokio::test]
+    async fn overwrite_preserves_legacy_and_canonical_schemas_even_when_all_rows_are_removed() {
+        for (profile, columns) in [
+            (EmbeddingProfile::local_model(model::MULTILINGUAL), 17),
+            (EmbeddingProfile::local(), 28),
+            (EmbeddingProfile::voyage("voyage-4-lite", 1024).unwrap(), 28),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let uri = table_uri(dir.path());
+            let full = schema_for(&profile);
+            let fields = full.fields()[..columns].iter().rev().cloned().collect::<Vec<_>>();
+            let mut metadata = full.metadata().clone();
+            metadata.insert("retained_fixture_metadata".into(), "unchanged".into());
+            let target = Arc::new(Schema::new_with_metadata(fields, metadata));
+            let chunks = chunk::chunks_from_turns(&turns(0, 2), true);
+            let vectors = vec![vec![0.0; profile.dimensions]; chunks.len()];
+            let batch = build_batch_for_schema(&chunks, &vectors, target).unwrap();
+            let mut ds = create(&uri, batch).await.unwrap();
+            stamp_languages(
+                &mut ds,
+                &Languages {
+                    rows: 2,
+                    counts: BTreeMap::new(),
+                },
+            )
+            .await
+            .unwrap();
+            let target = schema_of(&ds);
+            let before = scan_rows(&ds, &[], None, None).await.unwrap();
+            let rewritten = overwrite(&uri, before.clone(), &target).await.unwrap();
+            assert_eq!(schema_of(&rewritten).fields(), target.fields());
+            assert_eq!(embedding_profile(&rewritten).unwrap(), profile);
+            assert_eq!(languages(&rewritten), None);
+            assert_eq!(
+                schema_of(&rewritten).metadata()["retained_fixture_metadata"],
+                "unchanged"
+            );
+            let after = scan_rows(&rewritten, &[], None, None).await.unwrap();
+            assert_eq!(
+                after.iter().map(RecordBatch::columns).collect::<Vec<_>>(),
+                before.iter().map(RecordBatch::columns).collect::<Vec<_>>()
+            );
+
+            let empty = overwrite(&uri, Vec::new(), &target).await.unwrap();
+            assert_eq!(empty.count_rows(None).await.unwrap(), 0);
+            assert_eq!(schema_of(&empty).fields(), target.fields());
+            assert_eq!(embedding_profile(&empty).unwrap(), profile);
+            assert_eq!(languages(&empty), None);
+        }
     }
 
     #[tokio::test]

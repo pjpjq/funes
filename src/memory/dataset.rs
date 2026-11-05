@@ -1496,6 +1496,8 @@ mod tests {
         let mut rows = chunk::chunks_from_turns(&turns(0, 1), true);
         rows[0].source_identity = Some("stable-doc".into());
         rows[0].source_missing = Some(false);
+        // Canonical missing provenance stays null, unlike the transcript's empty repo facet.
+        rows[0].repo = None;
         let original = schema(model::MULTILINGUAL);
         let mut fields = original.fields().iter().map(|f| f.as_ref().clone()).collect::<Vec<_>>();
         fields.reverse();

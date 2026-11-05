@@ -3810,6 +3810,7 @@ class NativeMcpWorker:
         self.timeout = float(timeout)
         self.handshake_timeout = float(handshake_timeout)
         self._process = None
+        self._retired = False
         self._next_id = 1
         self._lock = threading.RLock()
         self._stderr_thread: threading.Thread | None = None
@@ -3830,6 +3831,19 @@ class NativeMcpWorker:
     def close(self) -> None:
         with self._lock:
             self._stop_locked()
+
+    def _retire_if_stopped(self) -> bool:
+        # A foreground retry must not respawn this child beside a cold replacement.
+        if not self._lock.acquire(blocking=False):
+            return False
+        try:
+            if self._process is not None and self._alive(self._process):
+                return False
+            self._retired = True
+            self._stop_locked()
+            return True
+        finally:
+            self._lock.release()
 
     def reset_read_metrics(self) -> None:
         self._read_metrics = []
@@ -3985,6 +3999,8 @@ class NativeMcpWorker:
             raise
 
     def _ensure_started_locked(self, deadline: float | None = None) -> None:
+        if self._retired:
+            raise NativeMcpBusyError("native MCP worker is being replaced")
         if self._process is not None and self._alive(self._process):
             return
         self._stop_locked()
@@ -4336,34 +4352,53 @@ def close_native_worker() -> None:
 def _refresh_native_worker() -> None:
     """Warm a replacement child and atomically swap it with the active one."""
     global MCP_WORKER, _MCP_WORKER_CONFIG
-    config = _native_worker_config()
-    maintained_at_open = _source_type_maintenance_success(SOURCE_APP)
-    # A maintenance commit may complete while the warm probe is running.
-    # Use a conservative lower bound on snapshot open, not probe completion.
-    opened_at = time.monotonic()
-    candidate = NativeMcpWorker(
-        FUNES_BIN,
-        REMOTE,
-        HOME,
-        timeout=MCP_TIMEOUT,
-        handshake_timeout=MCP_HANDSHAKE_TIMEOUT,
-    )
-    try:
-        probe = candidate.recall("memory", k=1, candidates=1, half_life=0, neighbors=0)
-        if probe.startswith("recall error:"):
-            raise NativeMcpError("native recall failed")
-        candidate._snapshot_opened_after = opened_at
-        candidate._source_type_maintenance_success = maintained_at_open
-    except Exception:
-        candidate.close()
-        raise
-    with INDEX_LOCK:
+    acquired_write_lock = False
+    while True:
         with _MCP_WORKER_LOCK:
-            previous = MCP_WORKER
-            MCP_WORKER = candidate
-            _MCP_WORKER_CONFIG = config
-        if isinstance(previous, NativeMcpWorker):
-            previous.close()
+            worker = MCP_WORKER
+            if worker is None:
+                break
+            retire = getattr(worker, "_retire_if_stopped", None)
+            if retire is not None and retire():
+                MCP_WORKER = None
+                _MCP_WORKER_CONFIG = None
+                break
+        # Only the replacement waits; the healthy active child keeps serving reads.
+        if NATIVE_WRITE_LOCK.acquire(timeout=0.1):
+            acquired_write_lock = True
+            break
+    try:
+        config = _native_worker_config()
+        maintained_at_open = _source_type_maintenance_success(SOURCE_APP)
+        # A maintenance commit may complete while the warm probe is running.
+        # Use a conservative lower bound on snapshot open, not probe completion.
+        opened_at = time.monotonic()
+        candidate = NativeMcpWorker(
+            FUNES_BIN,
+            REMOTE,
+            HOME,
+            timeout=MCP_TIMEOUT,
+            handshake_timeout=MCP_HANDSHAKE_TIMEOUT,
+        )
+        try:
+            probe = candidate.recall("memory", k=1, candidates=1, half_life=0, neighbors=0)
+            if probe.startswith("recall error:"):
+                raise NativeMcpError("native recall failed")
+            candidate._snapshot_opened_after = opened_at
+            candidate._source_type_maintenance_success = maintained_at_open
+        except Exception:
+            candidate.close()
+            raise
+        with INDEX_LOCK:
+            with _MCP_WORKER_LOCK:
+                previous = MCP_WORKER
+                MCP_WORKER = candidate
+                _MCP_WORKER_CONFIG = config
+            if isinstance(previous, NativeMcpWorker):
+                previous.close()
+    finally:
+        if acquired_write_lock:
+            NATIVE_WRITE_LOCK.release()
 
 
 atexit.register(close_native_worker)

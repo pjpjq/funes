@@ -230,7 +230,7 @@ impl OSObjectStore for FetchStore {
 }
 
 /// Why a fetched file cannot answer a read.
-enum Unservable {
+pub(super) enum Unservable {
     /// It does not span the requested range, so its bytes are not the object's.
     Corrupt,
     Unreadable,
@@ -240,7 +240,7 @@ enum Unservable {
 /// object's `location` and whole-file size. A `head` returns metadata only; a body request hands the
 /// open file to `object_store`, which reads the resolved range off the executor (so a large file is
 /// never buffered here).
-fn serve_from_file(path: &Path, location: &OPath, options: &GetOptions) -> Result<GetResult, Unservable> {
+pub(super) fn serve_from_file(path: &Path, location: &OPath, options: &GetOptions) -> Result<GetResult, Unservable> {
     let total = std::fs::metadata(path).map_err(|_| Unservable::Unreadable)?.len();
     let meta = meta(location.clone(), total);
     if options.head {

@@ -21,7 +21,7 @@
 //! ```
 //!
 //! So each op runs through a [`CaptureStore`](super::capture_store::CaptureStore) installed via
-//! Lance's [`WrappingObjectStore`] seam: Lance's writes are captured in memory instead of hitting
+//! Lance's [`WrappingObjectStore`] seam: Lance's writes are captured in temporary files instead of hitting
 //! the Hub, and we choose the commits that ship them.
 //!
 //! # Why this shape
@@ -63,7 +63,7 @@ use lance_io::object_store::{ChainedWrappingObjectStore, WrappingObjectStore};
 use object_store::ObjectStore as OSObjectStore;
 use serde::Serialize;
 
-use super::capture_store::{CaptureStore, Captured};
+use super::capture_store::{CaptureStore, Captured, CapturedFile};
 use super::dataset::{self, IndexBuildEvent};
 use super::fetch_store::{FetchStore, FileFetcher};
 use super::shard_store::{physical_path, ShardStore};
@@ -245,7 +245,7 @@ async fn append_at(
     };
     let text_indexed = measure_unindexed && dataset::sub_index_counts(&ds).await?.contains_key(dataset::FTS_INDEX);
     for (path, body) in extra_files {
-        files.insert(path.clone(), body.clone());
+        files.insert(path.clone(), CapturedFile::from_bytes(body)?);
     }
 
     let (ops, _dir) = write_ops(&files)?;
@@ -371,7 +371,11 @@ pub(crate) async fn first_publish(
     if ops.is_empty() {
         return Ok(None);
     }
-    let (extra_ops, _extra_dir) = write_ops(extra_files)?;
+    let captured = extra_files
+        .iter()
+        .map(|(path, body)| Ok((path.clone(), CapturedFile::from_bytes(body)?)))
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    let (extra_ops, _extra_dir) = write_ops(&captured)?;
     ops.extend(extra_ops);
 
     let info = send_commit_chunks(repo, ops, None, rev, message)
@@ -879,9 +883,9 @@ fn capturing_fetch_wrapper(fetch: Arc<FetchWrapper>, capture: Arc<CaptureWrapper
     Arc::new(ChainedWrappingObjectStore::new(vec![fetch, capture]))
 }
 
-/// The captured writes as physical repo-path → bytes, ready to commit. Existing flat files are
+/// The captured writes as physical repo-path → temporary file, ready to commit. Existing flat files are
 /// unchanged; new Lance files live in deterministic buckets so no directory hits Hub's file cap.
-fn captured_files(wrapper: &CaptureWrapper) -> BTreeMap<String, Bytes> {
+fn captured_files(wrapper: &CaptureWrapper) -> BTreeMap<String, CapturedFile> {
     let start = Instant::now();
     let files = wrapper
         .captured
@@ -993,19 +997,20 @@ pub(crate) async fn head_oid(repo: &HFRepository<RepoTypeDataset>, rev: &str) ->
         .context("target branch not found on the remote")
 }
 
-/// Write captured files (path → bytes) to a scratch dir and turn them into add-file commit
-/// operations — hf-hub uploads from local paths. The returned `TempDir` must outlive all chunks.
-fn write_ops(files: &BTreeMap<String, Bytes>) -> Result<(Vec<CommitOperation>, tempfile::TempDir)> {
+/// Turn captured files into add-file commit operations — hf-hub uploads directly from local paths.
+/// The returned file guards must outlive all chunks, including retries after the capture is dropped.
+fn write_ops(files: &BTreeMap<String, CapturedFile>) -> Result<(Vec<CommitOperation>, Vec<CapturedFile>)> {
     let start = Instant::now();
-    let dir = tempfile::tempdir()?;
     let mut ops = Vec::with_capacity(files.len());
-    for (i, (repo_path, body)) in files.iter().enumerate() {
-        let local = dir.path().join(format!("f{i}"));
-        std::fs::write(&local, body)?;
-        ops.push(CommitOperation::add_file(repo_path.clone(), local));
+    for (repo_path, body) in files {
+        ensure!(
+            std::fs::metadata(body.path())?.len() == body.len(),
+            "captured file changed before upload"
+        );
+        ops.push(CommitOperation::add_file(repo_path.clone(), body.path().to_path_buf()));
     }
     emit_phase_metric("write_ops", start.elapsed());
-    Ok((ops, dir))
+    Ok((ops, files.values().cloned().collect()))
 }
 
 /// The repo's `README.md` at `rev`, or `None` when it has none — fetched straight to bytes,
@@ -2254,13 +2259,28 @@ mod tests {
         };
         wrapper.captured.lock().unwrap().insert(
             object_store::path::Path::from("chunks.lance/data/test.lance"),
-            Some(Bytes::from_static(b"metric_test_bytes")),
+            Some(CapturedFile::from_bytes(b"metric_test_bytes").unwrap()),
         );
         let files = captured_files(&wrapper);
         assert_eq!(files.len(), 1);
 
         let (ops, _dir) = write_ops(&files).unwrap();
         assert_eq!(ops.len(), 1);
+    }
+
+    #[test]
+    fn upload_guards_keep_capture_files_alive_until_commit_finishes() {
+        let body = CapturedFile::from_bytes(b"durable upload input").unwrap();
+        let path = body.path().to_path_buf();
+        let files = BTreeMap::from([("chunks.lance/data/upload.lance".to_string(), body)]);
+        let (_ops, guards) = write_ops(&files).unwrap();
+        drop(files);
+        assert_eq!(std::fs::read(&path).unwrap(), b"durable upload input");
+        drop(guards);
+        assert!(
+            !path.exists(),
+            "commit guards own cleanup, not the discarded capture map"
+        );
     }
 
     #[test]
@@ -2314,8 +2334,16 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            capture.captured.lock().unwrap().get(&written),
-            Some(&Some(Bytes::from_static(b"captured")))
+            capture
+                .captured
+                .lock()
+                .unwrap()
+                .get(&written)
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .bytes(),
+            Bytes::from_static(b"captured")
         );
         assert!(
             inner.get_opts(&written, GetOptions::default()).await.is_err(),
@@ -2364,7 +2392,7 @@ mod tests {
         // Apply the captured writes as the commit would.
         let captured = wrapper.captured.lock().unwrap().clone();
         for (path, body) in captured {
-            store.inner.put(&path, body.unwrap().into()).await.unwrap();
+            store.inner.put(&path, body.unwrap().bytes().into()).await.unwrap();
         }
         let ds = Dataset::open(uri).await.unwrap();
         assert_eq!(ds.get_fragments().len(), 2, "the appended fragments are merged");
@@ -2418,7 +2446,11 @@ mod tests {
         for (path, body) in captured {
             let path = path.as_ref().replacen("snap/", "hub/", 1);
             if let Some(body) = body.filter(|_| !is_version_file(&path)) {
-                store.inner.put(&path.as_str().into(), body.into()).await.unwrap();
+                store
+                    .inner
+                    .put(&path.as_str().into(), body.bytes().into())
+                    .await
+                    .unwrap();
             }
         }
         txns
@@ -2602,7 +2634,7 @@ mod tests {
         }
         wrapper.captured.lock().unwrap().insert(
             "nested/chunks.lance/data/new.lance".into(),
-            Some(Bytes::from_static(b"new")),
+            Some(CapturedFile::from_bytes(b"new").unwrap()),
         );
         let expected = BTreeSet::from([
             flat.to_string(),
@@ -2927,7 +2959,7 @@ mod tests {
         ] {
             wrapper.captured.lock().unwrap().insert(
                 object_store::path::Path::from(logical),
-                Some(Bytes::from_static(b"unchanged")),
+                Some(CapturedFile::from_bytes(b"unchanged").unwrap()),
             );
         }
         let files = captured_files(&wrapper);
@@ -2940,8 +2972,8 @@ mod tests {
         ] {
             assert!(!files.contains_key(logical));
             assert_eq!(
-                files.get(&physical_path(logical).unwrap()),
-                Some(&Bytes::from_static(b"unchanged"))
+                files.get(&physical_path(logical).unwrap()).unwrap().bytes(),
+                Bytes::from_static(b"unchanged")
             );
         }
     }
@@ -3044,7 +3076,7 @@ mod tests {
                 store
                     .put_opts(
                         &OPath::from(path.as_str()),
-                        PutPayload::from(bytes.clone()),
+                        PutPayload::from(bytes.bytes()),
                         PutOptions::default(),
                     )
                     .await
@@ -3110,7 +3142,7 @@ mod tests {
         let read = compacting.version().version;
         refresh(&mut compacting, read, |_| {}).await.unwrap();
         for (path, body) in captured_files(&CaptureWrapper { captured }) {
-            store.put(&OPath::from(path), body.into()).await.unwrap();
+            store.put(&OPath::from(path), body.bytes().into()).await.unwrap();
         }
         let staged = [
             "chunks.lance/data/staged-flat.lance".to_string(),

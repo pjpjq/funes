@@ -24,8 +24,8 @@ use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::optimize::{compact_files, plan_compaction, CompactionOptions};
 use lance::dataset::scanner::Scanner;
 use lance::dataset::{
-    BatchUDF, Dataset, MergeInsertBuilder, MergeInsertWriteMode, NewColumnTransform, WhenMatched, WhenNotMatched,
-    WriteMode, WriteParams, ROW_ID,
+    BatchUDF, Dataset, MergeInsertBuilder, MergeInsertWriteMode, NewColumnTransform, ReadParams, WhenMatched,
+    WhenNotMatched, WriteMode, WriteParams, ROW_ID,
 };
 use lance::index::vector::VectorIndexParams;
 use lance::index::{DatasetIndexExt, DatasetIndexInternalExt};
@@ -97,10 +97,23 @@ pub fn table_uri(base: impl AsRef<Path>) -> String {
     format!("{}/{TABLE}.lance", base.as_ref().display())
 }
 
+fn read_params(maintenance_budget: Option<&str>) -> ReadParams {
+    let mut params = ReadParams::default();
+    if maintenance_budget == Some("1") {
+        // Reserve cache headroom for the query process; this is not a total RSS limit.
+        params.index_cache_size_bytes = 1024 * 1024 * 1024;
+        params.metadata_cache_size_bytes = 128 * 1024 * 1024;
+    }
+    params
+}
+
 /// Open the `chunks` dataset at `uri`; `storage_options` carries the backend credentials/revision a
 /// remote needs (empty for a local memory).
 pub async fn open(uri: &str, storage_options: HashMap<String, String>) -> Result<Dataset> {
     DatasetBuilder::from_uri(uri)
+        .with_read_params(read_params(
+            std::env::var("FUNES_MAINTENANCE_MEMORY_BUDGET").ok().as_deref(),
+        ))
         .with_storage_options(storage_options)
         .load()
         .await
@@ -118,6 +131,9 @@ pub async fn open_wrapped(
     // Order matters: `with_store_params` replaces the params wholesale, so install the wrapper
     // first, then layer the storage options on top (`with_storage_options` merges into them).
     DatasetBuilder::from_uri(uri)
+        .with_read_params(read_params(
+            std::env::var("FUNES_MAINTENANCE_MEMORY_BUDGET").ok().as_deref(),
+        ))
         .with_store_params(wrapped_store_params(uri, wrapper))
         .with_storage_options(storage_options)
         .load()
@@ -1431,6 +1447,90 @@ pub(crate) async fn fill_vectors(ds: &Dataset, ids: &[&str], vectors: &[Vec<f32>
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn maintenance_read_cache_budget_is_explicit_and_does_not_replace_store_options() {
+        let defaults = ReadParams::default();
+        for flag in [None, Some("0"), Some("true"), Some("invalid")] {
+            let params = read_params(flag);
+            assert_eq!(params.index_cache_size_bytes, defaults.index_cache_size_bytes);
+            assert_eq!(params.metadata_cache_size_bytes, defaults.metadata_cache_size_bytes);
+        }
+        let bounded = read_params(Some("1"));
+        assert_eq!(bounded.index_cache_size_bytes, 1024 * 1024 * 1024);
+        assert_eq!(bounded.metadata_cache_size_bytes, 128 * 1024 * 1024);
+        assert!(bounded.store_options.is_none() && bounded.session.is_none());
+    }
+
+    #[tokio::test]
+    #[ignore = "run alone under the bounded maintenance memory harness"]
+    async fn maintenance_memory_fixture_preserves_base_and_delta_recall() {
+        let directory = tempfile::tempdir().unwrap();
+        let uri = table_uri(directory.path());
+        let schema = Arc::new(Schema::new(vec![Field::new("text", DataType::Utf8, false)]));
+        let batch_schema = schema.clone();
+        let batches = (0..32).map(move |batch| {
+            let texts = (0..256)
+                .map(|row| {
+                    let id = batch * 256 + row;
+                    let mut text = String::from("maintenancebaseline ");
+                    for token in 0..512 {
+                        text.push_str(&format!("term{id:05}x{token:04} "));
+                    }
+                    text
+                })
+                .collect::<Vec<_>>();
+            RecordBatch::try_new(batch_schema.clone(), vec![Arc::new(StringArray::from(texts))])
+        });
+        let written = Dataset::write(RecordBatchIterator::new(batches, schema.clone()), &uri, None)
+            .await
+            .unwrap();
+        drop(written);
+        let mut ds = open(&uri, HashMap::new()).await.unwrap();
+        ds.create_index(
+            &["text"],
+            IndexType::Inverted,
+            Some(FTS_INDEX.into()),
+            &InvertedIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+        let base = ds.load_indices().await.unwrap()[0].uuid;
+        for _ in 0..MERGE_DELTAS {
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(StringArray::from(vec!["maintenanceappend"]))],
+            )
+            .unwrap();
+            append(&mut ds, batch).await.unwrap();
+            let subs = sub_index_counts(&ds).await.unwrap()[FTS_INDEX];
+            optimize_index(&mut ds, FTS_INDEX, subs, |_| {}).await.unwrap();
+        }
+        let subs = sub_index_counts(&ds).await.unwrap()[FTS_INDEX];
+        optimize_index(&mut ds, FTS_INDEX, subs, |_| {}).await.unwrap();
+        assert!(ds.load_indices().await.unwrap().iter().any(|index| index.uuid == base));
+        assert_eq!(ds.count_rows(None).await.unwrap(), 8192 + MERGE_DELTAS);
+        for query in ["maintenancebaseline", "maintenanceappend"] {
+            let mut scan = ds.scan();
+            scan.full_text_search(FullTextSearchQuery::new(query.into())).unwrap();
+            scan.limit(Some(1), None).unwrap();
+            assert_eq!(
+                collect(scan)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .map(|batch| batch.num_rows())
+                    .sum::<usize>(),
+                1
+            );
+        }
+        println!(
+            "MAINTENANCE_MEMORY_FIXTURE_PASSED rows={} indices={:?}",
+            8192 + MERGE_DELTAS,
+            sub_index_counts(&ds).await.unwrap()
+        );
+    }
 
     #[test]
     fn a_filter_literal_doubles_its_quotes() {

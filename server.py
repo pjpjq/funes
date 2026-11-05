@@ -363,6 +363,8 @@ def native_environment(
 ) -> dict[str, str]:
     """Build a secret-preserving native environment for one embedding profile."""
     env = os.environ.copy()
+    # Only run("optimize-index") may opt in; never constrain query/backfill children.
+    env.pop("FUNES_MAINTENANCE_MEMORY_BUDGET", None)
     profile = profile or embedding_profile()
     env["FUNES_HOME"] = str(home)
     env["FUNES_EMBEDDING_PROVIDER"] = str(profile["provider"])
@@ -1468,6 +1470,11 @@ def run(
 ) -> tuple[int, str, str]:
     """Run native Funes with a total timeout and reap its whole process group."""
     env = native_environment(profile=profile)
+    if args and args[0] == "optimize-index":
+        env["FUNES_MAINTENANCE_MEMORY_BUDGET"] = "1"
+        # Lance 11 reads these build-only defaults on optimize too; the size is MiB.
+        env["LANCE_FTS_NUM_SHARDS"] = "1"
+        env["LANCE_FTS_PARTITION_SIZE"] = "512"
     argv = [FUNES_BIN, *args]
     # Rust's scanner also creates plaintext temp files. Giving the whole native
     # process tree a private parent-owned TMPDIR lets Python remove them even

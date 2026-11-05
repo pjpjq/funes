@@ -8,7 +8,7 @@ use super::index;
 use super::push;
 use crate::agents::registry;
 use crate::hub;
-use crate::inference::EmbeddingModel;
+use crate::inference::EmbeddingProfile;
 use crate::memory::dataset;
 use crate::memory::{self, receipt, Memory, MemoryState, Reachability};
 use crate::traces::spool;
@@ -47,7 +47,7 @@ pub async fn run(spec: &str) -> Result<()> {
     let Some(Resolved { memory, created }) = resolved else {
         return Ok(());
     };
-    if owes_first_push(&memory, created).await? && index::local_memory_model().await?.is_some() {
+    if owes_first_push(&memory, created).await? && index::local_memory_profile().await?.is_some() {
         first_push(&memory, created).await.with_context(|| {
             format!(
                 "this host is bound to {memory}, but the first push there did not go through — run \
@@ -66,19 +66,19 @@ pub async fn run(spec: &str) -> Result<()> {
 pub(crate) async fn bind_host(resolved: Option<Resolved>, except: Option<&str>) -> Result<()> {
     let memory = resolved.as_ref().map(|r| r.memory.as_str());
     if let Some(memory) = memory {
-        let here = index::local_memory_model().await?;
-        match (bound_model(memory, here.is_none()).await?, here) {
+        let here = index::local_memory_profile().await?;
+        match (bound_profile(memory, here.is_none()).await?, here) {
             (Some(there), Some(here)) if there != here => bail!(
                 "{memory} is embedded with {}, and the local memory with {}: a memory takes one embedding model",
-                there.id(),
-                here.id()
+                there.model,
+                here.model
             ),
             (Some(there), None) => {
                 eprintln!(
                     "funes: embedding the local memory with {}, the model of {memory}.",
-                    there.id()
+                    there.model
                 );
-                index::ensure_local_memory(there).await?;
+                index::ensure_local_memory(&there).await?;
             }
             _ => {}
         }
@@ -247,7 +247,7 @@ async fn ensure_remote_exists(remote: &str) -> Result<bool> {
 /// The embedding model `memory` records, `None` when it holds no dataset or is unreachable.
 /// When the local memory `takes` its model from it, a memory whose model can't be read is an error:
 /// a guess could pin the local memory to another model.
-pub(crate) async fn bound_model(memory: &str, takes: bool) -> Result<Option<EmbeddingModel>> {
+pub(crate) async fn bound_profile(memory: &str, takes: bool) -> Result<Option<EmbeddingProfile>> {
     let target = Memory::parse(memory);
     async {
         let ds = match target.state().await? {
@@ -267,7 +267,7 @@ pub(crate) async fn bound_model(memory: &str, takes: bool) -> Result<Option<Embe
             MemoryState::Unauthorized if takes => return Err(target.unauthorized_error()),
             _ => return Ok(None),
         };
-        dataset::embedding_model(&ds).map(Some)
+        dataset::embedding_profile(&ds).map(Some)
     }
     .await
     .with_context(|| format!("can't read {memory}"))

@@ -2,7 +2,7 @@
 //! questions:
 //!
 //! ```text
-//! cargo run --release --example sweep_rerank -- questions.jsonl --memory mem/funes-memory --out sweep.jsonl
+//! FUNES_RERANK_PROVIDER=local cargo run --release --example sweep_rerank -- questions.jsonl --memory mem/funes-memory --out sweep.jsonl
 //! ```
 //!
 //! For each question and each `--pools` size N, it asks `recall_hits` for N hits from a pool of N (the
@@ -138,7 +138,7 @@ async fn main() -> Result<()> {
     let mut out = std::fs::OpenOptions::new().create(true).append(true).open(&args.out)?;
 
     let t = Instant::now();
-    let mut reranker = inference::reranker()?;
+    let mut reranker = inference::reranker()?.context("sweep_rerank requires FUNES_RERANK_PROVIDER=local or voyage")?;
     eprintln!("reranker built in {} ms", t.elapsed().as_millis());
     let t = Instant::now();
     let mut cpu: Option<Box<dyn Reranker>> = if args.cpu { Some(cpu_reranker()?) } else { None };

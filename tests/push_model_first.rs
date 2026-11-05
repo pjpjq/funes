@@ -14,7 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use funes::commands::index;
 use funes::commands::push::{self, Confirm};
-use funes::inference::EmbeddingModel;
+use funes::inference::{EmbeddingModel, EmbeddingProfile};
 use funes::memory::{dataset, Memory, MemoryState};
 use hf_hub::HFClient;
 
@@ -63,7 +63,9 @@ async fn a_first_push_with_no_rows_gives_the_remote_its_model() {
     let home = tempfile::tempdir().unwrap();
     std::env::set_var("FUNES_HOME", home.path());
     let e5 = EmbeddingModel::MultilingualE5Small;
-    index::ensure_local_memory(e5).await.unwrap();
+    index::ensure_local_memory(&EmbeddingProfile::local_model(e5))
+        .await
+        .unwrap();
     let created = push::run_push(Memory::parse(&uri), false, Confirm::Ask(never_asked), &[]).await;
     let after_create = remote_model_and_rows(&uri).await;
 

@@ -10,7 +10,7 @@ funes recall "why did we switch off the streaming parser"
 ```
 
 Retrieval is one pipeline: hybrid search (vector + BM25, fused by reciprocal rank) → neighbor
-expansion, with a cross-encoder rerank of the pool before the cut when the pool holds more rows
+expansion, with the configured optional reranker on the pool before the cut when the pool holds more rows
 than the hits asked for. What comes back is the **actual passage from the actual turn**, not a
 summary written about it.
 
@@ -19,6 +19,94 @@ languages a memory's sessions are written in.
 
 Passages are searchable by their words as soon as their text is indexed, even while embeddings
 are pending. If text search fails, recall reports an error.
+
+The BM25/FTS leg is best-effort: a scan error or an exhausted scan budget retains the vector
+results rather than failing the whole recall. Both legs keep the same metadata filters. A timed-out
+scan can omit keyword-only hits; with `FUNES_RECALL_METRICS=1`, `recall_fts` reports `timeout` or
+`error` instead of `done`. This budget does not reset the index or regenerate document embeddings.
+The HTTP bridge passes its remaining native-call budget as MCP `budget_ms`, after reserving 250ms
+for transport. Native recall anchors that budget before opening the memory and embedding; FTS uses
+the time still left after another 250ms response reserve. This lets the existing long-budget warmup
+finish cold index initialization instead of cancelling and restarting it on every query. Interactive
+calls remain bounded by their original caller deadline. If no time remains, FTS is skipped without
+polling the scan and the filtered vector hits are retained. CLI calls without this transport budget
+keep the existing three-second FTS cap.
+Vector and FTS reads overlap within this same deadline, so vector I/O does not leave keyword search
+only the final fraction of a second. A vector error cancels the optional FTS wait immediately. Read-I/O
+counters are process-wide and can include both legs, not exclusive measurements of vector traffic.
+The optional scan runs on an isolated thread/runtime so non-yielding FTS work cannot hold the
+query's timer. Each native worker admits one FTS scan with no queue; an occupied slot falls back to
+the same filtered vector results. Cancellation remains cooperative: a timed-out scan keeps the
+slot until its work and runtime cleanup finish, and its late result is discarded. Healthy scans
+still contribute keyword hits to the same RRF fusion; no index or checkpoint is replaced.
+The HTTP bridge selects Lance's lite I/O scheduler only for its MCP read worker. Cached FTS readers
+can then survive a scan runtime ending without retaining that runtime's stopped background I/O loop.
+The ingest/backfill subprocess environment is unchanged.
+
+When a Space restores its Hub cache from `FUNES_HUB_CACHE_MOUNT`, a restored blob is initially a
+link to the remote Bucket, not local file contents. Native reads materialize each touched blob in
+the local Hub cache before serving ranges; a per-blob file lock shares that work across query and
+maintenance processes. Failed downloads preserve the old link. This copies existing immutable
+index/data files, not embeddings, and does not wait for the backfill to finish. First access still
+requires downloading the touched files and enough local disk space to hold them.
+
+A failed background worker refresh leaves the matching, live old worker available for search.
+This does not waive source-filter index readiness or make a missing/dead worker serviceable;
+after a full Space rebuild, a new worker still has to complete its first warm successfully.
+
+Batch hydration of canonical raw text uses the same short-lived committed reader as single-record
+`get`, rather than sharing the backfill writer lock. Query deadlines and metadata filters are unchanged.
+The native RPC retains its configured timeout; hydration uses the remaining overall HTTP budget,
+not the shorter native deadline. The overall request cap remains at most 14 seconds, without
+resetting its deadline between stages.
+
+Native failure diagnostics retain the failed call's own stage metrics, worker role (active or
+candidate), allowlisted operation, budget and elapsed milliseconds. A later worker refresh does not
+replace that failure snapshot with unrelated stages. Query text, arguments and exception details
+are excluded; a candidate failure alone is not evidence of an HTTP search failure.
+
+With read metrics enabled, vector diagnostics separate stream creation (`recall_vector_stream`)
+from batch collection/decoding (`recall_vector_collect`). `recall_vector_io` records a starting
+snapshot, at most 16 one-second samples, and a final snapshot without cancelling or replaying the
+scan. Its integer counters are worker-process aggregates: active fetches, cache-lock waits,
+materializations and fallback operations, completed-operation milliseconds, and requested range
+bytes. Requested bytes are not network-download bytes; elapsed totals can overlap, and concurrent
+FTS reads may contribute. These counters do not prove per-request causality, cache hits, OOM, or
+ANN index coverage. No paths, file IDs, queries, raw errors or credentials are emitted. A runtime
+that cannot poll the sampler may omit samples; a missing sample is not proof of zero I/O.
+Authenticated status also exposes `native_worker.last_read` for the latest completed native recall,
+including its timestamp, active/candidate role and bounded metrics, without clearing `last_failure`.
+Warm recalls can populate this field; compare its timestamp and role when correlating a real query.
+The existing 32-event/8192-byte metric bounds and all query budgets remain unchanged.
+
+A verified worker retains its source-type filter readiness while a later maintenance result's
+replacement warms. Unverified snapshots still fail closed; normal refresh timing is unchanged.
+PostgreSQL source-type queries recheck hydrated current metadata before returning raw passages,
+so an older native hit cannot return a source row whose type or requested facets have changed.
+Pinned native workers also report the source-type bitmap capability from their own snapshot's
+index metadata at open time. A matching index name, column ID and bitmap type permit cold-start
+filtering without waiting for another maintenance run; this does not assert zero unindexed rows
+or skip residual-tail search. Unknown metadata fails closed, and older workers retain the
+maintenance-proof path. The bridge clears this capability whenever the child stops.
+
+Authenticated sync status includes maintenance `last_diagnostics`: the native exit code and a
+bounded failure category, never stdout, stderr, paths or credentials. Maintenance failures retain
+dirty work and the existing retry cooldown; they do not clear source checkpoints or stop queries.
+
+Ingest `last_metrics.native_exit_codes` counts nonzero subprocess exits by numeric code, excluding
+record-validation failures. `cumulative_metrics.native_exit_codes` retains these counts across
+successful cycles in the same server process; a server restart resets them. Negative codes identify
+signals (for example `-9` is SIGKILL), not their cause: SIGKILL alone does not prove an OOM kill.
+The existing retry categories and source checkpoints are unchanged; no native output is retained.
+
+The embedding provider is selected at runtime with `FUNES_EMBEDDING_PROVIDER=local|voyage`.
+`local` uses the stored BGE or multilingual E5 model. `voyage` sends original multilingual passages
+with `input_type=document` at index time and the original query with `input_type=query` at recall
+time. Production sets `FUNES_RETRIEVAL_LANGUAGE_MODE=raw`, so there is no translation or English
+shadow-text path. Reranking is independently selected with
+`FUNES_RERANK_PROVIDER=none|local|voyage`; production explicitly sets `none`, retaining the fused RRF
+order. See [configuration](configuration.md#retrieval-providers) for the
+full profile and credential contract.
 
 `funes recall` prints one stable, parseable layout — the **agent format** — everywhere, terminal or
 pipe. It's shaped for an agent to read, but it's the raw evidence for you too. If you want an
@@ -57,7 +145,7 @@ otherwise (see `--candidates` below).
 | Flag | Default | Meaning |
 | --- | --- | --- |
 | `-k` | 8 | hits returned, each a passage to read |
-| `--candidates` | 30 | fused pool the hits are cut from, reranked by the cross-encoder before the cut when it holds more than `-k` rows |
+| `--candidates` | 30 | fused pool the hits are cut from, reranked by the configured reranker before the cut when it holds more than `-k` rows |
 | `--neighbors` | 1 | adjacent chunks (by seq) attached per hit; 0 disables |
 | `--type` | — | restrict to `text \| thinking \| tool_use \| tool_result` |
 | `--role` | — | restrict to one role, as the turns carry it (an agent's turns say `user \| assistant \| tool \| system`) |
@@ -128,6 +216,10 @@ funes recall "why is funes append-only" --memory huggingface/funes-memory
 Recall over a remote caches whole files to local disk, so warm calls run at local speed — see
 [hub-caching.md](hub-caching.md). Publishing your own memory to read this way is covered in
 [push.md](push.md).
+
+By default, an unreachable remote may fall back to the local memory for offline use. Set
+`FUNES_NATIVE_FALLBACK=false` to disable that substitution and surface the remote error instead;
+production uses this setting so a requested remote is never silently replaced by local data.
 
 ## See also
 

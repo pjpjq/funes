@@ -339,8 +339,8 @@ async fn read_sessions(ds: &Dataset, sessions: &[String]) -> Result<Vec<RawRow>>
 
 /// The embedding model a cached sketch's vectors came from, as a cache key.
 fn embedding_fingerprint(ds: &Dataset) -> String {
-    match dataset::embedding_model(ds) {
-        Ok(model) => format!("embedding_model:{}", model.id()),
+    match dataset::embedding_profile(ds) {
+        Ok(profile) => profile.fingerprint,
         Err(_) => "unrecorded".to_string(),
     }
 }

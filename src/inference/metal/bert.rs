@@ -193,8 +193,8 @@ fn graph_layout(name: &str, vals: Vec<f32>) -> Option<(Vec<usize>, Vec<f32>)> {
 }
 
 impl Embedder for MetalEmbedder {
-    fn model(&self) -> EmbeddingModel {
-        self.model
+    fn model(&self) -> Option<EmbeddingModel> {
+        Some(self.model)
     }
 
     fn encode(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
@@ -273,8 +273,8 @@ impl Hybrid {
 }
 
 impl Embedder for Hybrid {
-    fn model(&self) -> EmbeddingModel {
-        self.model
+    fn model(&self) -> Option<EmbeddingModel> {
+        Some(self.model)
     }
 
     fn encode(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {

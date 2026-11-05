@@ -23,13 +23,14 @@ object_store = "=0.14.2"         # the ObjectStore trait the capture wrapper imp
 async-trait = "0.1"              # for the ObjectStore impl in src/memory/capture_store.rs
 bytes = "1"                      # captured write payloads
 chrono = "0.4"                   # ts parsing, status ages, install stamps
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "sync"] }  # sync: OnceCell/Mutex cache the recall models
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "sync", "time"] }  # sync: OnceCell/Mutex cache the recall models
 futures = "0.3"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 ratatui = "0.29"                 # canvas for `ask`'s wait animation; re-exports crossterm 0.28
 serde = { version = "1", features = ["derive"] }               # MCP request structs
 serde_json = { version = "1", features = ["preserve_order"] }  # parse JSONL; preserve tool_use key order
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }  # Voyage embeddings/rerank; blocking matches the inference traits
 sha1 = "0.10"                    # chunk id = sha1(...)[:16]
 sha2 = "0.10"                    # verify release binaries before the installer/updater executes them
 whatlang = "0.18"                # the language of a text block

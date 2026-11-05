@@ -3,13 +3,13 @@
 //! fail it.
 
 use funes::commands::{index, recall, target};
-use funes::inference::EmbeddingModel;
+use funes::inference::{EmbeddingModel, EmbeddingProfile};
 
 #[tokio::test]
 async fn an_empty_local_memory_adds_no_unpushed_pool() {
     let home = tempfile::tempdir().unwrap();
     std::env::set_var("FUNES_HOME", home.path());
-    index::ensure_local_memory(EmbeddingModel::MultilingualE5Small)
+    index::ensure_local_memory(&EmbeddingProfile::local_model(EmbeddingModel::MultilingualE5Small))
         .await
         .unwrap();
     // The receipt push keeps for hf://datasets/acme/memory, holding no chunk.

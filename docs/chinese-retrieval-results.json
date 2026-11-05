@@ -1,0 +1,28 @@
+{
+  "memories": 60,
+  "queries": 20,
+  "benchmark_kind": "synthetic_ascii_token_overlap_v1",
+  "not_a_real_funes_or_bge_benchmark": true,
+  "method": "ASCII-token overlap over a checked-in synthetic fixture; no Funes/Lance/FTS/BGE backend is invoked",
+  "synthetic_raw_chinese_ascii_token_proxy": {
+    "recall@1": 0.45,
+    "recall@3": 0.65,
+    "recall@5": 0.75
+  },
+  "synthetic_english_shadow_ascii_token_proxy": {
+    "recall@1": 0.75,
+    "recall@3": 0.75,
+    "recall@5": 1.0
+  },
+  "e2e": {
+    "status": "not_run",
+    "kind": "real_funes_e2e_scaffold",
+    "not_comparable_to_synthetic_proxy": true,
+    "required": [
+      "a real funes binary and local memory",
+      "the same fixture indexed through funes",
+      "a configured embedding/retrieval backend"
+    ],
+    "command_template": "python3 scripts/benchmark_chinese_retrieval.py --e2e-command '<command>'"
+  }
+}

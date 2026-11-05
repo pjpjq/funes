@@ -7,18 +7,22 @@
 use super::push;
 use super::target::Target;
 use crate::chunk;
-use crate::inference::{self, Embedder, EmbeddingModel, Reranker};
+use crate::inference::{self, Embedder, EmbeddingProfile, RerankScoreKind, Reranker};
 use crate::memory::dataset::{self, RecordBatch};
+use crate::memory::fetch_store::{read_io_snapshot, ReadIoSnapshot};
 use crate::memory::{Memory, MemoryState};
 use crate::traces;
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, NaiveDate, Utc};
 use lance::Dataset;
+use serde::Serialize;
 use std::cmp::Reverse;
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
-use tokio::sync::{Mutex, OnceCell};
+use std::sync::{Arc, LazyLock};
+use std::time::{Duration, Instant};
+use tokio::sync::{oneshot, Mutex, OnceCell, Semaphore};
 
 /// Columns a [`Hit`] needs from a search scan.
 const HIT_COLS: &[&str] = &[
@@ -63,6 +67,14 @@ pub struct Hit {
     /// none.
     pub memory: String,
     pub fused: f32,
+}
+
+/// One recall pipeline result carried to the MCP adapter as both the stable rendered text and the
+/// raw hits that produced it. CLI callers keep using [`recall`] and see only `text`.
+pub(crate) struct RecallResult {
+    pub text: String,
+    pub hits: Vec<(Hit, f64)>,
+    pub source_type_index_ready: Option<bool>,
 }
 
 /// Matching blocks `scan` lists before it stops. What the cap dropped is always reported.
@@ -261,7 +273,15 @@ fn harness_spellings(h: String) -> Vec<String> {
     }
 }
 
+fn rerank_relevance(kind: RerankScoreKind, score: f32) -> f64 {
+    match kind {
+        RerankScoreKind::Logit => 1.0 / (1.0 + (-(score as f64)).exp()),
+        RerankScoreKind::Relevance => score as f64,
+    }
+}
+
 /// A dataset opened for reading.
+#[derive(Clone)]
 struct Read {
     ds: Dataset,
     /// A degradation note to prepend to the command's output (e.g. the remote was unreachable);
@@ -270,6 +290,15 @@ struct Read {
     /// Label of the memory the dataset actually came from (the requested one, or the local memory
     /// after an offline degrade).
     memory_label: Option<String>,
+}
+
+/// One immutable dataset opened for a long-lived MCP server. The dataset stays opaque here so the
+/// caller cannot bypass the recall pipeline's profile checks, filtering, neighbor expansion, or
+/// rendering contract.
+pub(crate) struct PinnedRead {
+    read: Read,
+    requested_label: String,
+    source_type_index_ready: bool,
 }
 
 /// What a read verb does about the memory's state: query it, degrade to the local index, or point a
@@ -323,9 +352,111 @@ async fn open_read(memory: &Memory) -> Result<Read> {
             note: None,
             memory_label: Some(memory.label()),
         }),
-        ReadOutcome::Offline => degrade_offline(&memory.label()).await,
+        ReadOutcome::Offline if native_fallback_enabled() => degrade_offline(&memory.label()).await,
+        ReadOutcome::Offline => Err(anyhow!(
+            "remote {} unavailable; native fallback is disabled",
+            memory.label()
+        )),
         ReadOutcome::NoIndex => Err(no_index_error()),
     }
+}
+
+/// Open the server's default memory once for immutable, process-lifetime recall. This is an
+/// explicit MCP-only optimization; normal CLI and MCP reads continue through [`open_read`] for
+/// every call and therefore resolve a remote's current head.
+pub(crate) async fn pin_read(memory: Memory) -> Result<PinnedRead> {
+    let requested_label = memory.label();
+    emit_recall_metric("recall_open", "start", 0.0);
+    let t0 = Instant::now();
+    let read = open_read(&memory).await?;
+    let source_type_index_ready = read.note.is_none()
+        && read.memory_label.as_deref() == Some(requested_label.as_str())
+        && crate::memory::dataset::source_type_index_ready(&read.ds)
+            .await
+            .unwrap_or(false);
+    emit_recall_metric("recall_open", "done", round_ms(t0.elapsed()));
+    Ok(PinnedRead {
+        read,
+        requested_label,
+        source_type_index_ready,
+    })
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq)]
+struct RecallPhaseMetric {
+    stage: &'static str,
+    state: &'static str,
+    duration_ms: f64,
+}
+
+fn recall_metrics_enabled_from(value: Option<&str>) -> bool {
+    matches!(
+        value.map(|val| val.trim().to_ascii_lowercase()).as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
+}
+
+fn recall_metrics_enabled() -> bool {
+    recall_metrics_enabled_from(std::env::var("FUNES_RECALL_METRICS").ok().as_deref())
+}
+
+fn round_ms(duration: Duration) -> f64 {
+    ((duration.as_secs_f64() * 1000.0) * 100.0).round() / 100.0
+}
+
+fn format_recall_metric(stage: &'static str, state: &'static str, duration_ms: f64) -> Option<String> {
+    let metric = RecallPhaseMetric {
+        stage,
+        state,
+        duration_ms,
+    };
+    serde_json::to_string(&metric)
+        .ok()
+        .map(|json| format!("funes_metric {json}"))
+}
+
+fn emit_recall_metric(stage: &'static str, state: &'static str, duration_ms: f64) {
+    if !recall_metrics_enabled() {
+        return;
+    }
+    if let Some(line) = format_recall_metric(stage, state, duration_ms) {
+        eprintln!("{line}");
+    }
+}
+
+fn format_read_io_metric(state: &'static str, duration_ms: f64, io: &ReadIoSnapshot) -> String {
+    format!(
+        "funes_metric {}",
+        serde_json::json!({"stage": "recall_vector_io", "state": state, "duration_ms": duration_ms, "io": io})
+    )
+}
+
+async fn sample_vector_read<T>(
+    read: impl std::future::Future<Output = T>,
+    mut sample: impl FnMut(),
+    period: Duration,
+) -> T {
+    tokio::pin!(read);
+    // Keep polling the same scan; sampling must not cancel or replay a read.
+    for _ in 0..16 {
+        tokio::select! {
+            biased;
+            result = &mut read => return result,
+            _ = tokio::time::sleep(period) => sample(),
+        }
+    }
+    read.await
+}
+
+fn native_fallback_enabled() -> bool {
+    !matches!(
+        std::env::var("FUNES_NATIVE_FALLBACK")
+            .unwrap_or_else(|_| "true".to_string())
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "0" | "false" | "no" | "off"
+    )
 }
 
 /// The error a read verb returns when the default local memory has no index yet — points at the
@@ -367,25 +498,25 @@ pub fn memory_hint(read: Option<&str>) -> String {
 /// the work is CPU-bound and the server's calls are serial anyway.
 #[derive(Default)]
 struct Models {
-    embedders: HashMap<EmbeddingModel, Box<dyn Embedder>>,
+    embedders: HashMap<String, Box<dyn Embedder>>,
     reranker: Option<Box<dyn Reranker>>,
 }
 
 impl Models {
-    fn embedder(&mut self, model: EmbeddingModel) -> Result<&mut dyn Embedder> {
-        let embedder = match self.embedders.entry(model) {
+    fn embedder(&mut self, profile: &EmbeddingProfile) -> Result<&mut dyn Embedder> {
+        let embedder = match self.embedders.entry(profile.fingerprint.clone()) {
             Entry::Occupied(e) => e.into_mut(),
-            Entry::Vacant(e) => e.insert(inference::embedder(model)?),
+            Entry::Vacant(e) => e.insert(inference::embedder_for(profile)?),
         };
         Ok(embedder.as_mut())
     }
 
     /// The reranker, built on its first use.
-    fn reranker(&mut self) -> Result<&mut dyn Reranker> {
+    fn reranker(&mut self) -> Result<Option<&mut (dyn Reranker + 'static)>> {
         if self.reranker.is_none() {
-            self.reranker = Some(inference::reranker()?);
+            self.reranker = inference::reranker()?;
         }
-        Ok(self.reranker.as_deref_mut().expect("built above"))
+        Ok(self.reranker.as_deref_mut())
     }
 }
 
@@ -442,6 +573,64 @@ pub async fn recall_with_progress(
     Ok(crate::ui::render::recall_reply(&note, &hits, languages.as_deref()))
 }
 
+/// Recall once while retaining the raw hits for protocol adapters that expose additive structured
+/// data alongside the byte-stable agent rendering.
+pub(crate) async fn recall_filtered_result(
+    target: impl Into<Target>,
+    query: String,
+    k: usize,
+    candidates: usize,
+    neighbors: i64,
+    filter: RecallFilter,
+    deadline: Option<Instant>,
+) -> Result<RecallResult> {
+    let progress = &|_: &str| ();
+    let mut search = Search::new(query, candidates, filter)?;
+    search.deadline = deadline;
+    let pools = target.into().candidates(&search, progress).await?;
+    let languages = rephrase_languages(pools.iter().map(|pool| &pool.ds));
+    let (note, hits) = search.rank(pools, k, neighbors, progress).await?;
+    Ok(recall_result(note, hits, languages.as_deref()))
+}
+
+fn recall_result(note: String, hits: Vec<(Hit, f64)>, languages: Option<&str>) -> RecallResult {
+    let text = crate::ui::render::recall_reply(&note, &hits, languages);
+    RecallResult {
+        text,
+        hits,
+        source_type_index_ready: None,
+    }
+}
+
+/// Recall against an already-opened immutable dataset. Only the MCP server's explicit opt-in
+/// default-memory path calls this; call-level overrides and every ordinary read open afresh.
+pub(crate) async fn recall_filtered_pinned(
+    pinned: &PinnedRead,
+    query: String,
+    k: usize,
+    candidates: usize,
+    neighbors: i64,
+    filter: RecallFilter,
+    deadline: Option<Instant>,
+) -> Result<RecallResult> {
+    emit_recall_metric("recall_open", "start", 0.0);
+    emit_recall_metric("recall_open", "done", 0.0);
+    let progress = &|_: &str| ();
+    let mut search = Search::new(query, candidates, filter)?;
+    search.deadline = deadline;
+    let mut pool = search
+        .candidates_read(pinned.read.clone(), &pinned.requested_label, progress)
+        .await?;
+    if let Some(memory) = pinned.read.memory_label.as_deref() {
+        pool.hint(memory);
+    }
+    let languages = rephrase_languages([&pool.ds]);
+    let (note, hits) = search.rank(vec![pool], k, neighbors, progress).await?;
+    let mut result = recall_result(note, hits, languages.as_deref());
+    result.source_type_index_ready = Some(pinned.source_type_index_ready);
+    Ok(result)
+}
+
 /// Run the recall pipeline over what `target` reads: hybrid retrieval, pooled with this host's
 /// unpushed turns for the bound memory → rank, reranked when the pool holds more rows than `k` →
 /// neighbor expansion.
@@ -463,7 +652,7 @@ pub async fn recall_hits(
 }
 
 /// What narrows a search.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct RecallFilter {
     /// Keep chunks of this block type: `text`, `thinking`, `tool_use` or `tool_result`.
     pub block_type: Option<String>,
@@ -477,9 +666,43 @@ pub struct RecallFilter {
     pub since: Option<String>,
     /// Keep turns on or before this `YYYY-MM-DD`.
     pub until: Option<String>,
+    /// Exact canonical provenance; absent columns match no rows.
+    pub source_identity: Option<String>,
+    pub source_version: Option<String>,
+    pub content_hash: Option<String>,
+    pub updated_at: Option<String>,
+    pub source_agent: Option<String>,
+    pub source_type: Option<String>,
+    pub project: Option<String>,
+    pub device_id: Option<String>,
+    pub content_type: Option<String>,
+    pub source_missing: Option<bool>,
 }
 
 impl RecallFilter {
+    fn canonical_predicates(&self) -> Vec<(&'static str, String)> {
+        let mut clauses = Vec::new();
+        for (name, value) in [
+            ("source_identity", self.source_identity.as_deref()),
+            ("source_version", self.source_version.as_deref()),
+            ("content_hash", self.content_hash.as_deref()),
+            ("updated_at", self.updated_at.as_deref()),
+            ("source_agent", self.source_agent.as_deref()),
+            ("source_type", self.source_type.as_deref()),
+            ("project", self.project.as_deref()),
+            ("device_id", self.device_id.as_deref()),
+            ("content_type", self.content_type.as_deref()),
+        ] {
+            if let Some(value) = value {
+                clauses.push((name, dataset::eq(name, value)));
+            }
+        }
+        if let Some(value) = self.source_missing {
+            clauses.push(("source_missing", format!("source_missing = {value}")));
+        }
+        clauses
+    }
+
     fn days(&self) -> DayRange<'_> {
         DayRange {
             since: self.since.as_deref(),
@@ -492,10 +715,12 @@ impl RecallFilter {
 /// [`Search::candidates`] from one or more memories, pooled into a single [`Search::rank`].
 pub struct Search {
     query: String,
-    qv: OnceCell<(EmbeddingModel, Vec<f32>)>,
+    qv: OnceCell<(EmbeddingProfile, Vec<f32>)>,
     candidates: usize,
+    deadline: Option<Instant>,
     /// The columns `where_clause` reads that a migration added, which an older memory lacks.
     migrated: Vec<&'static str>,
+    canonical_columns: Vec<&'static str>,
     where_clause: Option<String>,
 }
 
@@ -536,18 +761,26 @@ impl Search {
         if filter.repo.is_some() {
             migrated.push("repo");
         }
+        let predicates = filter.canonical_predicates();
+        let canonical_columns = predicates.iter().map(|(name, _)| *name).collect();
+        let mut clauses: Vec<String> = build_where(
+            filter.block_type.as_deref(),
+            filter.role.as_deref(),
+            &harness,
+            filter.repo.as_deref(),
+            &filter.days(),
+        )?
+        .into_iter()
+        .collect();
+        clauses.extend(predicates.into_iter().map(|(_, clause)| clause));
         Ok(Self {
-            where_clause: build_where(
-                filter.block_type.as_deref(),
-                filter.role.as_deref(),
-                &harness,
-                filter.repo.as_deref(),
-                &filter.days(),
-            )?,
+            where_clause: (!clauses.is_empty()).then(|| clauses.join(" AND ")),
             migrated,
+            canonical_columns,
             query,
             qv: OnceCell::new(),
             candidates,
+            deadline: None,
         })
     }
 
@@ -555,31 +788,70 @@ impl Search {
     /// rank.
     pub async fn candidates(&self, memory: &Memory, progress: &(dyn Fn(&str) + Sync)) -> Result<Candidates> {
         progress(&format!("searching {}…", memory.label()));
+        emit_recall_metric("recall_open", "start", 0.0);
+        let started = Instant::now();
         let read = open_read(memory).await?;
+        emit_recall_metric("recall_open", "done", round_ms(started.elapsed()));
+        self.candidates_read(read, &memory.label(), progress).await
+    }
+
+    async fn candidates_read(&self, read: Read, label: &str, progress: &(dyn Fn(&str) + Sync)) -> Result<Candidates> {
+        // An older transcript memory has no canonical provenance to match.
+        if self
+            .canonical_columns
+            .iter()
+            .any(|column| !dataset::has_column(&read.ds, column))
+        {
+            return Ok(Candidates {
+                ds: read.ds,
+                note: read.note.unwrap_or_default(),
+                hits: Vec::new(),
+            });
+        }
         // A filter on a migrated column needs the column. On an un-migrated memory it would fail
         // deep inside Lance with an opaque schema error, so refuse with a clear message instead.
         if let Some(column) = self.migrated.iter().find(|c| !dataset::has_column(&read.ds, c)) {
             bail!("this memory predates the {column} facet — reindex it, or drop --{column}");
         }
-        let model = dataset::embedding_model(&read.ds)?;
+        let profile = dataset::embedding_profile(&read.ds)?;
         let (embedded_by, qv) = self
             .qv
             .get_or_try_init(|| async {
                 progress("loading model…");
-                let qv = models().await.lock().await.embedder(model)?.embed_query(&self.query)?;
-                Ok::<_, anyhow::Error>((model, qv))
+                emit_recall_metric("recall_models", "start", 0.0);
+                let started = Instant::now();
+                let mut guard = models().await.lock().await;
+                let embedder = guard.embedder(&profile)?;
+                emit_recall_metric("recall_models", "done", round_ms(started.elapsed()));
+                emit_recall_metric("recall_embed", "start", 0.0);
+                let started = Instant::now();
+                let qv = embedder.embed_query(&self.query)?;
+                emit_recall_metric("recall_embed", "done", round_ms(started.elapsed()));
+                Ok::<_, anyhow::Error>((profile.clone(), qv))
             })
             .await?;
-        if *embedded_by != model {
+        if embedded_by.fingerprint != profile.fingerprint {
             bail!(
-                "{} is embedded with {}, and the other memory of this search with {}",
-                memory.label(),
-                model.id(),
-                embedded_by.id()
+                "{} is embedded with {} ({}, {}d), and the other memory of this search with {} ({}, {}d)",
+                label,
+                profile.model,
+                profile.provider,
+                profile.dimensions,
+                embedded_by.model,
+                embedded_by.provider,
+                embedded_by.dimensions
             );
         }
-        progress(&format!("searching {}…", memory.label()));
-        let hits = hybrid_candidates(&read.ds, qv, &self.query, self.candidates, self.where_clause.as_deref()).await?;
+        progress(&format!("searching {label}…"));
+        let hits = hybrid_candidates(
+            &read.ds,
+            qv,
+            &self.query,
+            self.candidates,
+            self.where_clause.as_deref(),
+            self.deadline,
+        )
+        .await?;
         Ok(Candidates {
             ds: read.ds,
             note: read.note.unwrap_or_default(),
@@ -618,22 +890,36 @@ impl Search {
             return Ok((note, Vec::new()));
         }
 
-        let mut scored: Vec<(usize, f64)> = if reranks(k, hits.len()) {
-            let docs: Vec<&str> = hits.iter().map(|(_, h)| h.text.as_str()).collect();
-            progress(&format!("reranking {} candidates…", docs.len()));
-            let scores = models()
-                .await
-                .lock()
-                .await
-                .reranker()?
-                .rerank(self.query.as_str(), &docs)?;
-            scores
-                .iter()
+        let rank_scores = || {
+            hits.iter()
                 .enumerate()
-                .map(|(i, &s)| (i, 1.0 / (1.0 + (-(s as f64)).exp())))
-                .collect()
+                .map(|(i, (_, h))| (i, h.fused as f64))
+                .collect::<Vec<_>>()
+        };
+        let mut scored = if reranks(k, hits.len()) {
+            let mut models = models().await.lock().await;
+            if let Some(reranker) = models.reranker()? {
+                let docs: Vec<&str> = hits.iter().map(|(_, hit)| hit.text.as_str()).collect();
+                progress(&format!("reranking {} candidates…", docs.len()));
+                let kind = reranker.score_kind();
+                emit_recall_metric("recall_rerank", "start", 0.0);
+                let started = Instant::now();
+                let result = reranker.rerank(&self.query, &docs);
+                emit_recall_metric("recall_rerank", "done", round_ms(started.elapsed()));
+                match result {
+                    Ok(scores) if scores.len() == hits.len() => scores
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &score)| (i, rerank_relevance(kind, score)))
+                        .collect(),
+                    // Reranking is optional; retain the existing RRF result on provider failure.
+                    Ok(_) | Err(_) => rank_scores(),
+                }
+            } else {
+                rank_scores()
+            }
         } else {
-            hits.iter().enumerate().map(|(i, (_, h))| (i, h.fused as f64)).collect()
+            rank_scores()
         };
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         scored.truncate(k);
@@ -649,10 +935,13 @@ impl Search {
 
         if neighbors > 0 {
             progress("expanding neighbors…");
+            emit_recall_metric("recall_neighbors", "start", 0.0);
+            let started = Instant::now();
             for (i, ds) in sources.iter().enumerate() {
                 let mut refs: Vec<&mut Hit> = top.iter_mut().filter(|t| t.0 == i).map(|t| &mut t.1).collect();
                 attach_neighbors(ds, &mut refs, neighbors).await?;
             }
+            emit_recall_metric("recall_neighbors", "done", round_ms(started.elapsed()));
         }
 
         Ok((note, top.into_iter().map(|(_, h, score)| (h, score)).collect()))
@@ -666,15 +955,134 @@ async fn hybrid_candidates(
     query: &str,
     candidates: usize,
     filter: Option<&str>,
+    deadline: Option<Instant>,
 ) -> Result<Vec<Hit>> {
-    let vector = vector_candidates(ds, qv, candidates, filter).await?;
-    let fts = fts_candidates(ds, query, candidates, filter).await?;
+    let vector = async {
+        emit_recall_metric("recall_vector", "start", 0.0);
+        let started = Instant::now();
+        let read = vector_candidates(ds, qv, candidates, filter);
+        let hits = if recall_metrics_enabled() {
+            eprintln!("{}", format_read_io_metric("start", 0.0, &read_io_snapshot()));
+            let result = sample_vector_read(
+                read,
+                || {
+                    eprintln!(
+                        "{}",
+                        format_read_io_metric("sample", round_ms(started.elapsed()), &read_io_snapshot())
+                    )
+                },
+                Duration::from_secs(1),
+            )
+            .await;
+            eprintln!(
+                "{}",
+                format_read_io_metric("done", round_ms(started.elapsed()), &read_io_snapshot())
+            );
+            result?
+        } else {
+            read.await?
+        };
+        emit_recall_metric("recall_vector", "done", round_ms(started.elapsed()));
+        Ok(hits)
+    };
+    let fts = async {
+        let ds = ds.clone();
+        let query = query.to_owned();
+        let filter = filter.map(str::to_owned);
+        best_effort_fts(
+            async move { fts_candidates(&ds, &query, candidates, filter.as_deref()).await },
+            fts_budget(deadline),
+            FTS_SCAN_SLOT.clone(),
+        )
+        .await
+    };
+    fuse_hybrid_reads(vector, fts, candidates).await
+}
+
+async fn fuse_hybrid_reads(
+    vector: impl std::future::Future<Output = Result<Vec<(u64, Hit)>>>,
+    fts: impl std::future::Future<Output = Vec<(u64, Hit)>>,
+    candidates: usize,
+) -> Result<Vec<Hit>> {
+    // Start optional I/O before vector reads consume its deadline; vector errors cancel it immediately.
+    let (fts, vector) = tokio::try_join!(async { Ok::<_, anyhow::Error>(fts.await) }, vector)?;
     Ok(rrf_fuse(vector, fts, candidates))
 }
 
-/// Top-`limit` rows by vector distance, each with its row id (the fusion key).
+fn fts_budget(deadline: Option<Instant>) -> Duration {
+    // Warmup must be able to finish index initialization instead of repeatedly cancelling it at three seconds.
+    deadline.map_or(Duration::from_secs(3), |deadline| {
+        deadline
+            .saturating_duration_since(Instant::now())
+            .saturating_sub(Duration::from_millis(250))
+    })
+}
+
+static FTS_SCAN_SLOT: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(1)));
+
+async fn best_effort_fts(
+    scan: impl std::future::Future<Output = Result<Vec<(u64, Hit)>>> + Send + 'static,
+    budget: Duration,
+    slot: Arc<Semaphore>,
+) -> Vec<(u64, Hit)> {
+    emit_recall_metric("recall_fts", "start", 0.0);
+    let started = Instant::now();
+    if budget.is_zero() {
+        emit_recall_metric("recall_fts", "timeout", 0.0);
+        return Vec::new();
+    }
+    let Ok(permit) = slot.try_acquire_owned() else {
+        emit_recall_metric("recall_fts", "error", 0.0);
+        return Vec::new();
+    };
+    let (cancel, cancelled) = oneshot::channel::<()>();
+    let (sender, receiver) = oneshot::channel();
+    // The slot follows the scan and runtime cleanup, not the caller's shorter wait.
+    // shortcut: a stuck native scan keeps one slot; use process isolation if it never returns.
+    let worker = std::thread::Builder::new().name("funes-fts".into()).spawn(move || {
+        let _permit = permit;
+        let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                let _ = sender.send(Err(anyhow::Error::from(error)));
+                return;
+            }
+        };
+        let result = runtime.block_on(async move {
+            tokio::select! {
+                biased;
+                _ = cancelled => Ok(Vec::new()),
+                result = scan => result,
+            }
+        });
+        let _ = sender.send(result);
+    });
+    if worker.is_err() {
+        emit_recall_metric("recall_fts", "error", round_ms(started.elapsed()));
+        return Vec::new();
+    }
+    // Original inline approach, retained to document why isolation is required:
+    // Bound the optional scan without spawning a detached task or discarding vector hits.
+    // shortcut: cancellation is cooperative; isolate the scan if profiling finds non-yielding CPU work.
+    let deadline = tokio::time::Instant::from_std(started + budget);
+    let (hits, state) = match tokio::time::timeout_at(deadline, receiver).await {
+        Ok(Ok(Ok(hits))) => (hits, "done"),
+        Ok(_) => (Vec::new(), "error"),
+        Err(_) => (Vec::new(), "timeout"),
+    };
+    drop(cancel);
+    emit_recall_metric("recall_fts", state, round_ms(started.elapsed()));
+    hits
+}
+
+/// Top-`limit` rows by vector distance, each with its `_rowid` (the fusion key).
 async fn vector_candidates(ds: &Dataset, qv: &[f32], limit: usize, filter: Option<&str>) -> Result<Vec<(u64, Hit)>> {
-    hits_of(&dataset::nearest(ds, qv, limit, filter, &hit_cols(ds)).await?)
+    hits_of(
+        &dataset::nearest_with_progress(ds, qv, limit, filter, &hit_cols(ds), |stage, state, elapsed| {
+            emit_recall_metric(stage, state, round_ms(elapsed));
+        })
+        .await?,
+    )
 }
 
 /// Top-`limit` rows by BM25 score, each with its row id. Errors if the memory has no FTS index.
@@ -875,7 +1283,12 @@ pub async fn get_turns(memory: Memory, session_id: String, range: TurnRange) -> 
 
     let cols = ["turn_uuid", "seq", "ts", "role", "text", "block_idx", "split_idx"];
     let filter = dataset::eq("session_id", &session_id);
-    let batches = dataset::scan_rows(ds, &cols, Some(filter.as_str()), None).await?;
+    let mut batches = dataset::scan_rows(ds, &cols, Some(filter.as_str()), None).await?;
+    // Canonical documents can retain their original session id; the source identity is also addressable.
+    if batches.iter().all(|batch| batch.num_rows() == 0) && dataset::has_column(ds, "source_identity") {
+        let filter = dataset::eq("source_identity", &session_id);
+        batches = dataset::scan_rows(ds, &cols, Some(filter.as_str()), None).await?;
+    }
 
     // `text` is already the rendered chunk as stored by the indexer — do not re-render.
     let mut rows: Vec<TurnRow> = Vec::new();
@@ -1695,6 +2108,401 @@ mod tests {
     use chrono::TimeZone;
     use std::path::Path;
 
+    fn hit(text: &str) -> Hit {
+        Hit {
+            id: text.to_string(),
+            memory: String::new(),
+            fused: 0.0,
+            text: text.to_string(),
+            session_id: String::new(),
+            workdir: String::new(),
+            turn_uuid: String::new(),
+            seq: 0,
+            ts: "2026-01-31T00:00:00Z".to_string(),
+            block_type: "text".to_string(),
+            harness: String::new(),
+            neighbors: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn fts_budget_uses_only_the_callers_remaining_time() {
+        assert_eq!(fts_budget(None), Duration::from_secs(3));
+        let warm = fts_budget(Some(Instant::now() + Duration::from_secs(180)));
+        assert!(warm > Duration::from_secs(3));
+        assert!(warm <= Duration::from_millis(179_750));
+        let interactive = fts_budget(Some(Instant::now() + Duration::from_secs(7)));
+        assert!(interactive <= Duration::from_millis(6750));
+        let remaining = fts_budget(Some(Instant::now() + Duration::from_millis(500)));
+        assert!(remaining <= Duration::from_millis(250));
+        assert_eq!(
+            fts_budget(Some(Instant::now() + Duration::from_millis(100))),
+            Duration::ZERO
+        );
+        assert_eq!(fts_budget(Some(Instant::now())), Duration::ZERO);
+    }
+
+    #[tokio::test]
+    async fn explicit_warm_budget_allows_fts_initialization_to_finish() {
+        let hits = best_effort_fts(
+            async {
+                tokio::time::sleep(Duration::from_millis(3100)).await;
+                Ok(vec![(1, hit("initialized-fts"))])
+            },
+            fts_budget(Some(Instant::now() + Duration::from_secs(6))),
+            Arc::new(Semaphore::new(1)),
+        )
+        .await;
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].1.text, "initialized-fts");
+    }
+
+    #[tokio::test]
+    async fn hybrid_reads_start_fts_before_vector_finishes() {
+        let (fts_started, started) = oneshot::channel();
+        let vector = async {
+            started.await?;
+            Ok(vec![(1, hit("vector-only"))])
+        };
+        let fts = best_effort_fts(
+            async move {
+                fts_started.send(()).expect("vector is waiting for FTS");
+                Ok(vec![(2, hit("fts-only"))])
+            },
+            Duration::from_secs(1),
+            Arc::new(Semaphore::new(1)),
+        );
+        let fused = tokio::time::timeout(Duration::from_secs(1), fuse_hybrid_reads(vector, fts, 2))
+            .await
+            .expect("FTS must start while vector I/O is pending")
+            .expect("both reads succeed");
+        assert_eq!(fused.len(), 2);
+        assert!(fused.iter().any(|hit| hit.text == "fts-only"));
+    }
+
+    #[tokio::test]
+    async fn hybrid_reads_return_vector_errors_without_waiting_for_fts() {
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            fuse_hybrid_reads(async { Err(anyhow!("vector failed")) }, std::future::pending(), 1),
+        )
+        .await
+        .expect("a vector failure must not wait for optional FTS");
+        assert_eq!(
+            result.err().expect("vector error is preserved").to_string(),
+            "vector failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn hybrid_reads_keep_vector_hits_when_fts_times_out() {
+        let fts = best_effort_fts(
+            std::future::pending(),
+            Duration::from_millis(20),
+            Arc::new(Semaphore::new(1)),
+        );
+        let fused = fuse_hybrid_reads(async { Ok(vec![(1, hit("vector-only"))]) }, fts, 1)
+            .await
+            .expect("optional FTS timeout does not fail vector recall");
+        assert_eq!(fused.len(), 1);
+        assert_eq!(fused[0].text, "vector-only");
+    }
+
+    #[tokio::test]
+    async fn exhausted_fts_budget_never_polls_the_scan_or_loses_vector_hits() {
+        let scan = async { panic!("an exhausted optional scan must not be polled") };
+        let fts = best_effort_fts(scan, fts_budget(Some(Instant::now())), Arc::new(Semaphore::new(1))).await;
+        let fused = rrf_fuse(vec![(1, hit("vector-only"))], fts, 1);
+        assert_eq!(fused.len(), 1);
+        assert_eq!(fused[0].text, "vector-only");
+    }
+
+    #[tokio::test]
+    async fn fts_deadline_preserves_successful_hybrid_fusion() {
+        let fts = best_effort_fts(
+            async { Ok(vec![(2, hit("shared")), (3, hit("fts-only"))]) },
+            Duration::from_secs(1),
+            Arc::new(Semaphore::new(1)),
+        )
+        .await;
+        let fused = rrf_fuse(vec![(1, hit("vector-only")), (2, hit("shared"))], fts, 3);
+        assert_eq!(fused[0].text, "shared");
+        assert_eq!(fused.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn fts_deadline_keeps_vector_hits_on_scan_error() {
+        let fts = best_effort_fts(
+            async { Err(anyhow!("missing FTS index")) },
+            Duration::from_secs(1),
+            Arc::new(Semaphore::new(1)),
+        )
+        .await;
+        let fused = rrf_fuse(vec![(1, hit("vector-only"))], fts, 1);
+        assert_eq!(fused.len(), 1);
+        assert_eq!(fused[0].text, "vector-only");
+    }
+
+    #[tokio::test]
+    async fn fts_deadline_drops_stalled_scan_and_keeps_vector_hits() {
+        struct DropFlag(Arc<tokio::sync::Notify>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.notify_one();
+            }
+        }
+        let dropped = Arc::new(tokio::sync::Notify::new());
+        let guard = DropFlag(dropped.clone());
+        let scan = async move {
+            let _guard = guard;
+            std::future::pending::<Result<Vec<(u64, Hit)>>>().await
+        };
+        let fts = tokio::time::timeout(
+            Duration::from_secs(1),
+            best_effort_fts(
+                scan,
+                fts_budget(Some(Instant::now() + Duration::from_millis(260))),
+                Arc::new(Semaphore::new(1)),
+            ),
+        )
+        .await
+        .expect("optional FTS must not consume the caller's whole deadline");
+        tokio::time::timeout(Duration::from_secs(1), dropped.notified())
+            .await
+            .expect("a yielding scan must observe cancellation");
+        let fused = rrf_fuse(vec![(1, hit("vector-only"))], fts, 1);
+        assert_eq!(fused.len(), 1);
+        assert_eq!(fused[0].text, "vector-only");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn blocking_fts_must_not_hold_the_vector_response_past_its_budget() {
+        let slot = Arc::new(Semaphore::new(1));
+        let started = Instant::now();
+        let fts = best_effort_fts(
+            async {
+                std::thread::sleep(Duration::from_millis(400));
+                Ok(vec![(2, hit("late-fts"))])
+            },
+            Duration::from_millis(20),
+            slot.clone(),
+        )
+        .await;
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "blocking FTS held the query task beyond its deadline"
+        );
+        assert!(fts.is_empty());
+        let fused = rrf_fuse(vec![(1, hit("vector-only"))], fts, 1);
+        assert_eq!(fused[0].text, "vector-only");
+        drop(
+            tokio::time::timeout(Duration::from_secs(2), slot.acquire())
+                .await
+                .expect("the blocking scan must finish")
+                .unwrap(),
+        );
+    }
+
+    #[tokio::test]
+    async fn blocking_fts_child_cannot_starve_the_query_runtime() {
+        let slot = Arc::new(Semaphore::new(1));
+        let started = Instant::now();
+        let fts = best_effort_fts(
+            async {
+                tokio::spawn(async {
+                    std::thread::sleep(Duration::from_millis(400));
+                    Ok(vec![(2, hit("late-child"))])
+                })
+                .await?
+            },
+            Duration::from_millis(20),
+            slot.clone(),
+        )
+        .await;
+        assert!(started.elapsed() < Duration::from_millis(200));
+        assert!(fts.is_empty());
+        drop(
+            tokio::time::timeout(Duration::from_secs(2), slot.acquire())
+                .await
+                .expect("the blocking child must finish")
+                .unwrap(),
+        );
+    }
+
+    #[tokio::test]
+    async fn timed_out_fts_keeps_its_slot_and_discards_late_results() {
+        let slot = Arc::new(Semaphore::new(1));
+        let worker_slot = slot.clone();
+        let (started, started_rx) = oneshot::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let first = tokio::spawn(async move {
+            best_effort_fts(
+                async move {
+                    started.send(()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                    Ok(vec![(1, hit("stale"))])
+                },
+                Duration::from_millis(100),
+                worker_slot,
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(first.await.unwrap().is_empty());
+        assert_eq!(slot.available_permits(), 0);
+        assert!(best_effort_fts(
+            async { panic!("a busy slot must not poll another scan") },
+            Duration::from_secs(1),
+            slot.clone(),
+        )
+        .await
+        .is_empty());
+        release.send(()).unwrap();
+        drop(
+            tokio::time::timeout(Duration::from_secs(1), slot.acquire())
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+        let fresh = best_effort_fts(async { Ok(vec![(2, hit("fresh"))]) }, Duration::from_secs(1), slot).await;
+        assert_eq!(fresh.len(), 1);
+        assert_eq!(fresh[0].1.text, "fresh");
+    }
+
+    #[tokio::test]
+    async fn fts_slot_covers_blocking_child_runtime_cleanup() {
+        let slot = Arc::new(Semaphore::new(1));
+        let (started, started_rx) = oneshot::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let fts = best_effort_fts(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    started.send(()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                });
+                started_rx.await?;
+                Ok(vec![(1, hit("ready"))])
+            },
+            Duration::from_secs(1),
+            slot.clone(),
+        )
+        .await;
+        assert_eq!(fts.len(), 1);
+        assert_eq!(slot.available_permits(), 0);
+        release.send(()).unwrap();
+        drop(
+            tokio::time::timeout(Duration::from_secs(1), slot.acquire())
+                .await
+                .expect("runtime cleanup must release the slot")
+                .unwrap(),
+        );
+    }
+
+    #[tokio::test]
+    async fn isolated_fts_keeps_real_keyword_hits_and_filters_across_calls() {
+        use arrow_array::{ArrayRef, Int64Array, RecordBatchIterator, StringArray};
+        use arrow_schema::{DataType, Field, Schema};
+        use lance::index::DatasetIndexExt;
+        use lance_index::{scalar::InvertedIndexParams, IndexType};
+
+        // Select the scheduler in a child instead of mutating process env under parallel Tokio tests.
+        if std::env::var("FUNES_TEST_FTS_CHILD").as_deref() != Ok("1") {
+            let executable = std::env::args_os().next().expect("test executable");
+            let output = std::process::Command::new(executable)
+                .args([
+                    "--exact",
+                    "commands::recall::tests::isolated_fts_keeps_real_keyword_hits_and_filters_across_calls",
+                    "--test-threads=1",
+                ])
+                .env("FUNES_TEST_FTS_CHILD", "1")
+                .env("LANCE_USE_LITE_SCHEDULER", "true")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success(),
+                "{stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(stdout.contains("1 passed; 0 failed"), "{stdout}");
+            return;
+        }
+        let memory = tempfile::tempdir().unwrap();
+        let target_text = format!(
+            "alpha {} zulu target",
+            (0..300).map(|n| format!("middle{n:03}")).collect::<Vec<_>>().join(" ")
+        );
+        let schema = Arc::new(Schema::new(
+            HIT_COLS
+                .iter()
+                .map(|name| {
+                    Field::new(
+                        *name,
+                        if *name == "seq" {
+                            DataType::Int64
+                        } else {
+                            DataType::Utf8
+                        },
+                        false,
+                    )
+                })
+                .collect::<Vec<_>>(),
+        ));
+        let columns = HIT_COLS
+            .iter()
+            .map(|name| -> ArrayRef {
+                match *name {
+                    "seq" => Arc::new(Int64Array::from(vec![0, 1])),
+                    "text" => Arc::new(StringArray::from(vec![target_text.as_str(), "alpha excluded"])),
+                    "harness" => Arc::new(StringArray::from(vec!["codex", "pi"])),
+                    _ => Arc::new(StringArray::from(vec!["fixture", "fixture"])),
+                }
+            })
+            .collect();
+        let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
+        let mut ds = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            dataset::table_uri(memory.path().to_str().unwrap()).as_str(),
+            None,
+        )
+        .await
+        .unwrap();
+        ds.create_index(
+            &["text"],
+            IndexType::Inverted,
+            None,
+            &InvertedIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+        let ds = Dataset::open(&dataset::table_uri(memory.path().to_str().unwrap()))
+            .await
+            .unwrap();
+        let slot = Arc::new(Semaphore::new(1));
+        for query in ["alpha", "zulu"] {
+            let ds = ds.clone();
+            let hits = best_effort_fts(
+                async move { fts_candidates(&ds, query, 2, Some("harness = 'codex'")).await },
+                Duration::from_secs(3),
+                slot.clone(),
+            )
+            .await;
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].1.text, target_text);
+            assert_eq!(hits[0].1.harness, "codex");
+            drop(
+                tokio::time::timeout(Duration::from_secs(1), slot.acquire())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+    }
+
     #[test]
     fn age_picks_the_coarsest_readable_unit() {
         let now = Utc.with_ymd_and_hms(2026, 7, 9, 12, 0, 0).unwrap();
@@ -1729,7 +2537,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recall_requires_fts_even_when_vector_candidates_exist() {
+    async fn profile_mismatch_keeps_both_model_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let ds = memory_of(&[text_turn("session", 0, "user", "A saved memory.")], dir.path()).await;
+        let stored = dataset::embedding_profile(&ds).unwrap();
+        let embedded_by = EmbeddingProfile::local_model(crate::inference::EmbeddingModel::MultilingualE5Small);
+        let search = Search::new("query".into(), 1, Default::default()).unwrap();
+        search
+            .qv
+            .set((embedded_by.clone(), vec![0.0; dataset::DIM as usize]))
+            .unwrap();
+        let read = Read {
+            ds,
+            note: None,
+            memory_label: None,
+        };
+        let err = search
+            .candidates_read(read, "memory", &|_| {})
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains(&stored.model) && err.contains(&embedded_by.model), "{err}");
+        assert_eq!(search.qv.get().unwrap().0, embedded_by);
+    }
+
+    #[tokio::test]
+    async fn recall_retains_vector_candidates_when_fts_is_missing() {
         let dir = tempfile::tempdir().unwrap();
         let ds = memory_of(
             &[text_turn("session", 0, "user", "A narwhal parses transcripts.")],
@@ -1738,10 +2572,9 @@ mod tests {
         .await;
         let qv = vec![1.0; dataset::DIM as usize];
         assert_eq!(vector_candidates(&ds, &qv, 5, None).await.unwrap().len(), 1);
-        assert!(
-            hybrid_candidates(&ds, &qv, "narwhal", 5, None).await.is_err(),
-            "a missing FTS index must fail recall even when vector search finds a candidate"
-        );
+        let hits = hybrid_candidates(&ds, &qv, "narwhal", 5, None, None).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].text, "A narwhal parses transcripts.");
     }
 
     #[tokio::test]
@@ -1945,6 +2778,26 @@ mod tests {
     }
 
     #[test]
+    fn canonical_filter_port_escapes_values_and_tracks_missing_columns() {
+        let search = Search::new(
+            "query".into(),
+            4,
+            RecallFilter {
+                source_agent: Some("codex".into()),
+                project: Some("owner's repo".into()),
+                source_missing: Some(false),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            search.where_clause.as_deref(),
+            Some("source_agent = 'codex' AND project = 'owner''s repo' AND source_missing = false")
+        );
+        assert_eq!(search.canonical_columns, ["source_agent", "project", "source_missing"]);
+    }
+
+    #[test]
     fn build_where_combines_set_filters() {
         let one = |h: &str| vec![h.to_string()];
         let any = DayRange::default();
@@ -2035,7 +2888,7 @@ mod tests {
         let mut chunks = chunk::chunks_from_turns(&turns, true);
         for c in &mut chunks {
             let (_, repo) = repos.iter().find(|(session, _)| *session == c.session_id).unwrap();
-            c.repo = repo.to_string();
+            c.repo = Some(repo.to_string());
         }
         let vectors = vec![vec![0.0f32; dataset::DIM as usize]; chunks.len()];
         let batch = dataset::build_batch(dataset::model::ENGLISH, &chunks, Some(&vectors)).unwrap();
@@ -2128,5 +2981,139 @@ mod tests {
         ] {
             assert_eq!(week.holds(ts), ("2026-09-14".."2026-09-21").contains(&ts), "{ts}");
         }
+    }
+
+    #[test]
+    fn rrf_keeps_the_true_fused_score_for_recency_weighting() {
+        let fused = rrf_fuse(
+            vec![(1, hit("vector-only")), (2, hit("shared"))],
+            vec![(2, hit("shared")), (3, hit("fts-only"))],
+            3,
+        );
+
+        assert_eq!(fused[0].text, "shared");
+        assert!((fused[0].fused as f64 - (1.0 / 60.0 + 1.0 / 61.0)).abs() < 1e-7);
+        for hit in &fused[1..] {
+            let score = hit.fused as f64;
+            assert!(
+                (score - 1.0 / 60.0).abs() < 1e-7 || (score - 1.0 / 61.0).abs() < 1e-7,
+                "{} kept an invented rank score: {score}",
+                hit.text
+            );
+        }
+    }
+
+    #[test]
+    fn reranker_score_contract_only_sigmoids_local_logits() {
+        assert!((rerank_relevance(RerankScoreKind::Logit, 0.0) - 0.5).abs() < f64::EPSILON);
+        assert!((rerank_relevance(RerankScoreKind::Relevance, 0.1) - 0.1).abs() < 1e-7);
+    }
+
+    #[tokio::test]
+    async fn vector_sampler_keeps_one_read_and_stops_after_sixteen_samples() {
+        let (sender, receiver) = oneshot::channel();
+        let mut starts = 0;
+        let read = async {
+            starts += 1;
+            receiver.await.unwrap()
+        };
+        let mut sender = Some(sender);
+        let mut samples = 0;
+        let result = sample_vector_read(
+            read,
+            || {
+                samples += 1;
+                if samples == 16 {
+                    sender.take().unwrap().send(Err::<usize, _>("fixture failure")).unwrap();
+                }
+            },
+            Duration::from_millis(1),
+        )
+        .await;
+        assert_eq!(result, Err("fixture failure"));
+        assert_eq!(starts, 1);
+        assert_eq!(samples, 16);
+    }
+
+    #[test]
+    fn vector_io_metric_contains_only_static_labels_and_numeric_counters() {
+        let line = format_read_io_metric("sample", 1000.0, &read_io_snapshot());
+        let value: serde_json::Value = serde_json::from_str(line.strip_prefix("funes_metric ").unwrap()).unwrap();
+        let object = value.as_object().unwrap();
+        assert_eq!(object.len(), 4);
+        assert_eq!(value["stage"], "recall_vector_io");
+        assert_eq!(value["state"], "sample");
+        let io = value["io"].as_object().unwrap();
+        assert_eq!(io.len(), 11);
+        assert!(io.values().all(serde_json::Value::is_u64));
+        assert!(io.contains_key("cache_wait_active"));
+        assert!(io.contains_key("requested_bytes"));
+    }
+
+    #[test]
+    fn recall_metrics_env_gating() {
+        assert!(recall_metrics_enabled_from(Some("1")));
+        assert!(recall_metrics_enabled_from(Some("true")));
+        assert!(recall_metrics_enabled_from(Some("TRUE")));
+        assert!(recall_metrics_enabled_from(Some("yes")));
+        assert!(recall_metrics_enabled_from(Some("YES")));
+        assert!(recall_metrics_enabled_from(Some("on")));
+        assert!(recall_metrics_enabled_from(Some("ON")));
+        assert!(recall_metrics_enabled_from(Some(" 1 ")));
+
+        assert!(!recall_metrics_enabled_from(Some("0")));
+        assert!(!recall_metrics_enabled_from(Some("false")));
+        assert!(!recall_metrics_enabled_from(Some("no")));
+        assert!(!recall_metrics_enabled_from(Some("off")));
+        assert!(!recall_metrics_enabled_from(Some("")));
+        assert!(!recall_metrics_enabled_from(Some("random")));
+        assert!(!recall_metrics_enabled_from(None));
+    }
+
+    #[test]
+    fn recall_metrics_deterministic_serialization_and_redaction() {
+        let stages = [
+            "recall_open",
+            "recall_models",
+            "recall_embed",
+            "recall_vector",
+            "recall_vector_stream",
+            "recall_vector_collect",
+            "recall_fts",
+            "recall_rerank",
+            "recall_neighbors",
+        ];
+
+        for stage in stages {
+            let start_line = format_recall_metric(stage, "start", 0.0).expect("metric line");
+            assert_eq!(
+                start_line,
+                format!(r#"funes_metric {{"stage":"{stage}","state":"start","duration_ms":0.0}}"#)
+            );
+
+            let done_line = format_recall_metric(stage, "done", 12.34).expect("metric line");
+            assert_eq!(
+                done_line,
+                format!(r#"funes_metric {{"stage":"{stage}","state":"done","duration_ms":12.34}}"#)
+            );
+
+            let json_str = done_line.strip_prefix("funes_metric ").expect("prefix");
+            let raw: serde_json::Value = serde_json::from_str(json_str).expect("raw json");
+            assert_eq!(raw["stage"], stage);
+            assert_eq!(raw["state"], "done");
+            assert!((raw["duration_ms"].as_f64().expect("duration_ms") - 12.34).abs() < 1e-6);
+
+            // Redaction & schema check: only 3 static allowlisted fields, no sensitive payload.
+            let map = raw.as_object().expect("json object");
+            assert_eq!(map.len(), 3);
+            assert!(map.contains_key("stage"));
+            assert!(map.contains_key("state"));
+            assert!(map.contains_key("duration_ms"));
+        }
+
+        assert_eq!(round_ms(Duration::from_millis(0)), 0.0);
+        assert_eq!(round_ms(Duration::from_millis(150)), 150.0);
+        assert_eq!(round_ms(Duration::from_micros(12345)), 12.35);
+        assert_eq!(round_ms(Duration::from_micros(12344)), 12.34);
     }
 }

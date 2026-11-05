@@ -11,6 +11,11 @@ import pytest
 from service import runtime_diagnostics as diag
 
 
+@pytest.fixture(autouse=True)
+def isolated_os(monkeypatch):
+    monkeypatch.setattr(diag, "os", SimpleNamespace(**vars(os)))
+
+
 @pytest.fixture
 def roots(tmp_path, monkeypatch):
     diag.stop()
@@ -114,6 +119,7 @@ def test_log_pipe_is_nonblocking_bounded_and_closed(monkeypatch):
     monkeypatch.setattr(diag.os, "fpathconf", lambda fd, name: 4096)
     monkeypatch.setattr(diag.os, "write", lambda fd, data: calls.append((fd, data)))
     monkeypatch.setattr(diag.os, "close", lambda fd: calls.append(("closed", fd)))
+    assert os.fstat is not diag.os.fstat and os.open is not diag.os.open
     diag._emit({"event": "resource_sample", "processes": [{"pid": 1}] * 1000})
     assert calls[0][0] == "/proc/self/fd/2" and calls[0][1] & os.O_NONBLOCK
     assert len(calls[1][1]) <= 4096 and b'"processes_truncated":true' in calls[1][1]

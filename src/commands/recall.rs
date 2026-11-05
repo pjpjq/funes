@@ -715,7 +715,7 @@ impl RecallFilter {
 /// [`Search::candidates`] from one or more memories, pooled into a single [`Search::rank`].
 pub struct Search {
     query: String,
-    qv: OnceCell<(String, Vec<f32>)>,
+    qv: OnceCell<(EmbeddingProfile, Vec<f32>)>,
     candidates: usize,
     deadline: Option<Instant>,
     /// The columns `where_clause` reads that a migration added, which an older memory lacks.
@@ -827,13 +827,19 @@ impl Search {
                 let started = Instant::now();
                 let qv = embedder.embed_query(&self.query)?;
                 emit_recall_metric("recall_embed", "done", round_ms(started.elapsed()));
-                Ok::<_, anyhow::Error>((profile.fingerprint.clone(), qv))
+                Ok::<_, anyhow::Error>((profile.clone(), qv))
             })
             .await?;
-        if embedded_by != &profile.fingerprint {
+        if embedded_by.fingerprint != profile.fingerprint {
             bail!(
-                "{} and the other memory of this search use different embedding profiles",
-                label
+                "{} is embedded with {} ({}, {}d), and the other memory of this search with {} ({}, {}d)",
+                label,
+                profile.model,
+                profile.provider,
+                profile.dimensions,
+                embedded_by.model,
+                embedded_by.provider,
+                embedded_by.dimensions
             );
         }
         progress(&format!("searching {label}…"));
@@ -2528,6 +2534,32 @@ mod tests {
         let batch = dataset::build_batch(dataset::model::ENGLISH, &chunks, Some(&vectors)).unwrap();
         let reader = RecordBatchIterator::new(vec![Ok(batch)], dataset::schema(dataset::model::ENGLISH));
         Dataset::write(reader, dir.to_str().unwrap(), None).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn profile_mismatch_keeps_both_model_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let ds = memory_of(&[text_turn("session", 0, "user", "A saved memory.")], dir.path()).await;
+        let stored = dataset::embedding_profile(&ds).unwrap();
+        let embedded_by = EmbeddingProfile::local_model(crate::inference::EmbeddingModel::MultilingualE5Small);
+        let search = Search::new("query".into(), 1, Default::default()).unwrap();
+        search
+            .qv
+            .set((embedded_by.clone(), vec![0.0; dataset::DIM as usize]))
+            .unwrap();
+        let read = Read {
+            ds,
+            note: None,
+            memory_label: None,
+        };
+        let err = search
+            .candidates_read(read, "memory", &|_| {})
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains(&stored.model) && err.contains(&embedded_by.model), "{err}");
+        assert_eq!(search.qv.get().unwrap().0, embedded_by);
     }
 
     #[tokio::test]

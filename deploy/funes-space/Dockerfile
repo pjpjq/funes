@@ -1,9 +1,9 @@
 FROM python:3.12-slim-trixie
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
-ARG FUNES_SOURCE_REV=b968b5f216a8dd0e0f1852c6f0da32f60dfcf3f4
-ARG FUNES_BINARY_SHA256=e602a02ab7d679a4aa372c0889f5b59ccb1259529278d4cd6fe2950b18e7ecca
-ARG FUNES_ARCHIVE_SHA256=f610aa9d650cf70387f8ce871aca468cc971df1afd2d09789b678e66cb556401
-ARG FUNES_BINARY_URL=https://raw.githubusercontent.com/pjpjq/funes/d169f91e5b27697adb72163b3f863dd1b28dfaaf/space/bin/funes-x86_64-linux.bin.zst
+ARG FUNES_SOURCE_REV=80fb481bf49eae0d2a75160b5b64462cc2ee1dbc
+ARG FUNES_BINARY_SHA256=685e28e824d14d9ddcea3c6ac787df91bd3aefc5edf5f20035f4f562cfd37e56
+ARG FUNES_ARCHIVE_SHA256=fb5677b7c46a3cc185420a21ec5b28897d5a3a5c40b94220460981a093acfee2
+ARG FUNES_BINARY_URL=https://raw.githubusercontent.com/pjpjq/funes/9a28f2c33a22f12f3cebd58625949023249edafc/space/bin/funes-x86_64-linux.bin.zst
 LABEL org.opencontainers.image.source="https://github.com/pjpjq/funes" \
       org.opencontainers.image.revision="${FUNES_SOURCE_REV}"
 RUN apt-get update \

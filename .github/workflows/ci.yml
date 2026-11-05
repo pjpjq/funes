@@ -219,7 +219,7 @@ jobs:
       - name: Integration tests
         env:
           HF_FUNES_TEST_TOKEN: ${{ secrets.HF_FUNES_TEST_TOKEN }}
-        run: cargo test --profile ci -- --nocapture
+        run: cargo test --profile ci --no-fail-fast -- --nocapture
 
       - name: Save model weights
         if: ${{ !cancelled() && github.ref == 'refs/heads/main' && steps.models.outputs.cache-hit != 'true' }}

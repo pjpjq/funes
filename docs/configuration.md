@@ -123,7 +123,7 @@ environment: never commit it, write it into these files, or include it in logs.
 | `FUNES_INDEX_EMBEDDING_MODEL` | Optional build-target model. Defaults to the active model, or the provider default when the build provider changes. |
 | `FUNES_INDEX_EMBEDDING_DIMENSIONS` | Optional build-target vector width. Defaults to the active width, or the provider default when the build provider changes. |
 | `FUNES_INDEX_EMBEDDING_SCHEMA_VERSION` | Optional build-target schema version. Defaults to the active version, or the provider default when the build provider changes. |
-| `FUNES_RERANK_PROVIDER` | Runtime reranker: `none`, `local`, or `voyage`; default `none`, including production. |
+| `FUNES_RERANK_PROVIDER` | Runtime reranker: `none`, `local`, or `voyage`; default `local`. The production Voyage Space explicitly sets `none`. |
 | `FUNES_RERANK_MODEL` | Voyage rerank model; default `rerank-3-lite`. Ignored by `none` and `local`. |
 | `VOYAGE_API_KEY` | Required when either selected provider is `voyage`; secret-only process environment or secret-manager value. Never commit or log it. |
 | `FUNES_RETRIEVAL_LANGUAGE_MODE` | Retrieval text mode. Production sets `raw`, preserving original multilingual documents and queries without translation or shadow text. |

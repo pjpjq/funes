@@ -104,7 +104,7 @@ The embedding provider is selected at runtime with `FUNES_EMBEDDING_PROVIDER=loc
 with `input_type=document` at index time and the original query with `input_type=query` at recall
 time. Production sets `FUNES_RETRIEVAL_LANGUAGE_MODE=raw`, so there is no translation or English
 shadow-text path. Reranking is independently selected with
-`FUNES_RERANK_PROVIDER=none|local|voyage`; production defaults to `none`, retaining the fused RRF
+`FUNES_RERANK_PROVIDER=none|local|voyage`; production explicitly sets `none`, retaining the fused RRF
 order. See [configuration](configuration.md#retrieval-providers) for the
 full profile and credential contract.
 

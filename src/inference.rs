@@ -322,7 +322,7 @@ pub fn embedder_for(profile: &EmbeddingProfile) -> Result<Box<dyn Embedder>> {
 
 /// Build the reranker for the compiled-in backend. See [`embedder`].
 pub fn reranker() -> Result<Option<Box<dyn Reranker>>> {
-    let provider = env_value("FUNES_RERANK_PROVIDER")?.unwrap_or_else(|| "none".to_string());
+    let provider = env_value("FUNES_RERANK_PROVIDER")?.unwrap_or_else(|| "local".to_string());
     match provider.as_str() {
         "none" => Ok(None),
         "local" => {

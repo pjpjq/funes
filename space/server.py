@@ -35,6 +35,7 @@ from pathlib import Path
 from space.canonical_ab import CanonicalABController, FIXED_PROFILES
 
 from service.hub_cache import HubCache
+from service import runtime_diagnostics
 from service.server import App as SourceApp
 from service.server import expanded_candidate_limit
 from service.server import ingest_documents as persist_source_ingest
@@ -812,9 +813,11 @@ def schedule_ingest_process_restart() -> None:
     """Replace PID 1 after the timeout response has reached the caller."""
     def terminate() -> None:
         time.sleep(0.25)
+        runtime_diagnostics.event("ingest_restart")
         try:
             os.execv(sys.executable, [sys.executable, *sys.argv])
         except OSError:
+            runtime_diagnostics.event("ingest_exec_failed", exit_code=75)
             os._exit(75)
 
     thread = threading.Thread(
@@ -825,6 +828,7 @@ def schedule_ingest_process_restart() -> None:
     try:
         thread.start()
     except RuntimeError:
+        runtime_diagnostics.event("ingest_restart_thread_failed", exit_code=75)
         os._exit(75)
 
 
@@ -1478,6 +1482,7 @@ def run(
             env=env,
             start_new_session=os.name == "posix",
         )
+        runtime_diagnostics.event("native_start", pid=getattr(process, "pid", None), operation=args[0] if args else None)
         try:
             stdout, stderr = process.communicate(timeout=timeout)
         except subprocess.TimeoutExpired as exc:
@@ -1500,12 +1505,14 @@ def run(
                 else getattr(exc, "stderr", None)
             )
             safe_stderr = _safe_timeout_stderr(raw_stderr)
+            runtime_diagnostics.event("native_timeout", pid=getattr(process, "pid", None), operation=args[0] if args else None, exit_code=getattr(process, "returncode", None))
             # Never retain stdout or caller arguments in the exception:
             # a descendant may have emitted payloads, paths, or raw memory.
             # stderr contains only allowlisted, re-serialized diagnostic metrics.
             raise subprocess.TimeoutExpired(
                 [FUNES_BIN], timeout, output=None, stderr=safe_stderr
             ) from None
+        runtime_diagnostics.event("native_exit", pid=getattr(process, "pid", None), operation=args[0] if args else None, exit_code=process.returncode)
         return process.returncode, stdout, stderr
 
 
@@ -4818,6 +4825,7 @@ class Handler(BaseHTTPRequestHandler):
                 code, payload = ready_payload()
             else:
                 code, payload = sync_status_payload()
+                payload["runtime_resources"] = runtime_diagnostics.status()
             payload["hub_cache"] = hub_cache_status()
             self.send_json(code, payload)
             return
@@ -4837,6 +4845,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if self.path == "/sync/status":
                 code, payload = sync_status_payload()
+                payload["runtime_resources"] = runtime_diagnostics.status()
                 payload["hub_cache"] = hub_cache_status()
                 self.send_json(code, payload)
                 return
@@ -5605,4 +5614,8 @@ def serve(host: str = "0.0.0.0", port: int = PORT) -> None:
 
 
 if __name__ == "__main__":
-    serve()
+    runtime_diagnostics.start()
+    try:
+        serve()
+    finally:
+        runtime_diagnostics.stop()

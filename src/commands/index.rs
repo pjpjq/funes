@@ -543,10 +543,7 @@ impl Indexer {
         let _lock = acquire_lock(interactive).await?;
 
         let uri = dataset::table_uri(home::memory_dir());
-        let mut ds = Memory::local().dataset().await?;
-        if let Some(ds) = &mut ds {
-            dataset::ensure_canonical_columns(ds).await?;
-        }
+        let ds = Memory::local().dataset().await?;
 
         let profile = match &ds {
             Some(ds) => dataset::embedding_profile(ds)?,

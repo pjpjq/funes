@@ -333,7 +333,7 @@ pub fn chunks_from_turns(turns: &[Turn], include_thinking: bool) -> Vec<Chunk> {
                     block_idx: bi as i64,
                     split_idx: si as i64,
                     harness: turn.harness.clone(),
-                    repo: None,
+                    repo: Some(String::new()),
                     source_identity: None,
                     source_version: None,
                     content_hash: None,
@@ -477,6 +477,15 @@ mod tests {
             .map(|c| c.id)
             .collect();
         assert_eq!(ids, ["088ee3e13e4321bc", "4bbd19dac6de8612"]);
+    }
+
+    #[test]
+    fn transcript_repo_is_empty_without_canonical_provenance() {
+        let chunks = chunks_from_turns(&[turn(vec![block("text", "a decision", None)])], true);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].repo.as_deref(), Some(""));
+        assert!(chunks[0].source_identity.is_none());
+        assert!(chunks[0].source_type.is_none());
     }
 
     #[test]

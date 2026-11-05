@@ -270,6 +270,81 @@ def test_staged_blob_retry_on_manifest_failure(tmp_path: Path) -> None:
     assert len(manifest_adds) == 2
 
 
+@pytest.mark.parametrize("size_delta", [0, -1])
+def test_checkpoint_manifest_byte_limit(tmp_path: Path, monkeypatch, size_delta: int) -> None:
+    cache_dir, mount_dir = tmp_path / "cache", tmp_path / "mount"
+    repo, blob_hash, rev = "models--test--model", "a" * 40, "b" * 40
+    blobs = cache_dir / repo / "blobs"
+    blobs.mkdir(parents=True)
+    (blobs / blob_hash).write_bytes(b"abc")
+    snapshot = cache_dir / repo / "snapshots" / rev
+    snapshot.mkdir(parents=True)
+    (snapshot / "中文.json").symlink_to("../../blobs/" + blob_hash)
+    monkeypatch.setattr("service.hub_cache.time.time", lambda: 1.0)
+    manifest = {
+        "version": 1, "prefix": DEFAULT_PREFIX, "updated_at": 1.0,
+        "blobs": {repo: {blob_hash: {"size": 3}}},
+        "snapshots": {repo: {rev: {"中文.json": blob_hash}}},
+    }
+    size = len(json.dumps(manifest).encode("utf-8"))
+    monkeypatch.setattr("service.hub_cache.MAX_MANIFEST_SIZE", size + size_delta)
+    api = MockHfApi(mount_dir)
+    cache = HubCache("test-bucket", mount_dir, cache_dir, api=api)
+    result = cache.checkpoint()
+    published = mount_dir / DEFAULT_PREFIX / "manifest.json"
+    if size_delta == 0:
+        assert result["status"] == "ok"
+        assert published.stat().st_size == size
+        restored = HubCache("test-bucket", mount_dir, tmp_path / "restored", api=api)
+        assert restored.restore()["status"] == "ok"
+    else:
+        assert result["status"] == "error"
+        assert result["error_class"] == "ManifestOversizedError"
+        assert not published.exists()
+        assert cache._staged_blobs[repo][blob_hash] == 3
+        assert cache.status()["last_checkpoint_at"] is None
+    assert not list((cache_dir / ".hub_cache_tmp").iterdir())
+
+
+def test_oversized_checkpoint_preserves_manifest_and_retries_staged_blobs(tmp_path: Path, monkeypatch) -> None:
+    cache_dir, mount_dir = tmp_path / "cache", tmp_path / "mount"
+    repo, first_hash, second_hash = "models--test--model", "a" * 40, "b" * 40
+    blobs = cache_dir / repo / "blobs"
+    blobs.mkdir(parents=True)
+    (blobs / first_hash).write_bytes(b"first")
+    api = MockHfApi(mount_dir)
+    cache = HubCache("test-bucket", mount_dir, cache_dir, api=api)
+    monkeypatch.setattr("service.hub_cache.time.time", lambda: 1.0)
+    assert cache.checkpoint()["status"] == "ok"
+    published = mount_dir / DEFAULT_PREFIX / "manifest.json"
+    before = published.read_bytes()
+    checkpoint_at = cache.status()["last_checkpoint_at"]
+    cache._last_error = "ManifestOversizedError"
+    assert cache.checkpoint()["status"] == "ok"
+    assert cache.status()["error_class"] == "ManifestOversizedError"
+    (blobs / second_hash).write_bytes(b"second")
+    monkeypatch.setattr("service.hub_cache.time.time", lambda: 2.0)
+    monkeypatch.setattr("service.hub_cache.MAX_MANIFEST_SIZE", len(before))
+    for _ in range(2):
+        result = cache.checkpoint()
+        assert result["status"] == "error"
+        assert result["error_class"] == "ManifestOversizedError"
+        assert result["uploaded_files"] == 0
+        assert published.read_bytes() == before
+        assert second_hash in cache._staged_blobs[repo]
+        assert second_hash not in cache._published_blobs[repo]
+        assert cache.status()["last_checkpoint_at"] == checkpoint_at
+        assert not list((cache_dir / ".hub_cache_tmp").iterdir())
+    monkeypatch.setattr("service.hub_cache.MAX_MANIFEST_SIZE", MAX_MANIFEST_SIZE)
+    assert cache.checkpoint()["uploaded_files"] == 1
+    assert cache.status()["error_class"] is None
+    assert cache.status()["last_checkpoint_at"] == 2.0
+    assert not cache._staged_blobs
+    blob_uploads = [call for call in api.calls if not any("manifest.json" in dest for _, dest in call["add"])]
+    assert len(blob_uploads) == 2
+    assert all(not call["delete"] for call in api.calls)
+
+
 # ---------------------------------------------------------------------------
 # Blocker 3: Non-blocking status() During Network I/O
 # ---------------------------------------------------------------------------

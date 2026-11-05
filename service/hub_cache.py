@@ -581,11 +581,16 @@ class HubCache:
                     with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
                         json.dump(manifest_data, f)
                     manifest_obj = f"{self.prefix}/manifest.json"
-                    # Network I/O outside _state_lock
-                    self.api.batch_bucket_files(
-                        self.bucket_id, add=[(tmp_manifest, manifest_obj)]
-                    )
-                    manifest_committed = True
+                    if os.path.getsize(tmp_manifest) > MAX_MANIFEST_SIZE:
+                        with self._state_lock:
+                            self._last_error = "ManifestOversizedError"
+                        upload_failed = True
+                    else:
+                        # Network I/O outside _state_lock
+                        self.api.batch_bucket_files(
+                            self.bucket_id, add=[(tmp_manifest, manifest_obj)]
+                        )
+                        manifest_committed = True
                 except Exception as e:
                     with self._state_lock:
                         self._last_error = e.__class__.__name__
@@ -599,6 +604,7 @@ class HubCache:
                 if manifest_committed:
                     with self._state_lock:
                         self._last_checkpoint_at = time.time()
+                        self._last_error = None
                         # Commit state ONLY after manifest publish succeeds
                         for repo, hashes in staged_copy.items():
                             self._published_blobs.setdefault(repo, {}).update(hashes)

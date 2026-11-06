@@ -1,7 +1,8 @@
 //! Gated live test: a compaction builds the indexes a remote memory lacks. Each remote is a copy of
-//! a synthetic local memory written without any index — as a hand-uploaded snapshot is — so recall
+//! a synthetic local memory written without any index — as a hand-uploaded snapshot is — so FTS
 //! refuses it until a compaction gives it a text index: `funes compact`, with nothing pushed, and
 //! the one an ordinary push of one new chunk runs, far below the compaction threshold.
+//! Hybrid recall must keep serving vector hits while the optional text index is absent.
 //!
 //! Skipped unless `HF_FUNES_TEST_TOKEN` is set AND `trufflehog` is on PATH (push's pre-publish gate
 //! is fail-closed). To run:
@@ -20,6 +21,7 @@ use funes::commands::push::Confirm;
 use funes::memory::{dataset, Memory};
 use hf_hub::repository::CommitOperation;
 use hf_hub::{HFClient, HFRepository, RepoTypeDataset};
+use lance::index::DatasetIndexExt;
 use lance::Dataset;
 
 const OWNER: &str = "optimum-internal-testing";
@@ -29,6 +31,16 @@ const NAME: &str = "funes-test";
 async fn index_turns(source: &std::path::Path, texts: &[&str]) {
     support::write_session(source, "sess", texts);
     funes::commands::index::run_index(source, false, None).await.unwrap();
+}
+
+async fn index_names(memory: &str) -> anyhow::Result<Vec<String>> {
+    let ds = Memory::parse(memory).open().await?;
+    Ok(ds
+        .load_indices()
+        .await?
+        .iter()
+        .map(|index| index.name.clone())
+        .collect())
 }
 
 /// Upload the local memory's rows, rewritten without any index, as the memory at `<path>/lancedb`.
@@ -98,10 +110,13 @@ async fn push_builds_the_indexes_a_remote_lacks() {
     upload_without_indexes(&repo, &format!("{prefix}/forced")).await;
     upload_without_indexes(&repo, &format!("{prefix}/auto")).await;
 
+    let before_forced_indexes = index_names(&forced).await;
+    let before_auto_indexes = index_names(&auto).await;
     let before = support::recall_remote(&forced, "NOINDEXSMOKE").await;
 
     // `funes compact`, with nothing pushed.
     let compaction = funes::commands::compact::run(Memory::parse(&forced)).await;
+    let after_forced_indexes = index_names(&forced).await;
     let after_forced = support::recall_remote(&forced, "NOINDEXSMOKE").await;
 
     // One new chunk, pushed without forcing.
@@ -114,6 +129,7 @@ async fn push_builds_the_indexes_a_remote_lacks() {
     )
     .await;
     let append = funes::commands::push::run_push(Memory::parse(&auto), false, Confirm::Yes, &[]).await;
+    let after_auto_indexes = index_names(&auto).await;
     let after_auto = support::recall_remote(&auto, "NOINDEXSMOKE").await;
 
     // Cleanup before asserting, so a failed assertion can't leave the scratch path behind.
@@ -124,10 +140,21 @@ async fn push_builds_the_indexes_a_remote_lacks() {
         .send()
         .await;
 
+    assert!(before_forced_indexes.expect("forced fixture index metadata").is_empty());
+    assert!(before_auto_indexes.expect("auto fixture index metadata").is_empty());
+    assert!(!before.contains("<recall error:"), "vector recall failed: {before}");
     assert!(
-        before.contains("recall error"),
-        "recall should refuse a memory with no text index: {before}"
+        before.contains("NOINDEXSMOKE"),
+        "missing optional FTS must not discard vector hits: {before}"
     );
+    assert!(after_forced_indexes
+        .expect("forced compact index metadata")
+        .iter()
+        .any(|name| name == "text_idx"));
+    assert!(after_auto_indexes
+        .expect("auto compact index metadata")
+        .iter()
+        .any(|name| name == "text_idx"));
     let compaction = compaction.expect("compaction");
     assert!(
         compaction.contains("compacted"),

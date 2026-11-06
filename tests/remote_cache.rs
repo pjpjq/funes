@@ -1,7 +1,7 @@
 //! Gated live test: the read-through cache behind remote reads. It publishes a synthetic memory to
 //! a throwaway repo of its own (created and deleted here), so no other writer moves the head between
-//! the two recalls. A first recall over `hf://` downloads the index + touched fragments into an
-//! isolated HF cache; a second one is served from that cache and leaves it unchanged.
+//! the two recalls. A first recall over `hf://` plus explicit FTS warmup downloads the index + touched
+//! fragments into an isolated HF cache; a second recall is served from that cache and leaves it unchanged.
 //!
 //! Skipped unless `HF_FUNES_TEST_TOKEN` is set (it provides `HF_TOKEN`) AND `trufflehog` is on
 //! PATH (push's pre-publish gate is fail-closed) — and skipped with a note if the token cannot
@@ -14,10 +14,10 @@
 mod support;
 
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use funes::commands::push::Confirm;
-use funes::memory::Memory;
+use funes::memory::{dataset, Memory};
 use hf_hub::{HFClient, RepoTypeDataset};
 
 const OWNER: &str = "optimum-internal-testing";
@@ -94,6 +94,12 @@ async fn warm_recall_is_served_from_cache_without_downloading() {
 
     // Cold: the read wrapper downloads the index + touched fragments into the cache.
     let cold = recall(&uri).await;
+    // Recall can return vector hits before optional FTS finishes its three-second cold budget.
+    let cold_fts = tokio::time::timeout(Duration::from_secs(60), async {
+        let ds = Memory::parse(&uri).open().await?;
+        dataset::full_text(&ds, MARKER, 30, None, &["text"]).await
+    })
+    .await;
     let after_cold = cache_footprint(cache.path());
 
     // Warm: same head commit ⇒ every file is already cached ⇒ the cache stays as it was.
@@ -112,6 +118,13 @@ async fn warm_recall_is_served_from_cache_without_downloading() {
     assert_eq!(before, (0, 0), "cache must start empty");
     let cold = cold.expect("cold recall");
     assert!(cold.contains(MARKER), "cold recall should surface the marker: {cold}");
+    let cold_fts = cold_fts
+        .expect("FTS warmup exceeded 60 seconds")
+        .expect("cold FTS warmup");
+    assert!(
+        cold_fts.iter().any(|batch| batch.num_rows() > 0),
+        "FTS warmup must find the marker"
+    );
     assert!(
         after_cold.0 > 0,
         "cold recall must populate the cache, got {after_cold:?}"

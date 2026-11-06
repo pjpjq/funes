@@ -199,6 +199,7 @@ impl OSObjectStore for ShardStore {
         Ok(ListResult {
             common_prefixes: common_prefixes.into_iter().collect(),
             objects,
+            extensions: Default::default(),
         })
     }
 
@@ -864,6 +865,7 @@ mod tests {
     }
 
     use lance_io::object_store::WrappingObjectStore;
+    use object_store::list::PaginatedListStore;
 
     #[derive(Debug)]
     struct ShardStoreWrapping(Arc<dyn OSObjectStore>);
@@ -871,6 +873,14 @@ mod tests {
     impl WrappingObjectStore for ShardStoreWrapping {
         fn wrap(&self, _prefix: &str, _original: Arc<dyn OSObjectStore>) -> Arc<dyn OSObjectStore> {
             Arc::new(ShardStore::new(self.0.clone()))
+        }
+
+        fn wrap_paginated(
+            &self,
+            _prefix: &str,
+            _original: Arc<dyn PaginatedListStore>,
+        ) -> Option<Arc<dyn PaginatedListStore>> {
+            None
         }
     }
 
@@ -880,6 +890,14 @@ mod tests {
     impl WrappingObjectStore for PlainWrapping {
         fn wrap(&self, _prefix: &str, _original: Arc<dyn OSObjectStore>) -> Arc<dyn OSObjectStore> {
             self.0.clone()
+        }
+
+        fn wrap_paginated(
+            &self,
+            _prefix: &str,
+            _original: Arc<dyn PaginatedListStore>,
+        ) -> Option<Arc<dyn PaginatedListStore>> {
+            None
         }
     }
 

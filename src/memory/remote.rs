@@ -60,6 +60,7 @@ use lance::dataset::transaction::{Operation, Transaction};
 use lance::dataset::{ColumnAlteration, CommitBuilder, Dataset, NewColumnTransform, WriteParams};
 use lance::Error as LanceError;
 use lance_io::object_store::{ChainedWrappingObjectStore, WrappingObjectStore};
+use object_store::list::PaginatedListStore;
 use object_store::ObjectStore as OSObjectStore;
 use serde::Serialize;
 
@@ -1581,6 +1582,16 @@ impl WrappingObjectStore for CaptureWrapper {
     fn wrap(&self, _prefix: &str, original: Arc<dyn OSObjectStore>) -> Arc<dyn OSObjectStore> {
         Arc::new(CaptureStore::new(original, self.captured.clone()))
     }
+
+    /// A pushed-down listing would walk past the capture: it would miss the files written here and
+    /// still list the ones deleted here.
+    fn wrap_paginated(
+        &self,
+        _prefix: &str,
+        _original: Arc<dyn PaginatedListStore>,
+    ) -> Option<Arc<dyn PaginatedListStore>> {
+        None
+    }
 }
 
 /// Fetches a repo file whole at the pinned revision, returning its path in hf-hub's local cache.
@@ -1701,6 +1712,15 @@ impl WrappingObjectStore for FetchWrapper {
     fn wrap(&self, _prefix: &str, original: Arc<dyn OSObjectStore>) -> Arc<dyn OSObjectStore> {
         let cached = Arc::new(FetchStore::new(original, self.fetcher.clone()));
         Arc::new(ShardStore::new(cached))
+    }
+
+    /// [`FetchStore`] serves reads alone, but the surrounding [`ShardStore`] must translate listings.
+    fn wrap_paginated(
+        &self,
+        _prefix: &str,
+        _original: Arc<dyn PaginatedListStore>,
+    ) -> Option<Arc<dyn PaginatedListStore>> {
+        None
     }
 }
 
@@ -2150,6 +2170,36 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct UnusedLister;
+
+    #[async_trait]
+    impl PaginatedListStore for UnusedLister {
+        async fn list_paginated(
+            &self,
+            _prefix: Option<&str>,
+            _options: object_store::list::PaginatedListOptions,
+        ) -> object_store::Result<object_store::list::PaginatedListResult> {
+            unreachable!("listing must pass through the sharded capture wrappers")
+        }
+    }
+
+    #[test]
+    fn paginated_listing_cannot_bypass_shards_or_captured_writes() {
+        let original: Arc<dyn PaginatedListStore> = Arc::new(UnusedLister);
+        let fetch = Arc::new(FetchWrapper {
+            fetcher: Arc::new(UnusedFetcher),
+        });
+        let capture = Arc::new(CaptureWrapper {
+            captured: Captured::default(),
+        });
+        assert!(fetch.wrap_paginated("fixture", original.clone()).is_none());
+        assert!(capture.wrap_paginated("fixture", original.clone()).is_none());
+        assert!(capturing_fetch_wrapper(fetch, capture)
+            .wrap_paginated("fixture", original)
+            .is_none());
+    }
+
     /// Use the real production decorators over a deterministic backend, without Hub or Voyage.
     #[derive(Debug)]
     struct TestStoreWrapper {
@@ -2178,6 +2228,14 @@ mod tests {
             } else {
                 self.store.clone()
             }
+        }
+
+        fn wrap_paginated(
+            &self,
+            _prefix: &str,
+            _original: Arc<dyn PaginatedListStore>,
+        ) -> Option<Arc<dyn PaginatedListStore>> {
+            None
         }
     }
 

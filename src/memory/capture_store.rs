@@ -32,7 +32,7 @@ use chrono::Utc;
 use futures::stream::{self, BoxStream, StreamExt};
 use object_store::path::Path as OPath;
 use object_store::{
-    CopyOptions, Error as OSError, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
+    CopyOptions, Error as OSError, Extensions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
     ObjectStore as OSObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as OSResult,
     UploadPart,
 };
@@ -119,6 +119,7 @@ impl OSObjectStore for CaptureStore {
         Ok(PutResult {
             e_tag: None,
             version: None,
+            extensions: Extensions::default(),
         })
     }
 
@@ -264,6 +265,7 @@ impl MultipartUpload for CaptureMultipart {
         Ok(PutResult {
             e_tag: None,
             version: None,
+            extensions: Extensions::default(),
         })
     }
 

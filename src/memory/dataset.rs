@@ -186,6 +186,10 @@ pub async fn scan_rows_with_ids(ds: &Dataset, columns: &[&str], filter: Option<&
     collect(scan).await
 }
 
+/// The vector index's PQ codes shortlist this many times the rows asked for, and the stored vectors
+/// rank the shortlist: the codes alone misorder close neighbours.
+const REFINE_FACTOR: u32 = 10;
+
 /// The `limit` rows nearest to `query` by vector distance, nearest first, each with its row id.
 /// `filter` is applied before the search, not to its result: a selective filter would otherwise
 /// drop most of a globally-nearest pool and return far fewer than `limit` rows when matches exist.
@@ -211,6 +215,7 @@ pub(crate) async fn nearest_with_progress(
     let query = Float32Array::from(query.to_vec());
     let mut scan = ds.scan();
     scan.nearest("vector", &query, limit)?;
+    scan.refine(REFINE_FACTOR);
     if let Some(f) = filter {
         scan.prefilter(true);
         scan.filter(f)?;
@@ -807,7 +812,6 @@ fn fts_params(model: EmbeddingModel) -> InvertedIndexParams {
 /// Checked variant for callers, such as local indexing, that can return an index failure to the
 /// invoking user instead of only reporting it on stderr.
 pub async fn build_indexes(ds: &mut Dataset, on_event: impl Fn(IndexBuildEvent)) -> Result<()> {
-    sweep_shuffle_leftovers(&std::env::temp_dir());
     let existing = sub_index_counts(ds).await?;
     let profile = embedding_profile(ds)?;
     let fts = if profile.provider == "local" {
@@ -891,6 +895,10 @@ pub(crate) async fn indexes_need_rebuild(ds: &Dataset) -> Result<bool> {
     {
         return Ok(false);
     }
+    vector_needs_refresh(ds).await
+}
+
+async fn vector_needs_refresh(ds: &Dataset) -> Result<bool> {
     let fragments = ds
         .unindexed_fragments(VECTOR_INDEX)
         .await
@@ -955,6 +963,7 @@ const SOURCE_TYPE: IndexSpec = IndexSpec {
 
 /// Refresh `index` if `existing` lists it, else build it whole with `params`. A refresh that fails
 /// also builds it whole, so the rows it left out don't stay unindexed.
+/// A successful refresh must also cover every fragment; otherwise use the same fallback.
 async fn refresh_or_build(
     ds: &mut Dataset,
     index: &IndexSpec,
@@ -963,7 +972,15 @@ async fn refresh_or_build(
     on_event: impl Fn(IndexBuildEvent),
 ) -> Result<()> {
     if let Some(&subs) = existing.get(index.name) {
-        if optimize_index(ds, index.name, subs, &on_event).await.is_ok() {
+        // When lance cannot open one of the index's segments, it skips the refresh and still
+        // returns Ok, so only an index that now covers every fragment was refreshed.
+        if optimize_index(ds, index.name, subs, &on_event).await.is_ok()
+            && if index.name == VECTOR_INDEX {
+                vector_needs_refresh(ds).await.is_ok_and(|needed| !needed)
+            } else {
+                ds.unindexed_fragments(index.name).await.is_ok_and(|f| f.is_empty())
+            }
+        {
             return Ok(());
         }
     }
@@ -987,59 +1004,6 @@ pub(crate) async fn fts_needs_refresh(ds: &Dataset) -> Result<bool> {
         .await
         .context("checking text search index coverage")?
         .is_empty())
-}
-
-/// The files a lance IVF shuffle directory holds, and nothing else.
-const SHUFFLE_FILES: [&str; 4] = [
-    "shuffle_data.lance",
-    "shuffle_data.spill",
-    "shuffle_offsets.lance",
-    "shuffle_offsets.spill",
-];
-
-/// How long a shuffle directory must have sat untouched before a sweep may call it settled.
-const SHUFFLE_LEFTOVER_AGE: std::time::Duration = std::time::Duration::from_secs(3600);
-
-/// Best-effort: remove the shuffle directories a previous IVF build left in `$TMPDIR`.
-///
-/// lance drops the scratch directory's guard before the shuffler writes to it, so every build leaks
-/// one, tens of MB apiece (fixed in lance 13.0.0). Swept on entry, never on exit: age says a
-/// directory is settled, not that nothing is still reading it, so the current build's own is left
-/// to a later run.
-fn sweep_shuffle_leftovers(tmp_root: &std::path::Path) {
-    let Ok(entries) = std::fs::read_dir(tmp_root) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        if !entry.file_name().to_string_lossy().starts_with(".tmp") {
-            continue;
-        }
-        let path = entry.path();
-        if entry.metadata().is_ok_and(|m| {
-            m.is_dir()
-                && m.modified()
-                    .is_ok_and(|t| t.elapsed().is_ok_and(|age| age > SHUFFLE_LEFTOVER_AGE))
-        }) && holds_only_shuffle_files(&path)
-        {
-            let _ = std::fs::remove_dir_all(&path);
-        }
-    }
-}
-
-/// Whether `dir` is non-empty and every name in it is one of [`SHUFFLE_FILES`].
-fn holds_only_shuffle_files(dir: &std::path::Path) -> bool {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return false;
-    };
-    let mut seen = false;
-    for entry in entries {
-        let Ok(entry) = entry else { return false };
-        if !SHUFFLE_FILES.contains(&entry.file_name().to_string_lossy().as_ref()) {
-            return false;
-        }
-        seen = true;
-    }
-    seen
 }
 
 /// Fold an index's delta sub-indexes back into one once this many pile up. Queries fan out across
@@ -1446,7 +1410,6 @@ pub(crate) async fn fill_vectors(ds: &Dataset, ids: &[&str], vectors: &[Vec<f32>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
     #[test]
     fn maintenance_read_cache_budget_is_explicit_and_does_not_replace_store_options() {
@@ -1709,6 +1672,30 @@ mod tests {
         assert_eq!(ds.count_rows(Some("vector IS NOT NULL".into())).await.unwrap(), 256);
         assert_eq!(ds.count_rows(Some("vector IS NULL".into())).await.unwrap(), 2);
         assert_eq!(sub_index_counts(&ds).await.unwrap()[VECTOR_INDEX], 1);
+    }
+
+    #[tokio::test]
+    async fn nearest_measures_distances_on_the_stored_vectors() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = table_uri(dir.path());
+        // Far more rows than a PQ codebook's 256 centroids, so the codes can't hold the vectors exactly.
+        let n = 2000;
+        let mut ds = Dataset::write(reader(embedded(&turns(0, n))), &uri, None)
+            .await
+            .unwrap();
+        build_indexes(&mut ds, |_| {}).await.unwrap();
+        assert_eq!(sub_index_counts(&ds).await.unwrap()[VECTOR_INDEX], 1);
+
+        let batches = nearest(&ds, &vectors(n)[7], 10, None, &["turn_uuid", "_distance"])
+            .await
+            .unwrap();
+        let distance = batches[0]
+            .column_by_name("_distance")
+            .and_then(|c| c.as_any().downcast_ref::<Float32Array>())
+            .unwrap()
+            .value(0);
+        assert_eq!(strs(&batches[0], "turn_uuid").get(0), "turn7");
+        assert_eq!(distance, 0.0, "measured on the PQ codes instead of the stored vector");
     }
 
     #[tokio::test]
@@ -2229,6 +2216,9 @@ mod tests {
             std::fs::write(file.unwrap().path(), b"corrupt").unwrap();
         }
 
+        // A fresh handle, as the next `funes index` opens: the delta is read from disk, not from
+        // the cache of the handle that built it.
+        let mut ds = open(&uri, HashMap::new()).await.unwrap();
         ds.append(reader(embedded(&turns(TRAINABLE + MERGE_DELTAS, 1))), None)
             .await
             .unwrap();
@@ -2253,40 +2243,6 @@ mod tests {
             1,
             "one whole index, no delta left over"
         );
-    }
-
-    /// A directory under `root` holding `files`, backdated by `age`.
-    fn shuffle_dir(root: &std::path::Path, name: &str, files: &[&str], age: std::time::Duration) -> PathBuf {
-        let dir = root.join(name);
-        std::fs::create_dir(&dir).unwrap();
-        for f in files {
-            std::fs::write(dir.join(f), b"x").unwrap();
-        }
-        let when = std::time::SystemTime::now() - age;
-        std::fs::File::open(&dir).unwrap().set_modified(when).unwrap();
-        dir
-    }
-
-    #[test]
-    fn sweep_reclaims_only_settled_shuffle_dirs() {
-        let hour = SHUFFLE_LEFTOVER_AGE;
-        let root = tempfile::tempdir().unwrap();
-        let root = root.path();
-
-        let stale = shuffle_dir(root, ".tmpStale", &SHUFFLE_FILES, hour * 2);
-        // A build still writing: its shuffle files are there, but so are object_store's staging files.
-        let writing = shuffle_dir(root, ".tmpWriting", &["shuffle_data.lance", ".tmpStaging"], hour * 2);
-        let fresh = shuffle_dir(root, ".tmpFresh", &SHUFFLE_FILES, std::time::Duration::ZERO);
-        let foreign = shuffle_dir(root, ".tmpForeign", &["notes.txt"], hour * 2);
-        let empty = shuffle_dir(root, ".tmpEmpty", &[], hour * 2);
-        let named = shuffle_dir(root, "scratch", &SHUFFLE_FILES, hour * 2);
-
-        sweep_shuffle_leftovers(root);
-
-        assert!(!stale.exists(), "a settled shuffle dir must be reclaimed");
-        for kept in [&writing, &fresh, &foreign, &empty, &named] {
-            assert!(kept.exists(), "{} must be left alone", kept.display());
-        }
     }
 
     #[test]
@@ -2378,6 +2334,14 @@ mod tests {
             original: Arc<dyn object_store::ObjectStore>,
         ) -> Arc<dyn object_store::ObjectStore> {
             original
+        }
+
+        fn wrap_paginated(
+            &self,
+            _prefix: &str,
+            original: Arc<dyn object_store::list::PaginatedListStore>,
+        ) -> Option<Arc<dyn object_store::list::PaginatedListStore>> {
+            Some(original)
         }
     }
 
@@ -2545,6 +2509,17 @@ mod tests {
             .unwrap();
         assert!(!ds.unindexed_fragments(VECTOR_INDEX).await.unwrap().is_empty());
         assert!(!indexes_need_rebuild(&ds).await.unwrap());
+        let base = ds
+            .load_indices()
+            .await
+            .unwrap()
+            .iter()
+            .find(|index| index.name == VECTOR_INDEX)
+            .unwrap()
+            .uuid;
+        build_indexes(&mut ds, |_| {}).await.unwrap();
+        assert!(ds.load_indices().await.unwrap().iter().any(|index| index.uuid == base));
+        assert_eq!(ds.count_rows(Some("vector IS NULL".into())).await.unwrap(), 2);
         let vector = vectors(1).pop().unwrap();
         ds = fill_vectors(&ds, &[pending[0].id.as_str()], &[vector]).await.unwrap();
         assert!(indexes_need_rebuild(&ds).await.unwrap());

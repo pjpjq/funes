@@ -199,6 +199,7 @@ impl OSObjectStore for ShardStore {
         Ok(ListResult {
             common_prefixes: common_prefixes.into_iter().collect(),
             objects,
+            extensions: Default::default(),
         })
     }
 

@@ -2187,11 +2187,17 @@ mod tests {
     #[test]
     fn paginated_listing_cannot_bypass_shards_or_captured_writes() {
         let original: Arc<dyn PaginatedListStore> = Arc::new(UnusedLister);
-        let fetch = Arc::new(FetchWrapper { fetcher: Arc::new(UnusedFetcher) });
-        let capture = Arc::new(CaptureWrapper { captured: Captured::default() });
+        let fetch = Arc::new(FetchWrapper {
+            fetcher: Arc::new(UnusedFetcher),
+        });
+        let capture = Arc::new(CaptureWrapper {
+            captured: Captured::default(),
+        });
         assert!(fetch.wrap_paginated("fixture", original.clone()).is_none());
         assert!(capture.wrap_paginated("fixture", original.clone()).is_none());
-        assert!(capturing_fetch_wrapper(fetch, capture).wrap_paginated("fixture", original).is_none());
+        assert!(capturing_fetch_wrapper(fetch, capture)
+            .wrap_paginated("fixture", original)
+            .is_none());
     }
 
     /// Use the real production decorators over a deterministic backend, without Hub or Voyage.

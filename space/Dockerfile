@@ -26,9 +26,12 @@ FROM python:3.12-slim-bookworm
 COPY --from=build /src/target/release/funes /usr/local/bin/funes
 COPY --from=build /usr/local/bin/trufflehog /usr/local/bin/trufflehog
 COPY space/server.py /app/server.py
+COPY space/canonical_ab.py /app/space/canonical_ab.py
 COPY service /app/service
 RUN pip install --no-cache-dir -r /app/service/requirements.txt
 ENV FUNES_HOME=/data/.funes \
+    HF_HOME=/data/huggingface \
+    HF_HUB_CACHE=/data/huggingface/hub \
     PYTHONUNBUFFERED=1 \
     PORT=7860 \
     FUNES_EMBEDDING_PROVIDER=voyage \
@@ -40,7 +43,15 @@ ENV FUNES_HOME=/data/.funes \
     FUNES_NATIVE_FALLBACK=false \
     FUNES_RETRIEVAL_LANGUAGE_MODE=raw \
     FUNES_CANONICAL_INDEX_ACTIVE_INTERVAL=1 \
-    FUNES_CANONICAL_INDEX_IDLE_INTERVAL=300
+    FUNES_CANONICAL_INDEX_IDLE_INTERVAL=300 \
+    FUNES_CANONICAL_INDEX_BATCH=512 \
+    FUNES_CANONICAL_INDEX_REQUEST_ROWS=64 \
+    FUNES_CANONICAL_INDEX_MAX_CHARS=192000 \
+    FUNES_CANONICAL_INDEX_MIN_REQUEST_INTERVAL=1 \
+    FUNES_VOYAGE_CONCURRENCY=4 \
+    FUNES_VOYAGE_MAX_REQUEST_TOKENS=9000 \
+    FUNES_VOYAGE_TOKENS_PER_MINUTE=120000 \
+    FUNES_VOYAGE_MIN_REQUEST_INTERVAL=0
 RUN mkdir -p /data/.funes/sources
 WORKDIR /app
 EXPOSE 7860

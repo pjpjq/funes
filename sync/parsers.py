@@ -1,5 +1,6 @@
 from __future__ import annotations
 import hashlib, json, re
+from datetime import datetime, timezone
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any, Iterable
@@ -660,24 +661,76 @@ def _parse_claude_native(source: Source, start: int = 0) -> list[Chunk]:
             obj = json.loads(line)
         except Exception:
             continue
-        typ = str(obj.get("type") or "")
-        if typ not in {"user", "assistant", "system", "summary"}:
+        if not isinstance(obj, dict):
             continue
-        msg = obj.get("message") if isinstance(obj.get("message"), dict) else obj
-        role = str(msg.get("role") or typ)
-        text = _native_text(msg.get("content", obj.get("summary", "")))
-        ctype = {"user": "user_message", "assistant": "assistant_message", "system": "system", "summary": "summary"}.get(typ, typ)
-        sid = _session_value(obj) or session
-        mid = _native_value(obj)
-        record_type = typ
-        chunk = _chunk(source, ordinal=ordinal, session=sid, message=mid, role=role, text=text,
-                       raw=line, timestamp=_timestamp_value(obj), content_type=ctype,
-                       parent_session=str(obj.get("parentUuid") or ""),
-                       agent_id=str(obj.get("agentId") or ""),
-                       metadata={"is_sidechain": bool(obj.get("isSidechain")), "git_branch": obj.get("gitBranch")},
-                       worktree=str(obj.get("cwd") or ""), record_type=record_type)
-        if chunk:
-            out.append(chunk)
+        typ = str(obj.get("type") or "")
+        if typ in {"user", "assistant", "system", "summary"}:
+            msg = obj.get("message") if isinstance(obj.get("message"), dict) else obj
+            role = str(msg.get("role") or typ)
+            text = _native_text(msg.get("content", obj.get("summary", "")))
+            ctype = {"user": "user_message", "assistant": "assistant_message", "system": "system", "summary": "summary"}.get(typ, typ)
+            sid = _session_value(obj) or session
+            mid = _native_value(obj)
+            record_type = typ
+            chunk = _chunk(source, ordinal=ordinal, session=sid, message=mid, role=role, text=text,
+                           raw=line, timestamp=_timestamp_value(obj), content_type=ctype,
+                           parent_session=str(obj.get("parentUuid") or ""),
+                           agent_id=str(obj.get("agentId") or ""),
+                           metadata={"is_sidechain": bool(obj.get("isSidechain")), "git_branch": obj.get("gitBranch")},
+                           worktree=str(obj.get("cwd") or ""), record_type=record_type)
+            if chunk:
+                out.append(chunk)
+            continue
+        display = obj.get("display")
+        if isinstance(display, str) and display.strip():
+            role = "user"
+            ctype = "user_message"
+            record_type = "user_message"
+            sid = str(obj.get("sessionId") or obj.get("session_id") or session)
+            project = str(obj.get("project") or "") or source.project
+            ts_raw = obj.get("timestamp")
+            if isinstance(ts_raw, (int, float)) and not isinstance(ts_raw, bool):
+                if ts_raw > 0:
+                    try:
+                        sec = ts_raw / 1000.0 if ts_raw > 1e11 else float(ts_raw)
+                        ts = datetime.fromtimestamp(sec, timezone.utc).isoformat()
+                    except Exception:
+                        ts = str(ts_raw)
+                else:
+                    ts = ""
+            elif isinstance(ts_raw, str):
+                ts_clean = ts_raw.strip()
+                if ts_clean.isdigit():
+                    try:
+                        val = float(ts_clean)
+                        if val > 0:
+                            sec = val / 1000.0 if val > 1e11 else val
+                            ts = datetime.fromtimestamp(sec, timezone.utc).isoformat()
+                        else:
+                            ts = ""
+                    except Exception:
+                        ts = ts_raw
+                else:
+                    ts = ts_clean
+            else:
+                ts = ""
+            chunk = _chunk(
+                source,
+                ordinal=ordinal,
+                session=sid,
+                message="",
+                role=role,
+                text=display,
+                raw=line,
+                timestamp=ts,
+                content_type=ctype,
+                metadata={},
+                record_type=record_type,
+                project=project,
+            )
+            if chunk:
+                out.append(chunk)
+            continue
     return out
 
 

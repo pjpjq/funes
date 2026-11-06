@@ -1,16 +1,16 @@
 //! funes — recall over your past AI agent sessions.
 //!
 //! Pipeline: parse transcripts → chunk → embed → store (lance), then read via
-//! `recall` (hybrid → rerank → recency → neighbors), `get`, `status`.
-//! The binary ([`main`]) is a thin CLI over these modules; integration tests drive
-//! them directly.
+//! `recall` (hybrid → reranked when the pool exceeds the hits → neighbors), `get`, `status`.
+//! The binary (`main.rs`) is the CLI's definitions and dispatch, nothing else; integration
+//! tests drive the commands directly.
 //!
 //! One directory per layer, each with one job:
 //!
-//! - [`traces`] — where sessions come from and how each harness's transcript is parsed, plus the
-//!   `Turn`/`Block` model every parser produces.
-//! - [`chunk`], [`scan`] — the two models the layers share: chunk text and its ids, and secret
-//!   findings.
+//! - [`traces`] — where turns come from: turns files, the spools integrations write them into,
+//!   and the `Turn`/`Block` model they produce.
+//! - [`chunk`], [`scan`], [`home`] — what the layers share: chunk text and its ids, secret
+//!   findings, and where funes's home keeps each thing.
 //! - [`inference`] — embedding and reranking behind traits, so a backend swaps at build time.
 //! - [`hub`] — *transport*: the Hugging Face Hub's client, credentials, and dataset-repo identity
 //!   and lifecycle. Knows nothing about memories; four layers call it.
@@ -33,10 +33,10 @@ compile_error!("funes is unix-only (Linux/macOS)");
 pub mod agents;
 pub mod chunk;
 pub mod commands;
+pub mod home;
 pub mod hub;
 pub mod inference;
 pub mod memory;
 pub mod scan;
-pub mod session_sketch;
 pub mod traces;
 pub mod ui;

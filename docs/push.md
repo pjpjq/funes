@@ -12,8 +12,9 @@ funes recall "..." --memory <user|org>/funes-memory   # read it back from anywhe
 
 ## `funes push`
 
-`funes push <memory>` uploads the chunks your local memory has that the remote doesn't. The memory is an
-`<org>/<repo>` shorthand or a full `hf://…` URI.
+`funes push <memory>` uploads the embedded chunks your local memory has that the remote doesn't.
+Chunks awaiting embedding stay local; after indexing fills their vectors, the next push includes
+them. The memory is an `<org>/<repo>` shorthand or a full `hf://…` URI.
 
 On its **first publish**, push also writes the repo's dataset card — what a funes memory is, how to
 recall from it, live stats — tagged [`funes`](https://huggingface.co/datasets?other=funes) so every
@@ -23,19 +24,44 @@ you wrote yourself is never touched.
 | Flag | Meaning |
 | --- | --- |
 | `-y`, `--yes` | Skip the wrong-memory confirmation (below). |
-| `--force-reindex` | Refresh the remote index after pushing even if the backlog is below the auto-reindex threshold; with nothing new to push, reindex only. |
+| `--compact` | Compact the remote after pushing, even if the unindexed backlog is below the threshold that triggers it. With nothing new to push, compact only. `--force-reindex` is the old name. |
 
-**The wrong-memory guard.** A first push to a memory your local memory shares no chunks with — a first
-push, a new host, or genuinely the wrong memory — asks before uploading. Off a terminal it refuses
-rather than guess; `--yes` overrides. ([`funes add`](add.md) clears this for you by doing the first
-push interactively — once that machine has an index of its own to push.)
+Once 500 pushed rows sit unindexed on the remote, a push also compacts it: it merges the small
+fragments, adds those rows to the search indexes, and deletes the old versions.
+`funes compact <memory>` does the same without pushing ([index.md](index.md#compaction)).
+
+**The wrong-memory guard.** A push to a memory that holds none of the chunks it would publish asks
+before uploading, and says which case it found: sessions named with `--sessions` that the memory
+lacks, an empty memory (a first publish), chunks from other hosts only (a new host of yours), or
+nothing in common with a memory that held chunks from this host before (what the wrong memory looks like).
+Off a terminal it refuses rather than guess; `--yes` overrides. ([`funes add`](add.md) clears this
+for you by doing the first push interactively — once that machine has an index of its own to push.)
 
 If your token can't write the target, push says so — recall can still read a memory you can't publish
 to.
 
+A memory holds one embedding model's vectors, so a push into a memory embedded with another model than
+the local one is refused. A first publish with no chunks to upload still creates the memory with the
+local one's model, so every host that binds it next embeds with the same.
+
 One publish per memory at a time on a machine: a push that starts while another is still running
 says so and stops, and the next one picks up what it left. The hooks [`funes add`](add.md) installs
 run this at session boundaries automatically; see [automation.md](automation.md).
+
+### Hub file layout and compatibility
+
+New files appended to an existing remote Lance table are stored under
+`__funes_shards__/v1/<bucket>/<logical-path>`, with a deterministic SHA-256 bucket. Funes presents
+the original logical paths to Lance, merging these new files with the unchanged flat history.
+This avoids the Hub's per-directory file limit without deleting old manifests, transactions, or
+vectors. Data uploads still precede the manifest, transaction, and version-hint activation commit.
+
+The first publish remains a standard flat Lance dataset. After a sharded append, readers need a
+Funes version that understands this layout (including the deployed HTTP/MCP bridge). A plain
+Lance client or older Funes binary can only see the last flat snapshot; rolling back to such a
+binary does not roll back the underlying data. Keep the sharded reader when restoring or
+rebuilding derived indexes. No local-only shard inventory is required for recovery: it is
+reconstructed from the pinned Hub revision.
 
 ## Keeping secrets out: the gate and `funes scrub`
 
@@ -57,8 +83,8 @@ $ echo $?
 2
 ```
 
-A hold-back is easy to miss when the hooks push in the background, so `funes status <memory>`
-scans this host's pending rows the same way and reports what a push would hold back, until a
+A hold-back is easy to miss when the hooks push in the background, so `funes status` scans this
+host's pending rows for the bound memory the same way and reports what a push would hold back, until a
 scrub lets them publish.
 
 `funes push` and `funes scrub` refuse to run unscanned when TruffleHog is unavailable. See the
@@ -82,6 +108,10 @@ block, then makes one replacement commit:
 - Clean rows retain their existing embeddings. The vector and full-text indexes are rebuilt after
   the replacement.
 
+Scrub then deletes every older version of the memory from disk, so the pre-scrub rows can't be read
+back from the dataset's files. It does this even when it finds nothing to redact, so rerunning scrub
+also removes the old versions an earlier scrub left.
+
 The source transcripts are never modified. Scrub reports how many secrets and blocks it redacted and
 how many rows it had to drop. A completed scrub leaves a memory that scans clean, so the next
 `funes push <memory>` has nothing left to hold back; the repaired local rows pass through the
@@ -93,17 +123,17 @@ automate remote deletion.
 
 ## Publishing a selection: `--sessions`
 
-A push ships every local chunk the remote doesn't have. To publish a *selection* instead, name the
-sessions:
+A push ships every embedded local chunk the remote doesn't have. To publish a *selection* instead,
+name the sessions:
 
 ```bash
 funes push <memory> --sessions <session> --sessions <session>
 ```
 
-Those sessions' chunks are exactly what ships. The list **is** the decision — funes keeps no record
-of what you meant to publish, so a selection is made where it takes effect, and an unrecognized
-session id fails the push rather than quietly publishing the rest. `funes sessions` lists the ids,
-and a session is published whole: naming it publishes every chunk it holds.
+Those sessions' embedded chunks are exactly what ships. The list **is** the decision — funes keeps
+no record of what you meant to publish, so a selection is made where it takes effect, and an
+unrecognized session id fails the push rather than quietly publishing the rest. `funes sessions`
+lists the ids, and naming a session publishes every embedded chunk it holds.
 
 The remote is append-only, so a selection is a pre-publication gate and not a remote undo. Nothing
 retracts a session once it is up.
@@ -113,19 +143,17 @@ against your criteria and reports them, and the person publishing passes that li
 
 ## Inspecting a memory: `status`
 
-`funes status` takes an optional memory (an `<org>/<repo>`, an `hf://…` URI, a local path, or
-`local`); with none it acts on your local memory.
-
-```bash
-funes status                 # memory label, chunk/session counts, last indexed (and an update check)
-funes status <org>/<repo>    # …and what this host has or has not pushed there
-```
+`funes status` shows your local memory, then the memory this host is bound to (by
+[`funes bind`](add.md#binding-a-memory)), and an update check. A host set up by a funes from
+before the binding is told what its agents were bound to, and what binds it.
 
 `funes status` tells you whether recall is reading your own memory yet, and whether a newer funes
-release is out. When work exists, local-index sections report how many source sessions the latest
-indexing sweep left pending and the command to run; a completed sweep stays quiet. The status read
-uses the sweep's small coverage snapshot rather than recursively scanning transcript trees. For a
-personal remote memory, one `local push` line says either that this host is up to date or how many
+release is out. Its local-index sections distinguish chunks awaiting embedding from source
+sessions not yet indexed. Run `funes index` to continue either. Each memory also lists the
+languages its sessions are written in, with each one's share, and how many chunks the counts cover
+when they miss some.
+
+For the bound memory, one `local push` line says either that this host is up to date or how many
 local sessions are pending. This comes from a per-remote receipt kept on this host, so sessions
 contributed by other hosts do not distort the result and status never scans the remote to compute
 it. Run `funes push <memory>` once to initialize the receipt for an existing memory.

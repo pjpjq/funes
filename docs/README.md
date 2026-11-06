@@ -7,8 +7,8 @@ This directory contains the user guides and design notes for
 
 - [Adding and removing funes](add.md) — install or remove the tools and automation for Claude Code,
   Codex, pi, or Hermes.
-- [Building the memory](index.md) — index session transcripts and understand the indexing
-  pipeline.
+- [Building the memory](index.md) — index session transcripts, resume unfinished work, and compact
+  a memory.
 - [Recalling](recall.md) — retrieve passages and drill into their surrounding turns.
 - [Browsing sessions](sessions.md) — list what a memory holds, digest a session, scan one for a
   literal.
@@ -26,7 +26,11 @@ This directory contains the user guides and design notes for
 
 ## Design and reference
 
+- [Writing an integration](../CONTRIBUTING.md#writing-an-integration) — build, test, publish, and
+  list support for another agent or client.
 - [Why funes](RATIONALE.md) — the rationale behind funes's core design choices.
+- [The funes JSONL format](funes-jsonl.md) — the shared format integrations and other producers write:
+  fields, identity rules, validation, versioning.
 - [Storage growth](storage.md) — measured storage costs and growth estimates.
 - [Memory-tool landscape](landscape.md) — a comparison with other agent-memory tools.
 

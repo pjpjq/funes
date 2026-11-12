@@ -121,8 +121,9 @@ jobs:
       # Unit tests only here — hermetic, no network but the weights above. The integration test
       # that runs the real embedder lives in its own job below. --nocapture: the agreement test
       # says in the log whether it ran on the GPU or skipped for want of one.
-      - name: Unit tests
-        run: cargo test --lib --profile ci -- --nocapture
+      # The reachability regression uses only an isolated loopback HTTP fixture.
+      - name: Unit tests and reachability regression
+        run: cargo test --lib --test remote_reachability --profile ci -- --nocapture
 
       - name: Save model weights
         if: ${{ !cancelled() && github.ref == 'refs/heads/main' && steps.models.outputs.cache-hit != 'true' }}

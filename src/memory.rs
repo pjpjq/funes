@@ -296,7 +296,8 @@ pub async fn remote_reachability(uri: &str) -> Reachability {
         Ok(c) => c.dataset(owner, name),
         Err(_) => return Reachability::Ok,
     };
-    match tokio::time::timeout(PROBE_TIMEOUT, repo.info().send()).await {
+    // Only existence matters here; listing every sibling can exhaust the probe's deadline.
+    match tokio::time::timeout(PROBE_TIMEOUT, repo.info().expand(vec!["sha".into()]).send()).await {
         Err(_elapsed) => Reachability::Offline,
         Ok(Ok(_)) => Reachability::Ok,
         Ok(Err(HFError::RepoNotFound { .. })) => Reachability::Missing,

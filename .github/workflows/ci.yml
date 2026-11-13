@@ -99,7 +99,7 @@ jobs:
 
   integration-test:
     name: Integration Test (real embedder)
-    runs-on: sengi-basic-8-ubuntu-2404
+    runs-on: sengi-basic-4-ubuntu-2404
     needs: lint-test
     timeout-minutes: 45
     env:
@@ -163,7 +163,7 @@ jobs:
   onnx-variant:
     name: ONNX Variant (merge only)
     if: github.event_name == 'push'
-    runs-on: sengi-basic-8-ubuntu-2404
+    runs-on: sengi-basic-4-ubuntu-2404
     needs: lint-test
     timeout-minutes: 45
     env:

@@ -28,8 +28,6 @@ on:
           - minor
           - major
 
-permissions:
-  contents: write
 
 # On pull requests the build jobs run (to validate the release build) but compute/publish
 # don't; cancel superseded PR runs. Tag/dispatch runs key on run_id, so they never cancel.
@@ -41,12 +39,16 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: "1"
 
+permissions: {}
+
 jobs:
   # Dispatch-only: work out the release version (strip +dev, then bump). Nothing is written or
   # pushed here — the version is stamped into each build's working tree, and only the tag and the
   # dev-bump branch are pushed by `publish` after the builds succeed, so a failed build never tags a
   # release or pushes a bump branch.
   compute:
+    permissions:
+      contents: read
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -77,18 +79,23 @@ jobs:
 
       - name: Resolve bump type
         id: bump
+        env:
+          INPUT_BUMP: ${{ inputs.bump }}
+          DETECTED_BUMP: ${{ steps.detect.outputs.detected }}
         run: |
-          BUMP="${{ inputs.bump }}"
-          [ "$BUMP" = "auto" ] && BUMP="${{ steps.detect.outputs.detected }}"
+          BUMP="$INPUT_BUMP"
+          [ "$BUMP" = "auto" ] && BUMP="$DETECTED_BUMP"
           echo "type=$BUMP" >> "$GITHUB_OUTPUT"
 
       - name: Compute new version
         id: version
+        env:
+          BUMP_TYPE: ${{ steps.bump.outputs.type }}
         run: |
           CURRENT=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)"/\1/')
           BASE="${CURRENT%%+*}" # drop any +dev build-metadata before bumping
           IFS='.' read -r MAJOR MINOR PATCH <<< "$BASE"
-          case "${{ steps.bump.outputs.type }}" in
+          case "$BUMP_TYPE" in
             major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
             minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
             patch) PATCH=$((PATCH + 1)) ;;
@@ -98,6 +105,8 @@ jobs:
           echo "tag=v${NEW}" >> "$GITHUB_OUTPUT"
 
   build-linux:
+    permissions:
+      contents: read
     name: Build Linux (${{ matrix.arch }})
     needs: [compute]
     if: |
@@ -127,26 +136,24 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             arch: aarch64
             runner: sengi-basic-8-ubuntu-2404
-            features: --features vendored-openssl
             objdump: aarch64-linux-gnu-objdump
     steps:
       # Everything the bare container lacks: compilers and binutils, git for checkout/rust-cache,
       # perl for the version stamp, curl/ca-certificates for the toolchain installs, wget for
-      # setup-mold, pkg-config + libssl-dev for the native x86_64 TLS link, cmake for zstd-sys,
-      # unzip for bootstrap-protoc, zstd for rust-cache compression.
+      # setup-mold, cmake for zstd-sys, zstd for rust-cache compression, protoc used by lance.
       - name: Install build dependencies
         run: |
           apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            build-essential git perl curl ca-certificates pkg-config libssl-dev cmake unzip wget zstd
+            build-essential git perl curl ca-certificates cmake wget zstd protobuf-compiler
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+      - uses: dtolnay/rust-toolchain@46817827a5bfabe028bf34e1cce71fd40e2ff697 # 1.95.0
         with:
           targets: ${{ matrix.target }}
 
-      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+      - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
         with:
           # Keyed by profile: fat-LTO deps have different fingerprints than the fast profile's, so a
           # shared key would make each profile's build restore the other's artifacts and recompile.
@@ -156,17 +163,11 @@ jobs:
 
       # Faster, lower-memory linker — keeps the heavy lance link in budget. The action runs as
       # root inside the container (no sudo) and downloads with wget, installed above.
-      - uses: rui314/setup-mold@7e4f20ad28a2e8ca6fd0892ccf72e2abb706b9c3 # v1
-
-      # 22.04's packaged protoc is too old for the lance protos; bootstrap the pinned one.
-      - name: Install protoc
-        run: |
-          ./scripts/bootstrap-protoc.sh
-          echo "PROTOC=$PWD/.tools/protoc/bin/protoc" >> "$GITHUB_ENV"
+      - uses: rui314/setup-mold@da13e0b42e392e3a45d1215033a2270b849d7d36 # v1
 
       # aarch64 is cross-compiled inside the same 22.04 container, so its sysroot pins the same
       # glibc 2.35 floor. gcc-aarch64-linux-gnu links the binary and (via the cc crate) builds
-      # vendored OpenSSL for the target; g++-aarch64-linux-gnu brings the target libstdc++.
+      # the C dependencies for the target; g++-aarch64-linux-gnu brings the target libstdc++.
       # cc derives the tool names from the target triple, so installing the packages is enough.
       - name: Install aarch64 cross toolchain
         if: matrix.arch == 'aarch64'
@@ -182,14 +183,16 @@ jobs:
       # it via CARGO_PKG_VERSION. Skipped on tag/PR builds, which use Cargo.toml as-is.
       - name: Set release version
         if: needs.compute.outputs.version != ''
-        run: perl -i -pe 'if (!$d && s/^version = ".*"/version = "${{ needs.compute.outputs.version }}"/) { $d = 1 }' Cargo.toml
+        env:
+          NEW_VERSION: ${{ needs.compute.outputs.version }}
+        run: perl -i -pe 'if (!$d && s/^version = ".*"/version = "$ENV{NEW_VERSION}"/) { $d = 1 }' Cargo.toml
 
       - name: Build
-        run: cargo build --profile ${{ env.PROFILE }} --target ${{ matrix.target }} ${{ matrix.features }}
+        run: cargo build --profile ${PROFILE} --target ${{ matrix.target }}
 
       - name: Check binary version
         run: |
-          BIN="target/${{ matrix.target }}/${{ env.PROFILE }}/funes"
+          BIN="target/${{ matrix.target }}/${PROFILE}/funes"
           EXPECTED=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)"/\1/')
           if [ "${{ matrix.arch }}" = "aarch64" ]; then
             REPORTED=$(qemu-aarch64 -L /usr/aarch64-linux-gnu "$BIN" --version)
@@ -201,7 +204,7 @@ jobs:
       # The point of the container build: fail loudly if anything drags the floor above 22.04.
       - name: Check the glibc floor
         run: |
-          BIN="target/${{ matrix.target }}/${{ env.PROFILE }}/funes"
+          BIN="target/${{ matrix.target }}/${PROFILE}/funes"
           MAX=$(${{ matrix.objdump }} -T "$BIN" | grep -o 'GLIBC_[0-9.]*' | sort -V | tail -1)
           echo "max glibc symbol version: $MAX"
           if [ "$(printf '%s\n' "${MAX#GLIBC_}" 2.35 | sort -V | tail -1)" != "2.35" ]; then
@@ -212,15 +215,17 @@ jobs:
       - name: Package
         run: |
           mkdir -p dist
-          cp "target/${{ matrix.target }}/${{ env.PROFILE }}/funes" "dist/funes-${{ matrix.arch }}-linux"
+          cp "target/${{ matrix.target }}/${PROFILE}/funes" "dist/funes-${{ matrix.arch }}-linux"
           chmod +x dist/*
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: linux-${{ matrix.arch }}
           path: dist/
 
   build-macos:
+    permissions:
+      contents: read
     name: Build macOS (arm64)
     needs: [compute]
     if: |
@@ -234,11 +239,11 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+      - uses: dtolnay/rust-toolchain@46817827a5bfabe028bf34e1cce71fd40e2ff697 # 1.95.0
         with:
           targets: aarch64-apple-darwin
 
-      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+      - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
         with:
           key: release-aarch64-apple-darwin-${{ env.PROFILE }}
 
@@ -247,24 +252,26 @@ jobs:
 
       - name: Set release version
         if: needs.compute.outputs.version != ''
-        run: perl -i -pe 'if (!$d && s/^version = ".*"/version = "${{ needs.compute.outputs.version }}"/) { $d = 1 }' Cargo.toml
+        env:
+          NEW_VERSION: ${{ needs.compute.outputs.version }}
+        run: perl -i -pe 'if (!$d && s/^version = ".*"/version = "$ENV{NEW_VERSION}"/) { $d = 1 }' Cargo.toml
 
       - name: Build
-        run: cargo build --profile ${{ env.PROFILE }} --target aarch64-apple-darwin
+        run: cargo build --profile ${PROFILE} --target aarch64-apple-darwin
 
       - name: Check binary version
         run: |
           EXPECTED=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)"/\1/')
-          REPORTED=$(target/aarch64-apple-darwin/${{ env.PROFILE }}/funes --version)
+          REPORTED=$(target/aarch64-apple-darwin/${PROFILE}/funes --version)
           test "$REPORTED" = "funes $EXPECTED"
 
       - name: Package
         run: |
           mkdir -p dist
-          cp target/aarch64-apple-darwin/${{ env.PROFILE }}/funes dist/funes-arm64-apple-darwin
+          cp target/aarch64-apple-darwin/${PROFILE}/funes dist/funes-arm64-apple-darwin
           chmod +x dist/*
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: macos-arm64
           path: dist/
@@ -291,21 +298,24 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: artifacts
           pattern: "{linux-*,macos-*}"
           merge-multiple: true
 
       - name: Validate release metadata and generate checksums
+        env:
+          TAG_NAME: ${{ needs.compute.outputs.tag || github.ref_name }}
+          COMPUTED_VERSION: ${{ needs.compute.outputs.version }}
         run: |
-          TAG="${{ needs.compute.outputs.tag || github.ref_name }}"
+          TAG="$TAG_NAME"
           VERSION="${TAG#v}"
           if ! printf '%s' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
             echo "::error::release tag must have the form vMAJOR.MINOR.PATCH: $TAG"
             exit 1
           fi
-          COMPUTED="${{ needs.compute.outputs.version }}"
+          COMPUTED="$COMPUTED_VERSION"
           if [ -n "$COMPUTED" ] && [ "$VERSION" != "$COMPUTED" ]; then
             echo "::error::tag $TAG does not match computed version $COMPUTED"
             exit 1
@@ -338,9 +348,11 @@ jobs:
       - name: Tag and publish the release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ needs.compute.outputs.tag || github.ref_name }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
-          TAG="${{ needs.compute.outputs.tag || github.ref_name }}"
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          TAG="$TAG_NAME"
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
             git tag "$TAG"
             git push origin "$TAG"
           fi
@@ -354,8 +366,9 @@ jobs:
       - name: Publish binaries and installer to the Hugging Face bucket
         env:
           HF_TOKEN: ${{ secrets.HF_FUNES_RELEASE_TOKEN }}
+          TAG_NAME: ${{ needs.compute.outputs.tag || github.ref_name }}
         run: |
-          TAG="${{ needs.compute.outputs.tag || github.ref_name }}"
+          TAG="$TAG_NAME"
           python3 -m venv "$RUNNER_TEMP/hfvenv"
           "$RUNNER_TEMP/hfvenv/bin/pip" install -q -U "huggingface_hub>=1.21"
           HF="$RUNNER_TEMP/hfvenv/bin/hf"
@@ -373,9 +386,11 @@ jobs:
       # "create PR" link in the run summary; a maintainer opens that PR and merges it.
       - name: Push the dev-bump branch
         if: needs.compute.outputs.version != ''
+        env:
+          NEW_VERSION: ${{ needs.compute.outputs.version }}
         run: |
-          DEV="${{ needs.compute.outputs.version }}+dev"
-          BRANCH="chore/bump-dev-${{ needs.compute.outputs.version }}"
+          DEV="${NEW_VERSION}+dev"
+          BRANCH="chore/bump-dev-${NEW_VERSION}"
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git switch -c "$BRANCH"

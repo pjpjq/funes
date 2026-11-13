@@ -28,8 +28,8 @@ more recent.
 memory must decide at write time what each new piece of information supersedes — and every
 wrong call loses information *silently*, by overwriting the right answer with a confident
 wrong one. funes makes no write-time decisions at all. Every passage stays, and obsolescence
-is resolved at **read time**: recency weighting, plus a reader (you, or the model) who can
-see both the old and the new passage and judge. A log also keeps what a knowledge base
+is resolved at **read time**, by a reader (you, or the model) who can see both the old and the
+new passage and judge. A log also keeps what a knowledge base
 throws away — the superseded passage is often the answer itself: *what did we try before,
 and why did we move off it?*
 
@@ -56,7 +56,8 @@ decay relative to it.
 
 ### 3. Local-first, model-agnostic, on storage you own
 
-Local embeddings (`BAAI/bge-small-en-v1.5`) and a local cross-encoder reranker. The only
+Local embeddings (an English or a multilingual model, chosen per memory) and a local
+cross-encoder reranker, used only on a deep pool. The only
 state is a derived, rebuildable memory; the transcripts are the source of truth. Any model
 can query it — switch models per task; nothing is trained into weights.
 
@@ -93,6 +94,37 @@ about what matters right now. funes bets the model is the best judge of *when* i
 worth consulting — the same bet, applied to timing, that the other choices apply to
 interpretation. Pulled on demand, context stays clean and recall happens for a reason.
 
+## Why integrations live outside this repository
+
+funes owns the shared memory pipeline: the turns format, indexing, storage, recall, and publishing.
+An agent integration owns the parts that follow that agent: converting its transcripts, registering
+tools, and installing hooks or event handlers. The [integration contract](../CONTRIBUTING.md#the-integration-contract)
+connects those parts to funes through its CLI, MCP server, and turns files.
+
+Agent transcript formats and configuration change on their own schedules. Keeping their converters
+and setup code outside this repository lets their maintainers test and release fixes independently
+of the Rust binary. It also keeps funes's tests focused on the common formats and memory behavior;
+each integration keeps tests for its transcript conversion, configuration, and hooks.
+
+The same boundary lets a contributor add support for an agent without waiting for a change to
+funes. Authors choose where to host their code, how to release it, and which workflows to support.
+Hugging Face maintains its integrations in
+[huggingface/funes-integrations](https://github.com/huggingface/funes-integrations); other authors
+maintain theirs in their own repositories. The
+[community directory](https://github.com/huggingface/funes-integrations/blob/main/COMMUNITY.md)
+makes those projects discoverable while leaving releases and support with their publishers.
+
+The boundary also brings code funes did not write onto your machine: an integration's `setup` runs
+as you, and adding one grants it your session history and hooks that keep running after it. funes
+vouches only for what it published. Anything else runs after a person has confirmed it, and no flag
+answers in their place, because consent to run someone else's code on your sessions is not a step
+to script away. Signed, verifiable integration artifacts would let funes vouch for more. Until then,
+the person at the terminal is the certification. What funes vouches for, and how a confirmation is
+kept, is in [add.md](add.md#what-funes-vouches-for).
+
+For the steps to build, test, publish, and list one, see
+[Writing an integration](../CONTRIBUTING.md#writing-an-integration).
+
 ## Why not just use a memory provider?
 
 Agent-memory providers are now plentiful — frameworks like [hermes-agent](https://github.com/NousResearch/hermes-agent/tree/main/plugins/memory) bundle a
@@ -123,16 +155,22 @@ funes optimizes for the opposite: **verbatim, auditable, local-first recall with
 provenance, no LLM in the loop, pulled on demand rather than injected, and no dependency on
 infrastructure you don't own** (sharing, when you want it, is to a hub repo you control).
 It is a different contract with your data —
-note that the *retrieval* machinery (hybrid vector + lexical search, fused and reranked) is
+note that the *retrieval* machinery (hybrid vector + lexical search, fused, optionally reranked) is
 common to mature memory systems; funes does not differentiate on search. The difference is
 entirely *upstream*: deterministic no-LLM ingest, immutable passages, and provenance.
 
-This isn't a guess about search — it was measured. A run of recall-quality enhancements —
-abstention thresholds, MMR diversity, near-duplicate collapse, semantic expansion, deeper
-candidate pools, stronger rerankers, and a per-chunk *kind* facet, some at query time and
-some computed at index time — was A/B'd against a labeled retrieval anchor; none moved
-recall. The cross-encoder is the ceiling, and it already resolves a query's intent to the
-right *kind* of passage without a saved label.
+We evaluate every change to the search on the labeled questions of
+[`dacorvo/funes-recall-benchmark`](https://huggingface.co/datasets/dacorvo/funes-recall-benchmark),
+and keep only those that improve recall:
+
+- A cross-encoder reranks any pool larger than the hits.
+- The search is hybrid: the vector half finds answers full-text search misses.
+- The vector search refines the index's shortlist on the stored vectors.
+
+> **Tested and abandoned:** abstention thresholds, MMR diversity, near-duplicate collapse, semantic
+> expansion, deeper candidate pools and a per-chunk *kind* facet did not move recall. Rebuilding
+> the vector index (larger codes, RaBitQ, scalar quantization, more partitions, retraining) did no
+> better than refining its shortlist.
 
 ## Where this leaves funes
 

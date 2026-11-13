@@ -3,8 +3,8 @@
 How big does a funes memory get, and how does it grow? This document builds a
 per-chunk cost model from two real memories and projects it forward.
 
-Figures were measured on 2026-07-22 with funes 1.2.0+dev, the current schema,
-and bge-small-en-v1.5 (`DIM = 384`). Sizes use decimal MB/GB and count only
+Figures were measured on 2026-07-22 with funes 1.2.0+dev and bge-small-en-v1.5
+(`DIM = 384`), on fully embedded memories. Sizes use decimal MB/GB and count only
 files referenced by the current Lance manifest. They exclude manifest and
 transaction history, superseded generations awaiting cleanup, and Hub Git/Xet
 history. Coefficients vary with chunk content, vocabulary, schema, and Lance
@@ -36,6 +36,8 @@ A memory is a single Lance dataset (`chunks.lance`) with these parts:
 | `_indices/` | BM25 + vector index | chunks (sublinear) |
 | `_versions/` | one manifest per committed version | number of index/push commits |
 | `_transactions/` | transaction records | negligible |
+
+Rows are stored before their embeddings; a null vector means the chunk is awaiting embedding.
 
 Current local breakdown (`data/` plus the index IDs named by the manifest):
 
@@ -112,13 +114,19 @@ use, or several years of moderate use.
 
 ## Maintenance
 
-Re-indexing commits a new version rather than overwriting, so superseded index
+Indexing commits a new version rather than overwriting, so superseded index
 generations — and, after row-rewriting ops like `scrub`, orphaned data
-fragments — would otherwise accumulate. funes reaps them after each local re-index
-(past a short grace window, so a concurrent read isn't cut off), keeping
-on-disk size close to the live figures above. The remote push path optimizes
-indexes incrementally but does not yet reap, so a published memory can run
-above the live-generation estimate.
+fragments — would otherwise accumulate. funes reaps them when it compacts the local
+memory (past a short grace window, so a concurrent read isn't cut off), keeping
+on-disk size close to the live figures above. `scrub` reaps every old version
+itself as it finishes, with no grace window, so no pre-scrub row stays readable
+on disk. A recall reading an old version at that moment can fail once.
+
+Recall time grows with the number of fragments, so each compaction, at the end of
+an index run or once a push leaves 500 unindexed rows on a remote memory, merges the
+fragments written since the previous one. Once more than 256 small fragments are indexed, it rewrites every
+fragment. On a remote memory the compaction also deletes the old versions, so no
+folder of the repo nears the Hub's limit of 10k files.
 
 ## Fit against HF Hub storage
 

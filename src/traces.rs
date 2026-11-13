@@ -1,37 +1,133 @@
-//! Reading agent sessions: where they come from ([`source`]), the per-harness parsers, and the
-//! parsed-trace model they all produce.
+//! Reading agent sessions: where they come from ([`source`]), the readers of the formats funes
+//! accepts, and the trace model they all produce.
 //!
-//! A transcript becomes a sequence of [`Turn`]s, each carrying typed [`Block`]s. Every parser
-//! produces this shape, and everything downstream — chunk → embed → store → recall — operates on
-//! it, so the model is source-agnostic and lives here, at the root of the parsers that fill it.
+//! A session becomes a sequence of [`Turn`]s, each carrying typed [`Block`]s. Everything downstream
+//! — chunk → embed → store → recall — operates on that shape, so the model is source-agnostic and
+//! lives here, at the root of the readers that fill it. An agent's own transcripts are converted
+//! into [`funes_jsonl`] by its integration, outside funes, so that is the one format read here.
 
-pub mod claude;
-pub mod codex;
-pub mod harness;
-pub mod hermes;
+pub mod funes_jsonl;
 pub mod jsonl;
-pub mod parquet;
-pub mod pi;
 pub mod repo;
 pub mod source;
+pub mod spool;
 
+use serde::{Deserialize, Deserializer, Serialize};
+
+/// The version of the serialized turn format this build reads and writes.
+pub const FORMAT_VERSION: u32 = 1;
+
+// serde's `default` takes a function path, not a constant.
+/// The closed block vocabulary.
+pub const BLOCK_TYPES: [&str; 4] = ["text", "thinking", "tool_use", "tool_result"];
+
+fn format_default() -> u32 {
+    FORMAT_VERSION
+}
+
+/// A `format` this build does not know is refused rather than misread.
+fn known_format<'de, D: Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
+    let v = u32::deserialize(d)?;
+    if v == FORMAT_VERSION {
+        Ok(v)
+    } else {
+        Err(serde::de::Error::custom(format!("unknown format {v}")))
+    }
+}
+
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Block {
-    pub block_type: String, // "text" | "thinking" | "tool_use" | "tool_result"
+    pub block_type: String, // one of [`BLOCK_TYPES`]
     pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_use_id: Option<String>,
 }
 
+/// The serde derives on [`Turn`] and [`Block`] are the serialized turn format, `docs/funes-jsonl.md`.
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Turn {
+    #[serde(default = "format_default", deserialize_with = "known_format")]
+    pub format: u32,
     pub session_id: String,
+    /// The working directory the session recorded, as its harness wrote it; `None` when the
+    /// source records none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(skip)]
     pub workdir: String,
     pub turn_uuid: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_uuid: Option<String>,
     pub seq: i64,
     pub ts: String,
     pub role: String,
     pub blocks: Vec<Block>,
+    #[serde(skip)]
     pub source_path: String,
-    /// Which coding agent produced this session: `claude_code` | `codex` | `pi` | `hermes`.
+    /// Who produced this session: any `[a-z0-9_-]` id a turns file carries — an integration names
+    /// itself, and the rows an older funes wrote say `claude_code`.
     pub harness: String,
+}
+
+/// Whether a user text block's start is injected scaffolding rather than the human's words. Harness
+/// wrappers are XML-ish tags (`<ide_opened_file>`, `<command-name>`, `<environment_context>`,
+/// `<system-reminder>`, …); codex/pi agent-notes open with a markdown heading (`# AGENTS.md
+/// instructions…`); a Claude skill loads with the `Base directory for this skill:` preamble; a
+/// compacted session replays its machine-written recap as a user turn opening `This session is being
+/// continued…`. All are recognizable from the block's start (a mid-block split can begin anywhere, so
+/// test split 0).
+pub(crate) fn is_scaffolding(block_start: &str) -> bool {
+    let t = block_start.trim_start();
+    t.starts_with('<')
+        || t.starts_with('#')
+        || t.starts_with("Base directory for this skill")
+        || t.starts_with("This session is being continued from a previous conversation")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_scaffolding_flags_wrappers_and_headings() {
+        assert!(is_scaffolding("<ide_opened_file>/foo/bar.rs</ide_opened_file>"));
+        assert!(is_scaffolding("<environment_context>\n  <cwd>/w</cwd>"));
+        assert!(is_scaffolding("   <system-reminder>be nice"));
+        assert!(is_scaffolding("# AGENTS.md instructions for /w\n\n<INSTRUCTIONS>"));
+        assert!(is_scaffolding(
+            "Base directory for this skill: /home/u/.claude/skills/funes\n\n# funes"
+        ));
+        assert!(is_scaffolding(
+            "This session is being continued from a previous conversation that ran out of context."
+        ));
+        assert!(!is_scaffolding("explain me again why funes push finds secrets"));
+        assert!(!is_scaffolding("why did we drop lancedb for funes"));
+    }
+
+    /// A line of the spec's own example, minus `format`.
+    const LINE: &str = r#"{"session_id":"s","turn_uuid":"t-1","seq":0,"ts":"2026-09-18T09:41:07Z","role":"user","harness":"opencode","blocks":[{"block_type":"text","text":"hi"}]}"#;
+
+    fn with(field: &str) -> String {
+        format!("{{{field},{}", &LINE[1..])
+    }
+
+    #[test]
+    fn format_defaults_to_one_and_an_unknown_one_is_refused() {
+        assert_eq!(serde_json::from_str::<Turn>(LINE).unwrap().format, FORMAT_VERSION);
+        assert_eq!(serde_json::from_str::<Turn>(&with(r#""format":1"#)).unwrap().format, 1);
+        let err = serde_json::from_str::<Turn>(&with(r#""format":2"#)).unwrap_err();
+        assert!(err.to_string().contains("unknown format 2"), "{err}");
+    }
+
+    #[test]
+    fn an_unknown_or_funes_stamped_field_is_rejected() {
+        assert!(serde_json::from_str::<Turn>(&with(r#""extra":1"#)).is_err());
+        assert!(serde_json::from_str::<Turn>(&with(r#""workdir":"w""#)).is_err());
+        let block = LINE.replace(r#""text":"hi""#, r#""text":"hi","extra":1"#);
+        assert!(serde_json::from_str::<Turn>(&block).is_err());
+    }
 }

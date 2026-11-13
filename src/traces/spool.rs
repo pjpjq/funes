@@ -1,0 +1,177 @@
+//! The spool: where an integration writes the turns files funes indexes for it,
+//! `$FUNES_HOME/spool/<id>/`, one directory per integration id. funes owns the directory — a bundle
+//! only writes into it; funes reads, records and deletes — and finds producers by listing it, so
+//! indexing needs neither an installed integration nor a list of agents.
+
+use anyhow::{bail, Result};
+use std::path::{Path, PathBuf};
+
+use crate::home;
+
+/// Whether `s` is an id funes accepts: lowercase `[a-z0-9_-]`, non-empty. One charset serves the
+/// integration id, which names a directory funes creates, and the `harness` facet a turn carries,
+/// so an id is always a valid facet and a safe path segment.
+pub fn is_id(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+}
+
+/// Where the integration `id` writes its turns files.
+pub fn spool_dir(id: &str) -> PathBuf {
+    home::spool_root().join(id)
+}
+
+/// Whether `path` is a spool directory itself, not a link to one: funes drains only what resolves
+/// under the root, so a link would be swept and never emptied.
+fn is_spool_dir(path: &Path) -> bool {
+    path.symlink_metadata().is_ok_and(|m| m.is_dir())
+}
+
+/// Whether `path` names a place in the spool, by its spelling alone: what a record of a file that
+/// may be gone can say. Ownership of a file that exists is `is_spool`'s to decide.
+pub fn names_spool(path: &Path) -> bool {
+    path.starts_with(home::spool_root())
+}
+
+/// Whether `path` is inside a spool funes resolved for itself, rather than a path someone named.
+/// funes deletes what it owns here, so the answer is by what the paths resolve to: a `..` or a
+/// symlink cannot make a file elsewhere look like the spool's.
+pub fn is_spool(path: &Path) -> bool {
+    is_under(&home::spool_root(), path)
+}
+
+fn is_under(root: &Path, path: &Path) -> bool {
+    match (root.canonicalize(), path.canonicalize()) {
+        (Ok(root), Ok(path)) => path.starts_with(root),
+        _ => false,
+    }
+}
+
+/// The spool `--harness <id>` selects: a valid id whose directory a producer has created. Finding
+/// it clears the stamp a refusal left.
+pub fn select(id: &str) -> Result<PathBuf> {
+    if !is_id(id) {
+        bail!("{id:?} is not an integration id (lowercase [a-z0-9_-])");
+    }
+    let dir = spool_dir(id);
+    if !is_spool_dir(&dir) {
+        bail!("the {id} integration does not match this version of funes. Re-run `funes add {id}` to update it.");
+    }
+    let _ = std::fs::remove_file(missing_stamp(id));
+    Ok(dir)
+}
+
+/// The stamp a refused `--harness <id>` leaves, `<root>/<id>.missing`: a file, which the sweep
+/// (listing directories) never sees.
+fn missing_stamp(id: &str) -> PathBuf {
+    home::spool_root().join(format!("{id}.missing"))
+}
+
+/// Record that `id`'s spool was asked for and does not exist. Only a hook asks unattended, and only
+/// a hook from an install older than the spool asks for one nothing writes, so the stamp is what
+/// the read verbs report until `funes add {id}` creates the spool.
+pub fn note_missing(id: &str) -> Result<()> {
+    if !is_id(id) {
+        bail!("{id:?} is not an integration id (lowercase [a-z0-9_-])");
+    }
+    std::fs::create_dir_all(home::spool_root())?;
+    std::fs::write(missing_stamp(id), "")?;
+    Ok(())
+}
+
+/// Drop the stamp `id`'s refusals left, if any: `funes add` has made the spool, or `funes remove`
+/// has taken the hooks that asked for it, and neither leaves a spool to find it by.
+pub fn forget_missing(id: &str) -> Result<()> {
+    match std::fs::remove_file(missing_stamp(id)) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// The ids asked for whose spool still does not exist, in id order.
+pub fn missing() -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(home::spool_root()) else {
+        return Vec::new();
+    };
+    let mut ids: Vec<String> = entries
+        .flatten()
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter_map(|name| name.strip_suffix(".missing").map(str::to_string))
+        .filter(|id| is_id(id) && !is_spool_dir(&spool_dir(id)))
+        .collect();
+    ids.sort();
+    ids
+}
+
+/// Every spool a producer has created, in id order — what a no-argument `funes index` sweeps.
+pub fn spools() -> Vec<PathBuf> {
+    spools_in(&home::spool_root())
+}
+
+fn spools_in(root: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut dirs: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| is_spool_dir(p) && p.file_name().and_then(|n| n.to_str()).is_some_and(is_id))
+        .collect();
+    dirs.sort();
+    dirs
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_id_is_lowercase_digits_underscore_or_dash() {
+        for ok in ["claude", "claude_code", "my-agent2", "x"] {
+            assert!(is_id(ok), "{ok}");
+        }
+        for bad in ["", "Claude", "a b", "a/b", "a:b", ".hidden", "é"] {
+            assert!(!is_id(bad), "{bad:?}");
+        }
+    }
+
+    /// What funes owns is decided on resolved paths: a file reached through `..` or a symlink from
+    /// inside the spool is someone else's, and a file in the spool is funes's however it is spelled.
+    #[test]
+    fn ownership_follows_the_resolved_path_not_its_spelling() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("spool");
+        let mine = tmp.path().join("mine");
+        std::fs::create_dir_all(root.join("pi")).unwrap();
+        std::fs::create_dir_all(&mine).unwrap();
+        std::fs::write(root.join("pi/s.funes.jsonl"), "").unwrap();
+        std::fs::write(mine.join("y.funes.jsonl"), "").unwrap();
+        std::os::unix::fs::symlink(mine.join("y.funes.jsonl"), root.join("pi/link.funes.jsonl")).unwrap();
+
+        assert!(is_under(&root, &root.join("pi/s.funes.jsonl")));
+        assert!(is_under(&root, &root.join("pi/../pi/s.funes.jsonl")));
+        assert!(!is_under(&root, &root.join("pi/../../mine/y.funes.jsonl")));
+        assert!(!is_under(&root, &root.join("pi/link.funes.jsonl")));
+        assert!(!is_under(&root, &root.join("pi/gone.funes.jsonl")), "nothing to own");
+    }
+
+    /// A spool is a directory of the root's own: a link there, however it is named, is neither
+    /// swept nor selected, since what it holds resolves elsewhere and would never be drained.
+    #[test]
+    fn a_link_in_the_root_is_not_a_spool() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("spool");
+        let mine = tmp.path().join("mine");
+        std::fs::create_dir_all(root.join("pi")).unwrap();
+        std::fs::create_dir_all(&mine).unwrap();
+        std::os::unix::fs::symlink(&mine, root.join("clyde")).unwrap();
+        std::fs::write(root.join("pi.missing"), "").unwrap();
+
+        assert_eq!(spools_in(&root), vec![root.join("pi")]);
+        assert!(is_spool_dir(&root.join("pi")));
+        assert!(!is_spool_dir(&root.join("clyde")), "a link is not a spool");
+        assert!(!is_spool_dir(&root.join("pi.missing")), "nor is a stamp");
+    }
+}

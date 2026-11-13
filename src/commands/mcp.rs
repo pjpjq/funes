@@ -3,11 +3,12 @@
 //! stdout is the JSON-RPC channel — logs must go to stderr.
 
 use super::recall;
-use crate::memory::Memory;
+use super::target::Target;
+use crate::agents;
 use anyhow::Result;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, Content, Implementation, ProtocolVersion, ServerCapabilities, ServerInfo};
+use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerConfig};
 use rmcp::transport::stdio;
 use rmcp::{schemars, tool, tool_handler, tool_router, ServerHandler, ServiceExt};
 use std::sync::Arc;
@@ -16,6 +17,8 @@ use tokio::sync::OnceCell;
 #[derive(serde::Serialize)]
 struct StructuredRecall {
     hits: Vec<StructuredHit>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_type_index_ready: Option<bool>,
 }
 
 #[derive(serde::Serialize)]
@@ -62,62 +65,81 @@ fn recall_tool_result(result: recall::RecallResult) -> CallToolResult {
                 .collect(),
         })
         .collect();
-    let mut response = CallToolResult::success(vec![Content::text(result.text)]);
-    response.structured_content =
-        Some(serde_json::to_value(StructuredRecall { hits }).expect("recall hits contain only JSON-compatible values"));
+    let mut response = CallToolResult::success(vec![ContentBlock::text(result.text)]);
+    response.structured_content = Some(
+        serde_json::to_value(StructuredRecall {
+            hits,
+            source_type_index_ready: result.source_type_index_ready,
+        })
+        .expect("recall hits contain only JSON-compatible values"),
+    );
     response
 }
 
 fn text_tool_result(text: String) -> CallToolResult {
-    CallToolResult::success(vec![Content::text(text)])
+    CallToolResult::success(vec![ContentBlock::text(text)])
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct RecallRequest {
-    #[schemars(description = "Natural-language description of what to recall from past sessions")]
-    pub query: String,
-    #[schemars(description = "Number of results to return")]
-    pub k: Option<usize>,
     #[schemars(
-        description = "Recency half-life in days: a hit that old keeps half its score. Pass 0 to weigh every age alike, for a memory spanning months or an answer that may be old."
+        description = "Natural-language description of what to recall from past sessions. A query matches best in the language they are written in, which `status` reports."
     )]
-    pub half_life: Option<f64>,
+    pub query: String,
+    #[schemars(
+        description = "Caller remaining native budget in milliseconds, capped at 600000. Optional FTS may use the remaining time, including index warmup; without a budget it is capped at three seconds. Does not replace the caller's timeout."
+    )]
+    pub budget_ms: Option<u64>,
+    #[schemars(
+        description = "Hits returned (default 8). Each is a verbatim passage of a few hundred tokens, so `k` is what a call costs to read."
+    )]
+    pub k: Option<usize>,
     #[schemars(description = "Adjacent chunks attached to each hit for context; 0 returns the hits alone.")]
     pub neighbors: Option<i64>,
     #[schemars(
-        description = "How many fused candidates to retain before optional reranking. Raise it when a topic is rare and the first pass may not surface it."
+        description = "Size of the fused pool the hits are cut from (default 30): how far the search looks. Larger than `k`, the pool is reranked before the cut when a rerank provider is enabled, which costs seconds and grows with the pool, so `k` can stay small while the search looks deep. A pool of `k` rows or fewer is read whole, in the fused order."
     )]
     pub candidates: Option<usize>,
     #[schemars(description = "Restrict to a block type: text | thinking | tool_use | tool_result")]
     pub block_type: Option<String>,
-    #[schemars(description = "Restrict to a harness: claude | codex | pi | hermes")]
+    #[schemars(
+        description = "Restrict to a role, as the turns carry it (an agent's turns say user | assistant | tool | system)"
+    )]
+    pub role: Option<String>,
+    #[schemars(
+        description = "Restrict to a harness facet, as the turns carry it (`claude` also matches the older `claude_code`)"
+    )]
     pub harness: Option<String>,
-    #[schemars(description = "Restrict to one canonical source identity")]
-    pub source_identity: Option<String>,
-    #[schemars(description = "Restrict to one canonical source revision")]
-    pub source_version: Option<String>,
-    #[schemars(description = "Restrict to one canonical source content hash")]
-    pub content_hash: Option<String>,
-    #[schemars(description = "Restrict to an exact canonical revision timestamp")]
-    pub updated_at: Option<String>,
-    #[schemars(description = "Restrict to the canonical source agent")]
-    pub source_agent: Option<String>,
-    #[schemars(description = "Restrict to the canonical source type")]
-    pub source_type: Option<String>,
-    #[schemars(description = "Restrict to the canonical project")]
-    pub project: Option<String>,
-    #[schemars(description = "Restrict to the canonical source repo")]
+    #[schemars(description = "Restrict to turns whose checkout resolved to this repo, as `owner/name`")]
     pub repo: Option<String>,
-    #[schemars(description = "Restrict to the canonical device id")]
+    #[schemars(description = "Restrict to turns on or after this date, `YYYY-MM-DD`")]
+    pub since: Option<String>,
+    #[schemars(description = "Restrict to turns on or before this date, `YYYY-MM-DD`")]
+    pub until: Option<String>,
+    #[schemars(
+        description = "Memory to read for this call, as it stands — `<org>/<repo>`, an `hf://…` URI, a local path, or `local`. Omitted, the server's memory, with this host's turns not yet pushed to it when the host is bound to it."
+    )]
+    pub memory: Option<String>,
+    #[schemars(description = "Restrict to exact canonical source identity")]
+    pub source_identity: Option<String>,
+    #[schemars(description = "Restrict to exact canonical source version")]
+    pub source_version: Option<String>,
+    #[schemars(description = "Restrict to exact canonical content hash")]
+    pub content_hash: Option<String>,
+    #[schemars(description = "Restrict to exact canonical updated at")]
+    pub updated_at: Option<String>,
+    #[schemars(description = "Restrict to exact canonical source agent")]
+    pub source_agent: Option<String>,
+    #[schemars(description = "Restrict to exact canonical source type")]
+    pub source_type: Option<String>,
+    #[schemars(description = "Restrict to exact canonical project")]
+    pub project: Option<String>,
+    #[schemars(description = "Restrict to exact canonical device id")]
     pub device_id: Option<String>,
-    #[schemars(description = "Restrict to the canonical content type")]
+    #[schemars(description = "Restrict to exact canonical content type")]
     pub content_type: Option<String>,
     #[schemars(description = "Restrict to present (false) or soft-missing (true) canonical sources")]
     pub source_missing: Option<bool>,
-    #[schemars(
-        description = "Memory to read for this call — `<org>/<repo>`, an `hf://…` URI, a local path, or `local`. Defaults to the server's memory."
-    )]
-    pub memory: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -133,7 +155,7 @@ pub struct GetRequest {
     )]
     pub to: Option<i64>,
     #[schemars(
-        description = "Memory to read for this call — the one the recall hit's `→ get` line names. Defaults to the server's memory."
+        description = "Memory to read for this call, as it stands — the one the hit's `→ get` line carries, and none when it carries none, so the drill-down reads what the search read. Omitted, the server's memory, where a session this host has not finished pushing is read from the local memory."
     )]
     pub memory: Option<String>,
 }
@@ -155,7 +177,7 @@ pub struct SessionsRequest {
     )]
     pub offset: Option<usize>,
     #[schemars(
-        description = "Memory to list — `<org>/<repo>`, an `hf://…` URI, a local path, or `local`. Defaults to the server's memory."
+        description = "Memory to list, as it stands — `<org>/<repo>`, an `hf://…` URI, a local path, or `local`. Omitted, the server's memory, with the sessions this host has not finished pushing listed from the local memory when the host is bound to it."
     )]
     pub memory: Option<String>,
 }
@@ -179,7 +201,7 @@ pub struct ScanRequest {
     #[schemars(description = "Characters of surrounding text shown on each side of a match")]
     pub context: Option<usize>,
     #[schemars(
-        description = "Memory to scan — `<org>/<repo>`, an `hf://…` URI, a local path, or `local`. Defaults to the server's memory."
+        description = "Memory to scan, as it stands — `<org>/<repo>`, an `hf://…` URI, a local path, or `local`. Omitted, the server's memory, where a session this host has not finished pushing is read from the local memory."
     )]
     pub memory: Option<String>,
 }
@@ -203,7 +225,7 @@ pub struct SketchRequest {
     #[schemars(description = "Last turn to digest, as the session's own seq.")]
     pub to: Option<i64>,
     #[schemars(
-        description = "Memory to read for this call — `<org>/<repo>`, an `hf://…` URI, a local path, or `local`. Defaults to the server's memory."
+        description = "Memory to read for this call, as it stands — `<org>/<repo>`, an `hf://…` URI, a local path, or `local`. Omitted, the server's memory, where a session this host has not finished pushing is read from the local memory."
     )]
     pub memory: Option<String>,
 }
@@ -211,9 +233,19 @@ pub struct SketchRequest {
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct StatusRequest {
     #[schemars(
-        description = "Memory to inspect — `<org>/<repo>`, an `hf://…` URI, a local path, or `local`. Defaults to the server's memory."
+        description = "Memory to inspect — `<org>/<repo>`, an `hf://…` URI, a local path, or `local`. Omitted, the server's memory."
     )]
     pub memory: Option<String>,
+}
+
+/// A tool's text, led by the stale-install note when there is one. A tool result is the one channel
+/// every client hands to the model, so this is where an install that stopped capturing gets said;
+/// the CLI prints the same line on stderr and keeps stdout byte-identical to this text.
+fn noted(text: String) -> String {
+    match agents::stale_install_notice() {
+        Some(note) => format!("{note}\n{text}"),
+        None => text,
+    }
 }
 
 fn pin_memory_enabled() -> bool {
@@ -230,8 +262,8 @@ fn pin_memory_value(value: Option<&str>) -> bool {
 
 #[derive(Clone)]
 pub(crate) struct Funes {
-    /// Explicit memory spec (`funes mcp <memory>`), bound for the server's lifetime. `None` reads
-    /// the local memory unless a call passes its own `memory`.
+    /// The memory the server was started on (`funes mcp <memory>`), read by every call naming
+    /// none; `None` leaves those calls to the host's binding, as on the CLI.
     memory: Option<String>,
     /// Set only for an explicit server memory plus `FUNES_MCP_PIN_MEMORY=true`. Tool-call memory
     /// overrides never touch this cache and retain the normal resolve-current-head behavior.
@@ -257,10 +289,12 @@ impl Funes {
         }
     }
 
-    /// The memory a call reads: its explicit `memory` argument wins over the server's `<memory>`,
-    /// else the local memory.
-    fn memory(&self, spec: Option<String>) -> Memory {
-        Memory::resolve(spec.filter(|s| !s.trim().is_empty()).or_else(|| self.memory.clone()))
+    /// What a call reads: the memory it names, as it stands; naming none, the server's.
+    fn target(&self, spec: Option<String>) -> Result<Target> {
+        match spec.filter(|s| !s.trim().is_empty()) {
+            Some(spec) => Target::resolve(Some(&spec)),
+            None => Target::served(self.memory.as_deref()),
+        }
     }
 
     /// Only an omitted (or blank) call-level memory is the server default. Even an override that
@@ -277,37 +311,44 @@ impl Funes {
         query: String,
         k: usize,
         candidates: usize,
-        half_life: f64,
         neighbors: i64,
-        filter: recall::FacetFilter,
+        filter: recall::RecallFilter,
+        budget_ms: Option<u64>,
     ) -> Result<recall::RecallResult> {
+        let deadline =
+            budget_ms.map(|ms| std::time::Instant::now() + std::time::Duration::from_millis(ms.min(600_000)));
         if self.pins_recall(&memory) {
             let cache = self
                 .pinned_recall
                 .as_ref()
                 .expect("pins_recall requires a configured cache");
-            let server_memory = self.memory(None);
+            let server_memory =
+                crate::memory::Memory::parse(self.memory.as_deref().expect("pinned memory is explicit"));
             let pinned = cache.get_or_try_init(|| recall::pin_read(server_memory)).await?;
-            recall::recall_filtered_pinned(pinned, query, k, candidates, half_life, neighbors, filter).await
+            recall::recall_filtered_pinned(pinned, query, k, candidates, neighbors, filter, deadline).await
         } else {
-            recall::recall_filtered_result(self.memory(memory), query, k, candidates, half_life, neighbors, filter)
+            recall::recall_filtered_result(self.target(memory)?, query, k, candidates, neighbors, filter, deadline)
                 .await
         }
     }
 
     #[tool(
-        description = "Semantic search over the user's past AI agent sessions: describe what you are after, get back the verbatim passages — what was decided, tried, measured or investigated. Call it when they refer to earlier work, or when you are about to re-derive something a session may already have settled. Call it too before claiming that something was never built, was dropped, or was never discussed: the code cannot show that, only the sessions can. Ranked top-k, so it gives you a foothold on a topic, not every session touching it."
+        description = "Semantic search over the user's past AI agent sessions: describe what you are after, get back the verbatim passages — what was decided, tried, measured or investigated. Call it when they refer to earlier work, or when you are about to re-derive something a session may already have settled. Call it too before claiming that something was never built, was dropped, or was never discussed: the code cannot show that, only the sessions can. Ranked top-k, so it gives you a foothold on a topic, not every session touching it. Ranking weighs relevance, not age: for the latest word on a topic, or one stretch of time, bound it with `since`/`until`. Each hit is a passage you will read: `k` is the token cost, `candidates` the reach, and a pool larger than `k` can be reranked when enabled, at seconds of latency that grow with the pool, so the reach can grow without the reading."
     )]
     async fn recall(
         &self,
         Parameters(RecallRequest {
             query,
             k,
-            half_life,
+            budget_ms,
             neighbors,
             candidates,
             block_type,
+            role,
             harness,
+            repo,
+            since,
+            until,
             source_identity,
             source_version,
             content_hash,
@@ -315,7 +356,6 @@ impl Funes {
             source_agent,
             source_type,
             project,
-            repo,
             device_id,
             content_type,
             source_missing,
@@ -328,10 +368,12 @@ impl Funes {
                 query,
                 k.unwrap_or(recall::DEFAULT_K),
                 candidates.unwrap_or(recall::DEFAULT_CANDIDATES),
-                half_life.unwrap_or(recall::DEFAULT_HALF_LIFE),
                 neighbors.unwrap_or(recall::DEFAULT_NEIGHBORS),
-                recall::FacetFilter {
+                recall::RecallFilter {
                     block_type,
+                    role,
+                    since,
+                    until,
                     harness,
                     source_identity,
                     source_version,
@@ -345,11 +387,15 @@ impl Funes {
                     content_type,
                     source_missing,
                 },
+                budget_ms,
             )
             .await
         {
-            Ok(result) => recall_tool_result(result),
-            Err(e) => text_tool_result(format!("recall error: {e}")),
+            Ok(mut result) => {
+                result.text = noted(result.text);
+                recall_tool_result(result)
+            }
+            Err(e) => text_tool_result(noted(format!("recall error: {e}"))),
         }
     }
 
@@ -366,15 +412,17 @@ impl Funes {
         }): Parameters<GetRequest>,
     ) -> String {
         let range = recall::TurnRange { from, to };
-        match recall::get(self.memory(memory), session_id, range).await {
-            Ok(s) if !s.is_empty() => s,
-            Ok(_) => "no results".to_string(),
-            Err(e) => format!("get error: {e}"),
-        }
+        noted(
+            match async { recall::get(self.target(memory)?, session_id, range).await }.await {
+                Ok(s) if !s.is_empty() => s,
+                Ok(_) => "no results".to_string(),
+                Err(e) => format!("get error: {e}"),
+            },
+        )
     }
 
     #[tool(
-        description = "Enumerate a memory's sessions, oldest first. Metadata only — date, harness, repo, turn count, id, and the prompt each opened with, which is the ask a session started from, not what it became. Filter by repo or date to get the session ids the other verbs take; a whole memory can run to thousands of rows."
+        description = "Enumerate a memory's sessions, oldest first. Metadata only — when it started and when its last indexed turn was, harness, repo, turn count, id, and the prompt each opened with, which is the ask a session started from, not what it became. Filter by repo or date to get the session ids the other verbs take; a whole memory can run to thousands of rows."
     )]
     async fn sessions(
         &self,
@@ -394,11 +442,13 @@ impl Funes {
             limit,
             offset: offset.unwrap_or(0),
         };
-        match recall::sessions(self.memory(memory), filter).await {
-            Ok(s) if !s.is_empty() => s,
-            Ok(_) => "no results".to_string(),
-            Err(e) => format!("sessions error: {e}"),
-        }
+        noted(
+            match async { recall::sessions(self.target(memory)?, filter).await }.await {
+                Ok(s) if !s.is_empty() => s,
+                Ok(_) => "no results".to_string(),
+                Err(e) => format!("sessions error: {e}"),
+            },
+        )
     }
 
     #[tool(
@@ -416,21 +466,26 @@ impl Funes {
             memory,
         }): Parameters<ScanRequest>,
     ) -> String {
-        match recall::scan(
-            self.memory(memory),
-            needle,
-            session_id,
-            from,
-            to,
-            ignore_case.unwrap_or(false),
-            context.unwrap_or(recall::DEFAULT_CONTEXT),
+        noted(
+            match async {
+                recall::scan(
+                    self.target(memory)?,
+                    needle,
+                    session_id,
+                    from,
+                    to,
+                    ignore_case.unwrap_or(false),
+                    context.unwrap_or(recall::DEFAULT_CONTEXT),
+                )
+                .await
+            }
+            .await
+            {
+                Ok(s) if !s.is_empty() => s,
+                Ok(_) => "no results".to_string(),
+                Err(e) => format!("scan error: {e}"),
+            },
         )
-        .await
-        {
-            Ok(s) if !s.is_empty() => s,
-            Ok(_) => "no results".to_string(),
-            Err(e) => format!("scan error: {e}"),
-        }
     }
 
     #[tool(
@@ -447,44 +502,54 @@ impl Funes {
             memory,
         }): Parameters<SketchRequest>,
     ) -> String {
-        match super::sketch::run(self.memory(memory), session_id, from, to, units, max_chars).await {
-            Ok(s) if !s.is_empty() => s,
-            Ok(_) => "no results".to_string(),
-            Err(e) => format!("sketch error: {e}"),
-        }
+        noted(
+            match async { super::sketch::run(self.target(memory)?, session_id, from, to, units, max_chars).await }.await
+            {
+                Ok(s) if !s.is_empty() => s,
+                Ok(_) => "no results".to_string(),
+                Err(e) => format!("sketch error: {e}"),
+            },
+        )
     }
 
     #[tool(
-        description = "Health and size of a memory: how much is indexed, what is still pending, and for a remote what this host has yet to push. Call it when a read comes back empty or thinner than expected — it says whether the memory is the problem rather than the call."
+        description = "Health and size of a memory: indexed chunks, the languages its sessions are written in, local chunks awaiting embedding, source sessions awaiting indexing, and for a remote this host pushes to what it has yet to push. Call it when a read comes back empty or thinner than expected — it says whether the memory is the problem rather than the call."
     )]
     async fn status(&self, Parameters(StatusRequest { memory }): Parameters<StatusRequest>) -> String {
         // No update check here: it needs the network, and the "update available" notice belongs
         // on the human-facing CLI `funes status`, not on this hot, otherwise-local tool path.
-        recall::status(self.memory(memory))
-            .await
-            .unwrap_or_else(|e| format!("status error: {e}"))
+        noted(
+            async { recall::status(self.target(memory)?).await }
+                .await
+                .unwrap_or_else(|e| format!("status error: {e}")),
+        )
     }
 }
 
 #[tool_handler]
 impl ServerHandler for Funes {
-    fn get_info(&self) -> ServerInfo {
+    fn get_info(&self) -> ServerConfig {
         let mut server_info = Implementation::default();
         server_info.name = "funes".to_string();
         server_info.version = env!("CARGO_PKG_VERSION").to_string();
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+        let mut instructions = "Persistent memory over the user's past AI coding sessions: their transcripts, \
+                                indexed automatically as they work and read-only here — nothing has to be saved. \
+                                When earlier work matters, this is the memory to consult."
+            .to_string();
+        if let Some(note) = agents::stale_install_notice() {
+            instructions.push_str("\n\n");
+            instructions.push_str(&note);
+        }
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(server_info)
-            .with_protocol_version(ProtocolVersion::V_2024_11_05)
-            .with_instructions(
-                "Persistent memory over the user's past AI coding sessions: their transcripts, \
-                 indexed automatically as they work and read-only here — nothing has to be saved. \
-                 When earlier work matters, this is the memory to consult."
-                    .to_string(),
-            )
+            .with_instructions(instructions)
     }
 }
 
 pub async fn run(memory: Option<String>) -> Result<()> {
+    if crate::service_role::ServiceRole::from_env()? == crate::service_role::ServiceRole::Query {
+        crate::service_role::require_query_snapshot()?;
+    }
     let service = Funes::new(memory).serve(stdio()).await?;
     service.waiting().await?;
     Ok(())
@@ -494,78 +559,180 @@ pub async fn run(memory: Option<String>) -> Result<()> {
 mod tests {
     use super::*;
     use arrow_array::types::Float32Type;
-    use arrow_array::{ArrayRef, FixedSizeListArray, RecordBatch, RecordBatchIterator};
+    use arrow_array::{ArrayRef, FixedSizeListArray, RecordBatch, RecordBatchIterator, StringArray};
     use arrow_schema::{DataType, Field, Schema};
     use lance::dataset::Dataset;
+    use lance::index::DatasetIndexExt;
+    use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
+    use lance_index::IndexType;
 
-    async fn legacy_memory() -> tempfile::TempDir {
+    async fn memory_fixture(source_type_index: bool) -> tempfile::TempDir {
         let memory = tempfile::tempdir().unwrap();
         let dimension = crate::memory::dataset::DIM;
-        let schema = Arc::new(Schema::new(vec![Field::new(
+        let mut fields = vec![Field::new(
             "vector",
             DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), dimension),
             true,
-        )]));
+        )];
         let vectors: ArrayRef = Arc::new(FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
             [Some(vec![Some(0.0); dimension as usize])],
             dimension,
         ));
-        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![vectors]).unwrap();
+        let mut columns = vec![vectors];
+        if source_type_index {
+            fields.push(Field::new("source_type", DataType::Utf8, false));
+            columns.push(Arc::new(StringArray::from(vec!["memory"])));
+        }
+        let schema = Arc::new(Schema::new(fields));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), columns).unwrap();
         let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
-        let dataset = Dataset::write(
+        let mut dataset = Dataset::write(
             reader,
             crate::memory::dataset::table_uri(memory.path().to_str().unwrap()).as_str(),
             None,
         )
         .await
         .unwrap();
+        if source_type_index {
+            dataset
+                .create_index(
+                    &["source_type"],
+                    IndexType::Bitmap,
+                    Some("source_type_idx".to_string()),
+                    &ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap),
+                    false,
+                )
+                .await
+                .unwrap();
+        }
         drop(dataset);
         memory
     }
 
-    fn absent_facet() -> recall::FacetFilter {
-        recall::FacetFilter {
+    fn absent_facet() -> recall::RecallFilter {
+        recall::RecallFilter {
             source_identity: Some("not-in-legacy-schema".to_string()),
-            ..recall::FacetFilter::default()
+            ..recall::RecallFilter::default()
         }
     }
 
     #[tokio::test]
     async fn concurrent_and_sequential_default_recalls_open_once_but_an_override_opens_fresh() {
-        let memory = legacy_memory().await;
+        let memory = memory_fixture(false).await;
         let spec = memory.path().to_string_lossy().into_owned();
         let server = Funes::new_with_pin(Some(spec.clone()), true);
         let clone = server.clone();
 
         let (first, concurrent) = tokio::join!(
-            server.recall_with_memory(None, "unused".to_string(), 1, 1, 0.0, 0, absent_facet()),
-            clone.recall_with_memory(None, "unused".to_string(), 1, 1, 0.0, 0, absent_facet())
+            server.recall_with_memory(None, "unused".to_string(), 1, 1, 0, absent_facet(), None),
+            clone.recall_with_memory(None, "unused".to_string(), 1, 1, 0, absent_facet(), Some(0))
         );
         let first = first.unwrap();
         let concurrent = concurrent.unwrap();
-        assert_eq!(first.text, "no results");
-        assert_eq!(concurrent.text, "no results");
+        assert_eq!(first.text, crate::ui::render::recall_reply("", &[], None));
+        assert_eq!(concurrent.text, crate::ui::render::recall_reply("", &[], None));
         let pinned_json = serde_json::to_value(recall_tool_result(first)).unwrap();
-        assert_eq!(pinned_json["content"][0]["text"], "no results");
+        assert_eq!(
+            pinned_json["content"][0]["text"],
+            crate::ui::render::recall_reply("", &[], None)
+        );
         assert_eq!(pinned_json["structuredContent"]["hits"], serde_json::json!([]));
+        assert_eq!(pinned_json["structuredContent"]["source_type_index_ready"], false);
+
+        let explicit = server
+            .recall_with_memory(Some(spec.clone()), "unused".to_string(), 1, 1, 0, absent_facet(), None)
+            .await
+            .unwrap();
+        assert_eq!(explicit.source_type_index_ready, None);
 
         // Make a second Dataset::open impossible. The same server still recalls from its cached
         // handle, while an explicit call-level override must take the ordinary fresh-open path.
         std::fs::remove_dir_all(memory.path().join("chunks.lance")).unwrap();
         let second = server
-            .recall_with_memory(None, "unused".to_string(), 1, 1, 0.0, 0, absent_facet())
+            .recall_with_memory(None, "unused".to_string(), 1, 1, 0, absent_facet(), Some(u64::MAX))
             .await
             .unwrap();
-        assert_eq!(second.text, "no results");
+        assert_eq!(second.text, crate::ui::render::recall_reply("", &[], None));
 
-        let override_result = server
-            .recall_with_memory(Some(spec), "unused".to_string(), 1, 1, 0.0, 0, absent_facet())
-            .await;
-        let override_error = match override_result {
-            Err(error) => error,
-            Ok(_) => panic!("an explicit override must open the removed dataset afresh"),
+        let override_error = server
+            .recall_with_memory(
+                Some(spec.clone()),
+                "unused".to_string(),
+                1,
+                1,
+                0,
+                absent_facet(),
+                Some(1),
+            )
+            .await
+            .err()
+            .expect("an explicit override must open afresh");
+        assert_eq!(
+            override_error.to_string(),
+            crate::memory::Memory::parse(&spec).empty_error().to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn source_type_proof_belongs_to_the_pinned_snapshot_not_the_latest_manifest() {
+        let memory = memory_fixture(true).await;
+        let spec = memory.path().to_string_lossy().into_owned();
+        let mut latest = Dataset::open(&crate::memory::dataset::table_uri(&spec)).await.unwrap();
+        let mut counts = crate::memory::dataset::Languages {
+            rows: 1,
+            counts: std::collections::BTreeMap::from([("cmn".to_string(), 1)]),
         };
-        assert!(override_error.to_string().contains("no index found"));
+        crate::memory::dataset::stamp_languages(&mut latest, &counts)
+            .await
+            .unwrap();
+        let server = Funes::new_with_pin(Some(spec.clone()), true);
+        let first = server
+            .recall_with_memory(None, "unused".to_string(), 1, 1, 0, absent_facet(), None)
+            .await
+            .unwrap();
+        assert_eq!(first.source_type_index_ready, Some(true));
+        let response = serde_json::to_value(recall_tool_result(first)).unwrap();
+        assert_eq!(
+            response["content"][0]["text"],
+            crate::ui::render::recall_reply("", &[], Some("cmn"))
+        );
+        assert_eq!(response["structuredContent"]["source_type_index_ready"], true);
+
+        let mut latest = Dataset::open(&crate::memory::dataset::table_uri(&spec)).await.unwrap();
+        latest.drop_index("source_type_idx").await.unwrap();
+        counts.counts = std::collections::BTreeMap::from([("eng".to_string(), 1)]);
+        crate::memory::dataset::stamp_languages(&mut latest, &counts)
+            .await
+            .unwrap();
+        let old_snapshot = server
+            .recall_with_memory(None, "unused".to_string(), 1, 1, 0, absent_facet(), None)
+            .await
+            .unwrap();
+        assert_eq!(old_snapshot.source_type_index_ready, Some(true));
+        assert!(old_snapshot.text.contains("cmn"));
+        let explicit = server
+            .recall_with_memory(Some(spec.clone()), "unused".to_string(), 1, 1, 0, absent_facet(), None)
+            .await
+            .unwrap();
+        assert!(!explicit.text.contains("cmn"));
+        let fresh = Funes::new_with_pin(Some(spec), true)
+            .recall_with_memory(None, "unused".to_string(), 1, 1, 0, absent_facet(), None)
+            .await
+            .unwrap();
+        assert_eq!(fresh.source_type_index_ready, Some(false));
+        assert!(!fresh.text.contains("cmn"));
+    }
+
+    #[test]
+    fn recall_budget_is_optional_and_rejects_negative_values() {
+        let absent: RecallRequest = serde_json::from_value(serde_json::json!({"query": "原文"})).unwrap();
+        assert_eq!(absent.budget_ms, None);
+        let supplied: RecallRequest =
+            serde_json::from_value(serde_json::json!({"query": "原文", "budget_ms": 6750})).unwrap();
+        assert_eq!(supplied.budget_ms, Some(6750));
+        assert!(
+            serde_json::from_value::<RecallRequest>(serde_json::json!({"query": "原文", "budget_ms": -1})).is_err()
+        );
     }
 
     #[test]
@@ -596,6 +763,9 @@ mod tests {
     #[test]
     fn structured_recall_adds_raw_hits_without_changing_text_content() {
         let hit = recall::Hit {
+            id: "raw-hit".into(),
+            memory: String::new(),
+            fused: 0.875,
             text: "complete raw hit\nwith a second line".to_string(),
             session_id: "session-123".to_string(),
             workdir: "/tmp/project".to_string(),
@@ -612,15 +782,17 @@ mod tests {
             }],
         };
         let hits = vec![(hit, 0.875)];
-        let text = crate::ui::render::recall_agent("", "", &hits);
+        let text = crate::ui::render::recall_reply("", &hits, None);
 
         let response = recall_tool_result(recall::RecallResult {
             text: text.clone(),
             hits,
+            source_type_index_ready: None,
         });
         let json = serde_json::to_value(response).unwrap();
 
         assert_eq!(json["content"][0]["text"], text);
+        assert!(json["structuredContent"].get("source_type_index_ready").is_none());
         assert_eq!(
             json["structuredContent"]["hits"][0]["raw_text"],
             "complete raw hit\nwith a second line"

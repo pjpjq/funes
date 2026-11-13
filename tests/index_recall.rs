@@ -1,36 +1,16 @@
 //! End-to-end: build a real index from a tiny transcript in a temp dir, then exercise
-//! the read surface (recall / get / status). No mocking — this runs the real
-//! BGE embedder + reranker (downloaded to the fastembed cache on first run) against a
-//! real Lance memory under a temp `$FUNES_HOME`.
+//! the read surface (recall / get / status). No mocking: this runs the real embedder and
+//! reranker (downloaded on first run) against a real Lance memory under a temp `$FUNES_HOME`.
 
-use std::io::Write;
-
-/// Write a `<source>/projects/<project>/<session>.jsonl` transcript so `workdir_of` /
-/// `session_id_of` resolve the way they do for real Claude Code projects.
-fn write_transcript(source: &std::path::Path) -> (String, String) {
-    let workdir = "-home-u-dev-demo";
-    let session = "test-session-0001";
-    let dir = source.join("projects").join(workdir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let mut f = std::fs::File::create(dir.join(format!("{session}.jsonl"))).unwrap();
-    let lines = [
-        r#"{"type":"user","uuid":"t1","timestamp":"2026-01-01T00:00:00Z","message":{"role":"user","content":"how do we parse transcripts into turns"}}"#,
-        r#"{"type":"assistant","uuid":"t2","parentUuid":"t1","timestamp":"2026-01-01T00:00:05Z","message":{"role":"assistant","content":[{"type":"text","text":"We parse each JSONL line into a turn with typed blocks."},{"type":"tool_use","id":"c1","name":"Bash","input":{"command":"cargo test"}}]}}"#,
-        r#"{"type":"user","uuid":"t3","parentUuid":"t2","timestamp":"2026-01-01T00:00:10Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"c1","content":[{"type":"text","text":"22 passed"}]}]}}"#,
-    ];
-    for l in lines {
-        writeln!(f, "{l}").unwrap();
-    }
-    (session.to_string(), workdir.to_string())
-}
+mod support;
 
 #[tokio::test]
 async fn index_then_read_surface() {
     let db_dir = tempfile::tempdir().unwrap();
     let source = tempfile::tempdir().unwrap();
-    // db::funes_dir() reads $FUNES_HOME; point the whole read/write surface at the temp dir.
+    // home::dir() reads $FUNES_HOME; point the whole read/write surface at the temp dir.
     std::env::set_var("FUNES_HOME", db_dir.path());
-    let (session, workdir) = write_transcript(source.path());
+    let (session, workdir) = support::write_transcript(source.path());
 
     // Build the index for real: parse → chunk → embed → Lance + FTS.
     funes::commands::index::run_index(source.path(), false, None)
@@ -49,14 +29,12 @@ async fn index_then_read_surface() {
         "parse transcripts into turns".into(),
         5,
         30,
-        30.0,
         1,
-        None,
-        None,
+        Default::default(),
     )
     .await
     .unwrap();
-    assert_ne!(out, "no results", "recall returned nothing");
+    assert!(!out.starts_with("no results"), "recall returned nothing");
     assert!(
         out.contains(&session),
         "recall should surface the indexed session: {out}"
@@ -72,14 +50,25 @@ async fn index_then_read_surface() {
         "cargo test".into(),
         5,
         30,
-        0.0,
         0,
-        Some("tool_use".into()),
-        None,
+        funes::commands::recall::RecallFilter {
+            block_type: Some("tool_use".into()),
+            ..Default::default()
+        },
     )
     .await
     .unwrap();
-    assert!(tu.contains("tool_use"), "type filter should keep tool_use rows: {tu}");
+    // Five hits asked of four rows: the filter alone leaves the one tool_use.
+    let kinds: Vec<&str> = tu
+        .lines()
+        .filter_map(|l| l.split_once("  score="))
+        .map(|(head, _)| head.rsplit(' ').next().unwrap())
+        .collect();
+    assert_eq!(
+        kinds,
+        ["tool_use"],
+        "type filter should keep the tool_use row alone: {tu}"
+    );
 
     // scan: an exhaustive literal search of one session, and a zero that names what it cleared.
     let scanned = funes::commands::recall::scan(
@@ -154,13 +143,12 @@ async fn index_then_read_surface() {
     let listed = funes::commands::recall::sessions(funes::memory::Memory::local(), Default::default())
         .await
         .unwrap();
-    assert!(
-        listed.contains(&session) && listed.contains(" turns "),
-        "sessions should list the session with its turn count: {listed}"
-    );
-    assert!(
-        listed.trim_end().ends_with("1 sessions"),
-        "a complete listing closes with the total: {listed}"
+    assert_eq!(
+        listed,
+        format!(
+            "[2026-01-01T00:00:00Z → 2026-01-01T00:00:10Z] claude {workdir} 3 turns {session}\n  how do we parse transcripts into turns\n---\n1 sessions\n"
+        ),
+        "the sessions row is byte-stable"
     );
 
     // A limit of zero would render nothing, so it is an error that names the bounds.
@@ -175,6 +163,20 @@ async fn index_then_read_surface() {
     assert!(
         zero.is_err_and(|e| e.to_string().contains("would list nothing")),
         "a limit of 0 should error"
+    );
+
+    // A bound that is not a date is refused, as on recall.
+    let bad = funes::commands::recall::sessions(
+        funes::memory::Memory::local(),
+        funes::commands::recall::SessionFilter {
+            since: Some("2026-9".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(
+        bad.is_err_and(|e| e.to_string().contains("expected YYYY-MM-DD")),
+        "a bound that is not a date should error"
     );
 
     // A date filter narrows the population; one that excludes everything says so.
@@ -281,10 +283,8 @@ async fn index_then_read_surface() {
         "parse transcripts into turns".into(),
         5,
         30,
-        30.0,
         1,
-        None,
-        None,
+        Default::default(),
     )
     .await
     .unwrap();

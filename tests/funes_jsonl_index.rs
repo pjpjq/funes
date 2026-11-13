@@ -1,0 +1,223 @@
+//! Indexing `.funes.jsonl` turns files end to end: a valid file is written, an invalid one writes
+//! nothing and fails the run, and a directory mixing them writes the valid files, reports the rest,
+//! and exits non-zero. A second run over that directory skips what it already read and what it
+//! already refused. Own test binary: it sets `$FUNES_HOME`.
+
+mod support;
+
+use std::collections::BTreeSet;
+use std::path::Path;
+use std::process::Command;
+
+use arrow_array::{Array, StringArray};
+use funes::home;
+use funes::memory::dataset;
+
+async fn index(path: &Path) -> anyhow::Result<()> {
+    funes::commands::index::run_index(path, false, None).await
+}
+
+/// The `session_id` of every row the local memory holds.
+async fn stored_rows() -> Vec<String> {
+    let ds = dataset::open(&dataset::table_uri(home::memory_dir()), Default::default())
+        .await
+        .expect("the memory exists");
+    let mut out = Vec::new();
+    for batch in dataset::scan_rows(&ds, &["session_id"], None, None).await.unwrap() {
+        let col = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+        out.extend((0..col.len()).map(|i| col.value(i).to_string()));
+    }
+    out
+}
+
+async fn stored_sessions() -> BTreeSet<String> {
+    stored_rows().await.into_iter().collect()
+}
+
+/// `(turn_uuid, repo)` of every row the local memory holds.
+async fn stored_repos() -> Vec<(String, String)> {
+    let ds = dataset::open(&dataset::table_uri(home::memory_dir()), Default::default())
+        .await
+        .expect("the memory exists");
+    let mut out = Vec::new();
+    for batch in dataset::scan_rows(&ds, &["turn_uuid", "repo"], None, None)
+        .await
+        .unwrap()
+    {
+        let turn = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+        let repo = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+        out.extend((0..turn.len()).map(|i| (turn.value(i).to_string(), repo.value(i).to_string())));
+    }
+    out.sort();
+    out
+}
+
+#[tokio::test]
+async fn turns_files_are_indexed_and_invalid_ones_rejected() {
+    // One file at a time: a rejected file fails the run and writes nothing.
+    let home = tempfile::tempdir().unwrap();
+    std::env::set_var("FUNES_HOME", home.path());
+    let err = index(&support::fixture("bad_line.funes.jsonl"))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("bad_line.funes.jsonl:2:"), "{err}");
+    let err = index(&support::fixture("format2.funes.jsonl"))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("unknown format 2"), "{err}");
+    index(&support::fixture("valid.funes.jsonl")).await.unwrap();
+    assert_eq!(stored_sessions().await, BTreeSet::from(["b3f2e0c4".to_string()]));
+    // `--harness` is refused with a path: the facet is in the data.
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_funes"))
+        .arg("index")
+        .arg(support::fixture("valid.funes.jsonl"))
+        .args(["--harness", "claude"])
+        .env("FUNES_HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("names its own harness"), "{err}");
+
+    // The directory: the valid files land, the two rejected ones are counted and fail the exit
+    // status.
+    let home = tempfile::tempdir().unwrap();
+    std::env::set_var("FUNES_HOME", home.path());
+    let err = index(&support::fixture("")).await.unwrap_err().to_string();
+    assert!(err.contains("2 unit(s) rejected"), "{err}");
+    assert_eq!(
+        stored_sessions().await,
+        BTreeSet::from([
+            "b3f2e0c4".to_string(),
+            "dup-turn".to_string(),
+            "elided".to_string(),
+            "gh/huggingface/transformers#31234".to_string(),
+        ])
+    );
+    // A budgeted run reads each unit once for its rows; a rejected unit is counted once.
+    let home = tempfile::tempdir().unwrap();
+    std::env::set_var("FUNES_HOME", home.path());
+    let err = funes::commands::index::run_index_budgeted(&[support::fixture("")], false, None, true)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("2 unit(s) rejected"), "{err}");
+
+    // A turn re-emitted under its `turn_uuid` in the same file is one row, not two.
+    let rows = stored_rows().await;
+    assert_eq!(rows.iter().filter(|s| *s == "dup-turn").count(), 1, "{rows:?}");
+
+    // `repo` is each turn's own: a turn with a resolvable `cwd` gets its checkout's repo, a turn
+    // without `cwd` in the same session gets none, whatever file they arrive in.
+    let checkout = env!("CARGO_MANIFEST_DIR");
+    let own_repo = funes::traces::repo::of_cwd(checkout);
+    assert!(!own_repo.is_empty(), "this checkout has a git remote");
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("mixed.funes.jsonl");
+    std::fs::write(
+        &file,
+        format!(
+            concat!(
+                r#"{{"session_id":"mixed","turn_uuid":"with","seq":0,"ts":"2026-09-18T14:00:00Z","role":"user","harness":"t","cwd":{cwd:?},"blocks":[{{"block_type":"text","text":"in a checkout"}}]}}"#,
+                "\n",
+                r#"{{"session_id":"mixed","turn_uuid":"without","seq":1,"ts":"2026-09-18T14:00:01Z","role":"user","harness":"t","blocks":[{{"block_type":"text","text":"nowhere in particular"}}]}}"#,
+                "\n"
+            ),
+            cwd = checkout
+        ),
+    )
+    .unwrap();
+    let home = tempfile::tempdir().unwrap();
+    std::env::set_var("FUNES_HOME", home.path());
+    index(&file).await.unwrap();
+    assert_eq!(
+        stored_repos().await,
+        vec![("with".to_string(), own_repo), ("without".to_string(), String::new())]
+    );
+
+    // A directory funes revisits, the shape a producer's spool takes: the first run indexes what it
+    // can and fails on the file it refuses, and the second, finding the good file unchanged and the
+    // bad one already refused, reports nothing and exits zero.
+    let spool = tempfile::tempdir().unwrap();
+    let refused = spool.path().join("bad_line.funes.jsonl");
+    std::fs::copy(
+        support::fixture("valid.funes.jsonl"),
+        spool.path().join("valid.funes.jsonl"),
+    )
+    .unwrap();
+    std::fs::copy(support::fixture("bad_line.funes.jsonl"), &refused).unwrap();
+    let home = tempfile::tempdir().unwrap();
+    std::env::set_var("FUNES_HOME", home.path());
+    let err = index(spool.path()).await.unwrap_err().to_string();
+    assert!(err.contains("1 unit(s) rejected"), "{err}");
+    assert_eq!(stored_sessions().await, BTreeSet::from(["b3f2e0c4".to_string()]));
+    index(spool.path()).await.unwrap();
+
+    // The refusal is remembered against the file's content, so re-emitted content is read again.
+    std::fs::copy(support::fixture("github_issue.funes.jsonl"), &refused).unwrap();
+    index(spool.path()).await.unwrap();
+    assert_eq!(
+        stored_sessions().await,
+        BTreeSet::from(["b3f2e0c4".to_string(), "gh/huggingface/transformers#31234".to_string(),])
+    );
+}
+
+async fn stored_blocks(home: &Path) -> Vec<String> {
+    let uri = dataset::table_uri(home.join("memory"));
+    let ds = dataset::open(&uri, Default::default()).await.unwrap();
+    let mut blocks = Vec::new();
+    for batch in dataset::scan_rows(&ds, &["block_type"], None, None).await.unwrap() {
+        let col = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+        blocks.extend((0..col.len()).map(|i| col.value(i).to_string()));
+    }
+    blocks.sort();
+    blocks
+}
+
+#[tokio::test]
+async fn a_full_run_indexes_retained_thinking_before_draining_the_spool() {
+    for budgeted in [false, true] {
+        let home = tempfile::tempdir().unwrap();
+        let spool = home.path().join("spool/review");
+        std::fs::create_dir_all(&spool).unwrap();
+        let file = spool.join("thinking.funes.jsonl");
+        let turn = serde_json::json!({
+            "format": 1,
+            "session_id": "retained-thinking",
+            "turn_uuid": "turn-1",
+            "seq": 0,
+            "ts": "2026-01-01T00:00:00Z",
+            "role": "assistant",
+            "harness": "review",
+            "blocks": [
+                {"block_type": "text", "text": "Ordinary visible project content retained for indexing."},
+                {"block_type": "thinking", "text": "Deferred reasoning content must survive the later full sweep."}
+            ]
+        });
+        std::fs::write(&file, format!("{turn}\n")).unwrap();
+        let index = |no_thinking| {
+            let mut cmd = Command::new(env!("CARGO_BIN_EXE_funes"));
+            cmd.arg("index").arg("--yes").env("FUNES_HOME", home.path());
+            if budgeted {
+                cmd.args(["--harness", "review"]);
+            } else {
+                cmd.arg(&spool);
+            }
+            if no_thinking {
+                cmd.arg("--no-thinking");
+            }
+            let out = cmd.output().unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        };
+
+        index(true);
+        assert!(file.exists(), "the spool retains excluded thinking");
+        assert_eq!(stored_blocks(home.path()).await, ["text"]);
+
+        index(false);
+        assert_eq!(stored_blocks(home.path()).await, ["text", "thinking"]);
+        assert!(!file.exists(), "the full run drains only after storing thinking");
+    }
+}

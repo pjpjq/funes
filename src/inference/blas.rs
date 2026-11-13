@@ -1,21 +1,28 @@
-//! A from-scratch forward for funes' two models — a BLAS-backed alternative to the ONNX backend
+//! A from-scratch forward for funes' models — a BLAS-backed alternative to the ONNX backend
 //! (see `inference`). Every matmul goes through a small platform **seam** (`sgemm`/`vexp`): macOS
 //! wires it to Accelerate (cblas_sgemm on AMX + vForce vvexpf), Linux to faer's pure-Rust GEMM
-//! plus a runtime-dispatched polynomial exp. Everything else — the encoder, tokenization, the
-//! trait impls — is shared, cross-platform source. Gated behind the `blas` feature.
+//! plus a runtime-dispatched polynomial exp. This module holds the seam, the kernels, the model
+//! loaders and the length-grouped batching. The encoders built on them are cross-platform source:
+//! BERT (the embedders and bge-reranker-base) in [`bert`], ModernBERT
+//! (gte-reranker-modernbert-base) in [`modernbert`]. Gated behind the `blas` feature.
 
 use std::collections::HashMap;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Context, Result};
-use safetensors::SafeTensors;
-use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
+use anyhow::{anyhow, bail, Context, Result};
+use safetensors::tensor::Metadata;
+use tokenizers::utils::padding::pad_encodings;
+use tokenizers::{Encoding, PaddingParams, Tokenizer, TruncationParams};
 
-use super::{Embedder, Reranker};
+pub(super) mod bert;
+pub(super) mod modernbert;
+pub use bert::{BlasEmbedder, BlasReranker};
+pub use modernbert::GteReranker;
 
 // ---------------------------------------------------------------------------------------------
-// Platform seam: the ONLY OS-specific code. A platform backend implements just these two
-// functions (plus any library link in build.rs) and inherits the entire encoder below.
+// Platform seam: the ONLY OS-specific code. A platform backend implements just these functions
+// (plus any library link in build.rs) and inherits both encoders, in bert.rs and modernbert.rs.
 // ---------------------------------------------------------------------------------------------
 #[cfg(target_os = "macos")]
 mod seam {
@@ -146,7 +153,7 @@ mod seam {
     /// In-place vectorized exp: buf[i] = e^{buf[i]}. exp(x) = 2^f·exp(r), f = round(x/ln2), with
     /// exp(r) a degree-6 Taylor on |r| ≤ ln2/2 and 2^f built in the float's exponent bits — all
     /// branch-free so LLVM auto-vectorizes; multiversion picks the widest clone the CPU runs.
-    /// Max relative error 2.5e-7.
+    /// Max relative error 2.5e-7. Returns 0, not a subnormal, wherever e^x falls below FLT_MIN.
     #[multiversion::multiversion(targets("x86_64+avx512f+avx512bw+avx512dq", "x86_64+avx2+fma"))]
     pub fn vexp(buf: &mut [f32]) {
         const LOG2E: f32 = std::f32::consts::LOG2_E;
@@ -156,12 +163,23 @@ mod seam {
         const LN2_LO: f32 = -2.121_944_4e-4;
         const MAGIC: f32 = 12582912.0; // 1.5·2^23: add then subtract rounds to nearest integer
         const C: [f32; 5] = [1.0 / 720.0, 1.0 / 120.0, 1.0 / 24.0, 1.0 / 6.0, 0.5];
+        // e^x is a normal f32 only down to ln(FLT_MIN) = -126·ln2 = -87.3365448, and a subnormal
+        // result costs a microcode assist per operation on x86. This is the smallest f32 above
+        // that boundary: e^-87.3365402 = 1.1754997e-38, against FLT_MIN = 1.1754944e-38. The next
+        // f32 down, -87.3365479, gives 1.1754907e-38, which is subnormal.
+        const UNDERFLOW: f32 = -87.33654;
         for x in buf.iter_mut() {
-            let c = (*x).clamp(-87.336, 88.722);
+            let v = *x;
+            let c = v.clamp(UNDERFLOW, 88.722);
             let f = (c * LOG2E + MAGIC) - MAGIC;
             let r = c - f * LN2_HI - f * LN2_LO;
             let p = (((((C[0] * r + C[1]) * r + C[2]) * r + C[3]) * r + C[4]) * r + 1.0) * r + 1.0;
-            *x = p * f32::from_bits((((f as i32) + 127) << 23) as u32);
+            // A select rather than a branch: a branch here would stop LLVM vectorizing the loop.
+            *x = if v < UNDERFLOW {
+                0.0
+            } else {
+                p * f32::from_bits((((f as i32) + 127) << 23) as u32)
+            };
         }
     }
 
@@ -203,40 +221,14 @@ mod seam {
 const NO_T: i32 = 111;
 const T: i32 = 112;
 const EPS: f32 = 1e-5;
-const PAD: i64 = 1;
 const GELU_P: f32 = 0.3275911;
 const GELU_A: [f32; 5] = [0.254_829_6, -0.284_496_72, 1.421_413_8, -1.453_152_1, 1.061_405_4];
 const INV_SQRT2: f32 = std::f32::consts::FRAC_1_SQRT_2;
 
-/// A BERT-family encoder config. Reranker is XLM-R (pad-offset positions); embedder is BERT.
-#[derive(Clone, Copy)]
-struct Cfg {
-    prefix: &'static str,
-    h: usize,
-    heads: usize,
-    hd: usize,
-    ffn: usize,
-    layers: usize,
-    bert_pos: bool,
-}
-const RERANK: Cfg = Cfg {
-    prefix: "roberta.",
-    h: 768,
-    heads: 12,
-    hd: 64,
-    ffn: 3072,
-    layers: 12,
-    bert_pos: false,
-};
-const EMBED: Cfg = Cfg {
-    prefix: "",
-    h: 384,
-    heads: 12,
-    hd: 32,
-    ffn: 1536,
-    layers: 12,
-    bert_pos: true,
-};
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const RERANK_GROUP: usize = 16; // Apple Silicon AMX saturates at larger groups
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+const RERANK_GROUP: usize = 8;
 
 fn nthreads() -> usize {
     use std::sync::OnceLock;
@@ -308,11 +300,16 @@ fn par_add(dst: &mut [f32], src: &[f32]) {
     });
 }
 
-/// y[m,out] = x[m,in] · W[out,in]ᵀ + b[out]. The caller owns y (m·out): buffers are reused
-/// across layers — a fresh allocation per call makes the allocator release and re-fault
-/// hundreds of MB per layer on platforms that return large frees to the OS.
-fn linear(x: &[f32], m: usize, in_: usize, w: &[f32], b: &[f32], out: usize, y: &mut [f32]) {
+/// y[m,out] = x[m,in] · W[out,in]ᵀ. The caller owns y (m·out): buffers are reused across layers —
+/// a fresh allocation per call makes the allocator release and re-fault hundreds of MB per layer on
+/// platforms that return large frees to the OS.
+fn matmul(x: &[f32], m: usize, in_: usize, w: &[f32], out: usize, y: &mut [f32]) {
     seam::sgemm(NO_T, T, m, out, in_, 1.0, x, in_, w, in_, y);
+}
+
+/// y[m,out] = x[m,in] · W[out,in]ᵀ + b[out], into a caller-owned y like [`matmul`].
+fn linear(x: &[f32], m: usize, in_: usize, w: &[f32], b: &[f32], out: usize, y: &mut [f32]) {
+    matmul(x, m, in_, w, out, y);
     par_rows(y, out, |row| {
         for (c, bc) in row.iter_mut().zip(b) {
             *c += bc;
@@ -374,198 +371,10 @@ fn softmax_rows(s: &mut [f32], rows: usize, cols: usize) {
     }
 }
 
-fn l2_normalize(v: &mut [f32]) {
+pub(super) fn l2_normalize(v: &mut [f32]) {
     let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
     for x in v.iter_mut() {
         *x /= norm;
-    }
-}
-
-/// Forward-pass buffers, owned by the model and reused across calls, growing to the high-water
-/// mark. Freeing them between forwards hands the pages back to the OS, and the next call pays a
-/// page fault per 4 KiB rewritten — hundreds of MB per forward (see linear()).
-#[derive(Default)]
-struct Scratch {
-    hid: Vec<f32>,
-    q: Vec<f32>,
-    k: Vec<f32>,
-    v: Vec<f32>,
-    ctx: Vec<f32>,
-    attn: Vec<f32>,
-    inter: Vec<f32>,
-    ffn_out: Vec<f32>,
-}
-
-/// Shared BERT-family encoder → last_hidden_state in `s.hid` [n*l*h]. `mask[s*l+j]` 1=real, 0=pad.
-fn encode(w: &HashMap<String, Vec<f32>>, c: Cfg, ids: &[i64], mask: &[i64], n: usize, l: usize, s: &mut Scratch) {
-    let g = |k: &str| w.get(k).unwrap_or_else(|| panic!("missing weight {k}")).as_slice();
-    let (h, ffn, hd, heads) = (c.h, c.ffn, c.hd, c.heads);
-    let m = n * l;
-    let word = g(&format!("{}embeddings.word_embeddings.weight", c.prefix));
-    let pos = g(&format!("{}embeddings.position_embeddings.weight", c.prefix));
-    let typ = g(&format!("{}embeddings.token_type_embeddings.weight", c.prefix));
-    for (buf, len) in [
-        (&mut s.hid, m * h),
-        (&mut s.q, m * h),
-        (&mut s.k, m * h),
-        (&mut s.v, m * h),
-        (&mut s.ctx, m * h),
-        (&mut s.attn, m * h),
-        (&mut s.inter, m * ffn),
-        (&mut s.ffn_out, m * h),
-    ] {
-        buf.resize(len, 0.0);
-    }
-    let seqs_per = ceil_div(n, seq_workers(n));
-    std::thread::scope(|scope| {
-        for (gi, grp) in s.hid.chunks_mut(seqs_per * l * h).enumerate() {
-            scope.spawn(move || {
-                for (si, seq) in grp.chunks_mut(l * h).enumerate() {
-                    let sq = gi * seqs_per + si;
-                    let mut run = 0i64;
-                    for i in 0..l {
-                        let id = ids[sq * l + i];
-                        let posid = if c.bert_pos {
-                            i
-                        } else if id != PAD {
-                            run += 1;
-                            (PAD + run) as usize
-                        } else {
-                            PAD as usize
-                        };
-                        let dst = &mut seq[i * h..i * h + h];
-                        let we = &word[id as usize * h..id as usize * h + h];
-                        let pe = &pos[posid * h..posid * h + h];
-                        for cc in 0..h {
-                            dst[cc] = we[cc] + pe[cc] + typ[cc];
-                        }
-                    }
-                }
-            });
-        }
-    });
-    layernorm(
-        &mut s.hid,
-        h,
-        g(&format!("{}embeddings.LayerNorm.weight", c.prefix)),
-        g(&format!("{}embeddings.LayerNorm.bias", c.prefix)),
-    );
-
-    let scale = 1.0 / (hd as f32).sqrt();
-    for ly in 0..c.layers {
-        let p = format!("{}encoder.layer.{ly}", c.prefix);
-        linear(
-            &s.hid,
-            m,
-            h,
-            g(&format!("{p}.attention.self.query.weight")),
-            g(&format!("{p}.attention.self.query.bias")),
-            h,
-            &mut s.q,
-        );
-        linear(
-            &s.hid,
-            m,
-            h,
-            g(&format!("{p}.attention.self.key.weight")),
-            g(&format!("{p}.attention.self.key.bias")),
-            h,
-            &mut s.k,
-        );
-        linear(
-            &s.hid,
-            m,
-            h,
-            g(&format!("{p}.attention.self.value.weight")),
-            g(&format!("{p}.attention.self.value.bias")),
-            h,
-            &mut s.v,
-        );
-
-        let seqs_per = ceil_div(n, seq_workers(n));
-        let (qr, kr, vr, maskr) = (&s.q, &s.k, &s.v, &mask);
-        std::thread::scope(|scope| {
-            for (gi, grp) in s.ctx.chunks_mut(seqs_per * l * h).enumerate() {
-                scope.spawn(move || {
-                    let mut qh = vec![0f32; l * hd];
-                    let mut kh = vec![0f32; l * hd];
-                    let mut vh = vec![0f32; l * hd];
-                    let mut sc = vec![0f32; l * l];
-                    let mut ch = vec![0f32; l * hd];
-                    let s0 = gi * seqs_per;
-                    let nseq = grp.len() / (l * h);
-                    for si in 0..nseq {
-                        let s = s0 + si;
-                        for head in 0..heads {
-                            for i in 0..l {
-                                let src = (s * l + i) * h + head * hd;
-                                qh[i * hd..i * hd + hd].copy_from_slice(&qr[src..src + hd]);
-                                kh[i * hd..i * hd + hd].copy_from_slice(&kr[src..src + hd]);
-                                vh[i * hd..i * hd + hd].copy_from_slice(&vr[src..src + hd]);
-                            }
-                            seam::sgemm(NO_T, T, l, l, hd, scale, &qh, hd, &kh, hd, &mut sc);
-                            let mrow = &maskr[s * l..s * l + l];
-                            for j in 0..l {
-                                if mrow[j] == 0 {
-                                    for i in 0..l {
-                                        sc[i * l + j] += -1e30f32;
-                                    }
-                                }
-                            }
-                            softmax_rows(&mut sc, l, l);
-                            seam::sgemm(NO_T, NO_T, l, hd, l, 1.0, &sc, l, &vh, hd, &mut ch);
-                            for i in 0..l {
-                                let dst = (si * l + i) * h + head * hd;
-                                grp[dst..dst + hd].copy_from_slice(&ch[i * hd..i * hd + hd]);
-                            }
-                        }
-                    }
-                });
-            }
-        });
-        linear(
-            &s.ctx,
-            m,
-            h,
-            g(&format!("{p}.attention.output.dense.weight")),
-            g(&format!("{p}.attention.output.dense.bias")),
-            h,
-            &mut s.attn,
-        );
-        par_add(&mut s.hid, &s.attn);
-        layernorm(
-            &mut s.hid,
-            h,
-            g(&format!("{p}.attention.output.LayerNorm.weight")),
-            g(&format!("{p}.attention.output.LayerNorm.bias")),
-        );
-
-        linear(
-            &s.hid,
-            m,
-            h,
-            g(&format!("{p}.intermediate.dense.weight")),
-            g(&format!("{p}.intermediate.dense.bias")),
-            ffn,
-            &mut s.inter,
-        );
-        gelu(&mut s.inter);
-        linear(
-            &s.inter,
-            m,
-            ffn,
-            g(&format!("{p}.output.dense.weight")),
-            g(&format!("{p}.output.dense.bias")),
-            h,
-            &mut s.ffn_out,
-        );
-        par_add(&mut s.hid, &s.ffn_out);
-        layernorm(
-            &mut s.hid,
-            h,
-            g(&format!("{p}.output.LayerNorm.weight")),
-            g(&format!("{p}.output.LayerNorm.bias")),
-        );
     }
 }
 
@@ -573,94 +382,106 @@ fn encode(w: &HashMap<String, Vec<f32>>, c: Cfg, ids: &[i64], mask: &[i64], n: u
 // Model loading + tokenization (cross-platform)
 // ---------------------------------------------------------------------------------------------
 
-/// Resolve a snapshot dir for `repo` (e.g. "BAAI/bge-small-en-v1.5") in the standard HF cache,
-/// downloading the two files the forward needs on first use (like the ONNX backend does).
-fn hf_snapshot(repo: &str) -> Result<PathBuf> {
-    if let Some(dir) = local_snapshot(repo) {
-        return Ok(dir);
-    }
-    eprintln!("downloading {repo} (first use)…");
-    // A dedicated thread: the blocking hf-hub client drives its own runtime with block_on,
-    // which would panic if called from a thread already inside a tokio runtime (the MCP server).
-    let owned = repo.to_string();
-    let dir = std::thread::spawn(move || -> Result<PathBuf> {
-        let (owner, name) = owned
-            .split_once('/')
-            .ok_or_else(|| anyhow!("model repo {owned} is not owner/name"))?;
-        let client = hf_hub::HFClientSync::new().map_err(|e| anyhow!("hf-hub client: {e}"))?;
-        let r = client.model(owner, name);
-        r.download_file()
-            .filename("tokenizer.json")
-            .send()
-            .with_context(|| format!("downloading {owned}/tokenizer.json"))?;
-        let weights = r
-            .download_file()
-            .filename("model.safetensors")
-            .send()
-            .with_context(|| format!("downloading {owned}/model.safetensors"))?;
-        Ok(weights
-            .parent()
-            .ok_or_else(|| anyhow!("downloaded file has no parent dir"))?
-            .to_path_buf())
-    })
-    .join()
-    .map_err(|_| anyhow!("model download thread panicked"))??;
-    Ok(dir)
+/// A snapshot dir for `repo` in the standard HF cache, holding the two files [`load_weights`] and
+/// [`load_tokenizer`] read, downloaded on first use.
+pub(super) fn hf_snapshot(repo: &str) -> Result<PathBuf> {
+    super::snapshot(repo, &["tokenizer.json", "model.safetensors"])
 }
 
-/// A cached snapshot of `repo` holding both files the forward needs, if any. With several
-/// snapshots cached the pick is arbitrary — fine here: any complete copy of these frozen model
-/// repos is interchangeable.
-fn local_snapshot(repo: &str) -> Option<PathBuf> {
-    let base = std::env::var("HF_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".cache/huggingface"));
-    let snaps = base
-        .join("hub")
-        .join(format!("models--{}", repo.replace('/', "--")))
-        .join("snapshots");
-    for e in std::fs::read_dir(&snaps).ok()?.flatten() {
-        let p = e.path();
-        if p.join("model.safetensors").exists() && p.join("tokenizer.json").exists() {
-            return Some(p);
+/// The f32 tensors of `dir/model.safetensors`, one tensor at a time. Reading the file whole would
+/// hold its bytes and the f32 copies of them side by side, twice the memory the weights keep, so
+/// only the header is buffered and each tensor is converted through a small window.
+pub(super) fn load_weights(dir: &Path) -> Result<HashMap<String, Vec<f32>>> {
+    /// Bytes read per conversion. A multiple of 4, so no f32 straddles two reads.
+    const WINDOW: usize = 1 << 20;
+    /// What safetensors itself accepts, so a corrupt length cannot ask for an unbounded allocation.
+    const MAX_HEADER: u64 = 100_000_000;
+
+    let path = dir.join("model.safetensors");
+    let mut file = std::fs::File::open(&path).with_context(|| format!("opening {}", path.display()))?;
+    let size = file.metadata()?.len();
+
+    // A safetensors file is an 8-byte little-endian header length, that many bytes of JSON naming
+    // each tensor, then the tensor data the header's offsets index into.
+    let mut len = [0u8; 8];
+    file.read_exact(&mut len)
+        .with_context(|| format!("reading the header length of {}", path.display()))?;
+    let head_len = u64::from_le_bytes(len);
+    if head_len > MAX_HEADER || head_len + 8 > size {
+        bail!(
+            "{} declares a {head_len}-byte header, which its {size} bytes cannot hold",
+            path.display()
+        );
+    }
+    let mut head = vec![0u8; head_len as usize];
+    file.read_exact(&mut head)
+        .with_context(|| format!("reading the header of {}", path.display()))?;
+    // Deserializing `Metadata` runs safetensors' own validation: the offsets tile the data from zero
+    // and each tensor's shape and dtype account for exactly its byte range.
+    let meta: Metadata =
+        serde_json::from_slice(&head).with_context(|| format!("parsing the header of {}", path.display()))?;
+
+    // The one thing the header cannot answer on its own: the data has to be as long as it accounts for.
+    let data_start = 8 + head_len;
+    let accounted = meta.tensors().values().map(|i| i.data_offsets.1).max().unwrap_or(0) as u64;
+    let data_len = size - data_start;
+    if accounted != data_len {
+        bail!(
+            "{} carries {data_len} bytes of tensor data, its header accounts for {accounted}",
+            path.display()
+        );
+    }
+
+    let mut tensors: Vec<(String, usize, usize)> = meta
+        .tensors()
+        .into_iter()
+        .filter(|(_, i)| i.dtype == safetensors::Dtype::F32)
+        .map(|(name, i)| (name, i.data_offsets.0, i.data_offsets.1))
+        .collect();
+    // Front to back, so the reads below never seek backwards over the file.
+    tensors.sort_by_key(|(_, start, _)| *start);
+
+    let mut weights = HashMap::with_capacity(tensors.len());
+    let mut window = vec![0u8; WINDOW];
+    let mut at = 0usize;
+    for (name, start, end) in tensors {
+        if at != start {
+            file.seek(SeekFrom::Start(data_start + start as u64))
+                .with_context(|| format!("seeking to {name} in {}", path.display()))?;
         }
-    }
-    None
-}
-
-fn load_weights(dir: &Path) -> Result<HashMap<String, Vec<f32>>> {
-    let bytes = std::fs::read(dir.join("model.safetensors"))?;
-    let st = SafeTensors::deserialize(&bytes)?;
-    let mut w = HashMap::new();
-    for (name, view) in st.tensors() {
-        if view.dtype() == safetensors::Dtype::F32 {
-            let f: Vec<f32> = view
-                .data()
-                .chunks_exact(4)
-                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-                .collect();
-            w.insert(name, f);
+        let mut vals: Vec<f32> = Vec::with_capacity((end - start) / 4);
+        let mut left = end - start;
+        while left > 0 {
+            let take = left.min(WINDOW);
+            file.read_exact(&mut window[..take])
+                .with_context(|| format!("reading {name} from {}", path.display()))?;
+            vals.extend(
+                window[..take]
+                    .chunks_exact(4)
+                    .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])),
+            );
+            left -= take;
         }
+        at = end;
+        weights.insert(name, vals);
     }
-    Ok(w)
+    Ok(weights)
 }
 
-fn load_tokenizer(dir: &Path) -> Result<Tokenizer> {
+pub(super) fn load_tokenizer(dir: &Path) -> Result<Tokenizer> {
     let mut tok = Tokenizer::from_file(dir.join("tokenizer.json")).map_err(|e| anyhow!("load tokenizer: {e}"))?;
     tok.with_truncation(Some(TruncationParams {
-        max_length: 512,
+        max_length: super::MAX_LEN,
         ..Default::default()
     }))
     .map_err(|e| anyhow!("set truncation: {e}"))?;
-    tok.with_padding(Some(PaddingParams {
-        strategy: PaddingStrategy::BatchLongest,
-        ..Default::default()
-    }));
+    // Unpadded: `by_length` pads each forward's group to its own longest.
+    tok.with_padding(None);
     Ok(tok)
 }
 
 /// Tokenized batch → (ids, mask, n, l), both flattened row-major, padded to the batch's longest.
-fn to_batch(encs: &[tokenizers::Encoding]) -> (Vec<i64>, Vec<i64>, usize, usize) {
+fn to_batch(encs: &[Encoding]) -> (Vec<i64>, Vec<i64>, usize, usize) {
     let n = encs.len();
     let l = encs[0].get_ids().len();
     let mut ids = Vec::with_capacity(n * l);
@@ -672,100 +493,218 @@ fn to_batch(encs: &[tokenizers::Encoding]) -> (Vec<i64>, Vec<i64>, usize, usize)
     (ids, mask, n, l)
 }
 
-/// bge-small-en-v1.5 embedder: BERT encoder → CLS → L2-normalize.
-pub struct BlasEmbedder {
-    w: HashMap<String, Vec<f32>>,
-    tok: Tokenizer,
-    scratch: Scratch,
-}
-
-impl BlasEmbedder {
-    pub fn new() -> Result<Self> {
-        let dir = hf_snapshot("BAAI/bge-small-en-v1.5")?;
-        Ok(Self {
-            w: load_weights(&dir)?,
-            tok: load_tokenizer(&dir)?,
-            scratch: Scratch::default(),
-        })
+/// Run `forward` over `encs` in length-sorted groups of at most `group`, each padded to its own
+/// longest, and return the per-sequence outputs in input order. Chunks run from a few tokens to the
+/// 512 cap, so one forward over a whole call — indexing hands `embed` 256 texts at a time — would
+/// spend most of its work on padding. `forward` gets one group laid out as [`to_batch`] does and
+/// returns one output per sequence.
+fn by_length<T: Default + Clone>(
+    mut encs: Vec<Encoding>,
+    group: usize,
+    mut forward: impl FnMut(&[i64], &[i64], usize, usize) -> Vec<T>,
+) -> Result<Vec<T>> {
+    let mut order: Vec<usize> = (0..encs.len()).collect();
+    order.sort_by_key(|&i| encs[i].get_ids().len());
+    let mut out = vec![T::default(); encs.len()];
+    for group in order.chunks(group) {
+        let mut batch: Vec<Encoding> = group.iter().map(|&i| std::mem::take(&mut encs[i])).collect();
+        pad_encodings(&mut batch, &PaddingParams::default()).map_err(|e| anyhow!("pad: {e}"))?;
+        let (ids, mask, n, l) = to_batch(&batch);
+        for (&i, y) in group.iter().zip(forward(&ids, &mask, n, l)) {
+            out[i] = y;
+        }
     }
+    Ok(out)
 }
 
-impl Embedder for BlasEmbedder {
-    fn embed(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
-        let encs = self
-            .tok
-            .encode_batch(texts.to_vec(), true)
-            .map_err(|e| anyhow!("tokenize: {e}"))?;
-        let (ids, mask, n, l) = to_batch(&encs);
-        encode(&self.w, EMBED, &ids, &mask, n, l, &mut self.scratch);
-        let hid = &self.scratch.hid;
-        let h = EMBED.h;
-        Ok((0..n)
-            .map(|s| {
-                let mut e = hid[(s * l) * h..(s * l) * h + h].to_vec();
-                l2_normalize(&mut e);
-                e
+fn mean_pool(rows: &[f32], mask: &[i64], h: usize) -> Vec<f32> {
+    let mut sum = vec![0f32; h];
+    let mut kept = 0f32;
+    for (row, &m) in rows.chunks_exact(h).zip(mask) {
+        if m != 0 {
+            sum.iter_mut().zip(row).for_each(|(s, x)| *s += x);
+            kept += 1.0;
+        }
+    }
+    sum.iter_mut().for_each(|s| *s /= kept);
+    sum
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A hand-built safetensors file: every f32 tensor comes back whole whatever order the header
+    /// lists it in, a tensor of another dtype is skipped, and a file whose header and data disagree
+    /// is refused instead of read.
+    #[test]
+    fn load_weights_streams_every_f32_tensor_and_refuses_a_bad_file() {
+        fn file(dir: &Path, header: &str, data: &[u8]) {
+            let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+            bytes.extend_from_slice(header.as_bytes());
+            bytes.extend_from_slice(data);
+            std::fs::write(dir.join("model.safetensors"), bytes).unwrap();
+        }
+        let mut data = Vec::new();
+        data.extend(1.0f32.to_le_bytes()); // "second", listed first in the header
+        data.extend((-2.5f32).to_le_bytes());
+        data.extend(7i64.to_le_bytes()); // an i64 tensor, skipped
+        data.extend(0.5f32.to_le_bytes()); // "first", listed last
+        let header = r#"{"__metadata__":{"format":"pt"},"second":{"dtype":"F32","shape":[2],"data_offsets":[0,8]},"skipped":{"dtype":"I64","shape":[1],"data_offsets":[8,16]},"first":{"dtype":"F32","shape":[1],"data_offsets":[16,20]}}"#;
+
+        let dir = tempfile::tempdir().unwrap();
+        file(dir.path(), header, &data);
+        let w = load_weights(dir.path()).unwrap();
+        assert_eq!(w.len(), 2, "only the f32 tensors are loaded: {:?}", w.keys());
+        assert_eq!(w["second"], vec![1.0, -2.5]);
+        assert_eq!(w["first"], vec![0.5]);
+
+        // A shape its byte range cannot hold, and a gap between two tensors: safetensors' own
+        // validation catches both while the header is deserialized. `{err:#}` to see its message
+        // under the context this adds.
+        let bad = tempfile::tempdir().unwrap();
+        file(
+            bad.path(),
+            r#"{"t":{"dtype":"F32","shape":[64],"data_offsets":[0,4]}}"#,
+            &data[..4],
+        );
+        let err = format!("{:#}", load_weights(bad.path()).unwrap_err());
+        assert!(
+            err.contains("invalid shape, data type, or offset"),
+            "a shape its bytes cannot hold must be refused, got: {err}"
+        );
+
+        let gap = tempfile::tempdir().unwrap();
+        let two = r#"{"a":{"dtype":"F32","shape":[1],"data_offsets":[0,4]},"b":{"dtype":"F32","shape":[1],"data_offsets":[8,12]}}"#;
+        file(gap.path(), two, &data[..12]);
+        let err = format!("{:#}", load_weights(gap.path()).unwrap_err());
+        assert!(
+            err.contains("invalid offset for tensor"),
+            "a gap in the data must be refused, got: {err}"
+        );
+
+        // Data the header does not account for. The header alone cannot catch this, so the loader
+        // checks it against the file's length.
+        let extra = tempfile::tempdir().unwrap();
+        file(
+            extra.path(),
+            r#"{"t":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#,
+            &data[..8],
+        );
+        let err = format!("{:#}", load_weights(extra.path()).unwrap_err());
+        assert!(
+            err.contains("8 bytes of tensor data") && err.contains("accounts for 4"),
+            "a longer data section must be refused, got: {err}"
+        );
+
+        // And a truncated one, which the same check catches from the other side.
+        let short = tempfile::tempdir().unwrap();
+        file(
+            short.path(),
+            r#"{"t":{"dtype":"F32","shape":[2],"data_offsets":[0,8]}}"#,
+            &data[..4],
+        );
+        let err = format!("{:#}", load_weights(short.path()).unwrap_err());
+        assert!(
+            err.contains("4 bytes of tensor data") && err.contains("accounts for 8"),
+            "a truncated data section must be refused, got: {err}"
+        );
+    }
+
+    /// Padded columns carry a -1e30 mask into the softmax. Should `exp` return FLT_MIN for them
+    /// instead of 0, the `*= 1/sum` step scales that into the 1e-40 range, leaving every masked
+    /// column of the scores×V GEMM subnormal.
+    #[test]
+    fn masked_columns_leave_no_subnormal_weight() {
+        let (rows, cols, real) = (4, 512, 384);
+        let mut s: Vec<f32> = (0..rows * cols)
+            .map(|i| {
+                if i % cols < real {
+                    (i % 17) as f32 * 0.31 - 2.0
+                } else {
+                    -1e30
+                }
             })
-            .collect())
+            .collect();
+        softmax_rows(&mut s, rows, cols);
+
+        assert!(
+            !s.iter().any(|w| w.is_subnormal()),
+            "softmax produced a subnormal weight"
+        );
+        assert!(s.iter().skip(real).take(cols - real).all(|w| *w == 0.0));
+        for r in 0..rows {
+            let sum: f32 = s[r * cols..(r + 1) * cols].iter().sum();
+            assert!((sum - 1.0).abs() < 1e-5, "row {r} sums to {sum}");
+        }
     }
-}
 
-/// bge-reranker-base cross-encoder: XLM-R encoder → CLS → out_proj(tanh(dense(cls))).
-pub struct BlasReranker {
-    w: HashMap<String, Vec<f32>>,
-    tok: Tokenizer,
-    scratch: Scratch,
-}
+    /// `UNDERFLOW` has one correct value and two ways to be wrong: one f32 lower lets a subnormal
+    /// through, one f32 higher flushes e^x values that are representable normals to zero. This
+    /// walks every f32 across the boundary and rejects both. Linux only — the macOS seam calls
+    /// Accelerate's `exp`, which returns the subnormals rather than zeroing them.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn vexp_cutoff_sits_on_the_subnormal_boundary() {
+        let (mut bits, end) = ((-87.5f32).to_bits(), (-87.2f32).to_bits());
+        let (mut flushed_a_normal, mut kept_a_subnormal) = (0, 0);
+        while bits >= end {
+            let v = f32::from_bits(bits);
+            let mut buf = [v];
+            seam::vexp(&mut buf);
+            if buf[0] == 0.0 && (v as f64).exp() >= f32::MIN_POSITIVE as f64 {
+                flushed_a_normal += 1;
+            }
+            if buf[0].is_subnormal() {
+                kept_a_subnormal += 1;
+            }
+            bits -= 1;
+        }
+        assert_eq!(flushed_a_normal, 0, "zeroed an exp that is a normal f32");
+        assert_eq!(kept_a_subnormal, 0, "let a subnormal through");
+    }
 
-impl BlasReranker {
-    pub fn new() -> Result<Self> {
-        let dir = hf_snapshot("BAAI/bge-reranker-base")?;
-        Ok(Self {
-            w: load_weights(&dir)?,
-            tok: load_tokenizer(&dir)?,
-            scratch: Scratch::default(),
+    /// `by_length` must hand `forward` length-sorted groups of at most `group`, each padded only
+    /// to its own longest, and put every output back at its input's position.
+    #[test]
+    fn by_length_pads_each_group_to_its_own_longest_in_input_order() {
+        use tokenizers::Token;
+        let group = 8;
+        let lens: Vec<usize> = (0..3 * group + 5).map(|i| 1 + (i * 37) % 200).collect();
+        let encs = lens
+            .iter()
+            .map(|&n| {
+                let toks = (0..n).map(|t| Token::new(2 + t as u32, String::new(), (0, 0)));
+                Encoding::from_tokens(toks.collect(), 0)
+            })
+            .collect();
+        let mut padded = 0;
+        let out = by_length(encs, group, |_, mask, n, l| {
+            let real: Vec<usize> = mask
+                .chunks(l)
+                .map(|row| row.iter().filter(|&&m| m == 1).count())
+                .collect();
+            assert!(n <= group, "a group of {n} exceeds {group}");
+            assert_eq!(real.iter().max(), Some(&l), "a group padded past its longest");
+            padded += n * l;
+            real
         })
+        .unwrap();
+        assert_eq!(out, lens, "outputs are not in input order");
+        let mut sorted = lens.clone();
+        sorted.sort();
+        let want: usize = sorted.chunks(group).map(|g| g.len() * g[g.len() - 1]).sum();
+        assert_eq!(padded, want, "groups are not length-sorted");
     }
-}
 
-impl Reranker for BlasReranker {
-    fn rerank(&mut self, query: &str, docs: &[&str]) -> Result<Vec<f32>> {
-        let pairs: Vec<(&str, &str)> = docs.iter().map(|d| (query, *d)).collect();
-        let encs = self
-            .tok
-            .encode_batch(pairs, true)
-            .map_err(|e| anyhow!("tokenize: {e}"))?;
-        let (ids, mask, n, l) = to_batch(&encs);
-        encode(&self.w, RERANK, &ids, &mask, n, l, &mut self.scratch);
-        let hid = &self.scratch.hid;
-        let h = RERANK.h;
-        let mut cls = vec![0f32; n * h];
-        for s in 0..n {
-            cls[s * h..s * h + h].copy_from_slice(&hid[(s * l) * h..(s * l) * h + h]);
+    /// Zeroing below the cutoff must leave e^x untouched everywhere above it.
+    #[test]
+    fn vexp_is_accurate_in_range() {
+        let mut got: Vec<f32> = (-870..=880).map(|i| i as f32 / 10.0).collect();
+        let want: Vec<f32> = got.iter().map(|x| x.exp()).collect();
+        seam::vexp(&mut got);
+        for (g, w) in got.iter().zip(&want) {
+            assert!((g - w).abs() <= 1e-6 * w, "exp mismatch: {g} vs {w}");
         }
-        let mut d = vec![0f32; n * h];
-        linear(
-            &cls,
-            n,
-            h,
-            self.w["classifier.dense.weight"].as_slice(),
-            self.w["classifier.dense.bias"].as_slice(),
-            h,
-            &mut d,
-        );
-        for v in d.iter_mut() {
-            *v = v.tanh();
-        }
-        let mut scores = vec![0f32; n];
-        linear(
-            &d,
-            n,
-            h,
-            self.w["classifier.out_proj.weight"].as_slice(),
-            self.w["classifier.out_proj.bias"].as_slice(),
-            1,
-            &mut scores,
-        );
-        Ok(scores)
     }
 }

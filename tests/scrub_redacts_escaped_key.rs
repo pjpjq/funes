@@ -1,0 +1,127 @@
+//! Gated end-to-end: `funes scrub` redacts a key stored with escaped `\n` (literal backslash-n), as a
+//! compact-JSON `tool_use` input or logged transcript holds it. The scanner's canonical `raw` (real
+//! newlines) isn't a substring of the stored bytes, but its JSON-escaped form is, so scrub excises the
+//! key in place instead of dropping the whole block — and the secret's base64 body is fully gone, not
+//! left as residue. This is the exact shape that once leaked. Skipped unless trufflehog and ssh-keygen
+//! are available.
+
+use std::io::Write;
+use std::process::Command;
+
+#[tokio::test]
+async fn scrub_redacts_an_escaped_key_in_place() {
+    if funes::scan::Trufflehog::find().is_err() {
+        eprintln!("skip: trufflehog not found");
+        return;
+    }
+    if !std::path::Path::new("/usr/bin/true").exists() {
+        eprintln!("skip: /usr/bin/true unavailable");
+        return;
+    }
+    let home = tempfile::tempdir().unwrap();
+    let source = tempfile::tempdir().unwrap();
+    std::env::set_var("FUNES_HOME", home.path());
+
+    let keyfile = home.path().join("throwaway_ed25519");
+    let made = Command::new("ssh-keygen")
+        .args(["-t", "ed25519", "-N", "", "-q", "-f"])
+        .arg(&keyfile)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !made {
+        eprintln!("skip: ssh-keygen unavailable");
+        return;
+    }
+    let key = std::fs::read_to_string(&keyfile).unwrap();
+    std::fs::remove_file(&keyfile).unwrap();
+    // A base64 line of the key body — unchanged by escaping (escaping only rewrites the newlines),
+    // so it's a substring of both forms and a reliable "did the secret survive?" probe.
+    let key_body = key.lines().nth(1).unwrap().to_string();
+    let escaped = key.replace('\n', "\\n");
+    assert!(!escaped.contains('\n') && escaped.contains(&key_body));
+
+    let session = "scrub-drop-0001";
+    // Two turns: a clean one (must survive) and the escaped-key one (must be redacted in place).
+    let mut f = std::fs::File::create(source.path().join(format!("{session}.funes.jsonl"))).unwrap();
+    for (seq, (uuid, content)) in [
+        ("t1", "just chatting about parsers"),
+        ("t2", &format!("deploy key: {escaped}")[..]),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let line = serde_json::json!({
+            "format": 1,
+            "session_id": session,
+            "cwd": "/home/u/dev/demo",
+            "turn_uuid": uuid,
+            "seq": seq,
+            "ts": "2026-01-01T00:00:00Z",
+            "role": "user",
+            "blocks": [{"block_type": "text", "text": content}],
+            "harness": "claude",
+        })
+        .to_string();
+        writeln!(f, "{line}").unwrap();
+    }
+
+    // Index with a no-op scanner so the escaped key lands in the memory unredacted.
+    std::env::set_var("FUNES_TRUFFLEHOG", "/usr/bin/true");
+    funes::commands::index::run_index(source.path(), false, None)
+        .await
+        .unwrap();
+    let dirty = funes::commands::recall::get(
+        funes::memory::Memory::local(),
+        session.into(),
+        funes::commands::recall::TurnRange {
+            from: Some(1),
+            to: Some(1),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        dirty.contains(&key_body),
+        "setup: the escaped key should be in the memory before scrub"
+    );
+
+    // Scrub with the real scanner: it matches the key's JSON-escaped form and excises it in place.
+    std::env::remove_var("FUNES_TRUFFLEHOG");
+    funes::commands::scrub::run().await.unwrap();
+
+    let after_key = funes::commands::recall::get(
+        funes::memory::Memory::local(),
+        session.into(),
+        funes::commands::recall::TurnRange {
+            from: Some(1),
+            to: Some(1),
+        },
+    )
+    .await
+    .unwrap_or_default();
+    assert!(
+        !after_key.contains(&key_body),
+        "escaped key survived scrub: {after_key}"
+    );
+    assert!(
+        after_key.contains("[REDACTED"),
+        "escaped key should be redacted in place, not dropped: {after_key}"
+    );
+
+    // The clean turn is untouched.
+    let clean = funes::commands::recall::get(
+        funes::memory::Memory::local(),
+        session.into(),
+        funes::commands::recall::TurnRange {
+            from: Some(0),
+            to: Some(0),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        clean.contains("just chatting about parsers"),
+        "clean turn was lost: {clean}"
+    );
+}

@@ -3,7 +3,10 @@
 //! [`crate::memory`], and present the result through [`crate::ui`] — and they are where the
 //! decisions live. Every state they act on is one the layers below report; nothing here infers it.
 
+pub mod add;
 pub mod ask;
+pub mod bind;
+pub mod compact;
 pub mod index;
 pub mod ingest_docs;
 pub mod mcp;
@@ -11,4 +14,6 @@ pub mod push;
 pub mod recall;
 pub mod scrub;
 pub mod sketch;
+pub mod sync;
+pub mod target;
 pub mod update;

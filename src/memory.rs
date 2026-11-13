@@ -8,17 +8,21 @@
 //!
 //! Below it: [`dataset`], [`fetch_store`] and [`capture_store`] are **mechanics** — Lance and object
 //! stores, knowing nothing about the Hub. [`remote`] is **transport** — the pinned reads and the
-//! single guarded commit an append or reindex lands as, over the Hub client in [`crate::hub`].
-//! [`card`] serves a published memory's dataset card, [`lock`] the local writer lock.
+//! commits of an append or a compaction, over the Hub client in [`crate::hub`].
+//! [`card`] serves a published memory's dataset card, [`lock`] the local writer lock, [`receipt`]
+//! what this host pushed to each remote.
 //!
 //! The commands ask this module what state a memory is in; they never infer it from error shapes.
 
+pub(crate) mod canonical;
 pub mod capture_store;
 pub mod card;
 pub mod dataset;
 pub mod fetch_store;
 pub mod lock;
+pub mod receipt;
 pub mod remote;
+pub mod shard_store;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -28,6 +32,7 @@ use anyhow::{anyhow, Context, Result};
 use hf_hub::HFError;
 use lance::dataset::Dataset;
 
+use crate::home;
 use crate::hub::{client, hf_token, is_offline_error, is_remote_shorthand, parse_hf};
 use crate::inference::{self, EmbeddingProfile};
 use dataset::{
@@ -44,15 +49,14 @@ pub enum Memory {
     Remote { uri: String },
 }
 
-/// The branch reads pin to and resolve the head commit of. It must be the branch writes target, so a
-/// read sees the commits a push produced.
+/// The branch reads pin to and writes commit to, so a read sees the commits a push produced.
 const READ_BRANCH: &str = "main";
 
 impl Memory {
     /// The default local memory (`$FUNES_HOME` / `~/.funes` → `…/memory`).
     pub fn local() -> Self {
         Memory::Local {
-            path: PathBuf::from(dataset::local_memory_dir()),
+            path: home::memory_dir(),
         }
     }
 
@@ -74,9 +78,9 @@ impl Memory {
         }
     }
 
-    /// Resolve the memory the read commands should use: an explicit `spec` (a CLI `--memory`), else
-    /// the local index. There is no persisted default — a memory binding lives in the caller's
-    /// config (e.g. an agent's `funes mcp <memory>` registration), not in funes.
+    /// Resolve the memory a write command acts on: an explicit `spec`, else the local memory. What a
+    /// read command reads is [`crate::commands::target::Target`]'s to resolve: naming no memory, it
+    /// defaults to the one this host is bound to.
     pub fn resolve(spec: Option<String>) -> Self {
         match spec.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
             Some(s) => Memory::parse(&s),
@@ -87,7 +91,7 @@ impl Memory {
     /// True only for the default local memory (`$FUNES_HOME`/`~/.funes`), so the hello-world
     /// fallback fires only there — never masking a missing explicit memory.
     pub fn is_default_local(&self) -> bool {
-        matches!(self, Memory::Local { path } if path.as_path() == Path::new(&dataset::local_memory_dir()))
+        matches!(self, Memory::Local { path } if *path == home::memory_dir())
     }
 
     /// Short label for output/provenance.
@@ -102,16 +106,12 @@ impl Memory {
     /// Rejects any embedding-space mismatch, including same-width vectors from another provider.
     pub async fn open(&self) -> Result<Dataset> {
         let ds = match self {
-            Memory::Local { path } => {
-                dataset::open(&dataset::table_uri(&path.to_string_lossy()), HashMap::new()).await?
-            }
+            Memory::Local { path } => dataset::open(&dataset::table_uri(path), HashMap::new()).await?,
             Memory::Remote { uri } => {
                 let (owner, name, _) = parse_hf(uri)?;
                 let token = hf_token();
-                let mut opts = HashMap::new();
-                if let Some(t) = &token {
-                    opts.insert("hf_token".to_string(), t.clone());
-                }
+                // Always set: with the key absent Lance resolves `HF_TOKEN` itself, disable variable or not.
+                let mut opts = HashMap::from([("hf_token".to_string(), token.clone().unwrap_or_default())]);
                 let table = dataset::table_uri(uri);
                 // Pin reads to the head commit and install the read wrapper. The pin is re-resolved
                 // on every open, so a new push is picked up by the next command. If the head can't
@@ -166,6 +166,7 @@ impl Memory {
             }
         }
         match self.open().await {
+            Ok(ds) if matches!(self, Memory::Local { .. }) && ds.count_rows(None).await? == 0 => Ok(MemoryState::Empty),
             Ok(ds) => Ok(MemoryState::Ready(ds)),
             // A gated repo answers `info()` fine and 403s only here, on the file read — so the open
             // is the only place this is knowable. Local paths keep their own error: a
@@ -173,6 +174,25 @@ impl Memory {
             Err(e) if matches!(self, Memory::Remote { .. }) && is_auth_error(&e) => Ok(MemoryState::Unauthorized),
             Err(e) if dataset_absent(&e) => Ok(MemoryState::Empty),
             Err(e) => Err(e),
+        }
+    }
+
+    /// The memory's dataset, with rows or without: a memory with no rows yet still records its
+    /// embedding model. `None` when it holds no dataset. A memory that can't be read is an error,
+    /// worded by its state.
+    pub async fn dataset(&self) -> Result<Option<Dataset>> {
+        match self.state().await? {
+            MemoryState::Ready(ds) => Ok(Some(ds)),
+            // A remote's `Empty` is a repo with no dataset; a local one may be a dataset with no rows.
+            MemoryState::Empty if matches!(self, Memory::Local { .. }) => match self.open().await {
+                Ok(ds) => Ok(Some(ds)),
+                Err(e) if dataset_absent(&e) => Ok(None),
+                Err(e) => Err(e),
+            },
+            MemoryState::Empty => Ok(None),
+            MemoryState::Missing => Err(self.missing_error()),
+            MemoryState::Unauthorized => Err(self.unauthorized_error()),
+            MemoryState::Offline => Err(self.offline_error()),
         }
     }
 }
@@ -186,6 +206,14 @@ impl Memory {
         anyhow!(
             "{} doesn't exist on the Hub, and funes won't create it — create the dataset repo \
              first (https://huggingface.co/new-dataset)",
+            self.label()
+        )
+    }
+
+    /// [`MemoryState::Offline`]: the remote can't be reached right now.
+    pub fn offline_error(&self) -> anyhow::Error {
+        anyhow!(
+            "{} is unreachable right now — check your connection, then try again",
             self.label()
         )
     }
@@ -222,7 +250,7 @@ impl Memory {
 pub enum MemoryState {
     /// Opened, compatible, ready to query.
     Ready(Dataset),
-    /// Nothing there yet: a local memory with no dataset, or a repo never pushed to.
+    /// Nothing there yet: a local memory with no dataset or no rows, or a repo never pushed to.
     Empty,
     /// A remote repo that doesn't exist on the Hub. funes never creates it.
     Missing,
@@ -268,7 +296,8 @@ pub async fn remote_reachability(uri: &str) -> Reachability {
         Ok(c) => c.dataset(owner, name),
         Err(_) => return Reachability::Ok,
     };
-    match tokio::time::timeout(PROBE_TIMEOUT, repo.info().send()).await {
+    // Only existence matters here; listing every sibling can exhaust the probe's deadline.
+    match tokio::time::timeout(PROBE_TIMEOUT, repo.info().expand(vec!["sha".into()]).send()).await {
         Err(_elapsed) => Reachability::Offline,
         Ok(Ok(_)) => Reachability::Ok,
         Ok(Err(HFError::RepoNotFound { .. })) => Reachability::Missing,
@@ -298,11 +327,18 @@ pub(crate) fn dataset_absent(err: &anyhow::Error) -> bool {
 /// profile are recognized only as the historical local BGE/384 contract; Voyage always requires
 /// all profile metadata, so equal dimensions can never make incompatible vectors look valid.
 fn check_compat(ds: &Dataset) -> Result<()> {
-    let expected = inference::embedding_profile()?;
+    let configured = inference::embedding_profile()?;
+    let stored = dataset::embedding_profile(ds)?;
+    let expected = if configured.provider == "local" && stored.provider == "local" {
+        stored
+    } else {
+        configured
+    };
     check_compat_with_profile(ds, &expected)
 }
 
 pub(crate) fn check_compat_with_profile(ds: &Dataset, expected: &EmbeddingProfile) -> Result<()> {
+    expected.validate()?;
     let schema = arrow_schema::Schema::from(ds.schema());
     let field = schema
         .field_with_name("vector")
@@ -380,10 +416,60 @@ pub(crate) fn check_compat_with_profile(ds: &Dataset, expected: &EmbeddingProfil
     Ok(())
 }
 
+/// The memory this host is bound to: the one `funes add` installs every agent to read and publish
+/// to, as typed to it. `None` when the host is local.
+pub fn binding() -> Result<Option<String>> {
+    binding_at(&home::bound_file())
+}
+
+/// [`binding`], read from the file at `path`.
+pub fn binding_at(path: &Path) -> Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text.trim().to_string()).filter(|s| !s.is_empty())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(anyhow::Error::new(e).context(format!("reading {}", path.display()))),
+    }
+}
+
+/// Bind this host to `memory`, as typed; `None` makes it local.
+pub fn bind(memory: Option<&str>) -> Result<()> {
+    bind_at(&home::bound_file(), memory)
+}
+
+/// [`bind`], written to the file at `path`.
+pub fn bind_at(path: &Path, memory: Option<&str>) -> Result<()> {
+    match memory {
+        Some(memory) => {
+            if let Some(dir) = path.parent() {
+                std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+            }
+            std::fs::write(path, format!("{memory}\n")).with_context(|| format!("writing {}", path.display()))
+        }
+        None => match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(anyhow::Error::new(e).context(format!("removing {}", path.display()))),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn the_host_binding_is_kept_as_typed_until_unbound() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bound = tmp.path().join("funes").join("bound");
+        assert_eq!(binding_at(&bound).unwrap(), None);
+        bind_at(&bound, Some("acme/kb")).unwrap();
+        assert_eq!(binding_at(&bound).unwrap().as_deref(), Some("acme/kb"));
+        bind_at(&bound, None).unwrap();
+        assert_eq!(binding_at(&bound).unwrap(), None);
+        // A local host has nothing to unbind.
+        bind_at(&bound, None).unwrap();
+    }
 
     use arrow_array::types::Float32Type;
     use arrow_array::{ArrayRef, FixedSizeListArray, Int64Array, RecordBatch, RecordBatchIterator};
@@ -454,12 +540,6 @@ mod tests {
         // surfaces the real error rather than masking it as offline. (No network is touched.)
         assert!(matches!(remote_reachability("/local/path").await, Reachability::Ok));
         assert!(matches!(remote_reachability("not a uri").await, Reachability::Ok));
-    }
-
-    #[test]
-    fn memory_label() {
-        assert_eq!(Memory::Local { path: "/tmp/x".into() }.label(), "/tmp/x");
-        assert_eq!(Memory::parse("hf://datasets/org/kb").label(), "hf://datasets/org/kb");
     }
 
     #[test]
@@ -562,7 +642,38 @@ mod tests {
         let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
         let ds = Dataset::write(reader, &uri, None).await.unwrap();
         let err = check_compat(&ds).unwrap_err().to_string();
-        assert!(err.contains("other-model") && err.contains("not configured"), "{err}");
+        assert!(err.contains("other-model") && err.contains("does not run"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_local_memory_with_no_rows_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_string_lossy().into_owned();
+        dataset::create_empty(&dataset::table_uri(&path), dataset::model::ENGLISH)
+            .await
+            .unwrap();
+        assert!(matches!(
+            Memory::parse(&path).state().await.unwrap(),
+            MemoryState::Empty
+        ));
+    }
+
+    /// An empty local memory still hands out its dataset, which records the model: none only when
+    /// there is no dataset at all.
+    #[tokio::test]
+    async fn an_empty_local_memory_hands_out_its_dataset_once_it_has_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_string_lossy().into_owned();
+        let memory = Memory::parse(&path);
+        assert!(
+            memory.dataset().await.unwrap().is_none(),
+            "no dataset, nothing to hand out"
+        );
+
+        let e5 = crate::inference::EmbeddingModel::MultilingualE5Small;
+        dataset::create_empty(&dataset::table_uri(&path), e5).await.unwrap();
+        let ds = memory.dataset().await.unwrap().expect("a dataset with no rows");
+        assert_eq!(dataset::embedding_model(&ds).unwrap(), e5);
     }
 
     #[tokio::test]
@@ -586,5 +697,16 @@ mod tests {
             error.contains("embedding_model") || error.contains("embedding_fingerprint"),
             "{error}"
         );
+    }
+
+    #[tokio::test]
+    async fn an_empty_voyage_memory_preserves_its_profile_without_embedding() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = EmbeddingProfile::voyage("voyage-4-lite", 1024).unwrap();
+        let batch = dataset::build_batch_for_schema(&[], &[], dataset::schema_for(&profile)).unwrap();
+        let ds = dataset::create(&dataset::table_uri(dir.path()), batch).await.unwrap();
+        assert_eq!(ds.count_rows(None).await.unwrap(), 0);
+        assert_eq!(dataset::embedding_profile(&ds).unwrap(), profile);
+        check_compat_with_profile(&ds, &profile).unwrap();
     }
 }

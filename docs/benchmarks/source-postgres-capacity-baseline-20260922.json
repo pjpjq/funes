@@ -1,0 +1,25 @@
+{
+  "source_rows": 3590437,
+  "source_file_bytes": 25935802368,
+  "source_sha256": "8f72d49271e326f30acb489b921c686ac3b4c4186cd991d251475205c4467003",
+  "sample_selection": "deterministic equally spaced source IDs, endpoints included; verified dense ID interval",
+  "sample_file_bytes": 71938048,
+  "source_sample": {
+    "memories": {
+      "rows": 10000,
+      "sha256": "59e511a001f3d3c3bcd0b5ec19e4ef85195c583c52df88422e174553a4e6eb24"
+    },
+    "translation_cache": {
+      "rows": 63,
+      "sha256": "451fdc13012359579a033d503b03e8ab614f836acb557026b430e2f9520d1180"
+    },
+    "sync_state": {
+      "rows": 1,
+      "sha256": "a0f41a9093e9f8a510432ca9d7e317ebb071cc48d9c0c6696443a4609a77ace2"
+    },
+    "reindex_controls": {
+      "rows": 0,
+      "sha256": "c9e8f5b8e84f3cb6d7b80fbab3218f027f0b800024beacfe4fe1c4dba588b39f"
+    }
+  }
+}

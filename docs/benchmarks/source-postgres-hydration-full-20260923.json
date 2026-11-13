@@ -1,0 +1,344 @@
+{
+  "benchmark": "postgres_identifier_hydration",
+  "complete": true,
+  "completed_lookups": 15,
+  "elapsed_seconds": 60.718,
+  "failures": [],
+  "latency_semantics": {
+    "client": "separate SELECT execute plus full fetch, includes payload transfer",
+    "connection_setup_included": false,
+    "independent_executions": true,
+    "maxima_preserved": true,
+    "percentile_method": "nearest_rank",
+    "server": "EXPLAIN ANALYZE execution time, excludes planning"
+  },
+  "lookups": [
+    {
+      "client": {
+        "max_ms": 125.9169640034088,
+        "p50_ms": 60.19993000518298,
+        "p95_ms": 61.601075998623855,
+        "samples": 20
+      },
+      "failure": null,
+      "identity_count": 1,
+      "index_used_every_plan": true,
+      "kind": "get",
+      "label": "technical_identifier",
+      "seq_scan": false,
+      "server": {
+        "max_ms": 5.526,
+        "p50_ms": 0.057,
+        "p95_ms": 0.106,
+        "samples": 20
+      }
+    },
+    {
+      "client": {
+        "max_ms": 124.36131599679356,
+        "p50_ms": 61.0547129981569,
+        "p95_ms": 65.93872500525322,
+        "samples": 20
+      },
+      "failure": null,
+      "identity_count": 10,
+      "index_used_every_plan": true,
+      "kind": "get_many",
+      "label": "technical_identifier",
+      "seq_scan": false,
+      "server": {
+        "max_ms": 25.938,
+        "p50_ms": 0.133,
+        "p95_ms": 0.201,
+        "samples": 20
+      }
+    },
+    {
+      "client": {
+        "max_ms": 191.83313800022006,
+        "p50_ms": 73.32636800128967,
+        "p95_ms": 75.56819799356163,
+        "samples": 20
+      },
+      "failure": null,
+      "identity_count": 100,
+      "index_used_every_plan": true,
+      "kind": "get_many",
+      "label": "technical_identifier",
+      "seq_scan": false,
+      "server": {
+        "max_ms": 201.217,
+        "p50_ms": 0.944,
+        "p95_ms": 1.139,
+        "samples": 20
+      }
+    },
+    {
+      "client": {
+        "max_ms": 62.148227996658534,
+        "p50_ms": 60.30463999923086,
+        "p95_ms": 61.006263000308536,
+        "samples": 20
+      },
+      "failure": null,
+      "identity_count": 1,
+      "index_used_every_plan": true,
+      "kind": "get",
+      "label": "configuration_artifact",
+      "seq_scan": false,
+      "server": {
+        "max_ms": 4.278,
+        "p50_ms": 0.057,
+        "p95_ms": 0.507,
+        "samples": 20
+      }
+    },
+    {
+      "client": {
+        "max_ms": 71.02176700573182,
+        "p50_ms": 60.66241100052139,
+        "p95_ms": 62.12664800113998,
+        "samples": 20
+      },
+      "failure": null,
+      "identity_count": 10,
+      "index_used_every_plan": true,
+      "kind": "get_many",
+      "label": "configuration_artifact",
+      "seq_scan": false,
+      "server": {
+        "max_ms": 20.359,
+        "p50_ms": 0.133,
+        "p95_ms": 0.284,
+        "samples": 20
+      }
+    },
+    {
+      "client": {
+        "max_ms": 121.72004400053993,
+        "p50_ms": 73.90858000144362,
+        "p95_ms": 93.74220899917418,
+        "samples": 20
+      },
+      "failure": null,
+      "identity_count": 100,
+      "index_used_every_plan": true,
+      "kind": "get_many",
+      "label": "configuration_artifact",
+      "seq_scan": false,
+      "server": {
+        "max_ms": 199.44,
+        "p50_ms": 0.991,
+        "p95_ms": 3.003,
+        "samples": 20
+      }
+    },
+    {
+      "client": {
+        "max_ms": 61.69207600032678,
+        "p50_ms": 59.876897001231555,
+        "p95_ms": 61.084692999429535,
+        "samples": 20
+      },
+      "failure": null,
+      "identity_count": 1,
+      "index_used_every_plan": true,
+      "kind": "get",
+      "label": "chinese_context",
+      "seq_scan": false,
+      "server": {
+        "max_ms": 2.662,
+        "p50_ms": 0.052,
+        "p95_ms": 0.256,
+        "samples": 20
+      }
+    },
+    {
+      "client": {
+        "max_ms": 99.30250400066143,
+        "p50_ms": 60.55625099543249,
+        "p95_ms": 63.891664998664055,
+        "samples": 20
+      },
+      "failure": null,
+      "identity_count": 10,
+      "index_used_every_plan": true,
+      "kind": "get_many",
+      "label": "chinese_context",
+      "seq_scan": false,
+      "server": {
+        "max_ms": 12.382,
+        "p50_ms": 0.151,
+        "p95_ms": 0.241,
+        "samples": 20
+      }
+    },
+    {
+      "client": {
+        "max_ms": 127.7233300061198,
+        "p50_ms": 75.6041969943908,
+        "p95_ms": 78.8629220041912,
+        "samples": 20
+      },
+      "failure": null,
+      "identity_count": 100,
+      "index_used_every_plan": true,
+      "kind": "get_many",
+      "label": "chinese_context",
+      "seq_scan": false,
+      "server": {
+        "max_ms": 153.903,
+        "p50_ms": 0.986,
+        "p95_ms": 1.748,
+        "samples": 20
+      }
+    },
+    {
+      "client": {
+        "max_ms": 69.02828799502458,
+        "p50_ms": 60.02248699951451,
+        "p95_ms": 64.71154899918474,
+        "samples": 20
+      },
+      "failure": null,
+      "identity_count": 1,
+      "index_used_every_plan": true,
+      "kind": "get",
+      "label": "command_infrastructure",
+      "seq_scan": false,
+      "server": {
+        "max_ms": 1.027,
+        "p50_ms": 0.055,
+        "p95_ms": 0.099,
+        "samples": 20
+      }
+    },
+    {
+      "client": {
+        "max_ms": 62.25508799980162,
+        "p50_ms": 60.640489995421376,
+        "p95_ms": 62.23173699981999,
+        "samples": 20
+      },
+      "failure": null,
+      "identity_count": 10,
+      "index_used_every_plan": true,
+      "kind": "get_many",
+      "label": "command_infrastructure",
+      "seq_scan": false,
+      "server": {
+        "max_ms": 12.675,
+        "p50_ms": 0.142,
+        "p95_ms": 0.219,
+        "samples": 20
+      }
+    },
+    {
+      "client": {
+        "max_ms": 106.80136600421974,
+        "p50_ms": 75.97227900259895,
+        "p95_ms": 87.72211099858396,
+        "samples": 20
+      },
+      "failure": null,
+      "identity_count": 100,
+      "index_used_every_plan": true,
+      "kind": "get_many",
+      "label": "command_infrastructure",
+      "seq_scan": false,
+      "server": {
+        "max_ms": 150.477,
+        "p50_ms": 0.932,
+        "p95_ms": 1.165,
+        "samples": 20
+      }
+    },
+    {
+      "client": {
+        "max_ms": 63.3806129990262,
+        "p50_ms": 60.19740800547879,
+        "p95_ms": 62.36047799757216,
+        "samples": 20
+      },
+      "failure": null,
+      "identity_count": 1,
+      "index_used_every_plan": true,
+      "kind": "get",
+      "label": "error_diagnostic",
+      "seq_scan": false,
+      "server": {
+        "max_ms": 1.119,
+        "p50_ms": 0.055,
+        "p95_ms": 0.12,
+        "samples": 20
+      }
+    },
+    {
+      "client": {
+        "max_ms": 63.59505400178023,
+        "p50_ms": 60.727889998815954,
+        "p95_ms": 61.5386240024236,
+        "samples": 20
+      },
+      "failure": null,
+      "identity_count": 10,
+      "index_used_every_plan": true,
+      "kind": "get_many",
+      "label": "error_diagnostic",
+      "seq_scan": false,
+      "server": {
+        "max_ms": 13.037,
+        "p50_ms": 0.147,
+        "p95_ms": 0.201,
+        "samples": 20
+      }
+    },
+    {
+      "client": {
+        "max_ms": 187.40882499696454,
+        "p50_ms": 76.33630000054836,
+        "p95_ms": 128.3965709953918,
+        "samples": 20
+      },
+      "failure": null,
+      "identity_count": 100,
+      "index_used_every_plan": true,
+      "kind": "get_many",
+      "label": "error_diagnostic",
+      "seq_scan": false,
+      "server": {
+        "max_ms": 90.658,
+        "p50_ms": 0.919,
+        "p95_ms": 1.352,
+        "samples": 20
+      }
+    }
+  ],
+  "measurement_scope": {
+    "capacity_bytes_measured": false,
+    "controlled_cold_cache": false,
+    "http_end_to_end_recall_measured": false,
+    "native_lance_retrieval_measured": false,
+    "numeric_id_fallback_measured": false,
+    "path": "canonical source_identity unique B-tree get/get_many full-row hydration",
+    "postgres_content_search_measured": false,
+    "production_cutover_verified": false,
+    "read_only": true,
+    "search_identifiers_token_search_measured": false,
+    "uniform_full_corpus_sample": false
+  },
+  "observed_at": "2026-09-22T23:18:59.836606+00:00",
+  "ok": true,
+  "planned_lookups": 15,
+  "source_summary_sha256": "e23bc17f69924fb30f4fa3fdbdb9baa57829d1cbd199d9597d62fd69bc9b28e3",
+  "verified_scope": {
+    "actual_rows": 3590437,
+    "case_file_sha256": "1d3a6dc870f32768511c090075b45a8062f082085b34a2df7399fde70990628c",
+    "case_source": "unchanged frozen-prefix sample from original rehearsal",
+    "migration_ready": false,
+    "native_search_measured": false,
+    "primary": true,
+    "runtime_role": true,
+    "schema_version": 2
+  }
+}

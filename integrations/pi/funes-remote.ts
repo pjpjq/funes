@@ -174,14 +174,14 @@ const manualBudget: CallBudget = {
 
 const recallTimeoutMs = (() => {
   const ms = firstEnvNumber(["FUNES_REMOTE_RECALL_TIMEOUT_MS", "FUNES_REMOTE_SEARCH_TIMEOUT_MS"]);
-  if (ms !== undefined) return bounded(ms, 18_000, 100, 60_000);
+  if (ms !== undefined) return bounded(ms, 40_000, 100, 60_000);
   const sec = firstEnvNumber(["FUNES_REMOTE_RECALL_TIMEOUT", "FUNES_REMOTE_SEARCH_TIMEOUT"]);
-  if (sec !== undefined) return bounded(sec * 1_000, 18_000, 100, 60_000);
+  if (sec !== undefined) return bounded(sec * 1_000, 40_000, 100, 60_000);
   const cfgMs = configuredRemoteNumber(["recall_timeout_ms", "search_timeout_ms"]);
-  if (cfgMs !== undefined) return bounded(cfgMs, 18_000, 100, 60_000);
+  if (cfgMs !== undefined) return bounded(cfgMs, 40_000, 100, 60_000);
   const cfgSec = configuredRemoteNumber(["recall_timeout", "search_timeout"]);
-  if (cfgSec !== undefined) return bounded(cfgSec * 1_000, 18_000, 100, 60_000);
-  return 18_000;
+  if (cfgSec !== undefined) return bounded(cfgSec * 1_000, 40_000, 100, 60_000);
+  return 40_000;
 })();
 
 const recallAttempts = Math.floor(
@@ -190,7 +190,7 @@ const recallAttempts = Math.floor(
       "FUNES_REMOTE_RECALL_ATTEMPTS",
       "FUNES_REMOTE_SEARCH_ATTEMPTS",
     ]),
-    2,
+    5,
     1,
     5,
   ),
@@ -201,13 +201,13 @@ const recallAttemptTimeoutMs = (() => {
     "FUNES_REMOTE_RECALL_ATTEMPT_TIMEOUT_MS",
     "FUNES_REMOTE_SEARCH_ATTEMPT_TIMEOUT_MS",
   ]);
-  if (ms !== undefined) return bounded(ms, 8_000, 100, 30_000);
+  if (ms !== undefined) return bounded(ms, 30_000, 100, 30_000);
   const sec = firstEnvNumber([
     "FUNES_REMOTE_RECALL_ATTEMPT_TIMEOUT",
     "FUNES_REMOTE_SEARCH_ATTEMPT_TIMEOUT",
   ]);
-  if (sec !== undefined) return bounded(sec * 1_000, 8_000, 100, 30_000);
-  return 8_000;
+  if (sec !== undefined) return bounded(sec * 1_000, 30_000, 100, 30_000);
+  return 30_000;
 })();
 
 const manualRecallBudget: CallBudget = {

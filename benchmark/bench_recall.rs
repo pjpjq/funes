@@ -8,7 +8,7 @@
 //!
 //! ```text
 //! cargo run --release --example bench_recall -- "your query" \
-//!     --remote dacorvo/funes-Glint-Research-Fable-5 --iters 5 --cold
+//!     --remote huggingface/funes-memory --iters 5 --cold
 //! ```
 //!
 //! `--cold` points the hf-hub file cache (`HF_HUB_CACHE`) at a throwaway temp dir so the remote cold
@@ -33,7 +33,7 @@ struct Args {
     #[arg(default_value = "how does recall rerank candidates")]
     query: String,
     /// Dataset to benchmark (`org/repo` or `hf://…`), used for BOTH legs.
-    #[arg(long, default_value = "dacorvo/funes-Glint-Research-Fable-5")]
+    #[arg(long, default_value = "huggingface/funes-memory")]
     remote: String,
     /// Warm iterations timed per memory (after the one cold call).
     #[arg(long, default_value_t = 5)]
@@ -45,7 +45,7 @@ struct Args {
     /// Results to return (recall `k`).
     #[arg(long, default_value_t = 8)]
     k: usize,
-    /// Fused candidates to rerank.
+    /// Fused pool the hits are cut from, reranked when larger than --k.
     #[arg(long, default_value_t = 30)]
     candidates: usize,
     /// Neighbor chunks attached per hit.
@@ -61,10 +61,8 @@ async fn time_recall(memory: &Memory, a: &Args) -> Result<(f64, usize)> {
         a.query.clone(),
         a.k,
         a.candidates,
-        0.0,
         a.neighbors,
-        None,
-        None,
+        Default::default(),
     )
     .await?;
     let ms = t.elapsed().as_secs_f64() * 1000.0;
@@ -165,7 +163,7 @@ async fn main() -> Result<()> {
     // Warm up the embed + rerank models once (against the local copy), so the one-time model load
     // (hundreds of ms, identical for every memory) is excluded from all timings below.
     eprintln!("loading models…");
-    let _ = recall(local.clone(), a.query.clone(), 1, 5, 0.0, 0, None, None).await;
+    let _ = recall(local.clone(), a.query.clone(), 1, 5, 0, Default::default()).await;
 
     println!(
         "\ndataset: {}   query: {:?}   k={} candidates={} neighbors={}   warm iters={}\n",

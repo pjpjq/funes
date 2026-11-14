@@ -1,12 +1,13 @@
 [package]
 name = "funes"
-version = "1.3.0+dev"
+version = "1.10.0+dev"
 edition = "2021"
 description = "Recall over your past AI agent sessions — the man who forgets nothing, with discrimination."
 license = "Apache-2.0"
 repository = "https://github.com/huggingface/funes"
 
 [dependencies]
+libc = "0.2"  # geteuid: whose files funes will run
 # The `onnx` backend (feature below): embeddings + rerank on the ONNX Runtime. Off by default —
 # ort ships prebuilt against glibc 2.38, above the glibc 2.35 floor releases target (Ubuntu 22.04).
 fastembed = { version = "5", optional = true }
@@ -14,18 +15,15 @@ arrow-array = "58"               # RecordBatch types (must match lance's arrow v
 arrow-schema = "58"              # Schema/Field/DataType for building batches
 arrow-select = "58"              # filter_record_batch: drop secret-bearing rows before a push
 # huggingface = hf:// reads/writes (Xet-cached).
-lance = { version = "=11.0.0", default-features = false, features = ["huggingface"] }  # Dataset open/scan/append + create_index, local and over hf://
-lance-io = { version = "=11.0.0", default-features = false, features = ["huggingface"] }  # hf:// object store + WrappingObjectStore
-lance-index = "=11.0.0"          # FTS/IVF index params + FullTextSearchQuery
-lance-linalg = "=11.0.0"         # MetricType for the IVF_PQ index
-parquet = "58"                   # read agent-trace datasets stored as parquet (arrow-rs, matches arrow-* = "58")
-object_store = "=0.13.2"         # the ObjectStore trait the capture wrapper implements (matches lance-io)
+lance = { version = "=13.0.0", default-features = false, features = ["huggingface"] }  # Dataset open/scan/append + create_index, local and over hf://
+lance-io = { version = "=13.0.0", default-features = false, features = ["huggingface"] }  # hf:// object store + WrappingObjectStore
+lance-index = "=13.0.0"          # FTS/IVF index params + FullTextSearchQuery
+lance-linalg = "=13.0.0"         # MetricType for the IVF_PQ index
+object_store = "=0.14.2"         # the ObjectStore trait the capture wrapper implements (matches lance-io)
 async-trait = "0.1"              # for the ObjectStore impl in src/memory/capture_store.rs
 bytes = "1"                      # captured write payloads
-chrono = "0.4"                   # recency weighting
-rusqlite = { version = "0.32", features = ["bundled"] }  # read hermes' ~/.hermes/state.db; bundled = SQLite compiled in, no runtime dep
-serde_yaml = "0.9"               # merge funes' hooks into hermes' ~/.hermes/config.yaml
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "sync"] }  # sync: OnceCell/Mutex cache the recall models
+chrono = "0.4"                   # ts parsing, status ages, install stamps
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "sync", "time"] }  # sync: OnceCell/Mutex cache the recall models
 futures = "0.3"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
@@ -35,18 +33,16 @@ serde_json = { version = "1", features = ["preserve_order"] }  # parse JSONL; pr
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }  # Voyage embeddings/rerank; blocking matches the inference traits
 sha1 = "0.10"                    # chunk id = sha1(...)[:16]
 sha2 = "0.10"                    # verify release binaries before the installer/updater executes them
+whatlang = "0.18"                # the language of a text block
 hex = "0.4"
+uuid = { version = "1", features = ["v4"] }  # the anonymous install id in the User-Agent
 walkdir = "2"                    # recursive *.jsonl walk
-rmcp = { version = "1", features = ["server", "macros", "transport-io", "schemars"] }  # MCP stdio server
+rmcp = { version = "3", features = ["server", "macros", "transport-io", "schemars"] }  # MCP stdio server
 tempfile = "3"                   # temp dir for the pre-publish secret scan; temp files/dirs in tests
-hf-hub = { version = "1.0.0-rc.1", features = ["rustls-tls", "blocking"] }  # native create_commit + parent_commit CAS + Xet upload; blocking: model download in the blas backend
-# Optional handle on the transitively-pulled openssl-sys (native-tls, via lance).
-# The `vendored-openssl` feature builds OpenSSL from source so the aarch64-linux cross-build
-# needs no target sysroot. Off by default — native and macOS builds keep their system TLS.
-openssl-sys = { version = "0.9", optional = true }
+hf-hub = { version = "1.0.0", features = ["rustls-tls", "blocking"] }  # native create_commit + parent_commit CAS + Xet upload; blocking: model downloads (src/inference.rs)
 # The `blas` backend (feature below): a from-scratch forward that loads safetensors weights
 # and tokenizes itself. macOS runs it on Accelerate, Linux on faer.
-tokenizers = { version = "0.22", optional = true }
+tokenizers = { version = "0.22", optional = true, default-features = false, features = ["onig"] }  # onig: the reranker's normalizer is a regex
 safetensors = { version = "0.8", optional = true }
 
 # The `blas` backend's Linux seam. Both are pure Rust with runtime CPU dispatch, so release
@@ -55,12 +51,31 @@ safetensors = { version = "0.8", optional = true }
 faer = { version = "0.24", optional = true, default-features = false, features = ["std", "rayon"] }  # GEMM ("std" pulls its fast x86 kernels)
 multiversion = { version = "0.8", optional = true }  # per-CPU clones of the vectorized exp
 
+# The `metal` backend's Objective-C bindings and its weight format.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { version = "0.6", optional = true, features = ["exception"] }  # exception: catch what MPSGraph raises
+objc2-foundation = { version = "0.3", optional = true }
+objc2-metal = { version = "0.3", optional = true }
+objc2-metal-performance-shaders = { version = "0.3", optional = true }
+objc2-metal-performance-shaders-graph = { version = "0.3", optional = true }  # the GPU encoders' graphs
+half = { version = "2", optional = true }  # fp16 weights for the GPU
+
 [features]
-default = ["blas"]
-vendored-openssl = ["openssl-sys/vendored"]
+default = ["blas", "metal"]
 # BLAS inference backend (src/inference/blas.rs), the default: macOS wires it to Accelerate (see build.rs),
 # Linux to faer + a polynomial exp.
 blas = ["dep:tokenizers", "dep:safetensors", "dep:faer", "dep:multiversion"]
+# The embedder and the reranker on the GPU (src/inference/metal.rs), macOS only — a no-op elsewhere.
+# They reuse the BLAS backend's loaders, and its CPU forwards for small calls.
+metal = [
+    "blas",
+    "dep:objc2",
+    "dep:objc2-foundation",
+    "dep:objc2-metal",
+    "dep:objc2-metal-performance-shaders",
+    "dep:objc2-metal-performance-shaders-graph",
+    "dep:half",
+]
 # ONNX inference backend (fastembed/ort). When both backends are compiled in, `blas` is the one
 # funes runs; the ONNX types are the reference backend for bench_backends.
 onnx = ["dep:fastembed"]
@@ -70,15 +85,20 @@ onnx = ["dep:fastembed"]
 name = "bench_recall"
 path = "benchmark/bench_recall.rs"
 
-[[example]]
-name = "bench_index"
-path = "benchmark/bench_index.rs"
-
 # A/B the inference backends (BLAS vs ONNX as reference). Needs both compiled in:
 #   cargo run --release --features onnx --example bench_backends
 [[example]]
 name = "bench_backends"
 path = "benchmark/bench_backends.rs"
+
+# A default `funes recall` scored against a labeled set of questions.
+[[example]]
+name = "score_recall"
+path = "benchmark/score_recall.rs"
+
+[[example]]
+name = "sweep_rerank"
+path = "benchmark/sweep_rerank.rs"
 
 # One-off backfill of the `repo` column (local: add_columns; remote: add_columns via a guarded
 # commit). Delete both, and `memory::remote::add_column`, once every store carries `repo`.
@@ -89,6 +109,20 @@ path = "scripts/backfill_repo.rs"
 [[example]]
 name = "backfill_remote_repo"
 path = "scripts/backfill_remote_repo.rs"
+
+# One-off migration of a memory from before the workdir rename to today's schema (local and
+# remote, dry-run by default). Delete it, and `memory::remote::rename_column`, once every memory
+# is migrated.
+[[example]]
+name = "migrate_schema"
+path = "scripts/migrate_schema.rs"
+
+# One-off backfill of the language counts of a memory indexed before funes counted them (local: a
+# commit; remote: a guarded commit). Delete it, and `memory::remote::count_languages`, once every
+# memory records its languages.
+[[example]]
+name = "backfill_languages"
+path = "scripts/backfill_languages.rs"
 
 [profile.release]
 opt-level = 3

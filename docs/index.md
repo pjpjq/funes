@@ -1,133 +1,124 @@
 # Building the memory
 
-`funes index` builds or updates your local memory from session transcripts. [`funes add`](add.md)
-runs it for you on every turn; run it by hand to seed a memory, to fold in a new source, or to index
-sessions from a machine or agent that never ran the automation.
+`funes index` builds or updates your local memory from what the integrations convert and from the
+turns files you point it at. [`funes add`](add.md) runs it for you on every turn; run it by hand to
+catch a spool up, to finish the embeddings a budgeted run left, or to fold in a turns file or a
+directory of them. To index an agent's history from a machine that never ran the automation, convert
+it first — [add.md](add.md#converting-by-hand) says how. A Hugging Face agent-traces dataset converts
+the same way, with [`hf-traces`](https://github.com/huggingface/funes-integrations#hugging-face-agent-traces-datasets).
 
 ```bash
-funes index      # a fast, text-first pass over every known harness dir, into one local memory
+funes index      # a budgeted pass over every spool, into one memory
 ```
 
 ## What it indexes
 
-With **no argument**, in a terminal, `funes index` sweeps every supported agent's session dir it
-finds — `~/.claude/projects`, `~/.codex/sessions`, `~/.pi/agent/sessions`, `~/.hermes/state.db` — into
-one memory, then offers to finish any deeper work left. Scope it to a single agent with `--harness`:
+With **no argument**, in a terminal, `funes index` sweeps every spool under `~/.funes/spool/` — each
+integration converts its agent's sessions into its own, `~/.funes/spool/<id>`, which is what funes
+reads — into one memory, then offers to finish any work left. Scope it to one integration's
+spool with `--harness <id>`:
 
 ```bash
-funes index --harness codex        # only ~/.codex/sessions
+funes index --harness codex        # only Codex's sessions
 ```
 
-Point it at a **path** to index one place in full — a transcript tree or a single `.parquet` trace
-export — or at a **Hub trace repo** to index its auto-converted parquet:
+Point it at a **path** to index one place in full — a `.funes.jsonl` turns file, or a directory of
+them:
 
 ```bash
-funes index ./some/session/tree            # a local transcript tree or .parquet
-funes index <org>/<repo>                   # a Hub trace dataset (or a full hf://… URI)
+funes index ./turns                        # a directory of turns files
+funes index thread.funes.jsonl             # turns from a source funes has no parser for
 ```
 
-An existing local path always wins over reading the same string as a repo ref. An **automated
-(non-terminal) run must name a target** — a path or `--harness <name>`; funes refuses to sweep every
-harness root unattended (a Claude session-end shouldn't pull in Codex or pi sessions).
+An **automated (non-terminal) run must name a target** — a path or `--harness <id>`; funes refuses
+to sweep every spool unattended (a Claude session-end shouldn't pull in Codex or pi sessions).
 
-### Parquet trace format
+funes reads no agent's own transcripts: each integration converts its sessions into its spool, and a
+path holding transcripts that are not turns files is refused with a pointer at the format
+([funes-jsonl.md](funes-jsonl.md)) and at `funes add <agent>`. A session no integration has
+converted is not indexed — install it, and its history is converted at install.
+To rebuild a memory from an agent's history, re-run [`funes add <agent>`](add.md).
 
-Parquet import targets the Hugging Face agent-traces layout: **one row per session**, with these two
-required columns:
+Inline `data:` URI payloads are elided to `data:image/png;base64,[elided]` before a block is
+scanned or stored: a pasted screenshot is megabytes of base64 with nothing recallable in it.
 
-| Column | Arrow type | Meaning |
-| --- | --- | --- |
-| `session_id` | `Utf8` or `LargeUtf8` | Stable identity for the session. |
-| `messages` | `List<Utf8>` or `List<LargeUtf8>` | JSON-encoded, OpenAI-style chat messages in chronological order. |
+### funes JSONL (turns files)
 
-Each non-null `messages` element is a JSON object. funes reads these fields:
+A source funes has no parser for — another coding agent, an issue tracker, a chat export — reaches
+it as `.funes.jsonl`: funes's own turn model, one JSON object per line, written by a *producer*
+outside funes. [The format](funes-jsonl.md) is the contract — field table, identity rule,
+validation. What `funes index` does with one:
 
-| Field | Mapping |
-| --- | --- |
-| `role` | Turn role. |
-| `content` | A `text` block when it is a non-empty string. |
-| `reasoning_content` | A `thinking` block when it is a non-empty string. |
-| `tool_calls[].function.name` | Tool name on a `tool_use` block. |
-| `tool_calls[].function.arguments` | Tool input, kept as a string or serialized from its JSON value. |
-
-The importer does not currently derive `tool_result` blocks from Parquet messages. Other message
-fields are ignored. Invalid JSON elements are skipped; a row is skipped when none of its messages
-produces an indexable block.
-
-Optional string columns add provenance:
-
-| Column | Meaning |
-| --- | --- |
-| `sent_at` | Timestamp applied to the imported turns. |
-| `harness` | Agent/harness facet; it may differ per row. |
-| `file_path` | Original source path shown in provenance. |
-| `metadata` | JSON object whose `cwd` becomes the workdir facet. |
-
-When optional provenance is absent, funes falls back to the Parquet filename where possible. Turn
-UUIDs are synthesized as `<session_id>-<sequence>` and sequence counts only retained messages. This
-is the compatibility contract behind “another agent can join through a Parquet trace export”; an
-arbitrary Parquet table is not accepted merely because it has a `.parquet` suffix.
+- **One file is one unit**, always re-read (chunk-id dedup makes that a no-op) and never recorded in
+  `state.json`. One invalid line rejects the whole file and fails the run; nothing from it is written.
+  **A directory** is one unit per file: a rejected file writes nothing, is reported with its first bad
+  line, the run goes on, and the summary counts it under `rejected` with a non-zero exit. A directory
+  holding any other `.jsonl` is refused as ambiguous.
+- **The facets come from the data.** `harness` is each turn's own, so `--harness` is refused.
+  `workdir` and `repo` derive from the turn's `cwd`, resolved on the indexing machine — the one
+  derivation every native parser goes through too; a turn without `cwd` has neither facet.
+- **`funes index --check <file-or-dir>`** runs the same read and validation, computes the chunk ids,
+  and reports turns, chunks, rejected files and the ids a file produces twice (a turn re-emitted under
+  its `turn_uuid` would be deduped away, never indexed) — writing nothing. Run it before you publish a
+  producer.
 
 ## Incremental by construction
 
 A chunk's id derives from `(session, turn, block, split)`, so a completed turn produces **exactly the
-same chunks** no matter when it's indexed — and re-running embeds nothing already written. That is
+same chunks** no matter when it's indexed — and re-running embeds nothing already embedded. That is
 what makes it cheap to re-run as you work, and what lets the per-turn hook do the same job as one
 sweep at the end.
 
-A no-path refresh is **budgeted and text-first**: it does a fast text pass and offers to backfill the
-deeper content, so a large backlog fills in a bounded step at a time rather than one long stall. An
-explicit path or Hub repo is indexed in full.
+## Progress and resuming
 
-## Tiers and ordering
+Without a path, `funes index` works through the backlog in bounded steps. Indexed content can be
+recalled while embeddings are still pending. Later turns or another `funes index` continue the work;
+`funes status` shows what remains.
 
-Blocks are indexed in three tiers, cheapest-and-highest-value first:
+In a terminal, funes may offer to finish the remaining work. You can decline and keep the progress
+already made. Explicit imports have no time limit.
 
-| Tier | Blocks | Why first |
-| --- | --- | --- |
-| L1 `text` | user and assistant prose, thinking | the decisions and rationale — where recall pays off |
-| L2 `tool_use` | tool calls | context for what was done |
-| L3 `tool_result` | tool output | bulky, lowest value per byte |
+## Compaction
 
-A budgeted (no-path) run drains these **tier-major**: it indexes *every* owed session at `text`
-first — newest session first, subagents last — then every session at `tool_use`, then at
-`tool_result`, checking a ~60s wall-clock budget at each whole-session boundary and stopping at the
-first one past it. So the whole memory becomes recallable at the decision/rationale level within
-about a minute, and the bulky tool output backfills on later runs (the per-turn hook, or a rerun) a
-bounded step at a time. `--no-thinking` drops thinking blocks from the `text` tier; an explicit path
-or Hub repo skips the budget and indexes all tiers in one pass.
+A run that writes rows or vectors ends by compacting the memory, and prints `compacting the memory…`
+when it does. It merges the small fragments no index covers yet, adds their rows to the search
+indexes, and deletes the versions older than ten minutes. Recall time grows with the number of
+fragments, so past 256 small indexed fragments a run rewrites them all. A run that writes nothing
+still compacts a memory left fragmented, or one whose text index misses rows.
+[storage.md](storage.md#maintenance) has the details.
 
-Inline `data:` URI payloads are elided to `data:image/png;base64,[elided]` before a block is
-scanned or stored: a pasted screenshot is megabytes of base64 with nothing recallable in it.
+`funes compact` runs the same steps on demand, on any memory:
+
+```bash
+funes compact                  # your local memory
+funes compact ./other-memory   # a local memory at a path
+funes compact <org>/<repo>     # a remote memory (or a full hf://… URI)
+```
+
+On a remote memory it needs write access, and deletes every old version. A push also compacts its
+remote on its own, once 500 rows sit unindexed there. To compact a large remote, download it first
+with `hf download <org>/<repo> --repo-type dataset`: as long as nothing is pushed in between, the
+compaction then reads its files from that cache instead of fetching them one at a time.
+
+## Sessions not in English
+
+funes embeds with `BAAI/bge-small-en-v1.5`, an English model. For sessions in another language,
+answer multilingual when the first `funes add` asks, or create the local memory with
+`funes index --multilingual` before anything is indexed: it embeds with
+`intfloat/multilingual-e5-small`, and its keyword search splits Chinese and Japanese text into
+words. A memory keeps the model it was created with. Indexing also counts the languages your
+sessions are written in, and `funes status` lists them.
 
 ## Flags
 
 | Flag | Meaning |
 | --- | --- |
-| `--harness <name>` | Override auto-detection for a path, or (with no path) target one harness's dir: `claude \| codex \| pi \| hermes`. |
-| `--limit <N>` | Index only the most recent N sessions per source. Omit to index all. A Hub repo ignores it and indexes every shard. |
+| `--harness <id>` | Index one integration's spool, `~/.funes/spool/<id>`. Refused with a PATH, whose turns name their own harness. |
+| `--check` | Validate PATH without indexing it: turns, chunks, rejected files, duplicate ids; writes nothing, exits non-zero if a unit was rejected. |
+| `--limit <N>` | Index only the most recent N sessions per source. Omit to index all. |
 | `--no-thinking` | Exclude thinking blocks. |
 | `--yes` | Don't ask: a budgeted (no-path) run finishes all remaining work; an explicit path skips the first-index size confirmation. |
-
-## The pipeline
-
-Indexing and recall are one deterministic pipeline:
-
-```
-~/.claude/projects, ~/.codex/sessions, ~/.pi/agent/sessions, ~/.hermes/state.db   (or a .parquet trace)
-   │  parse        deterministic — turns (text / thinking / tool_use / tool_result), tagged by agent
-   │  chunk        one chunk per content block, tight provenance
-   │  embed        pinned local model (BAAI/bge-small-en-v1.5)
-   ▼  store        a local Lance dataset (vector + BM25)
-```
-
-The embedding model is **pinned and stamped into the memory**; querying with a different one is
-refused. To change it, rebuild from the transcripts — the memory is a disposable derived artifact, and
-the raw text is retained in every row.
-
-Each source is a `TraceSource` that reads its format into a generic turn/block shape; everything
-downstream is source-agnostic. A memory runs ~2.3 KB/chunk and grows ~6 MB on a heavy day — see
-[storage.md](storage.md).
+| `--multilingual` | Create the local memory with `intfloat/multilingual-e5-small`, for sessions not in English. Refused when the local memory exists with the English model. |
 
 ## See also
 

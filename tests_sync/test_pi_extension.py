@@ -390,7 +390,7 @@ def test_pi_funes_recall_uses_short_503_backoff_and_recovers(tmp_path):
 
 
 @pytest.mark.skipif(NODE is None, reason="node is unavailable")
-def test_pi_funes_recall_ignores_long_remote_env_and_defaults_to_two_attempts(tmp_path):
+def test_pi_funes_recall_ignores_long_remote_env_and_defaults_to_five_attempts(tmp_path):
     requests = []
 
     class Handler(BaseHTTPRequestHandler):
@@ -430,8 +430,8 @@ def test_pi_funes_recall_ignores_long_remote_env_and_defaults_to_two_attempts(tm
         parsed = json.loads(result.stdout)
         assert parsed["isError"] is True
         assert "HTTP 503" in parsed["text"]
-        assert len(requests) == 2
-        assert elapsed < 6.0
+        assert len(requests) == 5
+        assert elapsed < 15.0
     finally:
         server.shutdown()
         server.server_close()
@@ -526,6 +526,83 @@ def test_pi_funes_get_keeps_standard_backoff_and_remote_budget(tmp_path):
     finally:
         server.shutdown()
         server.server_close()
+
+@pytest.mark.skipif(NODE is None, reason="node is unavailable")
+@pytest.mark.parametrize(
+    ("busy_attempts", "response_ms", "expected_ms", "expected_attempts", "timed_out"),
+    [
+        (0, 11_000, 11_000, 1, False),
+        (4, 11_000, 23_000, 5, False),
+        (4, 29_000, 40_000, 5, True),
+    ],
+)
+def test_pi_funes_recall_default_budget_with_virtual_clock(
+    tmp_path, busy_attempts, response_ms, expected_ms, expected_attempts, timed_out
+):
+    body = """
+let clock = 0;
+let sequence = 0;
+const timers = new Map();
+const delays = [];
+Date.now = () => clock;
+globalThis.setTimeout = (callback, delay) => {
+  delays.push(delay);
+  const id = ++sequence;
+  timers.set(id, {at: clock + delay, callback});
+  return id;
+};
+globalThis.clearTimeout = (id) => timers.delete(id);
+const requests = [];
+globalThis.fetch = (url, init) => new Promise((resolve, reject) => {
+  requests.push({url, at: clock});
+  const busy = requests.length <= BUSY_ATTEMPTS;
+  const timer = setTimeout(() => resolve({
+    status: busy ? 429 : 200,
+    ok: !busy,
+    headers: new Headers(busy ? {'Retry-After': '3'} : {}),
+    json: async () => ({ok: !busy, results: []}),
+  }), busy ? 0 : RESPONSE_MS);
+  init.signal.addEventListener('abort', () => {
+    clearTimeout(timer);
+    reject(new Error('aborted'));
+  }, {once: true});
+});
+const tools = {};
+extension({registerTool(tool) { tools[tool.name] = tool; }, on() {}});
+let outcome;
+const pending = tools.funes_recall.execute('test', {query: 'decision'}).then(
+  result => { outcome = {value: JSON.parse(result.content[0].text)}; },
+  error => { outcome = {error: error.message}; },
+);
+while (!outcome) {
+  await new Promise(setImmediate);
+  if (outcome) break;
+  const next = [...timers].sort((a, b) => a[1].at - b[1].at)[0];
+  if (!next) throw new Error('request stalled without a timer');
+  const [id, timer] = next;
+  timers.delete(id);
+  clock = timer.at;
+  timer.callback();
+}
+await pending;
+console.log(JSON.stringify({outcome, requests, delays, elapsed: clock, timers: timers.size}));
+""".replace("BUSY_ATTEMPTS", str(busy_attempts)).replace("RESPONSE_MS", str(response_ms))
+    result = run_harness(tmp_path, '[remote]\nurl = "https://remote.example"\n', body)
+    assert result.returncode == 0, result.stderr
+    parsed = json.loads(result.stdout)
+    assert parsed["delays"][1] == 30_000
+    assert parsed["elapsed"] == expected_ms
+    assert len(parsed["requests"]) == expected_attempts
+    assert parsed["requests"] == [
+        {"url": "https://remote.example/search", "at": 3_000 * attempt}
+        for attempt in range(expected_attempts)
+    ]
+    assert parsed["timers"] == 0
+    if timed_out:
+        assert "timed out" in parsed["outcome"]["error"]
+    else:
+        assert parsed["outcome"]["value"]["ok"] is True
+
 
 @pytest.mark.skipif(NODE is None, reason="node is unavailable")
 def test_pi_funes_recall_allows_slow_search_matching_large_index_latency(tmp_path):

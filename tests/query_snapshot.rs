@@ -313,6 +313,7 @@ fn query_rejects_native_writes_before_any_io() {
         vec!["push", "test/snapshot", "--yes"],
         vec!["compact", "test/snapshot"],
         vec!["optimize-index", "test/snapshot"],
+        vec!["optimize-index", "test/snapshot", "--fts-only"],
         vec!["scrub"],
         vec!["reindex", "--all"],
         vec!["bind", "test/snapshot"],

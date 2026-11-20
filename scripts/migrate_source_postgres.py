@@ -24,17 +24,20 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from service.postgres import (  # noqa: E402
-    POSTGRES_SCHEMA_VERSION, PostgresStore, decode_pg_text, encode_pg_text,
+    POSTGRES_DERIVED_IDENTIFIERS_SCHEMA_VERSION, POSTGRES_SCHEMA_VERSION, PostgresStore,
+    decode_pg_text, encode_pg_text,
 )
 from service.server import (  # noqa: E402
     LOW_VALUE_CONTENT_TYPES, MEMORIES_GENERATION_INDEXES, MEMORIES_SECONDARY_INDEXES,
     NATIVE_CHECKPOINT_STATE_VERSION, utc_now,
 )
+from service.source_identifiers import logical_search_identifiers  # noqa: E402
 
 TABLES = ("memories", "translation_cache", "reindex_controls", "sync_state")
 KEYS = {"memories": "id", "translation_cache": "query",
         "reindex_controls": "generation", "sync_state": "id"}
 MIGRATION_VERSION = 2
+SUPPORTED_SCHEMA_VERSIONS = (POSTGRES_SCHEMA_VERSION, POSTGRES_DERIVED_IDENTIFIERS_SCHEMA_VERSION)
 TRIGGERS = ("memories_native_state", "memories_native_pending")
 LEDGER = "funes_source_migration"
 DERIVED_FIELDS = {
@@ -233,7 +236,7 @@ class Migration:
         if existing:
             if set(existing) != set(TABLES) or not self._exists("funes_schema_state"):
                 raise MigrationError("target has an incomplete/different schema; refusing initialization")
-            self.check_schema()
+            self.check_schema(require_bulk=True)
             marker = self.pg.execute("SELECT migration_ready,migration_source,document_count FROM funes_schema_state WHERE id=1").fetchone()
             if marker != (False, None, 0):
                 raise MigrationError("target is already initialized/finalized for a source")
@@ -251,7 +254,7 @@ class Migration:
                 store.prepare_bulk_migration()
             finally:
                 store.close()
-        self.check_schema()
+        self.check_schema(require_bulk=True)
         progress = {table: {"last_rowid": None, "rows": 0, "complete": False} for table in TABLES}
         with self.pg.transaction():
             self.pg.execute(f"""CREATE TABLE {LEDGER} (
@@ -267,13 +270,17 @@ class Migration:
             )
         return self.load()
 
-    def check_schema(self, *, require_runtime: bool = False, connection=None):
+    def check_schema(self, *, require_runtime: bool = False, require_bulk: bool = False,
+                     connection=None) -> int:
         pg = connection or self.pg
         if not self._exists("funes_schema_state", pg):
             raise MigrationError("target has no schema marker; explicit initialization is required")
         marker = pg.execute("SELECT schema_version,document_count FROM funes_schema_state WHERE id=1").fetchone()
-        if not marker or marker[0] != POSTGRES_SCHEMA_VERSION or marker[1] < 0:
+        if not marker or marker[0] not in SUPPORTED_SCHEMA_VERSIONS or marker[1] < 0:
             raise MigrationError("target schema version does not match this importer")
+        schema_version = marker[0]
+        if require_bulk and schema_version != POSTGRES_SCHEMA_VERSION:
+            raise MigrationError("bulk SQLite import requires target schema version 2")
         for table in TABLES:
             actual = pg.execute(
                 "SELECT column_name,data_type,is_generated,is_nullable FROM information_schema.columns "
@@ -288,11 +295,13 @@ class Migration:
                 for name, kind in expected.items()
             ):
                 raise MigrationError(f"source/target column schema differs: {table}")
-            if table == "memories" and not any(
-                name == "retrieval_text" and nullable == "YES"
-                for name, kind, generated, nullable in actual
-            ):
-                raise MigrationError("target v2 requires nullable retrieval_text")
+            if table == "memories":
+                nullability = {name: nullable for name, _, _, nullable in actual}
+                if nullability.get("retrieval_text") != "YES":
+                    raise MigrationError("target requires nullable retrieval_text")
+                expected_nullable = "YES" if schema_version == POSTGRES_DERIVED_IDENTIFIERS_SCHEMA_VERSION else "NO"
+                if nullability.get("search_identifiers") != expected_nullable:
+                    raise MigrationError("target search_identifiers nullability differs from its schema version")
         triggers = pg.execute(
             "SELECT c.relname,t.tgname,t.tgenabled FROM pg_trigger t JOIN pg_class c ON c.oid=t.tgrelid "
             "JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=current_schema() "
@@ -309,16 +318,17 @@ class Migration:
             "WHERE i.indrelid='memories'::regclass"
         ).fetchall()
         if any(row[1] != "btree" for row in indexes):
-            raise MigrationError("target v2 permits only B-tree source indexes")
+            raise MigrationError("target permits only B-tree source indexes")
         required = {"memories_pkey", "memories_source_identity_key"}
         if require_runtime:
             required.update(name for name, _ in MEMORIES_GENERATION_INDEXES)
             required.update(name for name, _ in MEMORIES_SECONDARY_INDEXES)
         if not required <= {row[0] for row in indexes if row[2] and row[3]}:
             raise MigrationError("target indexes are missing or invalid")
+        return schema_version
 
-    def load(self):
-        self.check_schema()
+    def load(self, *, require_bulk: bool = False):
+        self.schema_version = self.check_schema(require_bulk=require_bulk)
         if not self._exists(LEDGER):
             raise MigrationError("target has no resumable migration; use --initialize only for a fresh target")
         row = self.pg.execute(
@@ -338,18 +348,22 @@ class Migration:
                 raise MigrationError(f"invalid durable migration checkpoint: {table}")
         return self.phase
 
-    def _lock(self, connection=None):
+    def _lock(self, connection=None, *, require_bulk: bool = False):
         pg = connection or self.pg
         pg.execute("LOCK TABLE " + ",".join(map(quoted, (*TABLES, "funes_schema_state", LEDGER)))
                         + " IN ACCESS EXCLUSIVE MODE")
-        marker = pg.execute("SELECT migration_ready FROM funes_schema_state WHERE id=1").fetchone()
-        if marker is None or tuple(marker) != (False,):
+        marker = pg.execute("SELECT migration_ready,schema_version FROM funes_schema_state WHERE id=1").fetchone()
+        if marker is None or marker[0] is not False:
             raise MigrationError("target is already ready; migration cannot modify a live source")
+        if require_bulk and marker[1] != POSTGRES_SCHEMA_VERSION:
+            raise MigrationError("bulk SQLite import requires target schema version 2")
 
-    def _pg_digest(self, snapshot: Snapshot, table: str, connection=None):
+    def _pg_digest(self, snapshot: Snapshot, table: str, connection=None, *, schema_version: int):
         from psycopg.rows import tuple_row
-        # Physical NULL is only a compact representation of raw_text, not a
-        # change in the logical source. Expand BEFORE decoding the NUL codec.
+        if schema_version not in SUPPORTED_SCHEMA_VERSIONS:
+            raise MigrationError("target schema version does not match this importer")
+        # Expand compact retrieval_text BEFORE decoding the NUL codec; the
+        # identifier derivation operates on already-decoded logical text.
         columns = ",".join(
             "COALESCE(retrieval_text,raw_text) AS retrieval_text"
             if table == "memories" and name == "retrieval_text" else quoted(name)
@@ -357,26 +371,36 @@ class Migration:
         )
         key = quoted(KEYS[table])
         order = f"convert_to({key},'UTF8')" if table == "translation_cache" else key
+        derive = table == "memories" and schema_version == POSTGRES_DERIVED_IDENTIFIERS_SCHEMA_VERSION
+        if derive:
+            identifiers, raw, retrieval = map(snapshot.columns[table].index,
+                                               ("search_identifiers", "raw_text", "retrieval_text"))
+
+        def logical_rows(rows):
+            for row in rows:
+                decoded = [decode_pg_text(value) if isinstance(value, str) else value for value in row]
+                if derive and decoded[identifiers] is None:
+                    decoded[identifiers] = logical_search_identifiers(None, decoded[raw], decoded[retrieval])
+                yield decoded
+
         with (connection or self.pg).cursor(name="funes_source_verify", row_factory=tuple_row) as cursor:
             # This is a streaming cursor, not fetchall(). Larger blocks avoid
             # one WAN round trip per 128 rows during prefix/final verification.
             # 4096 rows remains bounded while reducing those round trips 32x.
             cursor.itersize = 4096
             cursor.execute(f"SELECT {columns} FROM {quoted(table)} ORDER BY {order}")
-            decoded = ((decode_pg_text(value) if isinstance(value, str) else value for value in row)
-                       for row in cursor)
-            return digest_rows(table, snapshot.columns[table], (tuple(row) for row in decoded))
+            return digest_rows(table, snapshot.columns[table], logical_rows(cursor))
 
     def verify_progress(self):
         """Re-read committed prefixes before resuming, not just importer counters."""
         with self.pg.transaction():
-            self._lock()
+            self._lock(require_bulk=True)
             for table in TABLES:
                 state = self.progress[table]
                 if table == "sync_state" and not state["rows"]:
                     self._bootstrap_state()
                     continue
-                actual = self._pg_digest(self.source, table)
+                actual = self._pg_digest(self.source, table, schema_version=POSTGRES_SCHEMA_VERSION)
                 through = state["last_rowid"]
                 expected = digest_rows(table, self.source.columns[table],
                                        self.source.rows(table, through=through) if state["rows"] else ())
@@ -388,7 +412,7 @@ class Migration:
              max_batches: int | None = None, before_commit=None, progress=None):
         if batch_rows < 1 or batch_bytes < 1 or (max_batches is not None and max_batches < 1):
             raise MigrationError("batch limits must be positive")
-        self.load()
+        self.load(require_bulk=True)
         if self.phase not in ("copying", "copied", "verified"):
             raise MigrationError("target is already finalized or its phase is invalid")
         self.verify_progress()
@@ -404,7 +428,7 @@ class Migration:
                     f"SELECT rowid,{columns} FROM {quoted(table)}{where} ORDER BY rowid LIMIT ?", params)
                 copied, size = 0, 0
                 with self.pg.transaction():
-                    self._lock()
+                    self._lock(require_bulk=True)
                     if table == "memories":
                         trigger_states = self.pg.execute(
                             "SELECT tgname,tgenabled FROM pg_trigger WHERE tgrelid='memories'::regclass "
@@ -514,13 +538,14 @@ class Migration:
             yield tuple(values)
 
     def _verify_tables(self, snapshot: Snapshot, *, connection=None, rebuilt: bool = False):
+        schema_version = self.check_schema(connection=connection)
         report = {}
         derived = self._derived_state(snapshot) if rebuilt else None
         for table in TABLES:
             if self.event_callback:
                 self.event_callback({"phase": "verifying", "table": table, "state": "started"})
             expected = digest_rows(table, snapshot.columns[table], self._expected_rows(snapshot, table, derived))
-            actual = self._pg_digest(snapshot, table, connection)
+            actual = self._pg_digest(snapshot, table, connection, schema_version=schema_version)
             if actual != expected or actual["rows"] != snapshot.counts[table]:
                 raise MigrationError(f"full decoded row digest/count mismatch: {table}")
             report[table] = actual

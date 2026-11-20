@@ -30,7 +30,7 @@ from scripts.migrate_source_postgres import (
     Snapshot,
     quoted,
 )
-from service.postgres import encode_pg_text
+from service.postgres import POSTGRES_DERIVED_IDENTIFIERS_SCHEMA_VERSION, encode_pg_text
 from service.tests.test_postgres_migration import (
     pg_dsn as pg_dsn,  # noqa: PLC0414 -- pytest fixture re-export
 )
@@ -121,7 +121,8 @@ def ready_baseline(baseline, dsn):
 
 def target_report(migration, source):
     with migration.pg.transaction():
-        return {table: migration._pg_digest(source, table) for table in TABLES}
+        version = migration.check_schema()
+        return {table: migration._pg_digest(source, table, schema_version=version) for table in TABLES}
 
 
 def install_desired_row(pg, final, table, key):
@@ -335,6 +336,127 @@ def test_unverified_or_ready_target_is_refused(baseline_path, desired_path, pg_d
         migration.pg.execute("UPDATE funes_schema_state SET migration_ready=true")
         with pytest.raises(MigrationError, match="already ready"):
             apply_tail(migration, desired)
+        assert not migration._exists(TAIL_LEDGER)
+
+
+def test_v3_tail_matches_mixed_storage_and_rolls_back_then_retries(baseline_path, tmp_path, pg_dsn):
+    raw = "中文Route_123\0NextWord\ue000MarkerName"
+    identifiers = "Route_123 NextWord MarkerName"
+    literal = "nonreproducible\0literal\ue0000"
+    conn = sqlite3.connect(baseline_path)
+    with conn:
+        conn.execute("UPDATE memories SET raw_text=?,retrieval_text=?,search_identifiers=? WHERE id=4",
+                     (raw, raw, identifiers))
+        conn.execute("UPDATE memories SET search_identifiers='' WHERE id=5")
+    conn.close()
+    path = tmp_path / "mixed.sqlite3"
+    conn = clone_snapshot(baseline_path, path)
+    with conn:
+        clone_memory(conn, 4, 19, "already-desired")
+        conn.execute("UPDATE memories SET search_identifiers='' WHERE id=4")
+        conn.execute("UPDATE memories SET search_identifiers=? WHERE id=5", (literal,))
+        conn.execute("UPDATE sync_state SET native_index_revision=101")
+    conn.close()
+    with Snapshot(baseline_path) as baseline, Snapshot(path) as desired, \
+            ready_baseline(baseline, pg_dsn) as migration:
+        pg = migration.pg
+        pg.execute("ALTER TABLE memories ALTER COLUMN search_identifiers DROP NOT NULL")
+        pg.execute("UPDATE funes_schema_state SET schema_version=%s",
+                   (POSTGRES_DERIVED_IDENTIFIERS_SCHEMA_VERSION,))
+        pg.execute("UPDATE memories SET search_identifiers=NULL WHERE id=4")
+        assert target_report(migration, baseline) == source_report(baseline)
+        with pytest.raises(MigrationError, match="bulk SQLite import requires target schema version 2"):
+            migration.copy()
+        install_desired_row(pg, desired, "memories", 19)
+        pg.execute("UPDATE memories SET search_identifiers=NULL,retrieval_text=NULL WHERE id=19")
+        ledger_before = pg.execute(f"SELECT * FROM {LEDGER}").fetchone()
+        sequence_before = pg.execute("SELECT last_value,is_called FROM memories_id_seq").fetchone()
+        revision_before = pg.execute("SELECT native_index_revision FROM sync_state").fetchone()
+        before = target_report(migration, baseline)
+
+        def interrupt():
+            raise KeyboardInterrupt()
+
+        with pytest.raises(KeyboardInterrupt):
+            apply_tail(migration, desired, before_commit=interrupt)
+        assert target_report(migration, baseline) == before
+        assert not migration._exists(TAIL_LEDGER)
+        assert pg.execute("SELECT native_index_revision FROM sync_state").fetchone() == revision_before
+        result = apply_tail(migration, desired)
+        assert result["applied"]["memories"] == {"removed": 2, "written": 2}
+        assert result["tables"] == source_report(desired)
+        assert pg.execute("SELECT id,search_identifiers FROM memories WHERE id IN (4,5,19) ORDER BY id"
+                          ).fetchall() == [(4, ""), (5, encode_pg_text(literal)), (19, None)]
+        assert apply_tail(migration, desired)["applied"] == {
+            table: {"removed": 0, "written": 0} for table in TABLES}
+        assert pg.execute("SELECT native_index_revision FROM sync_state").fetchone() == (101,)
+        assert pg.execute(f"SELECT * FROM {LEDGER}").fetchone() == ledger_before
+        assert pg.execute("SELECT last_value,is_called FROM memories_id_seq").fetchone() == sequence_before
+
+        # Physical NULL on a changed, non-reproducible literal is a conflict.
+        pg.execute("UPDATE memories SET search_identifiers=NULL WHERE id=5")
+        with pytest.raises(MigrationError, match="target row diverged.*memories"):
+            apply_tail(migration, desired)
+        pg.execute("UPDATE memories SET search_identifiers=%s WHERE id=5", (encode_pg_text(literal),))
+        # Full digest also catches a non-reproducible NULL on an unchanged row.
+        pg.execute("UPDATE memories SET search_identifiers=NULL WHERE id=1")
+        with pytest.raises(MigrationError, match="full decoded row digest/count mismatch: memories"):
+            apply_tail(migration, desired)
+        pg.execute("UPDATE memories SET search_identifiers=%s WHERE id=1", (encode_pg_text("NUL\0encoded\ue000"),))
+        pg.execute("UPDATE funes_schema_state SET migration_ready=true")
+        with pytest.raises(MigrationError, match="already ready"):
+            apply_tail(migration, desired)
+
+
+def test_v3_tail_disconnect_before_commit_reconnects_without_checkpoint_advance(
+        baseline_path, desired_path, pg_dsn):
+    import psycopg
+
+    with Snapshot(baseline_path) as baseline, Snapshot(desired_path) as desired:
+        with ready_baseline(baseline, pg_dsn) as migration:
+            migration.pg.execute("ALTER TABLE memories ALTER COLUMN search_identifiers DROP NOT NULL")
+            migration.pg.execute("UPDATE funes_schema_state SET schema_version=%s",
+                                 (POSTGRES_DERIVED_IDENTIFIERS_SCHEMA_VERSION,))
+            with psycopg.connect(pg_dsn, autocommit=True) as control:
+                def disconnect():
+                    terminated, = control.execute(
+                        "SELECT pg_terminate_backend(%s, 2000)", (migration.pg.info.backend_pid,),
+                    ).fetchone()
+                    assert terminated
+
+                with pytest.raises(psycopg.OperationalError):
+                    apply_tail(migration, desired, before_commit=disconnect)
+
+        with Migration(baseline, pg_dsn) as reconnected:
+            assert not reconnected._exists(TAIL_LEDGER)
+            assert target_report(reconnected, baseline) == source_report(baseline)
+            assert apply_tail(reconnected, desired)["tables"] == source_report(desired)
+            assert apply_tail(reconnected, desired)["applied"] == {
+                table: {"removed": 0, "written": 0} for table in TABLES}
+
+
+@pytest.mark.parametrize("version,nullable,error", [
+    (99, True, "target schema version"),
+    (3, False, "target search_identifiers nullability"),
+    (2, True, "target search_identifiers nullability"),
+])
+def test_tail_refuses_unknown_or_inconsistent_schema_without_checkpoint_changes(
+        baseline_path, desired_path, pg_dsn, version, nullable, error):
+    with Snapshot(baseline_path) as baseline, Snapshot(desired_path) as desired, \
+            ready_baseline(baseline, pg_dsn) as migration:
+        pg = migration.pg
+        if nullable:
+            pg.execute("ALTER TABLE memories ALTER COLUMN search_identifiers DROP NOT NULL")
+        pg.execute("UPDATE funes_schema_state SET schema_version=%s", (version,))
+        ledger_before = pg.execute(f"SELECT * FROM {LEDGER}").fetchone()
+        with pytest.raises(MigrationError, match=error):
+            apply_tail(migration, desired)
+        if version == 99:
+            with pytest.raises(MigrationError, match=error):
+                migration._pg_digest(baseline, "memories", schema_version=version)
+        assert pg.execute(f"SELECT * FROM {LEDGER}").fetchone() == ledger_before
+        assert pg.execute("SELECT native_index_revision FROM sync_state").fetchone() == (97,)
+        assert pg.execute("SELECT migration_ready,document_count FROM funes_schema_state").fetchone() == (False, 5)
         assert not migration._exists(TAIL_LEDGER)
 
 

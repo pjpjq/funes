@@ -32,6 +32,8 @@ from pathlib import Path
 from typing import Any
 from concurrent.futures import ThreadPoolExecutor
 
+from service.source_identifiers import technical_index_text_v1
+
 
 FIELDS = (
     "source_agent", "source_type", "device_id", "project", "repo", "worktree",
@@ -175,18 +177,7 @@ def technical_fts_query(terms: list[str]) -> str:
 
 def technical_index_text(raw_text: Any, retrieval_text: Any) -> str:
     """Materialize bounded ASCII identifiers so mixed CJK tokens stay indexable."""
-    terms = []
-    seen = set()
-    for value in (raw_text, retrieval_text):
-        for term in ASCII_FTS_TERM_RE.findall(str(value or "")):
-            key = term.casefold()
-            if key in seen:
-                continue
-            seen.add(key)
-            terms.append(term)
-            if len(terms) >= 256:
-                return " ".join(terms)
-    return " ".join(terms)
+    return technical_index_text_v1(raw_text, retrieval_text)
 
 
 def cjk_retrieval_terms(value: str, limit: int = 24) -> list[str]:
@@ -902,6 +893,9 @@ class Store:
         with self.lock:
             self.conn.close()
 
+    def _new_search_identifiers(self, raw: str, retrieval: str) -> str | None:
+        return technical_index_text(raw, retrieval)
+
     def ingest(self, docs: list[dict[str, Any]]) -> dict[str, Any]:
         created = updated = deduped = 0
         results = []
@@ -921,7 +915,6 @@ class Store:
                 if not raw:
                     raise ValueError("raw_text/text is required")
                 retrieval = str(doc.get("retrieval_text") or normalize_text(raw))
-                search_identifiers = technical_index_text(raw, retrieval)
                 metadata = dict(doc.get("metadata") or {})
 
                 def supplied(name: str) -> bool:
@@ -1262,7 +1255,8 @@ class Store:
                         # lifecycles.  A reconciled shadow must update in place even
                         # when the source bytes/version are unchanged.
                         self.conn.execute(
-                            """UPDATE memories SET retrieval_text=?, search_identifiers=?,
+                            """UPDATE memories SET retrieval_text=?,
+                            search_identifiers=CASE WHEN search_identifiers IS NOT NULL THEN ? END,
                             translation_hash=?,
                             translation_version=?, translation_status=?, retrieval_updated_at=?,
                             retrieval_generation=?,
@@ -1350,7 +1344,8 @@ class Store:
                                 values["native_generation"] = int(row["native_generation"] or 0)
                     self.conn.execute(
                         """UPDATE memories SET source_version=?, raw_text=?, retrieval_text=?,
-                        search_identifiers=?, metadata_json=?, source_metadata_clock_json=?,
+                        search_identifiers=CASE WHEN search_identifiers IS NOT NULL THEN ? END,
+                        metadata_json=?, source_metadata_clock_json=?,
                         source_agent=?, source_type=?, device_id=?, project=?, repo=?, worktree=?, session_id=?,
                         message_id=?, role=?, timestamp=?, source_path=?, content_hash=?, updated_at=?, retrieval_updated_at=?, content_type=?,
                         source_missing=?, agent_type=?, parent_session_id=?, agent_id=?, translation_hash=?, translation_version=?, translation_status=?,
@@ -1358,7 +1353,7 @@ class Store:
                         native_index_memory=?, native_indexed_at=?, native_index_error=?,
                         retrieval_generation=?, native_generation=?,
                         embedding_generation=? WHERE id=?""",
-                        (source_version, raw, retrieval, search_identifiers, json.dumps(metadata, ensure_ascii=False), incoming_metadata_clock_json,
+                        (source_version, raw, retrieval, technical_index_text(raw, retrieval), json.dumps(metadata, ensure_ascii=False), incoming_metadata_clock_json,
                          values.get("source_agent"), values.get("source_type"), values.get("device_id"),
                          values.get("project"), values.get("repo"), values.get("worktree"), values.get("session_id"),
                          values.get("message_id"), values.get("role"), values.get("timestamp"), values.get("source_path"),
@@ -1378,7 +1373,7 @@ class Store:
                         native_index_version,native_index_status,native_index_profile,native_index_memory,native_indexed_at,native_index_error,
                         retrieval_generation,native_generation,embedding_generation)
                         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                        (source_identity, source_version, raw, retrieval, search_identifiers, json.dumps(metadata, ensure_ascii=False), incoming_metadata_clock_json,
+                        (source_identity, source_version, raw, retrieval, self._new_search_identifiers(raw, retrieval), json.dumps(metadata, ensure_ascii=False), incoming_metadata_clock_json,
                          values.get("source_agent"), values.get("source_type"), values.get("device_id"), values.get("project"),
                          values.get("repo"), values.get("worktree"), values.get("session_id"), values.get("message_id"),
                          values.get("role"), values.get("timestamp"), values.get("source_path"), content_hash, values.get("ingested_at") or now, incoming_updated, values.get("retrieval_updated_at"),
@@ -1734,7 +1729,8 @@ class Store:
                 )
                 if next_values != current_values:
                     self.conn.execute(
-                        """UPDATE memories SET retrieval_text=?, search_identifiers=?,
+                        """UPDATE memories SET retrieval_text=?,
+                        search_identifiers=CASE WHEN search_identifiers IS NOT NULL THEN ? END,
                         translation_hash=?,
                         translation_version=?, translation_status=?, retrieval_updated_at=?,
                         retrieval_generation=?, native_index_version=?, native_index_status=?,

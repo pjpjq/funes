@@ -28,6 +28,7 @@ from service.postgres import (
     encode_pg_text,
 )
 from service.server import Store, technical_index_text
+from service.source_identifiers import logical_search_identifiers
 
 
 class AdapterTests(unittest.TestCase):
@@ -45,6 +46,22 @@ class AdapterTests(unittest.TestCase):
         row = _row_factory(cursor)([encode_pg_text("a\x00\ue0000"), None])
         self.assertEqual(row["retrieval_text"], "a\x00\ue0000")
         self.assertEqual(_row_factory(cursor)(["raw", ""])["retrieval_text"], "")
+
+    def test_logical_identifiers_preserve_empty_literal_and_decode_derived(self):
+        raw, retrieval = "配置 previous_response_id", "Translated translated_token"
+        self.assertEqual(logical_search_identifiers("", raw, retrieval), "")
+        self.assertEqual(logical_search_identifiers("legacy_literal", raw, retrieval), "legacy_literal")
+        self.assertEqual(logical_search_identifiers(None, raw, retrieval), technical_index_text(raw, retrieval))
+        self.assertEqual(logical_search_identifiers(None, raw, ""), technical_index_text(raw, ""))
+
+    def test_derived_v1_has_a_stable_byte_contract(self):
+        terms = [f"token{i:03}" for i in range(260)]
+        raw = "配置 Previous_ID foo\x00Bar\ue0000 A"
+        retrieval = "previous_id FOO New " + " ".join(terms)
+        self.assertEqual(
+            logical_search_identifiers(None, raw, retrieval),
+            " ".join(["Previous_ID", "foo", "Bar", "New", *terms[:252]]),
+        )
 
     def test_qmark_conversion_respects_literals_comments_and_percent(self):
         sql = "SELECT ?, '?', 'a''?b', \"?\", 5 % 2, '80%' /* ? /* ? */ */ -- ?\n, $tag$?%$tag$"
@@ -101,6 +118,8 @@ class PostgresIntegrationTests(unittest.TestCase):
         from psycopg.conninfo import conninfo_to_dict, make_conninfo
         from psycopg import sql
 
+        self.enterContext(mock.patch.dict(os.environ))
+        os.environ.pop("FUNES_POSTGRES_DERIVED_IDENTIFIERS", None)
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.schema = "funes_test_" + uuid.uuid4().hex
@@ -334,12 +353,98 @@ class PostgresIntegrationTests(unittest.TestCase):
         self.assertEqual(self.runtime().get("large")["raw_text"], raw)
         self.assertEqual(self.store.get("large")["retrieval_text"], raw)
 
+    def test_v3_enable_keeps_existing_v2_payload_and_native_revision(self):
+        self.enterContext(mock.patch.dict(os.environ, {"FUNES_SERVICE_ROLE": "writer"}))
+        writer = self.runtime()
+        writer.ingest([self.doc("legacy")])
+        state = writer.native_index_state_record()
+        filenode = writer.conn.execute("SELECT pg_relation_filenode('memories'::regclass)").fetchone()[0]
+        before = writer.conn.execute("SELECT search_identifiers FROM memories").fetchone()[0]
+        with mock.patch.dict(os.environ, {"FUNES_POSTGRES_DERIVED_IDENTIFIERS": "1"}):
+            with self.assertRaisesRegex(PostgresNotReady, "requires PostgreSQL source schema v3"):
+                self.runtime()
+        marker_sql = "SELECT schema_version,migration_ready,document_count FROM funes_schema_state"
+        self.assertEqual(tuple(writer.conn.execute(marker_sql).fetchone()), (2, True, 1))
+
+        writer.enable_derived_identifiers_schema()
+
+        self.assertEqual(tuple(writer.conn.execute(marker_sql).fetchone()), (3, True, 1))
+        self.assertEqual(writer.native_index_state_record(), state)
+        self.assertEqual(writer.conn.execute("SELECT pg_relation_filenode('memories'::regclass)").fetchone()[0], filenode)
+        self.assertEqual(writer.conn.execute("SELECT search_identifiers FROM memories").fetchone()[0], before)
+        nullable = self.admin.execute(
+            "SELECT is_nullable FROM information_schema.columns WHERE table_schema=%s "
+            "AND table_name='memories' AND column_name='search_identifiers'", (self.schema,),
+        ).fetchone()[0]
+        self.assertEqual(nullable, "YES")
+
+    def test_v3_mixed_writes_preserve_literal_rows_and_reads_do_not_derive(self):
+        writer = self.runtime()
+        writer.ingest([self.doc("legacy")])
+        writer.enable_derived_identifiers_schema()
+        raw, shadow = "配置 changed_identifier\x00\ue000e", "English translated_identifier"
+
+        def physical(identity):
+            return self.admin.execute(f'SELECT search_identifiers FROM "{self.schema}".memories '
+                                      'WHERE source_identity=%s', (identity,)).fetchone()[0]
+
+        with mock.patch.dict(os.environ, {"FUNES_POSTGRES_DERIVED_IDENTIFIERS": "1"}):
+            enabled = self.runtime()
+            enabled.ingest([
+                self.doc("legacy", source_version="v2", raw_text=raw, retrieval_text=shadow,
+                         translation_status="ok", updated_at="2026-09-22T11:00:00+00:00"),
+                self.doc("derived", raw_text=raw, retrieval_text=shadow, translation_status="ok"),
+            ])
+            self.assertEqual(enabled.get("legacy")["source_version"], "v2")
+            self.assertEqual(physical("legacy"), technical_index_text(raw, shadow))
+            self.assertIsNone(physical("derived"))
+
+            enabled.mark_translations_pending([enabled.get("legacy"), enabled.get("derived")])
+            self.assertEqual(enabled.get("derived")["translation_status"], "pending_provider")
+            self.assertEqual(physical("legacy"), technical_index_text(raw, raw))
+            self.assertIsNone(physical("derived"))
+
+            self.assertTrue(enabled.record_reindex_control(enabled.next_reindex_control("all")))
+            enabled.drain_reindex_controls(batch_size=1)
+            self.assertEqual(enabled.get("legacy")["retrieval_generation"], 1)
+            self.assertEqual(enabled.get("derived")["retrieval_generation"], 1)
+            self.assertEqual(physical("legacy"), technical_index_text(raw, raw))
+            self.assertIsNone(physical("derived"))
+
+            with mock.patch("service.source_identifiers.technical_index_text_v1",
+                            side_effect=AssertionError("read derived identifiers")):
+                self.assertEqual(enabled.get_many(["derived"])[0]["raw_text"], raw)
+                self.assertEqual(enabled.search("derived")[0]["source_identity"], "derived")
+                entries = {item["source_identity"]: item for batch in enabled.iter_documents() for item in batch}
+                self.assertNotIn("search_identifiers", entries["derived"])
+
+        disabled = self.runtime()
+        with mock.patch("service.source_identifiers.technical_index_text_v1",
+                        side_effect=AssertionError("read derived identifiers")):
+            self.assertEqual(disabled.get("derived")["retrieval_text"], raw)
+        row = disabled.conn.execute("SELECT search_identifiers,raw_text,retrieval_text FROM memories "
+                                    "WHERE source_identity=?", ("derived",)).fetchone()
+        self.assertEqual(logical_search_identifiers(*row), technical_index_text(raw, raw))
+        disabled.ingest([self.doc("off", raw_text=raw)])
+        self.assertEqual(physical("off"), technical_index_text(raw, raw))
+        self.assertIsNone(physical("derived"))
+
     def test_v1_marker_is_rejected_without_automatic_schema_rewrite(self):
         self.store.conn.execute("UPDATE funes_schema_state SET schema_version=1 WHERE id=1")
         with self.assertRaises(PostgresNotReady):
             self.runtime()
         row = self.admin.execute(f'SELECT schema_version FROM "{self.schema}".funes_schema_state').fetchone()
         self.assertEqual(row[0], 1)
+
+    def test_unknown_schema_marker_rejects_reads_and_writes(self):
+        writer = self.runtime()
+        writer.enable_derived_identifiers_schema()
+        self.admin.execute(f'UPDATE "{self.schema}".funes_schema_state SET schema_version=99')
+        for operation in (self.runtime, writer.probe_ready, lambda: writer.get("source"),
+                          lambda: writer.ingest([self.doc()])):
+            with self.subTest(operation=operation), self.assertRaises(PostgresNotReady):
+                operation()
+        self.assertEqual(self.admin.execute(f'SELECT count(*) FROM "{self.schema}".memories').fetchone()[0], 0)
 
     def test_snapshot_and_iterator_stream_and_checkpoint_survives_reopen(self):
         self.store.ingest([self.doc(str(i)) for i in range(7)])

@@ -35,7 +35,10 @@ from service.server import (
 )
 
 POSTGRES_SCHEMA_VERSION = 2
+POSTGRES_DERIVED_IDENTIFIERS_SCHEMA_VERSION = 3
 POSTGRES_STREAM_BATCH = 500
+_SOURCE_WRITER_LOCK = ("SELECT pg_advisory_xact_lock("
+                       "hashtextextended(current_schema() || ':funes-store-writer', 0))")
 _TEXT_ESCAPE = "\ue000"
 _TEXT_DECODE_RE = re.compile(_TEXT_ESCAPE + "([e0])")
 
@@ -274,10 +277,7 @@ class Connection:
         try:
             if not self._transactions and not self.read_only:
                 # Do not put identities, text, passwords or DSNs into lock keys.
-                self.raw.execute(
-                    "SELECT pg_advisory_xact_lock("
-                    "hashtextextended(current_schema() || ':funes-store-writer', 0))"
-                ).close()
+                self.raw.execute(_SOURCE_WRITER_LOCK).close()
                 if self.require_ready:
                     _verify_marker(self.raw)
         except BaseException as error:
@@ -302,7 +302,7 @@ class Connection:
         self._trace = callback
 
 
-def _verify_marker(raw, *, require_ready: bool = True):
+def _verify_marker(raw, *, require_ready: bool = True) -> int:
     try:
         with raw.cursor() as cursor:
             cursor.execute(
@@ -311,10 +311,11 @@ def _verify_marker(raw, *, require_ready: bool = True):
             state = cursor.fetchone()
     except Exception:
         raise PostgresNotReady("PostgreSQL source schema is missing or unavailable; run explicit migration") from None
-    if not state or int(state[0]) != POSTGRES_SCHEMA_VERSION:
+    if not state or state[0] not in (POSTGRES_SCHEMA_VERSION, POSTGRES_DERIVED_IDENTIFIERS_SCHEMA_VERSION):
         raise PostgresNotReady("PostgreSQL source schema version is incompatible")
     if require_ready and not state[1]:
         raise PostgresNotReady("PostgreSQL source migration is not finalized")
+    return int(state[0])
 
 
 # These are source columns, not a second implementation of Store's merge rules.
@@ -503,6 +504,7 @@ class PostgresStore(Store):
         if not self._dsn:
             raise PostgresNotReady("FUNES_POSTGRES_DSN is required for PostgreSQL source storage")
         self._migration_mode = bool(initialize)
+        self._derive_new_identifiers = not self.read_only and os.getenv("FUNES_POSTGRES_DERIVED_IDENTIFIERS") == "1"
         self._bulk_restore_depth = 0
         self._bulk_restore_prev_pragmas = None
         raw = self._connect()
@@ -551,11 +553,31 @@ class PostgresStore(Store):
             self._create_secondary_indexes_locked()
             self.conn.raw.execute(_native_trigger_sql()).close()
 
-    def verify_schema(self, *, require_ready: bool = True) -> None:
+    def enable_derived_identifiers_schema(self) -> None:
+        """Explicit v2 → v3 upgrade; never invoked by startup or ingest."""
+        if self.read_only or self._migration_mode:
+            raise PostgresNotReady("Identifier schema upgrade requires a ready writer connection")
+        with self.lock, self.conn.raw.transaction():
+            raw = self.conn.raw
+            raw.execute("SET LOCAL lock_timeout='2s'").close()
+            raw.execute(_SOURCE_WRITER_LOCK).close()
+            if self.verify_schema() == POSTGRES_DERIVED_IDENTIFIERS_SCHEMA_VERSION:
+                return
+            raw.execute("ALTER TABLE memories ALTER COLUMN search_identifiers DROP NOT NULL").close()
+            raw.execute(
+                "UPDATE funes_schema_state SET schema_version=%s WHERE id=1",
+                (POSTGRES_DERIVED_IDENTIFIERS_SCHEMA_VERSION,),
+            ).close()
+            self.verify_schema()
+
+    def verify_schema(self, *, require_ready: bool = True) -> int:
         """Catalog/one-row checks only. No startup DDL, rebuild, COUNT or row scan."""
         with self.lock:
             raw = self.conn.raw
-            _verify_marker(raw, require_ready=require_ready)
+            version = _verify_marker(raw, require_ready=require_ready)
+            allow_derived = version == POSTGRES_DERIVED_IDENTIFIERS_SCHEMA_VERSION
+            if self._derive_new_identifiers and not allow_derived:
+                raise PostgresNotReady("FUNES_POSTGRES_DERIVED_IDENTIFIERS requires PostgreSQL source schema v3")
             expected_columns = {
                 "memories": {
                     "id", "source_identity", "source_version", "raw_text", "retrieval_text",
@@ -589,15 +611,18 @@ class PostgresStore(Store):
                 )
                 definitions = list(cursor)
                 if any(row[1] == "tsvector" or row[3] != "NEVER" for row in definitions):
-                    raise PostgresNotReady("PostgreSQL v2 source must not contain derived search vectors")
+                    raise PostgresNotReady("PostgreSQL source must not contain derived search vectors")
                 if not any(row[0] == "retrieval_text" and row[2] == "YES" for row in definitions):
-                    raise PostgresNotReady("PostgreSQL v2 requires nullable retrieval_text")
+                    raise PostgresNotReady("PostgreSQL source requires nullable retrieval_text")
+                if not any(row[0] == "search_identifiers" and row[2] == ("YES" if allow_derived else "NO")
+                           for row in definitions):
+                    raise PostgresNotReady("PostgreSQL search_identifiers nullability does not match source schema")
                 cursor.execute(
                     "SELECT a.amname FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid "
                     "JOIN pg_am a ON a.oid=c.relam WHERE i.indrelid='memories'::regclass"
                 )
                 if any(row[0] != "btree" for row in cursor):
-                    raise PostgresNotReady("PostgreSQL v2 source supports only B-tree indexes")
+                    raise PostgresNotReady("PostgreSQL source supports only B-tree indexes")
                 cursor.execute(
                     "SELECT indexrelid::regclass::text FROM pg_index "
                     "WHERE indrelid='memories'::regclass AND indisvalid AND indisready"
@@ -626,6 +651,7 @@ class PostgresStore(Store):
                     or int(state[2]) != NATIVE_CHECKPOINT_STATE_VERSION
                 )):
                     raise PostgresNotReady("PostgreSQL source checkpoint or disabled-FTS marker is invalid")
+            return version
 
     def probe_ready(self) -> None:
         """Check the durable migration marker without waiting for the writer.
@@ -733,8 +759,8 @@ class PostgresStore(Store):
                 "UPDATE funes_schema_state SET migration_ready=TRUE,migration_source=?,migrated_at=?,document_count=? WHERE id=1",
                 (source, utc_now(), actual_count),
             )
-            self.verify_schema()
-        return {"documents": actual_count, "schema_version": POSTGRES_SCHEMA_VERSION, "ready": True}
+            version = self.verify_schema()
+        return {"documents": actual_count, "schema_version": version, "ready": True}
 
     def reconnect(self) -> None:
         """Explicit fail-closed reconnection; no interrupted write is replayed."""
@@ -768,6 +794,11 @@ class PostgresStore(Store):
         if result.get("retrieval_text") is None and "raw_text" in result:
             result["retrieval_text"] = result["raw_text"]
         return result
+
+    def _new_search_identifiers(self, raw: str, retrieval: str) -> str | None:
+        if self._derive_new_identifiers:
+            return None
+        return super()._new_search_identifiers(raw, retrieval)
 
     def get(self, ident: str | int) -> dict[str, Any] | None:
         with closing(self._read_connection()) as reader:
@@ -812,7 +843,8 @@ class PostgresStore(Store):
                     continue
                 identifiers = technical_index_text(row["raw_text"], row["raw_text"])
                 self.conn.execute(
-                    "UPDATE memories SET retrieval_text=NULL,search_identifiers=?,"
+                    "UPDATE memories SET retrieval_text=NULL,"
+                    "search_identifiers=CASE WHEN search_identifiers IS NOT NULL THEN ? END,"
                     "translation_status='pending_provider' WHERE " + predicate,
                     (identifiers, *parameters),
                 )

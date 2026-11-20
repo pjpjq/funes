@@ -35,6 +35,44 @@ below describe an explicitly approved migration into a fresh v2 target;
 they are **not** an instruction to alter an existing production schema. Existing
 v1 data must be retained until a separately reviewed conversion/cutover.
 
+### Optional v3 encoding for new PostgreSQL writes
+
+This is separate from the SQLite import below, which still starts on v2.
+Deploy compatible readers, writers, replay jobs and verification tools with
+`FUNES_POSTGRES_DERIVED_IDENTIFIERS` **unset** first. Drain every old process
+before upgrading: v2-only binaries reject the v3 marker. Neither normal
+startup nor setting the flag upgrades the schema.
+
+Only in an explicitly approved maintenance window, from the compatible
+checkout with the target DSN injected as in step 2, a database owner can run:
+
+```sh
+env -u FUNES_POSTGRES_DERIVED_IDENTIFIERS FUNES_SERVICE_ROLE=combined python - <<'PY'
+from contextlib import closing
+from tempfile import TemporaryDirectory
+
+from service.postgres import PostgresStore
+
+with TemporaryDirectory() as scratch, closing(PostgresStore(scratch)) as store:
+    store.enable_derived_identifiers_schema()
+PY
+```
+
+The operation uses a two-second lock timeout and atomically drops the column's
+`NOT NULL` constraint and advances the ready schema marker to v3. It takes a
+table lock but does not rewrite existing rows or move checkpoints. Verify reads
+and recovery before separately setting `FUNES_POSTGRES_DERIVED_IDENTIFIERS=1`
+on a compatible writer. Only new application inserts can omit identifiers;
+existing literals, including empty strings, are never converted to derived by
+updates. SQLite import/replay continues to use authoritative literals.
+
+In v3, direct SQL and physical dumps see a NULL for derived-v1: exact logical
+verification reconstructs the frozen v1 value from decoded raw/retrieval text.
+An empty string is a literal, not a marker. Ordinary API reads do not need or
+recompute the field. Unsetting the flag and restarting the writer restores
+literal inserts without changing v3 reads. It is **not** a downgrade to an
+old binary or schema, and it does not reclaim space occupied by existing rows.
+
 ## 1. Pin the immutable source (read-only, no database credentials)
 
 Create a SQLite backup from the authoritative source, stop modifying that backup,

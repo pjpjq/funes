@@ -75,6 +75,7 @@ pub(crate) struct RecallResult {
     pub text: String,
     pub hits: Vec<(Hit, f64)>,
     pub source_type_index_ready: Option<bool>,
+    pub fts_completed: Option<bool>,
 }
 
 /// Matching blocks `scan` lists before it stops. What the cap dropped is always reported.
@@ -599,6 +600,7 @@ fn recall_result(note: String, hits: Vec<(Hit, f64)>, languages: Option<&str>) -
         text,
         hits,
         source_type_index_ready: None,
+        fts_completed: None,
     }
 }
 
@@ -625,9 +627,11 @@ pub(crate) async fn recall_filtered_pinned(
         pool.hint(memory);
     }
     let languages = rephrase_languages([&pool.ds]);
+    let fts_completed = pool.fts_completed;
     let (note, hits) = search.rank(vec![pool], k, neighbors, progress).await?;
     let mut result = recall_result(note, hits, languages.as_deref());
     result.source_type_index_ready = Some(pinned.source_type_index_ready);
+    result.fts_completed = Some(fts_completed);
     Ok(result)
 }
 
@@ -729,6 +733,7 @@ pub struct Candidates {
     ds: Dataset,
     note: String,
     hits: Vec<Hit>,
+    fts_completed: bool,
 }
 
 impl Candidates {
@@ -806,6 +811,7 @@ impl Search {
                 ds: read.ds,
                 note: read.note.unwrap_or_default(),
                 hits: Vec::new(),
+                fts_completed: false,
             });
         }
         // A filter on a migrated column needs the column. On an un-migrated memory it would fail
@@ -843,7 +849,7 @@ impl Search {
             );
         }
         progress(&format!("searching {label}…"));
-        let hits = hybrid_candidates(
+        let (hits, fts_completed) = hybrid_candidates(
             &read.ds,
             qv,
             &self.query,
@@ -856,6 +862,7 @@ impl Search {
             ds: read.ds,
             note: read.note.unwrap_or_default(),
             hits,
+            fts_completed,
         })
     }
 
@@ -956,7 +963,7 @@ async fn hybrid_candidates(
     candidates: usize,
     filter: Option<&str>,
     deadline: Option<Instant>,
-) -> Result<Vec<Hit>> {
+) -> Result<(Vec<Hit>, bool)> {
     let vector = async {
         emit_recall_metric("recall_vector", "start", 0.0);
         let started = Instant::now();
@@ -1001,12 +1008,13 @@ async fn hybrid_candidates(
 
 async fn fuse_hybrid_reads(
     vector: impl std::future::Future<Output = Result<Vec<(u64, Hit)>>>,
-    fts: impl std::future::Future<Output = Vec<(u64, Hit)>>,
+    fts: impl std::future::Future<Output = Option<Vec<(u64, Hit)>>>,
     candidates: usize,
-) -> Result<Vec<Hit>> {
+) -> Result<(Vec<Hit>, bool)> {
     // Start optional I/O before vector reads consume its deadline; vector errors cancel it immediately.
     let (fts, vector) = tokio::try_join!(async { Ok::<_, anyhow::Error>(fts.await) }, vector)?;
-    Ok(rrf_fuse(vector, fts, candidates))
+    let fts_completed = fts.is_some();
+    Ok((rrf_fuse(vector, fts.unwrap_or_default(), candidates), fts_completed))
 }
 
 fn fts_budget(deadline: Option<Instant>) -> Duration {
@@ -1024,16 +1032,16 @@ async fn best_effort_fts(
     scan: impl std::future::Future<Output = Result<Vec<(u64, Hit)>>> + Send + 'static,
     budget: Duration,
     slot: Arc<Semaphore>,
-) -> Vec<(u64, Hit)> {
+) -> Option<Vec<(u64, Hit)>> {
     emit_recall_metric("recall_fts", "start", 0.0);
     let started = Instant::now();
     if budget.is_zero() {
         emit_recall_metric("recall_fts", "timeout", 0.0);
-        return Vec::new();
+        return None;
     }
     let Ok(permit) = slot.try_acquire_owned() else {
         emit_recall_metric("recall_fts", "error", 0.0);
-        return Vec::new();
+        return None;
     };
     let (cancel, cancelled) = oneshot::channel::<()>();
     let (sender, receiver) = oneshot::channel();
@@ -1048,27 +1056,27 @@ async fn best_effort_fts(
                 return;
             }
         };
-        let result = runtime.block_on(async move {
-            tokio::select! {
+        runtime.block_on(async move {
+            let result = tokio::select! {
                 biased;
-                _ = cancelled => Ok(Vec::new()),
+                _ = cancelled => return,
                 result = scan => result,
-            }
+            };
+            let _ = sender.send(result);
         });
-        let _ = sender.send(result);
     });
     if worker.is_err() {
         emit_recall_metric("recall_fts", "error", round_ms(started.elapsed()));
-        return Vec::new();
+        return None;
     }
     // Original inline approach, retained to document why isolation is required:
     // Bound the optional scan without spawning a detached task or discarding vector hits.
     // shortcut: cancellation is cooperative; isolate the scan if profiling finds non-yielding CPU work.
     let deadline = tokio::time::Instant::from_std(started + budget);
     let (hits, state) = match tokio::time::timeout_at(deadline, receiver).await {
-        Ok(Ok(Ok(hits))) => (hits, "done"),
-        Ok(_) => (Vec::new(), "error"),
-        Err(_) => (Vec::new(), "timeout"),
+        Ok(Ok(Ok(hits))) => (Some(hits), "done"),
+        Ok(_) => (None, "error"),
+        Err(_) => (None, "timeout"),
     };
     drop(cancel);
     emit_recall_metric("recall_fts", state, round_ms(started.elapsed()));
@@ -2155,7 +2163,8 @@ mod tests {
             fts_budget(Some(Instant::now() + Duration::from_secs(6))),
             Arc::new(Semaphore::new(1)),
         )
-        .await;
+        .await
+        .expect("FTS completed");
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].1.text, "initialized-fts");
     }
@@ -2175,10 +2184,11 @@ mod tests {
             Duration::from_secs(1),
             Arc::new(Semaphore::new(1)),
         );
-        let fused = tokio::time::timeout(Duration::from_secs(1), fuse_hybrid_reads(vector, fts, 2))
+        let (fused, completed) = tokio::time::timeout(Duration::from_secs(1), fuse_hybrid_reads(vector, fts, 2))
             .await
             .expect("FTS must start while vector I/O is pending")
             .expect("both reads succeed");
+        assert!(completed);
         assert_eq!(fused.len(), 2);
         assert!(fused.iter().any(|hit| hit.text == "fts-only"));
     }
@@ -2198,15 +2208,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hybrid_reads_count_a_completed_empty_fts_scan() {
+        let fts = best_effort_fts(
+            async { Ok(Vec::new()) },
+            Duration::from_secs(1),
+            Arc::new(Semaphore::new(1)),
+        );
+        let (hits, completed) = fuse_hybrid_reads(async { Ok(vec![(1, hit("vector-only"))]) }, fts, 1)
+            .await
+            .unwrap();
+        assert!(completed);
+        assert_eq!(hits[0].text, "vector-only");
+    }
+
+    #[tokio::test]
     async fn hybrid_reads_keep_vector_hits_when_fts_times_out() {
         let fts = best_effort_fts(
             std::future::pending(),
             Duration::from_millis(20),
             Arc::new(Semaphore::new(1)),
         );
-        let fused = fuse_hybrid_reads(async { Ok(vec![(1, hit("vector-only"))]) }, fts, 1)
+        let (fused, completed) = fuse_hybrid_reads(async { Ok(vec![(1, hit("vector-only"))]) }, fts, 1)
             .await
             .expect("optional FTS timeout does not fail vector recall");
+        assert!(!completed);
         assert_eq!(fused.len(), 1);
         assert_eq!(fused[0].text, "vector-only");
     }
@@ -2214,8 +2239,11 @@ mod tests {
     #[tokio::test]
     async fn exhausted_fts_budget_never_polls_the_scan_or_loses_vector_hits() {
         let scan = async { panic!("an exhausted optional scan must not be polled") };
-        let fts = best_effort_fts(scan, fts_budget(Some(Instant::now())), Arc::new(Semaphore::new(1))).await;
-        let fused = rrf_fuse(vec![(1, hit("vector-only"))], fts, 1);
+        let fts = best_effort_fts(scan, fts_budget(Some(Instant::now())), Arc::new(Semaphore::new(1)));
+        let (fused, completed) = fuse_hybrid_reads(async { Ok(vec![(1, hit("vector-only"))]) }, fts, 1)
+            .await
+            .unwrap();
+        assert!(!completed);
         assert_eq!(fused.len(), 1);
         assert_eq!(fused[0].text, "vector-only");
     }
@@ -2227,7 +2255,8 @@ mod tests {
             Duration::from_secs(1),
             Arc::new(Semaphore::new(1)),
         )
-        .await;
+        .await
+        .expect("FTS completed");
         let fused = rrf_fuse(vec![(1, hit("vector-only")), (2, hit("shared"))], fts, 3);
         assert_eq!(fused[0].text, "shared");
         assert_eq!(fused.len(), 3);
@@ -2239,9 +2268,11 @@ mod tests {
             async { Err(anyhow!("missing FTS index")) },
             Duration::from_secs(1),
             Arc::new(Semaphore::new(1)),
-        )
-        .await;
-        let fused = rrf_fuse(vec![(1, hit("vector-only"))], fts, 1);
+        );
+        let (fused, completed) = fuse_hybrid_reads(async { Ok(vec![(1, hit("vector-only"))]) }, fts, 1)
+            .await
+            .unwrap();
+        assert!(!completed);
         assert_eq!(fused.len(), 1);
         assert_eq!(fused[0].text, "vector-only");
     }
@@ -2273,7 +2304,8 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), dropped.notified())
             .await
             .expect("a yielding scan must observe cancellation");
-        let fused = rrf_fuse(vec![(1, hit("vector-only"))], fts, 1);
+        assert!(fts.is_none());
+        let fused = rrf_fuse(vec![(1, hit("vector-only"))], fts.unwrap_or_default(), 1);
         assert_eq!(fused.len(), 1);
         assert_eq!(fused[0].text, "vector-only");
     }
@@ -2295,8 +2327,8 @@ mod tests {
             started.elapsed() < Duration::from_millis(200),
             "blocking FTS held the query task beyond its deadline"
         );
-        assert!(fts.is_empty());
-        let fused = rrf_fuse(vec![(1, hit("vector-only"))], fts, 1);
+        assert!(fts.is_none());
+        let fused = rrf_fuse(vec![(1, hit("vector-only"))], fts.unwrap_or_default(), 1);
         assert_eq!(fused[0].text, "vector-only");
         drop(
             tokio::time::timeout(Duration::from_secs(2), slot.acquire())
@@ -2323,7 +2355,7 @@ mod tests {
         )
         .await;
         assert!(started.elapsed() < Duration::from_millis(200));
-        assert!(fts.is_empty());
+        assert!(fts.is_none());
         drop(
             tokio::time::timeout(Duration::from_secs(2), slot.acquire())
                 .await
@@ -2354,7 +2386,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(first.await.unwrap().is_empty());
+        assert!(first.await.unwrap().is_none());
         assert_eq!(slot.available_permits(), 0);
         assert!(best_effort_fts(
             async { panic!("a busy slot must not poll another scan") },
@@ -2362,7 +2394,7 @@ mod tests {
             slot.clone(),
         )
         .await
-        .is_empty());
+        .is_none());
         release.send(()).unwrap();
         drop(
             tokio::time::timeout(Duration::from_secs(1), slot.acquire())
@@ -2370,7 +2402,9 @@ mod tests {
                 .unwrap()
                 .unwrap(),
         );
-        let fresh = best_effort_fts(async { Ok(vec![(2, hit("fresh"))]) }, Duration::from_secs(1), slot).await;
+        let fresh = best_effort_fts(async { Ok(vec![(2, hit("fresh"))]) }, Duration::from_secs(1), slot)
+            .await
+            .expect("new scan completed");
         assert_eq!(fresh.len(), 1);
         assert_eq!(fresh[0].1.text, "fresh");
     }
@@ -2392,7 +2426,8 @@ mod tests {
             Duration::from_secs(1),
             slot.clone(),
         )
-        .await;
+        .await
+        .expect("FTS completed before runtime cleanup");
         assert_eq!(fts.len(), 1);
         assert_eq!(slot.available_permits(), 0);
         release.send(()).unwrap();
@@ -2493,7 +2528,8 @@ mod tests {
                 Duration::from_secs(3),
                 slot.clone(),
             )
-            .await;
+            .await
+            .expect("keyword scan completed");
             assert_eq!(hits.len(), 1);
             assert_eq!(hits[0].1.text, target_text);
             assert_eq!(hits[0].1.harness, "codex");
@@ -2575,7 +2611,7 @@ mod tests {
         .await;
         let qv = vec![1.0; dataset::DIM as usize];
         assert_eq!(vector_candidates(&ds, &qv, 5, None).await.unwrap().len(), 1);
-        let hits = hybrid_candidates(&ds, &qv, "narwhal", 5, None, None).await.unwrap();
+        let (hits, _) = hybrid_candidates(&ds, &qv, "narwhal", 5, None, None).await.unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].text, "A narwhal parses transcripts.");
     }

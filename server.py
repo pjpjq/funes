@@ -3870,13 +3870,18 @@ def native_worker_status() -> dict[str, object]:
         # by ``_snapshot_read_metrics``.  Do not feed it back through the
         # stderr-line parser: stringifying dicts would discard every metric.
         failure["read_metrics"] = worker_metrics
-    return {
+    status = {
         "configured": configured,
         "config_match": bool(config_match),
         "alive": alive,
         "last_failure": failure,
         "last_read": dict(worker._last_read) if isinstance(worker, NativeMcpWorker) else {},
     }
+    if service_role() == "query":
+        status["active_fts_warmed"] = bool(
+            config_match and alive and getattr(worker, "_snapshot_opened_after", None) is not None
+        )
+    return status
 
 
 class NativeMcpWorker:
@@ -4106,6 +4111,9 @@ class NativeMcpWorker:
             raise NativeMcpBusyError("native MCP worker is being replaced")
         if self._process is not None and self._alive(self._process):
             return
+        if self is MCP_WORKER and service_role() == "query":
+            # A new child has no pinned Dataset; only the background candidate may start it.
+            raise NativeMcpError("query worker needs warm replacement")
         self._stop_locked()
         self._start_locked(deadline)
 
@@ -4499,8 +4507,13 @@ def _refresh_native_worker(snapshot=None) -> None:
             candidate.query_snapshot = snapshot
             QUERY_CANDIDATE = candidate
         try:
-            probe = candidate.recall("memory", k=1, candidates=1, half_life=0, neighbors=0)
-            if probe.startswith("recall error:"):
+            if snapshot is not None:
+                probe = candidate.recall_result("memory", k=1, candidates=1, half_life=0, neighbors=0)
+                metadata = probe.get("structuredContent") if isinstance(probe, dict) else None
+                # A successful vector-only fallback does not certify the candidate's FTS reader.
+                if not isinstance(metadata, dict) or metadata.get("fts_completed") is not True:
+                    raise NativeMcpError("query candidate FTS warm incomplete")
+            elif candidate.recall("memory", k=1, candidates=1, half_life=0, neighbors=0).startswith("recall error:"):
                 raise NativeMcpError("native recall failed")
             candidate._snapshot_opened_after = opened_at
             candidate._source_type_maintenance_success = maintained_at_open

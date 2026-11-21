@@ -1006,6 +1006,59 @@ pub(crate) async fn fts_needs_refresh(ds: &Dataset) -> Result<bool> {
         .is_empty())
 }
 
+/// Append only the uncovered text fragments, retaining every existing index segment.
+/// Unlike `refresh_or_build`, this maintenance must never fall back to rebuilding.
+pub(crate) async fn append_fts_index(ds: &mut Dataset) -> Result<()> {
+    let field = ds
+        .schema()
+        .field("text")
+        .context("text search requires a text column")?;
+    let before = ds.load_indices().await.context("listing indexes before FTS append")?;
+    let segments: Vec<_> = before.iter().filter(|index| index.name == FTS_INDEX).collect();
+    anyhow::ensure!(!segments.is_empty(), "FTS append requires an existing {FTS_INDEX}");
+    for segment in &segments {
+        anyhow::ensure!(
+            segment.fields.as_slice() == [field.id]
+                && segment
+                    .index_details
+                    .as_ref()
+                    .is_some_and(|details| details.type_url.ends_with("InvertedIndexDetails")),
+            "invalid FTS segment {}",
+            segment.uuid
+        );
+        anyhow::ensure!(
+            segment.fragment_bitmap.is_some(),
+            "unknown FTS coverage for segment {}",
+            segment.uuid
+        );
+        let index = ds
+            .open_scalar_index("text", &segment.uuid, &lance_index::metrics::NoOpMetricsCollector)
+            .await
+            .with_context(|| format!("opening FTS segment {} before append", segment.uuid))?;
+        // Lance can rebuild legacy inverted indexes even with append options.
+        anyhow::ensure!(
+            index.index_type() == IndexType::Inverted && !index.update_criteria().requires_old_data,
+            "FTS segment {} does not support append-only maintenance",
+            segment.uuid
+        );
+    }
+    if !fts_needs_refresh(ds).await? {
+        return Ok(());
+    }
+    ds.optimize_indices(&OptimizeOptions::append().index_names(vec![FTS_INDEX.to_string()]))
+        .await
+        .context("appending text search index coverage")?;
+    let after = ds.load_indices().await.context("listing indexes after FTS append")?;
+    anyhow::ensure!(
+        before.iter().all(|index| after.contains(index))
+            && after.len() == before.len() + 1
+            && after.iter().filter(|index| index.name == FTS_INDEX).count() == segments.len() + 1,
+        "FTS append did not preserve existing segments or changed another index"
+    );
+    anyhow::ensure!(!fts_needs_refresh(ds).await?, "FTS append left uncovered fragments");
+    Ok(())
+}
+
 /// Fold an index's delta sub-indexes back into one once this many pile up. Queries fan out across
 /// every delta (and per-segment BM25 stats drift), so the pile must stay bounded. Only the deltas
 /// are merged — the base is never re-read, which would be the full-index rewrite [`optimize_index`]
@@ -2175,6 +2228,173 @@ mod tests {
             compactions.into_inner().unwrap(),
             [(FTS_INDEX.to_string(), MERGE_DELTAS)]
         );
+    }
+
+    async fn fts_append_fixture(rows: usize) -> (tempfile::TempDir, Dataset) {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = table_uri(dir.path());
+        let mut ds = Dataset::write(
+            RecordBatchIterator::new([Ok(indexable_batch(0, rows))], indexable_schema()),
+            &uri,
+            None,
+        )
+        .await
+        .unwrap();
+        build_indexes(&mut ds, |_| {}).await.unwrap();
+        (dir, ds)
+    }
+
+    #[tokio::test]
+    async fn append_fts_index_preserves_nine_segments_filters_and_other_indexes() {
+        let (_dir, mut ds) = fts_append_fixture(256).await;
+        assert_eq!(sub_index_counts(&ds).await.unwrap()[VECTOR_INDEX], 1);
+        for delta in 1..=MERGE_DELTAS + 1 {
+            assert_eq!(sub_index_counts(&ds).await.unwrap()[FTS_INDEX], delta);
+            let batch = indexable_batch(255 + delta, 1);
+            let mut columns = batch.columns().to_vec();
+            columns[0] = Arc::new(StringArray::from(vec!["tailtoken"]));
+            let batch = RecordBatch::try_new(indexable_schema(), columns).unwrap();
+            ds.append(RecordBatchIterator::new([Ok(batch)], indexable_schema()), None)
+                .await
+                .unwrap();
+            let before = ds.load_indices().await.unwrap();
+            let fragments = ds.fragments().clone();
+            let rows = scan_rows(&ds, &[], None, None).await.unwrap();
+            let schema = schema_of(&ds);
+            let version = ds.version().version;
+            append_fts_index(&mut ds).await.unwrap();
+            let after = ds.load_indices().await.unwrap();
+            assert!(
+                before.iter().all(|index| after.contains(index)),
+                "existing metadata changed"
+            );
+            assert_eq!(after.len(), before.len() + 1);
+            assert_eq!(sub_index_counts(&ds).await.unwrap()[FTS_INDEX], delta + 1);
+            assert_eq!(ds.fragments(), &fragments);
+            assert_eq!(schema_of(&ds), schema);
+            assert_eq!(scan_rows(&ds, &[], None, None).await.unwrap(), rows);
+            assert_eq!(ds.version().version, version + 1);
+            assert!(!fts_needs_refresh(&ds).await.unwrap());
+        }
+        for (query, predicate, expected) in [
+            ("canonical", "source_identity = 'source-0'", 1),
+            (
+                "tailtoken",
+                "source_identity = 'source-264' AND source_agent = 'codex'",
+                1,
+            ),
+            (
+                "tailtoken",
+                "source_identity = 'source-264' AND source_type = 'pi_session'",
+                0,
+            ),
+        ] {
+            let hits = full_text(&ds, query, 20, Some(predicate), &["source_identity"])
+                .await
+                .unwrap();
+            assert_eq!(hits.iter().map(RecordBatch::num_rows).sum::<usize>(), expected);
+        }
+        let version = ds.version().version;
+        let before = ds.load_indices().await.unwrap();
+        append_fts_index(&mut ds).await.unwrap();
+        assert_eq!(ds.version().version, version, "no tail must not commit");
+        assert_eq!(ds.load_indices().await.unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn append_fts_index_rejects_missing_index_without_rebuilding() {
+        let (_dir, mut ds) = fts_append_fixture(8).await;
+        ds.drop_index(FTS_INDEX).await.unwrap();
+        let before = ds.load_indices().await.unwrap();
+        let version = ds.version().version;
+        let error = append_fts_index(&mut ds).await.unwrap_err();
+        assert!(error.to_string().contains("requires an existing text_idx"));
+        assert_eq!(ds.version().version, version);
+        assert_eq!(ds.load_indices().await.unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn append_fts_index_rejects_corrupt_base_or_delta_with_or_without_tail() {
+        for corrupt_delta in [false, true] {
+            let (dir, mut ds) = fts_append_fixture(8).await;
+            let base = ds
+                .load_indices()
+                .await
+                .unwrap()
+                .iter()
+                .find(|i| i.name == FTS_INDEX)
+                .unwrap()
+                .uuid;
+            ds.append(
+                RecordBatchIterator::new([Ok(indexable_batch(8, 1))], indexable_schema()),
+                None,
+            )
+            .await
+            .unwrap();
+            append_fts_index(&mut ds).await.unwrap();
+            let before = ds.load_indices().await.unwrap();
+            let broken = before
+                .iter()
+                .find(|i| i.name == FTS_INDEX && (i.uuid != base) == corrupt_delta)
+                .unwrap();
+            let index_dir = Path::new(&table_uri(dir.path()))
+                .join("_indices")
+                .join(broken.uuid.to_string());
+            for entry in std::fs::read_dir(index_dir).unwrap() {
+                std::fs::write(entry.unwrap().path(), b"corrupt").unwrap();
+            }
+            let uri = table_uri(dir.path());
+            for tail in [false, true] {
+                let mut ds = open(&uri, HashMap::new()).await.unwrap();
+                if tail {
+                    ds.append(
+                        RecordBatchIterator::new([Ok(indexable_batch(9, 1))], indexable_schema()),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                }
+                let version = ds.version().version;
+                let before = ds.load_indices().await.unwrap();
+                assert!(append_fts_index(&mut ds).await.is_err());
+                assert_eq!(ds.version().version, version, "failure must not rebuild");
+                assert_eq!(ds.load_indices().await.unwrap(), before);
+                assert_eq!(open(&uri, HashMap::new()).await.unwrap().version().version, version);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn append_fts_index_rejects_skipped_optimization() {
+        use lance::dataset::transaction::{Operation, Transaction};
+        use lance::dataset::CommitBuilder;
+
+        let (_dir, mut ds) = fts_append_fixture(8).await;
+        let before = ds.load_indices().await.unwrap();
+        let original = before.iter().find(|i| i.name == FTS_INDEX).unwrap().clone();
+        let mut changed = original.clone();
+        // Lance skips unsupported segment versions instead of failing optimize_indices.
+        changed.index_version = i32::MAX;
+        let transaction = Transaction::new(
+            ds.version().version,
+            Operation::CreateIndex {
+                new_indices: vec![changed],
+                removed_indices: vec![original],
+            },
+            None,
+        );
+        ds = CommitBuilder::new(Arc::new(ds)).execute(transaction).await.unwrap();
+        ds.append(
+            RecordBatchIterator::new([Ok(indexable_batch(8, 1))], indexable_schema()),
+            None,
+        )
+        .await
+        .unwrap();
+        let before = ds.load_indices().await.unwrap();
+        let version = ds.version().version;
+        assert!(append_fts_index(&mut ds).await.is_err());
+        assert_eq!(ds.version().version, version);
+        assert_eq!(ds.load_indices().await.unwrap(), before);
     }
 
     #[tokio::test]

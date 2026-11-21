@@ -19,6 +19,8 @@ struct StructuredRecall {
     hits: Vec<StructuredHit>,
     #[serde(skip_serializing_if = "Option::is_none")]
     source_type_index_ready: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fts_completed: Option<bool>,
 }
 
 #[derive(serde::Serialize)]
@@ -70,6 +72,7 @@ fn recall_tool_result(result: recall::RecallResult) -> CallToolResult {
         serde_json::to_value(StructuredRecall {
             hits,
             source_type_index_ready: result.source_type_index_ready,
+            fts_completed: result.fts_completed,
         })
         .expect("recall hits contain only JSON-compatible values"),
     );
@@ -638,12 +641,15 @@ mod tests {
         );
         assert_eq!(pinned_json["structuredContent"]["hits"], serde_json::json!([]));
         assert_eq!(pinned_json["structuredContent"]["source_type_index_ready"], false);
+        assert_eq!(pinned_json["structuredContent"]["fts_completed"], false);
 
         let explicit = server
             .recall_with_memory(Some(spec.clone()), "unused".to_string(), 1, 1, 0, absent_facet(), None)
             .await
             .unwrap();
         assert_eq!(explicit.source_type_index_ready, None);
+        let explicit_json = serde_json::to_value(recall_tool_result(explicit)).unwrap();
+        assert!(explicit_json["structuredContent"].get("fts_completed").is_none());
 
         // Make a second Dataset::open impossible. The same server still recalls from its cached
         // handle, while an explicit call-level override must take the ordinary fresh-open path.
@@ -761,6 +767,20 @@ mod tests {
     }
 
     #[test]
+    fn completed_fts_serializes_as_true_even_with_no_hits() {
+        let response = recall_tool_result(recall::RecallResult {
+            text: "no hits".into(),
+            hits: Vec::new(),
+            source_type_index_ready: Some(false),
+            fts_completed: Some(true),
+        });
+        let json = serde_json::to_value(response).unwrap();
+        assert_eq!(json["content"][0]["text"], "no hits");
+        assert_eq!(json["structuredContent"]["hits"], serde_json::json!([]));
+        assert_eq!(json["structuredContent"]["fts_completed"], true);
+    }
+
+    #[test]
     fn structured_recall_adds_raw_hits_without_changing_text_content() {
         let hit = recall::Hit {
             id: "raw-hit".into(),
@@ -788,6 +808,7 @@ mod tests {
             text: text.clone(),
             hits,
             source_type_index_ready: None,
+            fts_completed: None,
         });
         let json = serde_json::to_value(response).unwrap();
 

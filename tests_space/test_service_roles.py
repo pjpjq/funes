@@ -163,3 +163,24 @@ def test_writer_lease_loss_replaces_process_unless_already_stopping(monkeypatch,
     bridge.writer_lease_lost()
     assert stop.is_set()
     assert restarts == ([] if stopping else [True])
+
+
+def test_writer_lease_loss_hard_exits_when_native_writer_is_not_reaped(monkeypatch):
+    import subprocess
+    calls = []
+    class Exited(BaseException):
+        pass
+    def exit_now(code):
+        calls.append(('exit', code))
+        raise Exited
+    def stuck(_process):
+        raise subprocess.TimeoutExpired(['funes'], 5)
+    monkeypatch.setattr(bridge, 'SERVICE_STOP', threading.Event())
+    monkeypatch.setattr(bridge, 'NATIVE_PROCESSES', {1: object()})
+    monkeypatch.setattr(bridge, '_kill_native_process', stuck)
+    monkeypatch.setattr(bridge.os, '_exit', exit_now)
+    monkeypatch.setattr(bridge, 'schedule_ingest_process_restart', lambda: calls.append('reexec'))
+    with pytest.raises(Exited):
+        bridge.writer_lease_lost()
+    # execv would orphan the unreaped writer beside its replacement.
+    assert calls == [('exit', 75)]

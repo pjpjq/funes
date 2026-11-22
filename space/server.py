@@ -4560,7 +4560,13 @@ def stop_native_writes():
 
 def writer_lease_lost():
     stopping = SERVICE_STOP.is_set()
-    stop_native_writes()
+    try:
+        stop_native_writes()
+    except Exception:
+        # An unreaped native writer may still commit; exiting PID 1 tears down the container
+        # instead of letting a replacement writer start beside it.
+        runtime_diagnostics.event("writer_lease_lost", exit_code=75)
+        os._exit(75)
     if not stopping:
         # The lease is never reacquired in-process; a fresh PID 1 contends for it on startup.
         runtime_diagnostics.event("writer_lease_lost")

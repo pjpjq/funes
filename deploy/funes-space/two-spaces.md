@@ -71,6 +71,8 @@ HF commit 不应触发切换。候选失败保留旧 reader，首次没有有效
 PG session advisory lock 只阻止遵守协议的 writer，并不是 HF 存储层 fencing。
 失联期间已有 HF 请求可能仍在执行；保留 HF parent-CAS，并在切换时确认旧 writer
 退出。租约丢失须停止新写任务并回收 native 写进程，不能自动反复抢锁继续写。
+回收后 Writer 替换 PID 1（`writer_lease_lost` 诊断事件），由新进程按启动流程
+重新竞争租约；旧进程内不重新获取，也不会停在“RUNNING 但永久 503”。
 
 ## 回滚
 

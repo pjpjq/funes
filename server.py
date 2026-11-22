@@ -441,7 +441,7 @@ def source_app():
                 # open an empty local source store. A later request retries.
                 return None
             if service_role() == "writer":
-                SOURCE_APP.writer_loss_callback = stop_native_writes
+                SOURCE_APP.writer_loss_callback = writer_lease_lost
                 SOURCE_APP.writer_lease.require()
             if service_role() != "query":
                 start_canonical_reconciler(SOURCE_APP)
@@ -4556,6 +4556,21 @@ def stop_native_writes():
     with NATIVE_PROCESSES_LOCK:
         for process in tuple(NATIVE_PROCESSES.values()):
             _kill_native_process(process)
+
+
+def writer_lease_lost():
+    stopping = SERVICE_STOP.is_set()
+    try:
+        stop_native_writes()
+    except Exception:
+        # An unreaped native writer may still commit; exiting PID 1 tears down the container
+        # instead of letting a replacement writer start beside it.
+        runtime_diagnostics.event("writer_lease_lost", exit_code=75)
+        os._exit(75)
+    if not stopping:
+        # The lease is never reacquired in-process; a fresh PID 1 contends for it on startup.
+        runtime_diagnostics.event("writer_lease_lost")
+        schedule_ingest_process_restart()
 
 
 def _describe_query_snapshot():

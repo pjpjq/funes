@@ -21,7 +21,8 @@ _SAMPLED_AT = None
 _EVENTS = deque(maxlen=16)
 _KINDS = frozenset(("service_start", "service_exit", "ingest_restart",
                     "ingest_exec_failed", "ingest_restart_thread_failed",
-                    "native_start", "native_exit", "native_timeout"))
+                    "native_start", "native_exit", "native_timeout",
+                    "writer_lease_lost"))
 _OPERATIONS = frozenset(("optimize-index", "ingest-docs", "index", "push", "compact"))
 
 

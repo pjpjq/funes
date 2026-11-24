@@ -1820,20 +1820,43 @@ class Store:
             return {"kept": len(keep), "deleted": deleted}
 
     def canonical_index_candidates(
-        self, limit: int, profile_fingerprint: str = "", memory: str = ""
+        self, limit: int, profile_fingerprint: str = "", memory: str = "",
+        *, retry_after: tuple[str, int] | None = None,
     ) -> list[dict[str, Any]]:
         """Return durable raw rows whose native checkpoint is not current."""
         with self.lock, self.conn:
             self._ensure_native_checkpoint_profile_locked(
                 str(profile_fingerprint), str(memory)
             )
-            rows = self.conn.execute(
-                """SELECT * FROM memories WHERE native_index_pending=1
-                ORDER BY CASE WHEN native_index_status='retry' THEN 1 ELSE 0 END,
-                COALESCE(retrieval_updated_at,updated_at),id LIMIT ?""",
-                (max(1, int(limit)),),
-            ).fetchall()
-            return [self._row(row) for row in rows]
+            limit = max(1, int(limit))
+            rank = "CASE WHEN native_index_status='retry' THEN 1 ELSE 0 END"
+            clock = "COALESCE(retrieval_updated_at,updated_at)"
+            rows = {}
+
+            def take(where, order, params=()):
+                remaining = limit - len(rows)
+                if remaining > 0:
+                    page = self.conn.execute(
+                        f"SELECT * FROM memories WHERE native_index_pending=1 {where} "
+                        f"ORDER BY {order} LIMIT ?", (*params, remaining),
+                    ).fetchall()
+                    for row in page:
+                        rows.setdefault(row["id"], row)
+
+            if retry_after is None:
+                take("", f"{rank},{clock},id")
+            else:
+                take(f"AND {rank}=0", f"{clock},id")
+                fresh = len(rows)
+                # Two index seeks: SQLite cannot seek a row-value comparison
+                # starting with an expression, especially with many equal clocks.
+                stamp, row_id = retry_after
+                take(f"AND {rank}=1 AND {clock}=? AND id>?", "id", (stamp, row_id))
+                take(f"AND {rank}=1 AND {clock}>?", f"{clock},id", (stamp,))
+                if len(rows) == fresh:
+                    # End of sweep. Wrap immediately, without an empty worker cycle.
+                    take(f"AND {rank}=1", f"{clock},id")
+            return [self._row(row) for row in rows.values()]
 
     def native_index_failure_counts(self) -> dict[str, int]:
         """Return allowlisted pending diagnostics without exposing row data."""

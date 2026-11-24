@@ -3063,14 +3063,18 @@ def _reconcile_canonical_index_body(
         max_chars = int(fixed["max_chars"])
         profile = {**profile, "concurrency": int(fixed["concurrency"])}
 
+    retry_target = (app.store, str(profile["fingerprint"]), memory)
+
     def select_candidates():
         if app.syncer.restoring or app.syncer.restore_failed:
             return []
         _canonical_reconcile_phase(app, "selecting")
+        cursor = getattr(app, "_canonical_retry_cursor", None)
         rows = app.store.canonical_index_candidates(
             max(batch_size, request_rows),
             str(profile["fingerprint"]),
             memory,
+            **({"retry_after": cursor[1]} if cursor and cursor[0] == retry_target else {}),
         )
         candidates = []
         for item in rows:
@@ -3099,8 +3103,6 @@ def _reconcile_canonical_index_body(
         ingest can therefore change a row while Voyage is being prepared; only
         the exact durable revision observed here may enter the native writer.
         """
-        if not selected:
-            return []
         identities = [str(item["source_identity"]) for item, _ in selected]
         if hasattr(app.store, "get_many"):
             current_rows = app.store.get_many(identities)
@@ -3115,6 +3117,7 @@ def _reconcile_canonical_index_body(
                 for identity in identities
             }
         stable = []
+        last_retry = None
         terminal = {"indexed", "held_secret", "held_invalid"}
         for original, _ in selected:
             identity = str(original["source_identity"])
@@ -3138,7 +3141,9 @@ def _reconcile_canonical_index_body(
             ):
                 continue
             stable.append((current, document))
-        return stable
+            if original.get("native_index_status") == "retry":
+                last_retry = original
+        return stable, last_retry
 
     _canonical_reconcile_phase(app, "preparing")
     with tempfile.TemporaryDirectory(prefix="funes-canonical-") as temporary:
@@ -3148,7 +3153,7 @@ def _reconcile_canonical_index_body(
         if selected:
             _canonical_reconcile_phase(app, "waiting_native_lock")
             with NATIVE_WRITE_LOCK:
-                selected = revalidate_candidates(selected)
+                selected, last_retry = revalidate_candidates(selected)
                 if selected:
                     _canonical_reconcile_phase(app, "native_ingest")
                     records = selected
@@ -3160,6 +3165,13 @@ def _reconcile_canonical_index_body(
                         profile=profile,
                         metrics=metrics,
                     )
+                    if last_retry is not None:
+                        # Advance only the selection key actually attempted by native,
+                        # never the prefetched tail or a row rejected by revalidation.
+                        stamp = last_retry["retrieval_updated_at"]
+                        if stamp is None:
+                            stamp = last_retry["updated_at"]
+                        app._canonical_retry_cursor = (retry_target, (stamp, last_retry["id"]))
     if not records:
         durable = not app.syncer.restoring and not app.syncer.restore_failed
         _set_canonical_reconcile_state(

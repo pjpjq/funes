@@ -202,6 +202,24 @@ class PostgresIntegrationTests(unittest.TestCase):
         self.assertEqual(self.store.get("new-after-control")["embedding_generation"], 1)
         self.assertEqual(self.store.compact_reindex_controls()["kept"], 1)
 
+    def test_retry_keyset_uses_clock_then_id_and_wraps_behind_fresh_rows(self):
+        target = ("profile", "memory")
+        self.assertEqual(self.store.canonical_index_candidates(4, *target, retry_after=("z", 1)), [])
+        early, late = "2020-01-01", "2022-01-01"
+        self.store.ingest([
+            self.doc("later", native_index_status="retry", updated_at=late),
+            self.doc("tie-a", native_index_status="retry", updated_at=early),
+            self.doc("tie-b", native_index_status="retry", updated_at=early),
+            self.doc("fresh"),
+        ])
+        first = self.store.canonical_index_candidates(4, *target)
+        self.assertEqual([r["source_identity"] for r in first], ["fresh", "tie-a", "tie-b", "later"])
+        for last, expected in ((first[1], ["fresh", "tie-b", "later"]),
+                               (first[-1], ["fresh", "tie-a", "tie-b", "later"])):
+            cursor = (last["retrieval_updated_at"] or last["updated_at"], last["id"])
+            result = self.store.canonical_index_candidates(4, *target, retry_after=cursor)
+            self.assertEqual([r["source_identity"] for r in result], expected)
+
     def test_native_null_transitions_counts_revisions_and_ignored_conflicts(self):
         profile = {"fingerprint": "profile"}
         self.store.native_index_checkpoint(profile, "memory")

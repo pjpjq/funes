@@ -4371,6 +4371,74 @@ def test_native_exit_code_metrics_are_bounded_and_accumulated_once():
     assert "private" not in json.dumps(state) and "hf_secret" not in json.dumps(state)
 
 
+def test_canonical_stale_retry_head_rotates_only_past_attempted_rows(monkeypatch, tmp_path):
+    app = _source_app(tmp_path)
+    monkeypatch.setattr(bridge, "REMOTE", "owner/memory")
+    monkeypatch.setattr(bridge, "CANONICAL_INDEX_BATCH", 8)
+    monkeypatch.setattr(bridge, "CANONICAL_INDEX_REQUEST_ROWS", 4)
+    monkeypatch.setattr(bridge, "CANONICAL_INDEX_MAX_CHARS", 1)
+    monkeypatch.setattr(bridge, "request_warm", lambda **_kwargs: None)
+    attempts = []
+
+    def run(_command, filename, *_args, **_kwargs):
+        document, = [json.loads(line) for line in Path(filename).read_text().splitlines()]
+        identity = document["source_identity"]
+        attempts.append(identity)
+        if identity.startswith("stale"):
+            return 0, "ingested sources=0 chunks=0 unchanged=0 stale=1 held=0\n", ""
+        return 0, "ingested sources=1 chunks=1 unchanged=0 stale=0 held=0 commit=rev\n", ""
+
+    monkeypatch.setattr(bridge, "run", run)
+    try:
+        for identity, error in (("stale-a", "native_stale"), ("stale-b", "native_stale"),
+                                ("recovering", "native_exit")):
+            _canonical_source(app.store, identity, native_index_status="retry",
+                              native_index_error=error)
+        assert bridge.reconcile_canonical_index(app)["indexed"] == 0
+        _canonical_source(app.store, "fresh")
+        assert bridge.reconcile_canonical_index(app)["indexed"] == 1
+        for _ in range(4):
+            bridge.reconcile_canonical_index(app)
+        assert attempts == ["stale-a", "fresh", "stale-b", "recovering", "stale-a", "stale-b"]
+        assert app.store.get("recovering")["native_index_pending"] == 0
+        for identity in ("stale-a", "stale-b"):
+            item = app.store.get(identity)
+            assert (item["native_index_pending"], item["native_index_error"]) == (1, "native_stale")
+    finally:
+        app.store.close()
+
+
+def test_retry_cursor_does_not_skip_last_row_rejected_by_revalidation(monkeypatch, tmp_path):
+    app = _source_app(tmp_path)
+    monkeypatch.setattr(bridge, "REMOTE", "owner/memory")
+    monkeypatch.setattr(bridge, "CANONICAL_INDEX_REQUEST_ROWS", 3)
+    attempts = []
+    hydrate = app.store.get_many
+
+    def get_many(identities):
+        rows = hydrate(identities)
+        if not attempts:
+            for row in rows:
+                if row["source_identity"] == "c":
+                    row["native_generation"] += 1
+        return rows
+
+    def run(_command, filename, *_args, **_kwargs):
+        attempts.append([json.loads(line)["source_identity"] for line in Path(filename).read_text().splitlines()])
+        return 1, "", "native failed"
+
+    monkeypatch.setattr(app.store, "get_many", get_many)
+    monkeypatch.setattr(bridge, "run", run)
+    try:
+        for identity in ("a", "b", "c"):
+            _canonical_source(app.store, identity, native_index_status="retry")
+        assert bridge.reconcile_canonical_index(app)["attempted"] == 2
+        assert bridge.reconcile_canonical_index(app)["attempted"] == 1
+        assert attempts == [["a", "b"], ["c"]]
+    finally:
+        app.store.close()
+
+
 def test_native_stale_report_is_retryable_not_indexed(monkeypatch, tmp_path):
     app = _source_app(tmp_path)
     _canonical_source(app.store, "stale-doc")

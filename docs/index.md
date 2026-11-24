@@ -100,6 +100,17 @@ remote on its own, once 500 rows sit unindexed there. To compact a large remote,
 with `hf download <org>/<repo> --repo-type dataset`: as long as nothing is pushed in between, the
 compaction then reads its files from that cache instead of fetching them one at a time.
 
+## Targeted text-index maintenance
+
+For an existing remote text index, the internal operator command
+`funes optimize-index <org>/<repo> --fts-only` appends only its missing coverage.
+It preserves the existing text-index segments, other indexes, data fragments, embeddings and
+checkpoints; it does not compact, merge, or fall back to rebuilding a missing or broken index.
+A concurrent Hub head change fails the guarded publish without automatically repeating the work.
+Run it only under the Writer's maintenance/write exclusion, never on the Query service.
+This is not final optimization and does not change the periodic maintenance schedule.
+Opening existing segments checks compatibility; it is not a full integrity scan of historical postings.
+
 ## Sessions not in English
 
 funes embeds with `BAAI/bge-small-en-v1.5`, an English model. For sessions in another language,

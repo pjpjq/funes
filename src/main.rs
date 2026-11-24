@@ -175,6 +175,9 @@ enum Cmd {
     OptimizeIndex {
         #[arg(value_name = "MEMORY")]
         memory: String,
+        /// Append only missing text-index coverage; never merge, rebuild, or refresh other indexes.
+        #[arg(long)]
+        fts_only: bool,
     },
     /// Find a literal string everywhere in one session — exhaustive, unranked.
     Scan {
@@ -628,8 +631,14 @@ async fn run(cli: Cli, role: ServiceRole) -> Result<()> {
             );
             Ok(())
         }
-        Cmd::OptimizeIndex { memory: target } => {
-            print!("{}", push::run_reindex_only(memory::Memory::parse(&target)).await?);
+        Cmd::OptimizeIndex {
+            memory: target,
+            fts_only,
+        } => {
+            print!(
+                "{}",
+                push::run_reindex_only(memory::Memory::parse(&target), fts_only).await?
+            );
             Ok(())
         }
         Cmd::Status => {
@@ -685,6 +694,14 @@ async fn run(cli: Cli, role: ServiceRole) -> Result<()> {
 mod tests {
     use super::{Cli, Cmd};
     use clap::Parser;
+
+    #[test]
+    fn fts_only_maintenance_is_explicit() {
+        let ordinary = Cli::try_parse_from(["funes", "optimize-index", "org/memory"]).unwrap();
+        assert!(matches!(ordinary.cmd, Cmd::OptimizeIndex { fts_only: false, .. }));
+        let fts = Cli::try_parse_from(["funes", "optimize-index", "org/memory", "--fts-only"]).unwrap();
+        assert!(matches!(fts.cmd, Cmd::OptimizeIndex { fts_only: true, .. }));
+    }
 
     #[test]
     fn push_still_takes_force_reindex() {

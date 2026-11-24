@@ -282,7 +282,7 @@ fn disjoint_refusal(label: &str, chunks: usize, why: Disjoint) -> String {
 
 /// Refresh one remote memory's existing Lance indexes without opening or scanning local memory.
 /// Used by the durable raw-source rebuild after its last embedding batch is committed.
-pub async fn run_reindex_only(target: Memory) -> Result<String> {
+pub async fn run_reindex_only(target: Memory, fts_only: bool) -> Result<String> {
     let uri = match &target {
         Memory::Remote { uri } => uri.clone(),
         Memory::Local { .. } => bail!("optimize-index target must be a remote memory"),
@@ -312,6 +312,7 @@ pub async fn run_reindex_only(target: Memory) -> Result<String> {
             opts.clone(),
             &revision,
             "funes optimize-index".into(),
+            fts_only,
         )
         .await?
         {
@@ -323,11 +324,15 @@ pub async fn run_reindex_only(target: Memory) -> Result<String> {
                 report = Some("index already current".into());
                 break;
             }
+            remote::Reindexed::Conflict if fts_only => {
+                bail!("FTS append conflicted with a newer head; no index update was published")
+            }
             remote::Reindexed::Conflict => continue,
         }
     }
     let report = report.context("index refresh kept conflicting; retry optimize-index")?;
-    Ok(format!("{}: index refresh complete\n{report}", target.label()))
+    let scope = if fts_only { "text index append" } else { "index refresh" };
+    Ok(format!("{}: {scope} complete\n{report}", target.label()))
 }
 
 /// Publish the local memory's new embedded chunks to `target` (a remote memory on the HF Hub). With

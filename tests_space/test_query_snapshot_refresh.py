@@ -84,7 +84,7 @@ def test_failed_bridge_candidate_preserves_old_worker_and_config(monkeypatch):
     monkeypatch.setattr(bridge, 'MCP_WORKER', old)
     monkeypatch.setattr(bridge, '_MCP_WORKER_CONFIG', original_config)
     candidate = Mock()
-    candidate.recall.side_effect = RuntimeError('open failed')
+    candidate.recall_result.side_effect = RuntimeError('open failed')
     monkeypatch.setattr(bridge, 'NativeMcpWorker', Mock(return_value=candidate))
     with pytest.raises(RuntimeError):
         bridge._refresh_native_worker(snapshot(2))
@@ -106,7 +106,7 @@ def test_failed_hot_refresh_keeps_bridge_ready_200_and_old_worker_open(monkeypat
     original_config = bridge._native_worker_config()
     monkeypatch.setattr(bridge, '_MCP_WORKER_CONFIG', original_config)
     candidate = Mock()
-    candidate.recall.side_effect = RuntimeError('candidate failed')
+    candidate.recall_result.side_effect = RuntimeError('candidate failed')
     monkeypatch.setattr(bridge, 'NativeMcpWorker', Mock(return_value=candidate))
     monkeypatch.setattr(bridge, 'native_worker_status', lambda: {})
     with pytest.raises(RuntimeError):
@@ -127,6 +127,68 @@ def test_query_request_never_resolves_snapshot_or_spawns_worker(monkeypatch):
     monkeypatch.setattr(bridge, '_describe_query_snapshot', describe)
     assert bridge.native_worker() is old
     describe.assert_not_called()
+
+
+@pytest.mark.parametrize("proof", [False, None, 1, "true", True])
+def test_query_promotes_only_the_child_that_completed_fts(monkeypatch, tmp_path, proof):
+    monkeypatch.setenv("FUNES_SERVICE_ROLE", "query")
+    monkeypatch.setattr(bridge, "SERVICE_STOP", threading.Event())
+    monkeypatch.setattr(bridge, "QUERY_REFRESHER", None)
+    monkeypatch.setattr(bridge, "_WARM_STATE", {"state": "ready"})
+    monkeypatch.setattr(bridge, "REMOTE", "owner/name")
+    monkeypatch.setattr(bridge, "source_readiness_state", lambda: {"configured": True, "ready": True})
+    old = bridge.NativeMcpWorker("unused", "owner/name", tmp_path)
+    old._process = SimpleNamespace(poll=lambda: None)
+    monkeypatch.setattr(old, "close", Mock())
+    monkeypatch.setattr(bridge, "MCP_WORKER", old)
+    monkeypatch.setattr(bridge, "_MCP_WORKER_CONFIG", bridge._native_worker_config())
+    received = []
+    metadata = {"hits": []} if proof is None else {"hits": [], "fts_completed": proof}
+
+    def start(worker, deadline):
+        worker._process = SimpleNamespace(poll=lambda: None)
+
+    def respond(worker, method, params, timeout):
+        received.append((worker, worker.process, params["arguments"]))
+        return {"content": [{"type": "text", "text": "vector result"}],
+                "structuredContent": metadata}
+
+    monkeypatch.setattr(bridge.NativeMcpWorker, "_start_locked", start)
+    monkeypatch.setattr(bridge.NativeMcpWorker, "_request_locked", respond)
+    if proof is True:
+        bridge._install_query_snapshot(snapshot(2))
+        old.close.assert_called_once()
+        assert bridge.native_worker_status()["active_fts_warmed"] is True
+        assert bridge.native_worker().recall("actual traffic") == "vector result"
+        assert len(received) == 2
+        assert received[0][0] is received[1][0] is bridge.native_worker()
+        assert received[0][1] is received[1][1] is bridge.native_worker().process
+        received[0][1].poll = lambda: 1
+        assert bridge.native_worker_status()["active_fts_warmed"] is False
+    else:
+        with pytest.raises(bridge.NativeMcpError):
+            bridge._install_query_snapshot(snapshot(2))
+        assert bridge.native_worker() is old
+        assert bridge.search_ready_payload()[0] == 200
+        old.close.assert_not_called()
+        assert len(received) == 1
+    assert all("memory" not in arguments for _, _, arguments in received)
+
+
+def test_query_foreground_cannot_replace_warmed_child(monkeypatch, tmp_path):
+    monkeypatch.setenv("FUNES_SERVICE_ROLE", "query")
+    worker = bridge.NativeMcpWorker("unused", "owner/name", tmp_path)
+    child = SimpleNamespace(poll=lambda: None)
+    worker._process = child
+    monkeypatch.setattr(bridge, "MCP_WORKER", worker)
+    start = Mock()
+    monkeypatch.setattr(worker, "_start_locked", start)
+    worker._ensure_started_locked()
+    assert worker.process is child
+    child.poll = lambda: 1
+    with pytest.raises(bridge.NativeMcpError):
+        worker._ensure_started_locked()
+    start.assert_not_called()
 
 
 def test_background_metadata_budget_allows_observed_cold_open_without_changing_query_budget(monkeypatch):

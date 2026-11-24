@@ -733,10 +733,15 @@ pub(crate) async fn reindex(
     storage_options: HashMap<String, String>,
     rev: &str,
     message: String,
+    fts_only: bool,
 ) -> Result<Reindexed> {
     let parent = head_oid(repo, rev).await?;
     let (mut ds, wrapper) = open_pinned(dataset_uri, &storage_options, &parent).await?;
-    dataset::build_indexes(&mut ds, |_| {}).await?;
+    if fts_only {
+        dataset::append_fts_index(&mut ds).await?;
+    } else {
+        dataset::build_indexes(&mut ds, |_| {}).await?;
+    }
     let files = captured_files(&wrapper);
     if files.is_empty() {
         return Ok(Reindexed::AlreadyCurrent);

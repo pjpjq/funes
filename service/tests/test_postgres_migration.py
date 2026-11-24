@@ -19,7 +19,9 @@ import pytest
 from scripts.migrate_source_postgres import (
     LEDGER, TABLES, Migration, MigrationError, Snapshot, digest_rows, main, quoted,
 )
-from service.postgres import PostgresNotReady, PostgresStore, encode_pg_text
+from service.postgres import (
+    POSTGRES_DERIVED_IDENTIFIERS_SCHEMA_VERSION, PostgresNotReady, PostgresStore, encode_pg_text,
+)
 from service.server import Store
 
 
@@ -238,6 +240,25 @@ def test_full_readback_detects_corruption_after_verified_import(source_path, pg_
             migration.finalize(tail_confirmed=True)
         assert migration.pg.execute(f"SELECT phase FROM {LEDGER}").fetchone() == ("verified",)
         assert migration.pg.execute("SELECT migration_ready FROM funes_schema_state").fetchone() == (False,)
+
+
+def test_finalize_preserves_v3_marker_and_verifies_mixed_identifiers(source_path, pg_dsn):
+    with Snapshot(source_path) as source, Migration(source, pg_dsn) as migration:
+        migration.initialize()
+        migration.copy()
+        pg = migration.pg
+        pg.execute("ALTER TABLE memories ALTER COLUMN search_identifiers DROP NOT NULL")
+        pg.execute("UPDATE funes_schema_state SET schema_version=%s",
+                   (POSTGRES_DERIVED_IDENTIFIERS_SCHEMA_VERSION,))
+        pg.execute("UPDATE memories SET search_identifiers=NULL WHERE id=3")
+        expected = source_report(source)
+        assert migration.verify()["tables"] == expected
+        report = migration.finalize(tail_confirmed=True)
+        assert report["before_finalize_tables"] == expected
+        assert report["tables"]["memories"] == expected["memories"]
+        assert pg.execute("SELECT migration_ready,schema_version FROM funes_schema_state").fetchone() == (
+            True, POSTGRES_DERIVED_IDENTIFIERS_SCHEMA_VERSION)
+        assert pg.execute("SELECT search_identifiers FROM memories WHERE id=3").fetchone() == (None,)
 
 
 def test_different_source_and_schema_are_refused(source_path, pg_dsn, tmp_path):

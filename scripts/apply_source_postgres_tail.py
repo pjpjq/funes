@@ -41,8 +41,9 @@ from scripts.migrate_source_postgres import (
     Snapshot,
     quoted,
 )
-from service.postgres import encode_pg_text
+from service.postgres import POSTGRES_DERIVED_IDENTIFIERS_SCHEMA_VERSION, encode_pg_text
 from service.server import utc_now
+from service.source_identifiers import logical_search_identifiers
 
 TAIL_LEDGER = "funes_source_migration_tail"
 
@@ -149,7 +150,7 @@ def _stored_row(snapshot: Snapshot, table: str, row):
     return values
 
 
-def _stage(migration: Migration, desired: Snapshot, table: str, progress):
+def _stage(migration: Migration, desired: Snapshot, table: str, progress, *, derive: bool):
     source, pg = migration.source, migration.pg
     stage = "funes_tail_" + table
     key = KEYS[table]
@@ -163,6 +164,10 @@ def _stage(migration: Migration, desired: Snapshot, table: str, progress):
         fields.extend(quoted(prefix + info[1]) + " "
                       + ("TEXT COLLATE \"C\"" if info[2].upper() == "TEXT" else "BIGINT")
                       for info in source.schema[table])
+    if derive:
+        fields.extend(['"old_identifiers_derived" BOOLEAN NOT NULL',
+                       '"new_identifiers_derived" BOOLEAN NOT NULL'])
+        identifiers, raw, retrieval = map(columns.index, ("search_identifiers", "raw_text", "retrieval_text"))
     pg.execute(f"CREATE TEMP TABLE {quoted(stage)} ({','.join(fields)}) ON COMMIT DROP")
     qualified = "pg_temp." + quoted(stage)
     counts = {"inserted": 0, "updated": 0, "deleted": 0}
@@ -173,8 +178,12 @@ def _stage(migration: Migration, desired: Snapshot, table: str, progress):
             old_values, new_values = (_stored_row(source, table, old),
                                       _stored_row(desired, table, new))
             values = new_values if new is not None else old_values
+            # Raw and logical retrieval must also match before a staged flag
+            # proves equality with a PG NULL. Keep the literal for INSERT.
+            flags = [row is not None and row[identifiers] == logical_search_identifiers(
+                None, row[raw], row[retrieval]) for row in (old, new)] if derive else []
             copier.write_row([old is not None, new is not None, values[columns.index(key)],
-                              *old_values, *new_values])
+                              *old_values, *new_values, *flags])
             _count_change(counts, old, new)
     pg.execute(f"ANALYZE {qualified}")
     if progress:
@@ -182,7 +191,7 @@ def _stage(migration: Migration, desired: Snapshot, table: str, progress):
     return qualified, counts
 
 
-def _matches(snapshot: Snapshot, table: str, prefix: str) -> str:
+def _matches(snapshot: Snapshot, table: str, prefix: str, *, derive: bool) -> str:
     """Compare complete logical rows with byte-exact, null-safe equality."""
     fields = []
     types = {info[1]: info[2].upper() for info in snapshot.schema[table]}
@@ -193,7 +202,11 @@ def _matches(snapshot: Snapshot, table: str, prefix: str) -> str:
             staged = f"COALESCE({staged},s.{quoted(prefix + 'raw_text')})"
         if types[name] == "TEXT":
             target, staged = target + ' COLLATE "C"', staged + ' COLLATE "C"'
-        fields.append(f"({target} IS NOT DISTINCT FROM {staged})")
+        condition = f"({target} IS NOT DISTINCT FROM {staged})"
+        if derive and name == "search_identifiers":
+            condition = (f"(CASE WHEN t.search_identifiers IS NULL THEN "
+                         f"s.{quoted(prefix + 'identifiers_derived')} ELSE {condition} END)")
+        fields.append(condition)
     return " AND ".join(fields)
 
 
@@ -215,8 +228,10 @@ def apply_tail(migration: Migration, desired: Snapshot, *, progress=None, before
                 or migration.verification.get("source") != source.identity
                 or not all(state["complete"] for state in migration.progress.values())):
             raise MigrationError("baseline import must be fully verified before applying a tail")
+        v3 = migration.schema_version == POSTGRES_DERIVED_IDENTIFIERS_SCHEMA_VERSION
+        derived = {table: v3 and table == "memories" for table in TABLES}
         for table in TABLES:
-            stages[table], changes[table] = _stage(migration, desired, table, progress)
+            stages[table], changes[table] = _stage(migration, desired, table, progress, derive=derived[table])
 
         # Preflight every changed table before mutating any source data.
         for table in TABLES:
@@ -226,7 +241,7 @@ def apply_tail(migration: Migration, desired: Snapshot, *, progress=None, before
                 present = "s." + quoted(prefix + "present")
                 acceptable.append(f"(NOT {present} AND t.{key} IS NULL) OR "
                                   f"({present} AND t.{key} IS NOT NULL AND "
-                                  f"({_matches(source, table, prefix)}))")
+                                  f"({_matches(source, table, prefix, derive=derived[table])}))")
             conflict = pg.execute(
                 f"SELECT EXISTS(SELECT 1 FROM {stage} s LEFT JOIN {quoted(table)} t "
                 f"ON t.{key}=s.row_key WHERE NOT ({' OR '.join(acceptable)}))"
@@ -247,7 +262,7 @@ def apply_tail(migration: Migration, desired: Snapshot, *, progress=None, before
             # reinserted. Triggers stay disabled to preserve opaque checkpoints.
             removed = pg.execute(
                 f"DELETE FROM {quoted(table)} t USING {stage} s WHERE t.{key}=s.row_key "
-                f"AND NOT (s.new_present AND ({_matches(source, table, 'new_')}))"
+                f"AND NOT (s.new_present AND ({_matches(source, table, 'new_', derive=derived[table])}))"
             ).rowcount
             written = pg.execute(
                 f"INSERT INTO {quoted(table)} ({','.join(map(quoted, columns))}) "

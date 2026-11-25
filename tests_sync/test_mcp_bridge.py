@@ -167,7 +167,7 @@ def test_remote_search_does_not_probe_while_source_store_restores(monkeypatch):
     assert [url for url, _, _ in calls] == ["https://memory.example/search"]
 
 
-def test_remote_search_default_budget_is_two_attempts(monkeypatch):
+def test_remote_search_default_budget_is_five_attempts(monkeypatch):
     monkeypatch.setenv("FUNES_REMOTE_URL", "https://memory.example")
     monkeypatch.setenv("FUNES_API_TOKEN", "api-token")
     for name in (
@@ -190,9 +190,8 @@ def test_remote_search_default_budget_is_two_attempts(monkeypatch):
     assert bridge._remote_call("/search", {"query": "previous"}) is None
     assert [(url, method) for url, method, _ in calls] == [
         ("https://memory.example/search", "POST"),
-        ("https://memory.example/search", "POST"),
-    ]
-    assert all(0 < timeout <= 8 for _, _, timeout in calls)
+    ] * 5
+    assert all(0 < timeout <= 30 for _, _, timeout in calls)
 
     # Explicit override back to 1 attempt is honored
     calls.clear()
@@ -681,8 +680,8 @@ def test_remote_search_ignores_long_remote_timeout_env(monkeypatch):
     monkeypatch.setattr(bridge.time, "sleep", lambda _seconds: None)
 
     assert bridge._remote_call("/search", {"query": "test"}) is None
-    assert len(calls) == 2
-    assert all(0 < timeout <= 8.0 for _, timeout in calls)
+    assert len(calls) == 5
+    assert all(0 < timeout <= 30.0 for _, timeout in calls)
 
 
 def test_remote_search_reads_dedicated_recall_timeout_env(monkeypatch):
@@ -760,7 +759,7 @@ def test_remote_search_short_backoff_on_503_preserves_second_attempt_budget(monk
     assert result == {"ok": True, "results": [{"raw_text": "retried_503"}]}
     assert len(calls) == 2
     assert slept == [0.5]
-    assert 7.0 <= calls[1][1] <= 8.0
+    assert 29.0 <= calls[1][1] <= 30.0
 
 
 def test_remote_get_still_uses_remote_timeout_env(monkeypatch):
@@ -779,3 +778,62 @@ def test_remote_get_still_uses_remote_timeout_env(monkeypatch):
     assert bridge._remote_call("/get", {"source_identity": "one"}) == {"ok": True}
     assert len(calls) == 1
     assert calls[0][1] == 45.0
+
+
+@pytest.fixture
+def recall_clock(monkeypatch):
+    for name in tuple(bridge.os.environ):
+        if name.startswith("FUNES_REMOTE_"):
+            monkeypatch.delenv(name)
+    monkeypatch.setenv("FUNES_REMOTE_URL", "https://memory.example")
+    monkeypatch.setenv("FUNES_API_TOKEN", "api-token")
+    clock = [0.0]
+    monkeypatch.setattr(bridge.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(bridge.time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+    return clock
+
+
+def test_remote_search_allows_eleven_second_response(monkeypatch, recall_clock):
+    calls = []
+
+    def slow_response(req, timeout):
+        calls.append(timeout)
+        recall_clock[0] += min(11, timeout)
+        if timeout < 11:
+            raise TimeoutError("response still running")
+        return _Response({"ok": True, "results": ["中文"]})
+
+    monkeypatch.setattr(bridge, "_open_remote", slow_response)
+    assert bridge._remote_call("/search", {"query": "中文"}) == {"ok": True, "results": ["中文"]}
+    assert calls == [30.0]
+    assert recall_clock[0] == 11
+
+
+def test_remote_search_waits_for_busy_reader_within_total_budget(monkeypatch, recall_clock):
+    calls = []
+
+    def busy_response(req, timeout):
+        calls.append(timeout)
+        if len(calls) <= 4:
+            raise HTTPError(req.full_url, 429, "busy", {"Retry-After": "3"}, None)
+        recall_clock[0] += 11
+        return _Response({"ok": True, "results": ["中文"]})
+
+    monkeypatch.setattr(bridge, "_open_remote", busy_response)
+    assert bridge._remote_call("/search", {"query": "中文"}) == {"ok": True, "results": ["中文"]}
+    assert calls == [30.0, 30.0, 30.0, 30.0, 28.0]
+    assert recall_clock[0] == 23
+
+
+def test_remote_search_stops_retrying_at_total_deadline(monkeypatch, recall_clock):
+    calls = []
+
+    def timeout_response(req, timeout):
+        calls.append(timeout)
+        recall_clock[0] += timeout
+        raise TimeoutError("unavailable")
+
+    monkeypatch.setattr(bridge, "_open_remote", timeout_response)
+    assert bridge._remote_call("/search", {"query": "中文"}) is None
+    assert calls == [30.0, 8.0]
+    assert recall_clock[0] == 40

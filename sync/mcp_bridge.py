@@ -382,9 +382,10 @@ def _remote_call(path, payload):
     _validated_url(base)
     headers = _auth_headers(token, hub_token)
     if recall:
+        # Allow the native reader to finish before retrying into its busy slot.
         total = _first_float_env(
             ["FUNES_REMOTE_RECALL_TIMEOUT", "FUNES_REMOTE_SEARCH_TIMEOUT"],
-            18.0,
+            40.0,
             0.1,
             60.0,
         )
@@ -394,7 +395,7 @@ def _remote_call(path, payload):
                 "FUNES_REMOTE_SEARCH_ATTEMPTS",
                 "FUNES_REMOTE_ATTEMPTS",
             ],
-            2,
+            5,
             1,
             5,
         )
@@ -403,7 +404,7 @@ def _remote_call(path, payload):
                 "FUNES_REMOTE_RECALL_ATTEMPT_TIMEOUT",
                 "FUNES_REMOTE_SEARCH_ATTEMPT_TIMEOUT",
             ],
-            8.0,
+            30.0,
             0.1,
             30.0,
         )
